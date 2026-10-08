@@ -73,6 +73,19 @@ def invert(perm: Tuple[int, ...]) -> Tuple[int, ...]:
     return tuple(inverse)
 
 
+def to_canonical(values: Sequence[Any], perm: Optional[Tuple[int, ...]]) -> List[Any]:
+    """:func:`permute`, but identity for ``perm=None`` and for ``values`` of some
+    other rank."""
+    if perm is None or len(values) != len(perm):
+        return list(values)
+    return permute(values, perm)
+
+
+def to_native(values: Sequence[Any], perm: Optional[Tuple[int, ...]]) -> List[Any]:
+    """The inverse of :func:`to_canonical`: canonical-order ``values`` to native."""
+    return to_canonical(values, None if perm is None else invert(perm))
+
+
 def permute_repeated(field, perm: Tuple[int, ...]) -> None:
     """Permute a repeated proto field in place, iff its length matches the rank.
 
@@ -81,6 +94,12 @@ def permute_repeated(field, perm: Tuple[int, ...]) -> None:
     """
     if len(field) == len(perm):
         field[:] = permute(list(field), perm)
+
+
+def permute_level(level: Any, perm: Tuple[int, ...]) -> None:
+    """Permute a ``PyramidLevel``'s per-axis fields in place."""
+    permute_repeated(level.shape, perm)
+    permute_repeated(level.scale_hint, perm)
 
 
 def permute_bounds(bounds: ChunkBounds, perm: Tuple[int, ...]) -> ChunkBounds:
@@ -114,25 +133,13 @@ def permute_descriptor(
         permute_repeated(out.slice_hint.start, perm)
         permute_repeated(out.slice_hint.stop, perm)
     for level in out.pyramid:
-        permute_repeated(level.shape, perm)
-        permute_repeated(level.scale_hint, perm)
+        permute_level(level, perm)
     return out
 
 
 def descriptor_permutation(desc: TensorDescriptor) -> Optional[Tuple[int, ...]]:
     """The permutation ``desc``'s own labels imply, or None for identity."""
     return canonical_permutation(desc.dim_labels, desc.shape)
-
-
-def normalize_descriptor(desc: TensorDescriptor) -> TensorDescriptor:
-    """Normalize one descriptor by its **own** labels, or return it unchanged.
-
-    Per-descriptor rather than per-source: a multi-tensor source (HCS fields, a
-    multi-scene file) may hold tensors of differing rank and labelling, so each
-    catalog row is classified on its own.
-    """
-    perm = descriptor_permutation(desc)
-    return desc if perm is None else permute_descriptor(desc, perm)
 
 
 def log_reordering(source_id: str, descriptors: Sequence[TensorDescriptor]) -> None:

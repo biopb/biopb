@@ -80,10 +80,11 @@ from biopb_tensor_server.core.errors import (
 from biopb_tensor_server.core.normalize import (
     descriptor_permutation,
     invert,
-    normalize_descriptor,
-    permute,
     permute_bounds,
-    permute_repeated,
+    permute_descriptor,
+    permute_level,
+    to_canonical,
+    to_native,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
 from biopb_tensor_server.core.retention import (
@@ -274,8 +275,7 @@ class SourceAdapter(ABC):
     # mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
     # Permuting behind such an owner is the same desynchronization the write path
     # already refuses at ``add_tensor``, so those sources are validated and
-    # refused at their read boundary instead. See ``core.normalize`` and
-    # ``core.axes.noncanonical_order``.
+    # refused at their read boundary instead. See ``core.axes.noncanonical_order``.
     _normalizable_axes: bool = True
 
     @property
@@ -427,10 +427,16 @@ class SourceAdapter(ABC):
         of differing rank and labelling. Subclasses implement
         :meth:`_list_native_descriptors`.
         """
-        descs = self._list_native_descriptors()
-        if not self._normalizable_axes:
-            return descs
-        return [normalize_descriptor(d) for d in descs]
+        out = []
+        for d in self._list_native_descriptors():
+            perm = self._permutation_of(d)
+            out.append(d if perm is None else permute_descriptor(d, perm))
+        return out
+
+    def _permutation_of(self, desc: TensorDescriptor) -> Optional[Tuple[int, ...]]:
+        """The permutation ``desc``'s own labels imply, or None for identity --
+        always None for a source whose order is owned elsewhere."""
+        return descriptor_permutation(desc) if self._normalizable_axes else None
 
     @abstractmethod
     def _list_native_descriptors(self) -> List[TensorDescriptor]:
@@ -875,24 +881,21 @@ class TensorAdapter(SourceAdapter):
         Derived from the native descriptor on every call, deliberately **not**
         memoized: an adapter's advertised labels are not immutable -- a source can
         be undescribable now and describable later, or differently later -- and a
-        cached permutation cannot notice. Cheap: ``canonical_permutation`` is
-        O(ndim) over a descriptor most callers build anyway.
+        cached permutation cannot notice. The permutation itself is O(ndim); the
+        cost is the ``_native_descriptor()`` call, which builds a proto for most
+        adapters -- small next to the read it precedes.
         """
-        if not self._normalizable_axes:
-            return None
         try:
-            desc = self._native_descriptor()
+            return self._permutation_of(self._native_descriptor())
         except Exception:
             return None
-        return descriptor_permutation(desc)
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """The full **serving** descriptor for this bound tensor, in canonical
         axis order. Subclasses implement :meth:`_native_descriptor`."""
         desc = self._native_descriptor()
-        if not self._normalizable_axes:
-            return desc
-        return normalize_descriptor(desc)
+        perm = self._permutation_of(desc)
+        return desc if perm is None else permute_descriptor(desc, perm)
 
     @abstractmethod
     def _native_descriptor(self) -> TensorDescriptor:
@@ -1012,10 +1015,7 @@ class TensorAdapter(SourceAdapter):
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """:meth:`_native_read_block_shape`, in canonical axis order."""
         block = self._native_read_block_shape
-        perm = self._axis_perm() if block is not None else None
-        if perm is None or len(block) != len(perm):
-            return block
-        return tuple(permute(block, perm))
+        return block if block is None else tuple(to_canonical(block, self._axis_perm()))
 
     @property
     def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -1059,9 +1059,8 @@ class TensorAdapter(SourceAdapter):
         perm = self._axis_perm()
         if perm is None:
             return self._decimated_native(bounds, step)
-        inverse = invert(perm)
         out = self._decimated_native(
-            permute_bounds(bounds, inverse), tuple(permute(step, inverse))
+            permute_bounds(bounds, invert(perm)), tuple(to_native(step, perm))
         )
         return None if out is None else out.transpose(perm)
 
@@ -1522,11 +1521,7 @@ class TensorAdapter(SourceAdapter):
         """
         # The hint arrives canonical; the level lookup matches native factors.
         perm = self._axis_perm()
-        native_hint = (
-            tuple(permute(scale_hint, invert(perm)))
-            if perm is not None and len(scale_hint) == len(perm)
-            else tuple(scale_hint)
-        )
+        native_hint = tuple(to_native(scale_hint, perm))
         level = self._find_level_for_scale(native_hint)
         if level is None:
             raise ValueError(
@@ -1535,9 +1530,7 @@ class TensorAdapter(SourceAdapter):
         slice_hint = (
             request_desc.slice_hint if request_desc.HasField("slice_hint") else None
         )
-        factors = self._level_downsample_factors(level)
-        if perm is not None and len(factors) == len(perm):
-            factors = permute(factors, perm)
+        factors = to_canonical(self._level_downsample_factors(level), perm)
         level_slice = _convert_slice_to_level(slice_hint, factors)
         return self._plan_from_precomputed(level, level_slice)
 
@@ -1681,8 +1674,7 @@ class TensorAdapter(SourceAdapter):
         for level in levels:
             copy = type(level)()
             copy.CopyFrom(level)
-            permute_repeated(copy.shape, perm)
-            permute_repeated(copy.scale_hint, perm)
+            permute_level(copy, perm)
             out.append(copy)
         return out
 
@@ -1807,8 +1799,10 @@ class TensorAdapter(SourceAdapter):
         if phys is not None:
             scale_vec, unit_vec = phys
             perm = self._axis_perm()
-            if perm is not None and len(scale_vec) == len(perm) == len(unit_vec):
-                scale_vec, unit_vec = permute(scale_vec, perm), permute(unit_vec, perm)
+            scale_vec, unit_vec = (
+                to_canonical(scale_vec, perm),
+                to_canonical(unit_vec, perm),
+            )
             ndim = len(descriptor.dim_labels)
             if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
                 descriptor.physical_scale[:] = scale_vec

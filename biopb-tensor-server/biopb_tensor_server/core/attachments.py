@@ -34,7 +34,6 @@ from biopb_tensor_server.core.labels import (
     join_fields,
     split_label_field,
 )
-from biopb_tensor_server.core.normalize import normalize_descriptor
 
 __all__ = ["Attachments"]
 
@@ -162,7 +161,7 @@ class Attachments:
         """
         descs = list(parent.list_tensor_descriptors())
         descs += [t.get_tensor_descriptor() for t in self.attached_fields().values()]
-        return {d.array_id: normalize_descriptor(d) for d in descs}
+        return {d.array_id: d for d in descs}
 
     def label_binding_error(
         self,

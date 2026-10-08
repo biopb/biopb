@@ -442,7 +442,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     # The upstream owns this source's axis order, so the server validates it
     # rather than permuting it (biopb/biopb#596) -- see
-    # ``_require_canonical_upstream`` and ``core.normalize``.
+    # ``_require_canonical_upstream``.
     _normalizable_axes = False
 
     # A miss here is an upstream round trip plus load on someone else's server,

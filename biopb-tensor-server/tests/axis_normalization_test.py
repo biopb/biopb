@@ -222,14 +222,14 @@ class TestTheAdapterOwnsTheOrder:
 class TestNormalizedDescriptorAndData:
     """Every per-axis surface moves together, or the view is incoherent."""
 
-    def _wrapped(self, tmp):
+    def _permuted(self, tmp):
         src = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)  # x, y, z
         adapter = _zarr_adapter(tmp, src, ["x", "y", "z"])
         return adapter, src
 
     def test_descriptor_is_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             desc = adapter.get_tensor_descriptor()
             assert list(desc.dim_labels) == ["z", "y", "x"]
             assert list(desc.shape) == [4, 3, 2]
@@ -248,7 +248,7 @@ class TestNormalizedDescriptorAndData:
         from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._wrapped(tmp)
+            adapter, _ = self._permuted(tmp)
             reg = SourceRegistry()
             tensors = reg.catalog_tensors("wrapped", reg.register("wrapped", adapter))
             assert [list(t.dim_labels) for t in tensors] == [["z", "y", "x"]]
@@ -259,7 +259,7 @@ class TestNormalizedDescriptorAndData:
 
     def test_chunk_size_is_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             native = list(
                 _zarr_adapter(tmp, src, ["x", "y", "z"], name="raw")
                 ._native_descriptor()
@@ -269,7 +269,7 @@ class TestNormalizedDescriptorAndData:
 
     def test_get_data_takes_and_returns_canonical_axes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             got = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 3, 2]))
             assert got.shape == (4, 3, 2)
             np.testing.assert_array_equal(got, src.transpose(2, 1, 0))
@@ -278,7 +278,7 @@ class TestNormalizedDescriptorAndData:
         """The bounds are read in canonical order, so a sub-box must land where
         the caller meant it to -- an inverse-permutation bug shows up here."""
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             got = adapter.get_data(ChunkBounds(start=[1, 0, 0], stop=[3, 2, 1]))
             np.testing.assert_array_equal(got, src.transpose(2, 1, 0)[1:3, 0:2, 0:1])
 
@@ -287,7 +287,7 @@ class TestNormalizedDescriptorAndData:
         the bytes DoGet returns for its chunk_id have exactly the shape the
         endpoint's bounds claim."""
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._wrapped(tmp)
+            adapter, _ = self._permuted(tmp)
             plan = adapter.plan_flight_info(
                 TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
                 PyramidConfig(),
@@ -305,7 +305,7 @@ class TestNormalizedDescriptorAndData:
 
     def test_read_plan_reassembles_into_the_canonical_array(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             plan = adapter.plan_flight_info(
                 TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
                 PyramidConfig(),
@@ -330,7 +330,7 @@ class TestNormalizedDescriptorAndData:
         # and the slice would snap out to the whole tensor (biopb/biopb#809).
         transfer_target(4)
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, src = self._wrapped(tmp)
+            adapter, src = self._permuted(tmp)
             read_opt = TensorReadOption(
                 array_id="src", fields=FieldMask(paths=["endpoints"])
             )
@@ -412,7 +412,7 @@ class TestNormalizedDescriptorAndData:
         from biopb_tensor_server.core.errors import WriteNotSupportedError
 
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._wrapped(tmp)
+            adapter, _ = self._permuted(tmp)
             with pytest.raises(WriteNotSupportedError, match="canonical"):
                 adapter.put_chunk(
                     ChunkBounds(start=[0, 0, 0], stop=[1, 1, 1]), None, (1, 1, 1), "u2"
@@ -429,12 +429,11 @@ class TestNormalizedDescriptorAndData:
         """
         with tempfile.TemporaryDirectory() as tmp:
             inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
-            wrapper = inner
-            assert wrapper._axis_perm() == (2, 1, 0)
+            assert inner._axis_perm() == (2, 1, 0)
 
             inner.dim_labels = ["z", "y", "x"]
-            assert wrapper._axis_perm() is None
-            desc = wrapper.get_tensor_descriptor()
+            assert inner._axis_perm() is None
+            desc = inner.get_tensor_descriptor()
             assert list(desc.dim_labels) == ["z", "y", "x"]
             assert list(desc.shape) == [2, 3, 4]
 
@@ -443,7 +442,6 @@ class TestNormalizedDescriptorAndData:
         nothing is cached, the source normalizes normally once it can be."""
         with tempfile.TemporaryDirectory() as tmp:
             inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
-            wrapper = inner
             broken = {"raise": True}
             real = inner._native_descriptor
 
@@ -453,9 +451,9 @@ class TestNormalizedDescriptorAndData:
                 return real()
 
             inner._native_descriptor = flaky
-            assert wrapper._axis_perm() is None  # outage -> identity, not a crash
+            assert inner._axis_perm() is None  # outage -> identity, not a crash
             broken["raise"] = False
-            assert wrapper._axis_perm() == (2, 1, 0)  # recovered, not stranded
+            assert inner._axis_perm() == (2, 1, 0)  # recovered, not stranded
 
 
 @requires_zarr
@@ -670,7 +668,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
     order instead of permuting behind it, exactly as ``add_tensor`` does for an
     uploader's declared order."""
 
-    def test_a_proxy_is_never_wrapped(self):
+    def test_a_proxy_is_never_permuted(self):
         """Not because it is compliant -- it is asserted non-canonical here -- but
         because it enforces the contract itself."""
         proxy = _proxy_adapter(1)
