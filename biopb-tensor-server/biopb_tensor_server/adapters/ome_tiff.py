@@ -55,6 +55,7 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.labels import label_extent, label_field
+from biopb_tensor_server.core.normalize import canonical_axes
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +448,7 @@ def _parallel_read_enabled() -> bool:
 _UNSET: Any = object()
 
 
+@canonical_axes
 class OmeTiffAdapter(TensorAdapter):
     """Pure-tifffile adapter for OME-TIFF (embedded OME-XML), single or multi-file.
 
@@ -626,7 +628,7 @@ class OmeTiffAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One whole page -- the same expression that seeds the grid below.
 
         The read path opens ``series.aszarr(level=0, chunkmode="page")``, and
@@ -648,7 +650,7 @@ class OmeTiffAdapter(TensorAdapter):
             for label, size in zip(descriptor.dim_labels, descriptor.shape, strict=True)
         )
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 
         The read holds a lease on the pooled store, so it is never closed
@@ -663,7 +665,7 @@ class OmeTiffAdapter(TensorAdapter):
         if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super()._read_native(bounds)  # validate bounds against the descriptor
+        super().get_data(bounds)  # validate bounds against the descriptor
         slices = self._bounds_to_slices(bounds)
 
         with self._leased_store() as handle:
@@ -744,7 +746,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._cached_descriptors = descriptors if descriptors is not None else []
         return self._cached_descriptors
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         """Structural catalog entries for every scene (no grid, #812)."""
         return [catalog_entry(d) for d in self._scene_descriptors()]
 

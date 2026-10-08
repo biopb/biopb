@@ -25,6 +25,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -211,6 +212,7 @@ class _LazyZarrArray:
         return getattr(self._array(), name)
 
 
+@canonical_axes
 class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
@@ -433,7 +435,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         self._write_lock = threading.Lock()
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The store's chunk -- the ``native=`` seed of the grid below.
 
         Inherited by ``OmeZarrAdapter``, ``_HcsFieldAdapter`` and
@@ -452,7 +454,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             return None
         return tuple(int(size) for size in chunks)
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from zarr array.
 
         Args:
@@ -464,7 +466,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
@@ -558,5 +560,5 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             dtype=self.zarr_array.dtype.str,
         )
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         return [catalog_entry(self._native_descriptor())]

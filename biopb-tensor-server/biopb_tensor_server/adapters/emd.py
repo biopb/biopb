@@ -43,6 +43,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,7 @@ class _EmdHandle:
         self._released = True
 
 
+@canonical_axes
 class EmdAdapter(TensorAdapter):
     """Adapter for EMD electron-microscopy files (NCEM and Velox flavors).
 
@@ -340,7 +342,7 @@ class EmdAdapter(TensorAdapter):
         """Within-source field for a signal. The signal index is the field."""
         return str(index)
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         """One structural entry per EMD signal (no grid -- biopb/biopb#812)."""
         return [
             TensorEntry(
@@ -435,16 +437,16 @@ class EmdAdapter(TensorAdapter):
             self._handle._release_persistent_handle()
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The dask block -- the ``native=`` seed of this field's grid."""
         chunksize = getattr(self._data, "chunksize", None)
         return tuple(int(size) for size in chunksize) if chunksize else None
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region from this signal's dask array (native h5py read)."""
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._handle.array(self.signal_index)[slices].compute()

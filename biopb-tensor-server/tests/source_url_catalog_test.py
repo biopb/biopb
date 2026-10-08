@@ -73,7 +73,7 @@ class _StubAdapter(SourceAdapter):
     def create_from_config(cls, source, credentials_config=None):  # pragma: no cover
         raise NotImplementedError
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         return []
 
     def get_metadata(self):

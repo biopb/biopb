@@ -37,6 +37,7 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     _is_offline_placeholder,
 )
+from biopb_tensor_server.core.normalize import canonical_axes
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -371,6 +372,7 @@ class _PerFileTiffLockMixin:
 # =============================================================================
 
 
+@canonical_axes
 class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
@@ -777,7 +779,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     def _read_padded_plane(
@@ -816,7 +818,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         return plane
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One strile: the tile when tiled, one strip's rows when striped.
 
         Not the ``native=`` seed, which is the coarser per-page block
@@ -830,7 +832,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
         )
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.
 
         Uses TiffFile().aszarr() for true tile-level lazy reading.
@@ -844,7 +846,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import tifffile
         import zarr
 
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
@@ -1013,6 +1015,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
 # =============================================================================
 
 
+@canonical_axes
 class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
@@ -1480,11 +1483,11 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One strile: the tile when tiled, one strip's rows when striped.
 
         Not the ``native=`` seed, which is the coarser per-page block
@@ -1498,7 +1501,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             [1] * (len(self.full_shape) - 2) + [int(size) for size in self._strile]
         )
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds using tile-level lazy access.
 
         Uses TiffFile().aszarr() for true tile-level lazy reading.
@@ -1512,7 +1515,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import tifffile
         import zarr
 
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; all state read below is immutable

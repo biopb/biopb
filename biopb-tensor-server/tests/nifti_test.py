@@ -155,7 +155,7 @@ class TestNiftiAdapterClose:
             adapter = NiftiAdapter(nib.load(str(nii_path)), "s")
             adapter.close()
             with pytest.raises(RuntimeError, match="closed"):
-                adapter._read_native(ChunkBounds(start=[0, 0, 0], stop=[8, 8, 4]))
+                adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
 
     def test_close_leaves_a_local_source_file_alone(self):
         import nibabel as nib

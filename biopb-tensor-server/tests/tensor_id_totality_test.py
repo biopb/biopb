@@ -70,14 +70,14 @@ class _SingleTensorAdapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def get_metadata(self) -> dict:
         return {}
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
-        super()._read_native(bounds)
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        super().get_data(bounds)
         shape = tuple(
             int(s - a) for a, s in zip(bounds.start, bounds.stop, strict=True)
         )

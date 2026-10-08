@@ -136,17 +136,17 @@ class TestAPermutedAdapter:
         adapter = permuted
         monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: (32, 16))
         monkeypatch.setattr(
-            type(adapter), "_native_read_block_shape", property(lambda self: None)
+            type(adapter), "read_block_shape", property(lambda self: None)
         )
         for endpoint in adapter.get_read_plan(TensorDescriptor()).chunk_endpoints:
             adapter.resolve_chunk_data(endpoint.chunk_id, cache)
         bounds = ChunkBounds(start=[0, 0], stop=[64, 32])
         expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
         reads = []
-        native = adapter._read_native
+        native = adapter.get_data
         monkeypatch.setattr(
             adapter,
-            "_read_native",
+            "get_data",
             lambda b: (reads.append(tuple(b.start)), native(b))[1],
         )
 

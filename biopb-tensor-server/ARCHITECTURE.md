@@ -214,15 +214,15 @@ it. And only Z/Y/X/S count as trailing; T and C classify through the same
 vocabulary but have no canonical place, so they ride with the unlabeled.
 
 The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` holds the
-permutation helpers and `TensorAdapter` applies them. A leaf adapter implements
-the `_native_*` hooks (`_native_descriptor`, `_read_native`,
-`_list_native_tensors`, `_decimated_native`, `_native_read_block_shape`,
-`_native_pyramid_levels`) in its reader's order; the public methods present them
-canonical, so the planner, scaled and streamed reads and the pyramid all work in
-canonical order with no translation of their own. Inside a leaf, `self` speaks
-native. Adapters that already emit canonical order (`bioio` fixes `TCZYXS`;
-OME-TIFF / QPTIFF / TIFF-sequence / ndtiff / DICOM) pay one `None` check per
-call.
+permutation helpers and the `@canonical_axes` class decorator. A leaf adapter is
+written in its reader's order — `_native_descriptor` plus its own `get_data`,
+`get_decimated_data`, `read_block_shape`, `get_native_pyramid_levels` and
+`list_tensors` — and carries the decorator, which wraps those methods to present
+them canonical (the base permutes `get_tensor_descriptor` to match). The planner,
+scaled and streamed reads and the pyramid therefore work in canonical order with
+no translation of their own. A leaf reads its own geometry through
+`_native_descriptor()`. Adapters that already emit canonical order pay one `None`
+check per call.
 
 | | |
 |---|---|
@@ -239,7 +239,7 @@ through the shared `core/axes.py::noncanonical_order`:
 | | |
 |---|---|
 | **Writes** | `add_tensor` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
-| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
+| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy does not carry `@canonical_axes` and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)
 

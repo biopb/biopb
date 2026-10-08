@@ -23,6 +23,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
 _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
+@canonical_axes
 class NiftiAdapter(TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
@@ -315,10 +317,10 @@ class NiftiAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from NIfTI file.
 
         Returns scaled float64 data (applying slope/intercept if present).
@@ -333,10 +335,10 @@ class NiftiAdapter(TensorAdapter):
             ValueError: If bounds exceed array shape
             RuntimeError: If the source has been closed.
         """
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._read_slices(self._bounds_to_slices(bounds))
 
-    def _decimated_native(
+    def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """The same lazy slice, strided: nibabel reads what the step lands on.
@@ -347,7 +349,7 @@ class NiftiAdapter(TensorAdapter):
         more. So a strided read is never worse than reading the extent and
         striding it, and on a coarse scale it is a small fraction of the I/O.
         """
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._read_slices(self._bounds_to_strided_slices(bounds, step))
 
     def _read_slices(self, slices: Tuple[slice, ...]) -> np.ndarray:

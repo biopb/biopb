@@ -56,6 +56,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -73,6 +74,7 @@ _MAPPING_TTL = 5.0
 _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "dv-mapping-reaper", max_handles=8)
 
 
+@canonical_axes
 class DeltaVisionAdapter(TensorAdapter):
     """Reads DeltaVision DV volumes through ``mrc.DVFile``. Single-tensor source."""
 
@@ -203,26 +205,26 @@ class DeltaVisionAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: the mapping has no block structure to align a tile to."""
         return None
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._copy_out(self._bounds_to_slices(bounds))
 
-    def _decimated_native(
+    def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """A strided slice of the same mapping -- see MrcAdapter for why this
         is cheap: indexing a memmap computes byte offsets, so the copy shrinks
         by the product of the strides."""
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._copy_out(self._bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:

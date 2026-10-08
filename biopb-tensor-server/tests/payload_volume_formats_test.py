@@ -333,9 +333,9 @@ class TestNifti:
         assert rebuilt._physical_scale() == parsed._physical_scale()
         assert rebuilt.get_metadata() == _row_view(parsed.get_metadata())
         assert loads == []
-        shape = [8, 6, 4]
+        shape = [4, 6, 8]
         for _ in range(2):
-            rebuilt._read_native(ChunkBounds(start=[0, 0, 0], stop=shape))
+            rebuilt.get_data(ChunkBounds(start=[0, 0, 0], stop=shape))
         assert len(loads) == 1
 
     def test_a_closed_rebuilt_source_does_not_load_again(self, tmp_path):
@@ -345,7 +345,7 @@ class TestNifti:
         rebuilt = hydrate(parsed, source)
         rebuilt.close()
         with pytest.raises(RuntimeError, match="closed"):
-            rebuilt._read_native(ChunkBounds(start=[0, 0, 0], stop=[8, 6, 4]))
+            rebuilt.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 6, 8]))
 
     def test_a_remote_file_is_parsed(self):
         from biopb_tensor_server.adapters import NiftiAdapter

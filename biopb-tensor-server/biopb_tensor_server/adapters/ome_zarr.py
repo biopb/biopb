@@ -23,6 +23,7 @@ from biopb_tensor_server.core.adapter_base import TensorEntry, catalog_entry
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -221,6 +222,7 @@ def minimal_ome_metadata(desc: TensorDescriptor) -> dict:
     }
 
 
+@canonical_axes
 class OmeZarrAdapter(ZarrAdapter):
     """Adapter for OME-Zarr (OME-NGFF) datasets.
 
@@ -732,7 +734,7 @@ class OmeZarrAdapter(ZarrAdapter):
                     "shape": [int(s) for s in d.shape],
                     "dtype": d.dtype,
                 }
-                for d in self._list_native_tensors()
+                for d in self._native_entries()
             ],
         }
 
@@ -981,7 +983,7 @@ class OmeZarrAdapter(ZarrAdapter):
         datasets = multiscales[0].get("datasets", [])
         return len(datasets) >= 2
 
-    def _native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """Advertise the OME-Zarr multiscales datasets as native pyramid levels.
 
         One ``PyramidLevel`` per native dataset, ``native=True`` and
@@ -1035,7 +1037,10 @@ class OmeZarrAdapter(ZarrAdapter):
             )
         return levels or None
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
+        return self._native_entries()
+
+    def _native_entries(self) -> List[TensorEntry]:
         """List all tensors available in this source.
 
         For HCS plates: Returns flattened list of field tensors.
