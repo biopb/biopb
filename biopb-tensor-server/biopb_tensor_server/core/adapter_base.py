@@ -165,6 +165,55 @@ def strip_source_prefix(source_id: str, array_id: Optional[str]) -> Optional[str
     return array_id
 
 
+def bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
+    """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``."""
+    return tuple(
+        slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop, strict=True)
+    )
+
+
+def bounds_to_strided_slices(
+    bounds: ChunkBounds, step: Tuple[int, ...]
+) -> Tuple[slice, ...]:
+    """:func:`bounds_to_slices` with a per-axis stride, for a decimated read.
+
+    Kept next to its unstrided sibling so the two index a store identically
+    apart from the step -- which is the whole of what makes a fused
+    ``nearest`` bit-identical to reading the extent and slicing it.
+    """
+    return tuple(
+        slice(int(s), int(e), max(1, int(size)))
+        for s, e, size in zip(bounds.start, bounds.stop, step, strict=True)
+    )
+
+
+def validate_bounds(bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
+    """Validate that bounds are within array shape.
+
+    Args:
+        bounds: Chunk bounds (start, stop coordinates)
+        shape: Array shape
+
+    Raises:
+        ValueError: If bounds are out-of-bounds or invalid
+    """
+    ndim = len(shape)
+    if len(bounds.start) != ndim or len(bounds.stop) != ndim:
+        raise ValueError(
+            f"Bounds dimensionality mismatch: expected {ndim}, "
+            f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
+        )
+    for ax, (s, e, dim) in enumerate(
+        zip(bounds.start, bounds.stop, shape, strict=True)
+    ):
+        if s < 0:
+            raise ValueError(f"Bounds start[{ax}]={s} is negative")
+        if e > dim:
+            raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
+        if s >= e:
+            raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
+
+
 @dataclass(frozen=True)
 class TensorEntry:
     """What a *source* lists about one of its tensors: the **structural** facts.
@@ -230,7 +279,6 @@ class SourceAdapter(ABC):
     source_id: str  # Data source identifier
     _source_url: Optional[str] = None  # URL/path to the data source
     _source_type: Optional[str] = None  # Source type identifier
-    _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
     # Optional content-version token (biopb/biopb#178), folded into every
     # chunk_id this adapter mints and hence into the cache key, so a
@@ -426,7 +474,7 @@ class SourceAdapter(ABC):
             TensorNotFound: ``tensor_id`` names a field this source does not have.
         """
         field = strip_source_prefix(self.source_id, tensor_id)
-        if field and field != self.source_id and field != self._tensor_name:
+        if field and field != self.source_id:
             raise TensorNotFound(
                 f"tensor {tensor_id!r} not found in source {self.source_id!r} "
                 f"(single-tensor source has no field {field!r})",
@@ -495,6 +543,9 @@ class TensorAdapter(SourceAdapter):
     # (``TensorFlightServer._authorize_read``); None = no gate here, and the
     # server-wide rule alone.
     _capability_token: Optional[str] = None
+    # Set on a tensor that is one of several in its source; None for the sole
+    # tensor. ``array_id`` is minted from it.
+    _tensor_name: Optional[str] = None
 
     @property
     def capability_token(self) -> Optional[str]:
@@ -574,20 +625,7 @@ class TensorAdapter(SourceAdapter):
     # adapter decodes its own bytes from a backend it can read again.
     #
     # False for the two kinds that would be measured wrong rather than not at
-    # all, in opposite directions. An upload has no backend: its cache entry is
-    # the only copy, so a local read times a memcpy out of the very cache being
-    # classified and a "cheap" stamp is data loss. A passthrough proxy has one,
-    # but a miss costs an upstream round trip that the local hand-off does not
-    # contain, so timing it clocks a LAN upstream as fast and evicts it first.
-    # Both are declined here rather than measured and ignored: a rate nobody may
-    # act on is a diagnostic that reads as fact.
-    #
-    # Both also override ``resolve_chunk_data`` today and so never reach the
-    # sample site, which is what makes this a guard rather than a live switch.
-    # It is declared because that structural exemption is invisible from either
-    # adapter -- neither file mentions retention -- so narrowing an override
-    # (biopb/biopb#265, to serve a cache source's scaled reads from the chunks
-    # it already holds) would otherwise enrol it silently.
+    # all, in opposite directions. An upload and a passthrough proxy.
     _decode_time_is_rebuild_cost: bool = True
 
     # --- canonical axis order (biopb/biopb#596) ---------------------------------
@@ -627,13 +665,6 @@ class TensorAdapter(SourceAdapter):
         """Return the full **serving** descriptor for this bound tensor, in the
         order the reader emits.
 
-        The counterpart to :meth:`SourceAdapter.list_tensors`, which
-        answers the structural half for every tensor without binding any of them.
-        This is called on an adapter that ``get_tensor_adapter(array_id)`` has
-        already bound to one tensor -- a bioio/CZI scene, an OME-Zarr HCS field,
-        a QPTIFF level -- so it can answer for facts that only exist once that
-        selection is made (biopb/biopb#812).
-
         Field must be populated:
             - array_id: Unique tensor identifier (for single-tensor: source_id;
               for multi-tensor: source_id/tensor_name)
@@ -654,51 +685,6 @@ class TensorAdapter(SourceAdapter):
         docstring) answers here for its default tensor, and must do so by binding
         it -- not by reading its own catalog listing back, which carries no grid.
         """
-
-    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
-        """Return this tensor's transfer grid, clamped to the Arrow ceiling.
-
-        ``chunk_shape`` *is* the transfer grid and the adapter chose it
-        (biopb/biopb#809). The server sizes nothing on the adapter's behalf here
-        -- an adapter that knows its physical layout would only have its answer
-        undone, which is what made biopb/biopb#806 unfixable while the planner
-        ran on this seam -- and re-planning would also break the cache-backed
-        sources, which serve *only* the chunk_ids that were written, so a grid
-        that is not theirs asks for bounds that do not exist.
-
-        The one thing left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a
-        property of Arrow IPC, not of any format, so a declared grid above it is
-        re-split here rather than failing mid-transfer.
-
-        A descriptor may still reach here with an empty ``chunk_shape``: a
-        bulk-seeded remote proxy whose upstream is unreachable, or a
-        :func:`catalog_entry` handed in by a caller that should have bound the
-        tensor first. Handing the read planner a too-short tuple indexes out of
-        range against the full-rank shape (biopb/biopb#292), so fall back to the
-        whole tensor split under the ceiling -- a safe answer, never a good one,
-        which is why the catalog grid is not a fallback anyone may plan on.
-
-        An *unresolved* descriptor (empty shape/dtype -- a not-yet-hydrated
-        cloud/remote source) is rejected up front: the fallback would otherwise
-        reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
-        illegible ``TypeError``. ``require_resolved`` converts it to a clean
-        ``SourceUnresolvedError`` at this read-planning boundary, exactly as
-        ``get_arrow_schema`` and ``_get_read_plan`` already do.
-        """
-        desc = self.get_tensor_descriptor()
-        require_resolved(desc)
-        shape = tuple(int(dim) for dim in desc.shape)
-        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
-        if len(chunk_shape) != len(shape):
-            chunk_shape = shape
-        return compute_safe_chunk_size(
-            tuple(
-                min(max(1, chunk), dim)
-                for chunk, dim in zip(chunk_shape, shape, strict=True)
-            ),
-            desc.dtype,
-            list(desc.dim_labels),
-        )
 
     @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -724,40 +710,23 @@ class TensorAdapter(SourceAdapter):
         """
         desc = self._native_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
-        self._validate_bounds(bounds, shape)
+        validate_bounds(bounds, shape)
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """What this backend's reads are quantized to, or ``None`` for none.
 
-        A zarr chunk, a TIFF page: reading any part of one costs
-        the whole one. The streamed scaled read floors its tile here
+        **This is the ``native=`` seed the adapter passes to**
+        :func:`~.chunk.default_transfer_chunk_shape`.
+
+        The streamed scaled read floors its tile here
         (:func:`~.stream_reduce.streaming_unit`), because the transfer grid is
         derived from this same granularity by *dividing* it whenever it exceeds
-        the transfer target -- and a tile inside a block re-reads that block once
-        per tile. Unfloored that is 8-11x on a tiled 8192^2 OME-TIFF page and ~3x
-        on an OME-Zarr chunked at 4096^2.
-
-        **This is the ``native=`` seed the adapter already passes to**
-        :func:`~.chunk.default_transfer_chunk_shape`, not a second fact -- state
-        them from one expression so they cannot drift.
+        the transfer target.
 
         ``None`` claims something stronger than "unknown": that no part of a read
         is wasted, which is true of an mmap and of a backend that forwards
-        arbitrary bounds. Declaring it wrongly is silent -- every value stays
-        bit-identical, the read just costs more -- so ``adapter_read_block_test``
-        requires every adapter class to appear in one list or the other rather
-        than letting a new one default in.
-
-        Note the seed is an upper bound on granularity and a reader may beat it:
-        ``NikonAdapter`` seeds its grid with a whole C/Y/X ND2 frame (1.1 GiB on
-        a 14234^2 scene) that ``read_frame`` hands back as an mmap view, then
-        crops -- so it declares ``None`` and is right to.
-
-        A property rather than a class attribute because the answer is per
-        *instance* -- a tiled and a striped TIFF are the same adapter with
-        different answers -- and derived live rather than captured in
-        ``__init__`` because an adapter may not hold its store yet.
+        arbitrary bounds.
         """
         return None
 
@@ -766,26 +735,10 @@ class TensorAdapter(SourceAdapter):
     ) -> Optional[np.ndarray]:
         """Every ``step``-th element of ``bounds``, or ``None`` to decline.
 
-        ``None`` is the default and means "read the extent and stride it", which
-        is what the caller does anyway. An adapter implements this only where a
-        strided read costs in proportion to what it *returns* rather than to the
-        extent it spans -- and that is exactly what a ``nearest`` reduction is:
-        ``data[::step]``, element 0 of every block, needing none of the elements
-        it skips.
-
-        The candidates are the backends that already report no
-        :attr:`read_block_shape`, and the two answers correlate for one reason:
-        a quantized backend has to decode a whole block to hand back any of it,
-        so skipping elements inside it saves no reading -- only a memcpy, which
-        the streamed path already bounds. Where nothing is quantized, the skipped
-        elements are never touched at all. That is the one reduction where fusing
-        removes *reads* and not just heap: ``area`` has to visit every source
-        element whatever it does with them.
-
-        Declaring this where the backend cannot honour it cheaply is silent in
-        the same way :attr:`read_block_shape` is -- every value stays
-        bit-identical, the read merely costs more -- so ``decimated_read_test``
-        requires every adapter class to appear in one list or the other.
+        ``None`` is the default and means "read the extent and stride it".
+        An adapter implements this if strided read costs in proportion to what
+        it *returns* rather than to the extent it spans. The candidates are the
+        backends that already report no :attr:`read_block_shape`.
 
         An implementation must hold to all of:
 
@@ -816,10 +769,7 @@ class TensorAdapter(SourceAdapter):
 
         The default streams the extent in tiles of the transfer grid, floored at
         :attr:`read_block_shape`, reducing each tile as it arrives, so peak
-        residency is one tile rather than the extent (see
-        :mod:`~.stream_reduce`). An extent that is already one tile is read and
-        reduced whole, which is what every unscaled read and most small scaled
-        ones do.
+        residency is one tile.
 
         ``cache_manager`` lets the default source its units from the
         full-resolution chunks the cache already holds rather than decode them
@@ -832,10 +782,7 @@ class TensorAdapter(SourceAdapter):
         apply there -- a decimated read already materialises exactly the output.
 
         An adapter whose reader can deliver the extent in pieces more cheaply
-        than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
-        overrides this instead, so no view onto a reader-owned mapping ever
-        leaves the adapter's lock. Overriding to bound memory is no longer a
-        reason: the default already does.
+        than ``get_data`` can overrides this.
 
         An override must hold to all of:
 
@@ -889,7 +836,7 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
 
-        transfer = tuple(max(1, int(size)) for size in self.get_transfer_chunk_size())
+        transfer = tuple(max(1, int(size)) for size in transfer_chunk_size(descriptor))
         unit = streaming_unit(extent, transfer, self.read_block_shape, scale_hint)
         unit, fetch, borrowed = cache_sourced_units(
             cache_manager,
@@ -933,60 +880,6 @@ class TensorAdapter(SourceAdapter):
         finally:
             borrowed.release()
 
-    @staticmethod
-    def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
-        """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``.
-
-        The bounds->slices idiom every ``get_data`` needs to turn chunk bounds
-        into a numpy/zarr/h5py index; shared here so each adapter slices its
-        store the same way.
-        """
-        return tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
-
-    @staticmethod
-    def _bounds_to_strided_slices(
-        bounds: ChunkBounds, step: Tuple[int, ...]
-    ) -> Tuple[slice, ...]:
-        """:meth:`_bounds_to_slices` with a per-axis stride, for a decimated read.
-
-        Kept next to its unstrided sibling so the two index a store identically
-        apart from the step -- which is the whole of what makes a fused
-        ``nearest`` bit-identical to reading the extent and slicing it.
-        """
-        return tuple(
-            slice(int(s), int(e), max(1, int(size)))
-            for s, e, size in zip(bounds.start, bounds.stop, step, strict=True)
-        )
-
-    def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
-        """Validate that bounds are within array shape.
-
-        Args:
-            bounds: Chunk bounds (start, stop coordinates)
-            shape: Array shape
-
-        Raises:
-            ValueError: If bounds are out-of-bounds or invalid
-        """
-        ndim = len(shape)
-        if len(bounds.start) != ndim or len(bounds.stop) != ndim:
-            raise ValueError(
-                f"Bounds dimensionality mismatch: expected {ndim}, "
-                f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
-            )
-        for ax, (s, e, dim) in enumerate(
-            zip(bounds.start, bounds.stop, shape, strict=True)
-        ):
-            if s < 0:
-                raise ValueError(f"Bounds start[{ax}]={s} is negative")
-            if e > dim:
-                raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
-            if s >= e:
-                raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
-
     def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
         """Get the Arrow schema for this tensor.
 
@@ -1010,12 +903,6 @@ class TensorAdapter(SourceAdapter):
         desc = desc or self.get_tensor_descriptor()
         require_resolved(desc)
 
-        # One key, one contract: the wire-protocol version the client enforces
-        # (biopb/biopb#293). A `tensor_schema_version` release tag sat here too
-        # until biopb/biopb#1070 -- it stopped meaning anything when its one
-        # consumer (an shm feature probe) was replaced, and a release tag beside
-        # a byte-encoding gate reads like a second gate. It was: the Java client
-        # implemented it.
         metadata = {
             WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
         }
@@ -1097,11 +984,6 @@ class TensorAdapter(SourceAdapter):
                 :meth:`check_chunk_version`, called first, before any bytes
                 are read.
         """
-        # The two read gates, together and ahead of any I/O. Here rather than
-        # in a writable mixin's override because that made the gate depend on
-        # an adapter's base order, and on every override of this method
-        # remembering to call up; both defaults are no-ops, so every adapter
-        # is covered and a new one cannot forget.
         self.check_chunk_version(chunk_id)
         self.check_readable()
         array_id, bounds = decode_chunk_id(chunk_id)
@@ -1118,10 +1000,6 @@ class TensorAdapter(SourceAdapter):
 
         def compute_fn():
             if is_scaled_chunk_flag:
-                # The requested reduction_method rides in the chunk_id (#578), so a
-                # do_get honors it; a byte-free (pre-#578) scaled chunk_id decodes
-                # to area. Read and reduce through one call so an adapter that can
-                # do both at once never materializes the full-resolution extent.
                 result_arr = self.get_scaled_data(
                     bounds,
                     decode_scale_info(chunk_id),
@@ -1129,12 +1007,6 @@ class TensorAdapter(SourceAdapter):
                     cache_manager,
                 )
             else:
-                # The one read that is always a real decode: a scaled read may
-                # be sourced from the cache (#965) and would time the cache's
-                # own state instead. Measured here rather than inside
-                # ``get_data`` so no adapter has to cooperate, and so a
-                # delegating wrapper's transpose -- a view, materialized after
-                # this returns -- stays out of the number.
                 started = time.perf_counter()
                 result_arr = self.get_data(bounds)
                 if self._decode_time_is_rebuild_cost:
@@ -1143,17 +1015,11 @@ class TensorAdapter(SourceAdapter):
                     )
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
-            # string, wrapped zero-copy. This preserves the exact dtype including
-            # endianness (big-endian FITS '>i2' round-trips without conversion)
-            # and avoids the per-element typed-list encoding (biopb/biopb#293).
+            # string, wrapped zero-copy.
             result = pack_chunk_batch(result_arr)
             return result, result_arr.nbytes
 
         if should_cache:
-            # The method is part of the key, not advisory: since #578 the
-            # chunk_id carries a method byte and cache_key_for_chunk_id keeps
-            # it, so a nearest read cannot be served an area chunk (this
-            # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
                 cache_key,
@@ -1188,10 +1054,7 @@ class TensorAdapter(SourceAdapter):
         if reduction_method == "precompute" and scale_hint is not None:
             return self._plan_precomputed_read(request_desc, scale_hint)
 
-        chunk_size = self.get_transfer_chunk_size()
-        # content_version is a SourceAdapter property; every TensorAdapter is a
-        # SourceAdapter, so it is always present -- an unversioned source
-        # returns None. The epoch is the codec's to add.
+        chunk_size = transfer_chunk_size(base_desc)
         return _get_read_plan(
             base_desc,
             request_desc,
@@ -1200,12 +1063,7 @@ class TensorAdapter(SourceAdapter):
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
-    # Turning a ``precompute`` read into a read against one on-disk level's store
-    # is shared here, so the native-pyramid adapters (OME-Zarr multiscales,
-    # QPTIFF) stop duplicating it near-verbatim (biopb/biopb#557). A leaf adapter
-    # supplies only the per-format level lookup + scale extraction:
-    # :meth:`_find_level_for_scale`, :meth:`_level_downsample_factors`, and
-    # :meth:`get_level_adapter`.
+    # Turning a ``precompute`` read into a read against one on-disk level's store.
 
     def _plan_precomputed_read(
         self, request_desc: TensorDescriptor, scale_hint: Tuple[int, ...]
@@ -1276,24 +1134,6 @@ class TensorAdapter(SourceAdapter):
         read_plan.descriptor.array_id = self.array_id
         return read_plan
 
-    @staticmethod
-    def _base_structural_descriptor(base_desc: TensorDescriptor) -> TensorDescriptor:
-        """The stable per-tensor facts alone: shape/dtype/dim_labels/chunk_shape.
-
-        Copies only the structural fields off ``base_desc``, deliberately dropping
-        any pyramid / physical_scale / metadata_json the adapter's own
-        ``get_tensor_descriptor`` may already carry -- ``plan_flight_info`` re-fills
-        those under the response field masks (biopb/biopb#563), so a straight
-        ``CopyFrom`` would leak an unmasked pyramid or scale into the response.
-        """
-        return TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=base_desc.shape,
-            chunk_shape=base_desc.chunk_shape,
-            dtype=base_desc.dtype,
-        )
-
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
     ) -> TensorReadPlan:
@@ -1323,36 +1163,32 @@ class TensorAdapter(SourceAdapter):
         forward the upstream's authoritative plan instead (biopb/biopb#295).
         """
         base_desc = self.get_tensor_descriptor()
+        desc = TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
 
         # Opt-in: an empty mask is a describe, and the O(chunks) plan is the
         # most expensive thing here, so it is never what saying nothing buys.
         mask = read_mask(read_opt)
-
         if ENDPOINTS in mask:
-            request_desc = self._base_structural_descriptor(base_desc)
             if read_opt.HasField("slice_hint"):
-                request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-            # scale_hint / reduction_method route the read to a downsampled level.
+                desc.slice_hint.CopyFrom(read_opt.slice_hint)
             if read_opt.scale_hint:
-                request_desc.scale_hint[:] = list(read_opt.scale_hint)
+                desc.scale_hint[:] = list(read_opt.scale_hint)
             if read_opt.reduction_method:
-                request_desc.reduction_method = read_opt.reduction_method
-            read_plan = self.get_read_plan(
-                request_desc,
-            )
+                desc.reduction_method = read_opt.reduction_method
+            read_plan = self.get_read_plan(desc)
         else:
-            # Describe-only still exposes the server's transfer grid, never the
-            # adapter's private file/dask read geometry (#684).
-            desc = self._base_structural_descriptor(base_desc)
-            desc.chunk_shape[:] = list(self.get_transfer_chunk_size())
+            desc.chunk_shape[:] = list(transfer_chunk_size(base_desc))
             read_plan = TensorReadPlan(
                 descriptor=desc,
                 chunk_endpoints=[],
             )
 
-        # Advertise the server-decided resolution pyramid (opt-in -- native-level
-        # sizing is the costly part), then the compact physical scale (cheap,
-        # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
         if PYRAMID in mask:
             read_plan.descriptor.pyramid.extend(
@@ -1467,10 +1303,7 @@ class TensorAdapter(SourceAdapter):
         """
         descriptor.ClearField("physical_scale")
         descriptor.ClearField("physical_unit")
-        # Physical scale is constant for the lifetime of an adapter. Some format
-        # adapters derive it from expensive resident metadata, so cache both a
-        # value and a computed ``None`` result (there is no base __init__ shared
-        # by all adapters).
+
         if hasattr(self, "_physical_scale_cache"):
             phys = self._physical_scale_cache
         else:
@@ -1493,15 +1326,6 @@ class TensorAdapter(SourceAdapter):
 
 
 # --- role-scope enforcement -------------------------------------------------
-# The two role interfaces must stay disjoint *as declared* and match their
-# declared scope, so a tensor-scoped method can never silently land on
-# SourceAdapter again (the past scramble that this split fixes). TensorAdapter
-# inherits SourceAdapter's methods, but must not re-declare or override any of
-# them -- _public_api reads `vars(cls)`, so the checks below are about where a
-# method is written, not what an instance can answer. Adding a public method to
-# either ABC without classifying it here fails the equality check; any overlap
-# fails the disjointness check. Underscore-private helpers are intentionally
-# excluded.
 _SOURCE_SCOPED_API = frozenset(
     {
         "source_url",
@@ -1519,10 +1343,8 @@ _SOURCE_SCOPED_API = frozenset(
         "close",
         "release_registration_cache",
         "catalog_payload",
-        # attached tensors (biopb/biopb#1059)
         "get_embedded_labels",
         "resolve_chunk_adapter",
-        # the level lookup of the chunk route, which is source-scoped
         "get_level_adapter",
     }
 )
@@ -1534,7 +1356,6 @@ _TENSOR_SCOPED_API = frozenset(
         "check_chunk_version",
         "put_chunk",
         "get_tensor_descriptor",
-        "get_transfer_chunk_size",
         "read_block_shape",
         "get_data",
         "get_decimated_data",
@@ -1549,6 +1370,35 @@ _TENSOR_SCOPED_API = frozenset(
         "plan_flight_info",
     }
 )
+
+
+def transfer_chunk_size(desc: TensorDescriptor) -> Tuple[int, ...]:
+    """The transfer grid a tensor is read on, from its *desc*riptor,, clamped to the Arrow ceiling.
+
+    ``chunk_shape`` *is* the transfer grid and the adapter chose it
+    (biopb/biopb#809); the server sizes nothing on its behalf. The one thing
+    left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a property of Arrow
+    IPC, so a declared grid above it is re-split rather than failing mid-transfer.
+
+    An empty or short ``chunk_shape`` (a bulk-seeded remote proxy whose upstream
+    is unreachable, a :func:`catalog_entry` that was never bound) falls back to
+    the whole tensor under the ceiling: safe, never good (biopb/biopb#292). An
+    unresolved descriptor raises ``SourceUnresolvedError`` rather than a raw
+    ``TypeError`` out of ``np.dtype("")``.
+    """
+    require_resolved(desc)
+    shape = tuple(int(dim) for dim in desc.shape)
+    chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
+    if len(chunk_shape) != len(shape):
+        chunk_shape = shape
+    return compute_safe_chunk_size(
+        tuple(
+            min(max(1, chunk), dim)
+            for chunk, dim in zip(chunk_shape, shape, strict=True)
+        ),
+        desc.dtype,
+        list(desc.dim_labels),
+    )
 
 
 def _public_api(cls: type) -> frozenset:
@@ -1581,18 +1431,6 @@ def _convert_slice_to_level(
     so it is a module function, not a method: it reads no adapter state, and
     ``TensorAdapter._plan_precomputed_read`` supplies the level's downsample
     factors from the per-format hook.
-
-    Start floors and stop **ceils**, so the half-open range covers every level
-    pixel the base range touches. Flooring both -- which this did until
-    biopb/biopb#889 -- drops the partial pixel at a ragged end, and that is not
-    a rounding taste: it disagrees with the computed path, which decimates with
-    ``data[::s]`` and therefore returns ``ceil(extent / s)``. The two must
-    agree, because the same region at the same scale is served either way
-    depending only on whether the tensor happens to ship a pyramid. Worked
-    through, a level read of ``[a, b)`` at factor ``f`` then reduced by ``r``
-    yields ``ceil(ceil((b-a)/f)/r) == ceil((b-a)/(f*r))`` -- the computed count
-    exactly. With a floored stop the identity breaks, and where the last tile is
-    one pixel wide the result is empty rather than short.
     """
     if slice_hint is None:
         return None
@@ -1613,10 +1451,6 @@ def _get_read_plan(
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
-
-    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
-    chunk_id so the cache namespaces by it -- alongside the serving-semantics
-    epoch, which ``mint_chunk_id`` adds (biopb/biopb#1076).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -1630,7 +1464,7 @@ def _get_read_plan(
     reduction_method = normalize_reduction_method(request_desc.reduction_method)
     ndim = len(base_shape)
 
-    # STEP 1 was performed by TensorAdapter.get_transfer_chunk_size(). This
+    # STEP 1 was performed by transfer_chunk_size(). This
     # helper receives the public transfer grid and leaves it unchanged.
     transfer_chunk_size = chunk_size
 

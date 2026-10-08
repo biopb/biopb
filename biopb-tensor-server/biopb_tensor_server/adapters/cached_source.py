@@ -41,6 +41,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    transfer_chunk_size,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_of,
@@ -265,27 +266,6 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             response.physical_unit.extend(self._physical_unit_vec)
         return response
 
-    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
-        """The write grid, verbatim -- not re-split at the wire bound.
-
-        The base clamps a declared grid to ``MAX_ARROW_BATCH_BYTES`` so an
-        oversized chunk is fetched in pieces. Here the pieces do not exist as
-        chunks: a plan on any other grid asks for bounds no upload stored, and
-        every one of them is then reassembled by a scan of the whole record
-        (:meth:`get_data`) -- correct, and quadratic in the chunk count. An
-        uploader that wrote one 67 MB chunk -- a whole result in one DoPut is
-        the ordinary runtime case -- is served that chunk whole; the cache
-        keeps an oversized entry in memory rather than on disk, and DoGet
-        streams it as it was put. A consumer that replans a handle (every
-        fast-return consumer, since its handle carries no endpoints) meets
-        this path, where the producer's own embedded endpoints used to hide it.
-        """
-        shape = self._shape
-        return tuple(
-            min(max(1, int(chunk)), int(dim))
-            for chunk, dim in zip(self._chunk_shape, shape, strict=True)
-        )
-
     def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this cache source.
 
@@ -303,7 +283,10 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             array_id=self.array_id,
             dim_labels=self._dim_labels,
             shape=list(self._shape),
-            chunk_shape=list(self._chunk_shape),
+            chunk_shape=[
+                min(max(1, int(chunk)), int(dim))
+                for chunk, dim in zip(self._chunk_shape, self._shape, strict=True)
+            ],
             dtype=self._dtype,
         )
 
@@ -456,7 +439,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         The grid a read plan mints chunk_ids on, so an on-grid write is one a
         later read asks for by that same id.
         """
-        grid = self.get_transfer_chunk_size()
+        grid = transfer_chunk_size(self.get_tensor_descriptor())
         return all(
             lo % size == 0 and hi == min(lo + size, dim)
             for lo, hi, size, dim in zip(

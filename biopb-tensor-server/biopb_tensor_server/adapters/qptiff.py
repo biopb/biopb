@@ -51,6 +51,7 @@ from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -165,7 +166,7 @@ class _QptiffLevelAdapter(ZarrAdapter):
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         super(ZarrAdapter, self).get_data(bounds)  # validate against the level
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._parent._file() as handle:
             return np.asarray(handle.level_store(self._level)[0][slices])
 
@@ -329,7 +330,7 @@ class QptiffAdapter(TensorAdapter):
             return tuple(int(x) for x in handle.series.levels[level].shape)
 
     def _read_level(self, level: int, bounds: ChunkBounds) -> np.ndarray:
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         # The read runs under a lease and no lock, so parallel do_get chunk reads
         # decode concurrently. tifffile already makes this safe: its aszarr store
         # serializes the raw seek+read on one shared handle lock (fh.lock, the

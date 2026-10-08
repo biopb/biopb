@@ -558,6 +558,11 @@ class MockImage0Adapter(TensorAdapter):
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-aics"
 
+    def get_tensor_adapter(self, tensor_id):
+        if strip_source_prefix(self.source_id, tensor_id) == self._tensor_name:
+            return self
+        return super().get_tensor_adapter(tensor_id)
+
     def _native_descriptor(self) -> TensorDescriptor:
         # Tensor-level: source-qualified array_id, like aicsimageio.
         return TensorDescriptor(

@@ -21,6 +21,7 @@ import numpy as np
 from bioio import BioImage
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.bioio import NikonAdapter
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 
 
 def _time_ms(fn):
@@ -54,7 +55,7 @@ def main() -> None:
         source_url=str(path),
     )
     desc = adapter.get_tensor_descriptor()
-    transfer = adapter.get_transfer_chunk_size()
+    transfer = transfer_chunk_size(adapter.get_tensor_descriptor())
     starts = [0] * len(desc.shape)
     stops = [
         min(int(size), int(chunk))

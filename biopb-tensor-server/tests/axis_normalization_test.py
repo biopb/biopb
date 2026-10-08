@@ -25,6 +25,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core import normalize as _normalize
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.axes import canonical_axis, canonical_permutation
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
 from biopb_tensor_server.serving.server import TensorFlightServer
@@ -309,7 +310,9 @@ class TestNormalizedDescriptorAndData:
                 ._native_descriptor()
                 .chunk_shape
             )
-            assert adapter.get_transfer_chunk_size() == tuple(native[::-1])
+            assert transfer_chunk_size(adapter.get_tensor_descriptor()) == tuple(
+                native[::-1]
+            )
 
     def test_get_data_takes_and_returns_canonical_axes(self):
         with tempfile.TemporaryDirectory() as tmp:

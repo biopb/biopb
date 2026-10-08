@@ -58,6 +58,8 @@ from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -303,7 +305,7 @@ class MrcAdapter(TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_slices(bounds))
+        return self._copy_out(bounds_to_slices(bounds))
 
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
@@ -318,7 +320,7 @@ class MrcAdapter(TensorAdapter):
         and I/O only where the stride outruns the readahead.
         """
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_strided_slices(bounds, step))
+        return self._copy_out(bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:
         """Copy ``slices`` out of the shared mapping, counting the read.

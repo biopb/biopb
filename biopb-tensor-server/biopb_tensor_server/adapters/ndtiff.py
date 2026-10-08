@@ -30,6 +30,7 @@ from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -453,7 +454,7 @@ class NdTiffAdapter(TensorAdapter):
             Numpy array with data within the requested bounds
         """
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         with self._leased() as handle, handle.lock:
             return handle.value[1][slices].compute()

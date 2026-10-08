@@ -48,6 +48,8 @@ from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
     strip_source_prefix,
 )
@@ -525,7 +527,7 @@ class _BioioAdapterBase(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._io_lock:
             return self._scene_dask()[slices].compute()
 
@@ -1403,9 +1405,9 @@ class NikonAdapter(_BioioAdapterBase):
         paid reading the extent and striding it.
         """
         slices = (
-            self._bounds_to_slices(bounds)
+            bounds_to_slices(bounds)
             if step is None
-            else self._bounds_to_strided_slices(bounds, step)
+            else bounds_to_strided_slices(bounds, step)
         )
         with self._io_lock:
             self._bio_image.set_scene(self.scene_index)

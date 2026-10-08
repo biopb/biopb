@@ -92,6 +92,11 @@ class _NamedTensorAdapter(_SingleTensorAdapter):
         super().__init__(source_id, shape)
         self._tensor_name = tensor_name
 
+    def get_tensor_adapter(self, tensor_id):
+        if strip_source_prefix(self.source_id, tensor_id) == self._tensor_name:
+            return self
+        return super().get_tensor_adapter(tensor_id)
+
 
 class _LegacyMissAdapter(_SingleTensorAdapter):
     """An adapter that predates the typed taxonomy: raises a *bare* ``ValueError``

@@ -30,6 +30,7 @@ from biopb_tensor_server.adapters.fields import (
 from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.chunk import (
     content_version_of,
     encode_chunk_id,
@@ -322,7 +323,7 @@ class TestCachedSourceAdapter:
             dim_labels=["t", "c", "z", "y", "x"],
         )
 
-        assert adapter.get_transfer_chunk_size() == tuple(grid)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == tuple(grid)
 
         plan = adapter.get_read_plan(adapter.get_tensor_descriptor())
         written = {
@@ -445,25 +446,6 @@ class TestCachedSourceAdapter:
         finally:
             CacheManager.reset()
             shutil.rmtree(cache_dir, ignore_errors=True)
-
-    def test_the_write_grid_is_not_resplit_at_the_wire_bound(self):
-        """A chunk over MAX_ARROW_BATCH_BYTES is served whole, because the
-        pieces the base planner would fetch instead were never written.
-
-        A consumer that replans a handle -- every fast-return consumer, whose
-        handle carries no endpoints -- meets this; the producer's own embedded
-        endpoints used to hide it.
-        """
-        from biopb_tensor_server.cache import MAX_ARROW_BATCH_BYTES
-
-        side = int((MAX_ARROW_BATCH_BYTES * 2) ** 0.5) + 1  # > 64 MiB of uint8
-        adapter = CachedSourceAdapter(
-            source_id="whole", shape=[side, side], dtype="|u1", chunk_shape=[side, side]
-        )
-
-        assert adapter.get_transfer_chunk_size() == (side, side)
-        plan = adapter.get_read_plan(adapter.get_tensor_descriptor())
-        assert len(plan.chunk_endpoints) == 1
 
 
 class TestScaledReads:
@@ -765,6 +747,22 @@ class TestAddTensor:
         assert [d.array_id for d in server.sources.catalog_tensors(source)] == [
             desc.array_id
         ]
+
+    def test_a_write_grid_above_the_wire_bound_is_refused(self, tmp_path):
+        from biopb_tensor_server.cache import MAX_ARROW_BATCH_BYTES
+
+        side = int((MAX_ARROW_BATCH_BYTES * 2) ** 0.5) + 1  # > 64 MiB of uint8
+        server = self._server(tmp_path)
+        with pytest.raises(flight.FlightServerError, match="smaller chunks"):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"cache://{SCRATCH_SOURCE_ID}/@fields/whole",
+                    shape=[side, side],
+                    dtype="|u1",
+                    chunk_shape=[side, side],
+                    dim_labels=["y", "x"],
+                )
+            )
 
     def test_an_unregistered_source_is_refused(self, tmp_path):
         server = self._server(tmp_path)

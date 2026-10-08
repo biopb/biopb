@@ -23,6 +23,7 @@ from biopb_tensor_server.adapters._signature_memo import SignatureMemo
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -663,7 +664,7 @@ class DicomAdapter(TensorAdapter):
         from pydicom.pixels import iter_pixels, pixel_array
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
         with self._io_lock, self._pixel_source() as src:
@@ -1012,7 +1013,7 @@ class DicomSeriesAdapter(TensorAdapter):
         from pydicom.pixels import pixel_array
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])
 

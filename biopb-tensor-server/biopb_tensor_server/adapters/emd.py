@@ -39,6 +39,7 @@ from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
@@ -451,7 +452,7 @@ class EmdAdapter(TensorAdapter):
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._io_lock:
             return self._handle.array(self.signal_index)[slices].compute()
 

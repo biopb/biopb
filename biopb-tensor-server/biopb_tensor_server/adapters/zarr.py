@@ -18,7 +18,9 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    bounds_to_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
@@ -467,7 +469,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
     def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
@@ -540,6 +542,14 @@ class ZarrAdapter(WritableSource, TensorAdapter):
                 for start, stop in zip(bounds.start, bounds.stop, strict=True)
             )
         ] = arr
+
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """Itself for its own name, as well as for the source's."""
+        if self._tensor_name is not None and (
+            strip_source_prefix(self.source_id, tensor_id) == self._tensor_name
+        ):
+            return self
+        return super().get_tensor_adapter(tensor_id)
 
     def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

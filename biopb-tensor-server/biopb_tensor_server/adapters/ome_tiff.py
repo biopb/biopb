@@ -46,6 +46,7 @@ from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     catalog_entry,
     strip_source_prefix,
 )
@@ -667,7 +668,7 @@ class OmeTiffAdapter(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         with self._leased_store() as handle:
             if handle is None:
@@ -1146,7 +1147,7 @@ class OmeTiffAdapter(TensorAdapter):
                     # path's native unit, so the transfer grid stays a whole
                     # multiple of it rather than straddling pages; a page above
                     # the Arrow ceiling is still re-split by
-                    # get_transfer_chunk_size (biopb/biopb#809).
+                    # transfer_chunk_size (biopb/biopb#809).
                     descriptors.append(
                         TensorDescriptor(
                             # Identity policy: array_id = source_id/field; the

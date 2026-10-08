@@ -20,6 +20,7 @@ from biopb_tensor_server import (
     ZarrAdapter,
 )
 from biopb_tensor_server.core import downsample as _ds
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.config import parse_config
 
 
@@ -362,7 +363,7 @@ class TestGetScaledReadPlan:
 
 
 class TestEmptyChunkShapeFallback:
-    """get_transfer_chunk_size() must tolerate an empty/partial chunk_shape.
+    """transfer_chunk_size() must tolerate an empty/partial chunk_shape.
 
     A descriptor may still omit chunk_shape -- an unresolved source has no shape
     to size a grid from, and the bulk-seeded remote proxy mirrors whatever the
@@ -412,7 +413,7 @@ class TestEmptyChunkShapeFallback:
 
         from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
-        chunk = adapter.get_transfer_chunk_size()
+        chunk = transfer_chunk_size(adapter.get_tensor_descriptor())
         # A full-rank grid (no longer a 0-length tuple).
         assert len(chunk) == len(shape)
         # Matches the server's default transfer-grid policy exactly.
@@ -437,7 +438,7 @@ class TestEmptyChunkShapeFallback:
         )
         # The adapter's declared grid, served verbatim -- the server clamps to
         # the Arrow ceiling and re-sizes nothing (biopb/biopb#809).
-        assert adapter.get_transfer_chunk_size() == (50, 50)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (50, 50)
 
     def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
         # An unresolved descriptor (shape known, dtype still empty) must fail the
@@ -449,14 +450,14 @@ class TestEmptyChunkShapeFallback:
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
         )
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_transfer_chunk_size()
+            transfer_chunk_size(adapter.get_tensor_descriptor())
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
         from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_transfer_chunk_size()
+            transfer_chunk_size(adapter.get_tensor_descriptor())
 
 
 class TestDeclaredGridIsServedVerbatim:
@@ -479,11 +480,11 @@ class TestDeclaredGridIsServedVerbatim:
         adapter = self._Stub(
             [1, 1, 64, 1024, 1024], "<u2", ["t", "c", "z", "y", "x"], [1, 1, 1, 64, 64]
         )
-        assert adapter.get_transfer_chunk_size() == (1, 1, 1, 64, 64)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (1, 1, 1, 64, 64)
 
     def test_grid_declaring_one_chunk_is_honoured(self):
         adapter = self._Stub([64, 64], "uint8", ["y", "x"], [64, 64])
-        assert adapter.get_transfer_chunk_size() == (64, 64)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (64, 64)
 
     def test_grid_above_the_arrow_ceiling_is_resplit(self):
         from biopb_tensor_server.core.chunk import (
@@ -493,7 +494,7 @@ class TestDeclaredGridIsServedVerbatim:
 
         shape = [1, 1, 512, 2048, 2048]
         adapter = self._Stub(shape, "<u2", ["t", "c", "z", "y", "x"], shape)
-        grid = adapter.get_transfer_chunk_size()
+        grid = transfer_chunk_size(adapter.get_tensor_descriptor())
 
         assert estimate_chunk_bytes(grid, "<u2") <= MAX_ARROW_BATCH_BYTES
         # Clamped, not re-optimized: it is not pulled down to the 8 MB target.
@@ -503,7 +504,7 @@ class TestDeclaredGridIsServedVerbatim:
 
     def test_grid_is_clipped_to_the_shape(self):
         adapter = self._Stub([4, 8], "uint8", ["y", "x"], [64, 64])
-        assert adapter.get_transfer_chunk_size() == (4, 8)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (4, 8)
 
 
 class TestTransferChunkSize:

@@ -16,7 +16,11 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core import cache_source as _cs, downsample as _ds
+from biopb_tensor_server.core import (
+    adapter_base,
+    cache_source as _cs,
+    downsample as _ds,
+)
 from biopb_tensor_server.core.adapter_base import _TENSOR_SCOPED_API, TensorAdapter
 from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
@@ -63,7 +67,7 @@ def _set_grid(monkeypatch, adapter, grid, block=None):
     at its own 16x16 chunk -- correct behaviour, but it would mask the grid these
     cases are choosing.
     """
-    monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: grid)
+    monkeypatch.setattr(adapter_base, "transfer_chunk_size", lambda _d: grid)
     monkeypatch.setattr(type(adapter), "read_block_shape", property(lambda self: block))
 
 

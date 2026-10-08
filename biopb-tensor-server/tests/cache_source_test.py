@@ -18,6 +18,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.core import (
+    adapter_base,
     adapter_base as _ab,
     cache_source as _cs,
     downsample as _ds,
@@ -134,7 +135,7 @@ class TestAPermutedAdapter:
 
     def test_a_warm_cache_serves_a_scaled_read(self, permuted, cache, monkeypatch):
         adapter = permuted
-        monkeypatch.setattr(adapter, "get_transfer_chunk_size", lambda: (32, 16))
+        monkeypatch.setattr(adapter_base, "transfer_chunk_size", lambda _d: (32, 16))
         monkeypatch.setattr(
             type(adapter), "read_block_shape", property(lambda self: None)
         )

@@ -16,6 +16,8 @@ from biopb_tensor_server.adapters._scale import scale_from_payload, scale_to_pay
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -336,7 +338,7 @@ class NiftiAdapter(TensorAdapter):
             RuntimeError: If the source has been closed.
         """
         super().get_data(bounds)
-        return self._read_slices(self._bounds_to_slices(bounds))
+        return self._read_slices(bounds_to_slices(bounds))
 
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
@@ -350,7 +352,7 @@ class NiftiAdapter(TensorAdapter):
         striding it, and on a coarse scale it is a small fraction of the I/O.
         """
         super().get_data(bounds)
-        return self._read_slices(self._bounds_to_strided_slices(bounds, step))
+        return self._read_slices(bounds_to_strided_slices(bounds, step))
 
     def _read_slices(self, slices: Tuple[slice, ...]) -> np.ndarray:
         """Read ``slices`` from the lazy dataobj, scaled to float64."""
