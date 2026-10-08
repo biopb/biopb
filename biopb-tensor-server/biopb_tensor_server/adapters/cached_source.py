@@ -52,6 +52,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA, unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -294,9 +298,11 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         """Cache sources are single-tensor."""
         return [catalog_entry(self._native_descriptor())]
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return OME metadata."""
-        return self._ome_metadata
+        return metadata_record(self._ome_metadata)
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Echo the uploader's physical calibration onto the wire descriptor.

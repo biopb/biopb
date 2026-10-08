@@ -114,7 +114,7 @@ class TestItIsEmptyByDefault:
         adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
 
         assert writable_server.sources.catalog_tensors(SCRATCH_SOURCE_ID) == []
-        assert adapter.get_metadata() == {}
+        assert adapter.registration_record([], import_rois=False).metadata == {}
 
     def test_the_sweep_leaves_it_alone(self, writable_server, client):
         """It has no directory and no orphan row, so there is nothing for the

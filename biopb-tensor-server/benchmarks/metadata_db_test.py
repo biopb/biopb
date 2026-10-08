@@ -9,6 +9,10 @@ Measures performance for:
 import concurrent.futures
 
 import pytest
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
@@ -47,11 +51,15 @@ class MockAdapter:
             )
         ]
 
-    def get_metadata(self):
-        return {
-            "plate_id": self.source_id.split("-")[0],
-            "acquisition_date": "2024-01-01",
-        }
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(
+            {
+                "plate_id": self.source_id.split("-")[0],
+                "acquisition_date": "2024-01-01",
+            }
+        )
 
 
 def populate_database(db: MetadataDatabase, n_sources: int) -> None:

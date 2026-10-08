@@ -35,6 +35,10 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.server import (
     _adapter_lookup_error,
     to_flight_error,
@@ -73,8 +77,10 @@ class _SingleTensorAdapter(TensorAdapter):
     def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         super().get_data(bounds)

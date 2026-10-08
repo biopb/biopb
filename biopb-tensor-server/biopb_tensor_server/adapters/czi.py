@@ -56,6 +56,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache.manager import CacheManager
@@ -673,9 +677,11 @@ class CziAdapter(TensorAdapter):
         """Voxel size per descriptor axis, from the document's Scaling items."""
         return scale_by_label(self.dim_labels, self._layout.scale_um, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """The CZI Information subtree: sizes, channels, acquisition summary."""
-        return dict(self._layout.information)
+        return metadata_record(dict(self._layout.information))
 
 
 __all__ = ["CziAdapter"]

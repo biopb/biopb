@@ -32,6 +32,10 @@ from biopb_tensor_server.core.adapter_base import (
     transfer_chunk_size,
 )
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.sources.source_registry import SourceRegistry
 from google.protobuf.field_mask_pb2 import FieldMask
@@ -107,8 +111,10 @@ def test_the_catalog_lists_entries_that_cannot_name_a_grid():
         def create_from_config(cls, source, credentials_config=None):
             raise NotImplementedError
 
-        def get_metadata(self):
-            return {}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({})
 
         def list_tensors(self):
             return [

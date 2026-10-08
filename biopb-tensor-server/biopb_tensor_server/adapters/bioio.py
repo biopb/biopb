@@ -42,6 +42,7 @@ from biopb_tensor_server.adapters._handle_reaper import (
 )
 from biopb_tensor_server.adapters._ome_rois import (
     imported_annotations,
+    ome_registration_record,
     tensors_by_image_order,
 )
 from biopb_tensor_server.core import chunk as chunk_policy
@@ -785,16 +786,6 @@ class _BioioAdapterBase(TensorAdapter):
         """
         return None
 
-    def get_metadata(self) -> dict:
-        """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
-
-        Returns:
-            OME metadata as dict, or empty dict if unavailable.
-        """
-        if self._hydration is not None:
-            return copy.deepcopy(self._hydration.metadata)
-        return self._read_metadata()
-
     def _read_metadata(self) -> dict:
         """The metadata as the file holds it, opening the file if need be."""
         try:
@@ -821,10 +812,12 @@ class _BioioAdapterBase(TensorAdapter):
         except Exception:
             return {}
 
-    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
-        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ):
+        """The metadata and the OME-XML ``<ROI>`` elements this file carries.
 
-        Matched by POSITION, not by id. A field here is named by
+        ROIs are matched by POSITION, not by id. A field here is named by
         ``BioImage.scenes`` -- a CZI scene label, an ND2 point name -- which is
         not the OME image id, so equality would match nothing at all. Position
         is the relation ``_build_tensor_descriptors`` already pairs these on.
@@ -833,14 +826,23 @@ class _BioioAdapterBase(TensorAdapter):
         holds the ``rois``: it reads them from the file, and only when the payload
         says the file has some.
         """
-        if self._hydration is not None and self._hydration.has_rois:
-            metadata = self._read_metadata()
-        return imported_annotations(
-            metadata,
-            tensors_by_image_order(metadata, tensors),
-            content_version=self.content_version,
-            max_per_tensor=max_per_tensor,
+
+        def read_rois(metadata):
+            if self._hydration is not None and self._hydration.has_rois:
+                metadata = self._read_metadata()
+            return imported_annotations(
+                metadata,
+                tensors_by_image_order(metadata, tensors),
+                content_version=self.content_version,
+                max_per_tensor=max_rois_per_tensor,
+            )
+
+        metadata = (
+            copy.deepcopy(self._hydration.metadata)
+            if self._hydration is not None
+            else self._read_metadata()
         )
+        return ome_registration_record(metadata, read_rois, import_rois=import_rois)
 
     def _hydrated_scale(self) -> Any:
         """The stored scale of this scene (the first, at source level), or

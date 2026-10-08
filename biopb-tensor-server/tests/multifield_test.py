@@ -12,6 +12,10 @@ from biopb_tensor_server.core.adapter_base import (
     TensorDescriptor,
     strip_source_prefix,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 from tests import catalog_server, register_and_catalog
 
@@ -83,8 +87,12 @@ class MockMultifieldAdapter(TensorAdapter):
             return self._tensor_adapters[tensor_id]
         raise ValueError(f"Unknown tensor: {tensor_id}")
 
-    def get_metadata(self) -> dict:
-        return {"multifield": True, "n_tensors": len(self.tensor_specs)}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(
+            {"multifield": True, "n_tensors": len(self.tensor_specs)}
+        )
 
     def get_data(self, bounds):
         """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
@@ -140,9 +148,11 @@ class MockSingleTensorAdapter(TensorAdapter):
         )
         return np.full(shape, self.value, dtype=self.dtype)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return mock metadata."""
-        return {"mock_tensor": True, "value": self.value}
+        return metadata_record({"mock_tensor": True, "value": self.value})
 
 
 class TestMultifieldSourceLevel:
@@ -585,8 +595,10 @@ class MockImage0Adapter(TensorAdapter):
             )
         ]
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def _physical_scale(self):
         return list(self._phys_scale), list(self._phys_unit)

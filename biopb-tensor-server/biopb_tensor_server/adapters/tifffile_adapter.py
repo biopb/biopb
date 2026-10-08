@@ -22,6 +22,10 @@ from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
 from biopb_tensor_server.core.adapter_base import strip_source_prefix
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.discovery import DiscoveryState
@@ -375,7 +379,9 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             )
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return lightweight metadata exposed by the native TIFF reader.
 
         ImageJ and LSM metadata take precedence. Plain TIFFs commonly carry
@@ -384,28 +390,28 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         rebuilt from its row returns the row's metadata, which is this dict.
         """
         if self._hydrated_metadata is not None:
-            return dict(self._hydrated_metadata)
+            return metadata_record(dict(self._hydrated_metadata))
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
-            return {}
+            return metadata_record({})
         path = url[len("file://") :] if url.startswith("file://") else url
         if not path:
-            return {}
+            return metadata_record({})
         try:
             import tifffile
 
             with tifffile.TiffFile(path) as tiff:
                 if self._LSM:
-                    return dict(tiff.lsm_metadata or {})
+                    return metadata_record(dict(tiff.lsm_metadata or {}))
                 imagej = tiff.imagej_metadata or {}
                 if imagej:
-                    return dict(imagej)
+                    return metadata_record(dict(imagej))
                 for metadata in tiff.shaped_metadata or ():
                     if metadata:
-                        return dict(metadata)
-                return {}
+                        return metadata_record(dict(metadata))
+                return metadata_record({})
         except Exception:
-            return {}
+            return metadata_record({})
 
 
 class TiffAdapter(_TifffileAdapterBase):

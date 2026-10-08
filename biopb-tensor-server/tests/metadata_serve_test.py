@@ -15,6 +15,10 @@ import threading
 import time
 
 import pytest
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 from tests import catalog_server, register_and_catalog
 
@@ -40,9 +44,11 @@ def _meta_zarr_cls():
             self._meta = meta
             self.get_metadata_calls = 0
 
-        def get_metadata(self):
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
             self.get_metadata_calls += 1
-            return self._meta
+            return metadata_record(self._meta)
 
     return _MetaZarr
 
@@ -200,8 +206,12 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
             super().__init__(*a, **k)
             self._field_meta = field_meta
 
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}  # source-level (cached in catalog)
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record(
+                {"plate": {"rows": ["A"]}}
+            )  # source-level (cached in catalog)
 
         def get_tensor_metadata(self):
             return self._field_meta  # per-tensor delta, merged over the row
@@ -240,8 +250,10 @@ def test_source_metadata_excludes_the_per_tensor_delta(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
 
     class _PerTensorZarr(ZarrAdapter):
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({"plate": {"rows": ["A"]}})
 
         def get_tensor_metadata(self):
             return {"ome": "field"}
@@ -274,8 +286,10 @@ def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
 
     class _RowOnlyZarr(ZarrAdapter):
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({"plate": {"rows": ["A"]}})
 
         # get_tensor_metadata inherits the None default -> no delta
 

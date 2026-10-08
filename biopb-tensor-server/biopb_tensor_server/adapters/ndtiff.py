@@ -39,6 +39,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -153,7 +157,7 @@ def _extract_summary(dataset) -> dict:
 
     ``summary_metadata`` is parsed from ``NDTiff.index`` at construction and does
     not depend on the per-file readers, but snapshotting it at registration means
-    ``get_metadata`` / ``_physical_scale`` never touch the dataset -- which
+    ``registration_record`` / ``_physical_scale`` never touch the dataset -- which
     the pool may have closed between reads.
     """
     meta = getattr(dataset, "summary_metadata", None)
@@ -327,7 +331,7 @@ class NdTiffAdapter(TensorAdapter):
         if dataset is not None:
             dask_arr = dataset.as_array()
 
-            # Summary metadata snapshot -- so get_metadata/_physical_scale never
+            # Summary metadata snapshot -- so registration_record/_physical_scale never
             # reach through the dataset, which the pool may have closed (see the
             # helper).
             self._summary_metadata = _extract_summary(dataset)
@@ -494,13 +498,15 @@ class NdTiffAdapter(TensorAdapter):
         """
         return mm_summary_scale(self._summary_metadata, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return dataset summary metadata (MicroManager acquisition settings).
 
         Served from the snapshot taken at registration, so it stands even after
         the pool has closed the underlying dataset.
         """
-        return self._summary_metadata
+        return metadata_record(self._summary_metadata)
 
     # ---- lifecycle ----------------------------------------------------------
 

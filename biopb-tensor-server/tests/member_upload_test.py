@@ -115,7 +115,12 @@ class TestOneSourceManyTensors:
         has one."""
         client.upload_array(_add(client, source, "img"), _arr())
 
-        assert writable_server.sources.get(source).get_metadata() == {}
+        assert (
+            writable_server.sources.get(source)
+            .registration_record([], import_rois=False)
+            .metadata
+            == {}
+        )
 
 
 class TestItSurvivesARestart:

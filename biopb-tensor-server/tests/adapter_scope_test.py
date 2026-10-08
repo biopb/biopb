@@ -23,6 +23,10 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     _public_api,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 
 def test_role_interfaces_are_disjoint():
@@ -77,7 +81,9 @@ def test_has_native_pyramid_derives_from_levels_by_default():
         def list_tensors(self):  # abstract
             raise NotImplementedError
 
-        def get_metadata(self):  # abstract
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
             raise NotImplementedError
 
     class _WithPyramid(_NoPyramid):
@@ -129,8 +135,10 @@ def test_close_default_is_a_harmless_no_op():
         def list_tensors(self):
             return []
 
-        def get_metadata(self):
-            return {}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({})
 
         @classmethod
         def create_from_config(cls, source, credentials_config=None):

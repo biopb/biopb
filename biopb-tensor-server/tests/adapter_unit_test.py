@@ -23,6 +23,10 @@ from biopb_tensor_server.core import downsample as _ds
 from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.config import parse_config
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 
 def _zarr_available() -> bool:
@@ -403,8 +407,10 @@ class TestEmptyChunkShapeFallback:
         def list_tensors(self):
             return [self._desc]
 
-        def get_metadata(self):
-            return {}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({})
 
     def test_empty_chunk_shape_derives_default_grid(self):
         # The reproducer: a 5-D FITS-like tensor (>i2) with no chunk_shape, as a

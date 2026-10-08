@@ -40,7 +40,11 @@ def _as_stored(adapter):
     which the annotation store owns once a registration has imported them."""
     # Once: BioIO numbers the OME ids it generates from a counter, so two reads of
     # one parsed adapter already disagree on them, which is not what is under test.
-    stored = {k: v for k, v in adapter.get_metadata().items() if k != "rois"}
+    stored = {
+        k: v
+        for k, v in adapter.registration_record([], import_rois=False).metadata.items()
+        if k != "rois"
+    }
     adapter.get_metadata = lambda: stored
     return adapter
 
@@ -240,7 +244,7 @@ class TestSharedBase:
         scene = rebuilt.get_tensor_adapter(entries[1].array_id)
         scene.get_tensor_descriptor()
         scene._physical_scale()
-        rebuilt.get_metadata()
+        rebuilt.registration_record([], import_rois=False)
         assert _FakeBioImage.opened == 0
 
         shape = list(scene.get_tensor_descriptor().shape)
@@ -274,16 +278,12 @@ class TestEmbeddedRois:
         parsed, source, payload, metadata = self._sources(tmp_path, monkeypatch, True)
         assert payload["has_rois"] is True
         assert "rois" not in metadata
-        expected, _ = parsed.get_embedded_rois(
-            parsed.get_metadata(), self._tensors(parsed)
-        )
+        expected = parsed.registration_record(self._tensors(parsed)).rois
         assert expected  # the fixture has a rectangle on the first image
 
         rebuilt = OlympusAdapter.create_from_payload(source, payload, metadata, None)
         _FakeBioImage.opened = 0
-        got, _ = rebuilt.get_embedded_rois(
-            rebuilt.get_metadata(), self._tensors(rebuilt)
-        )
+        got = rebuilt.registration_record(self._tensors(rebuilt)).rois
 
         assert {k: [a.SerializeToString() for a in v] for k, v in got.items()} == {
             k: [a.SerializeToString() for a in v] for k, v in expected.items()
@@ -298,9 +298,7 @@ class TestEmbeddedRois:
 
         rebuilt = OlympusAdapter.create_from_payload(source, payload, metadata, None)
         _FakeBioImage.opened = 0
-        got, _ = rebuilt.get_embedded_rois(
-            rebuilt.get_metadata(), self._tensors(rebuilt)
-        )
+        got = rebuilt.registration_record(self._tensors(rebuilt)).rois
 
         assert got == {}
         assert _FakeBioImage.opened == 0

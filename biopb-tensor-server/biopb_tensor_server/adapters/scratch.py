@@ -24,6 +24,10 @@ from biopb_tensor_server.core.adapter_base import (
     strip_source_prefix,
 )
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 __all__ = ["DEFAULT_SCRATCH_TTL", "SCRATCH_SOURCE_ID", "ScratchSource"]
 
@@ -88,10 +92,12 @@ class ScratchSource(SourceAdapter):
         the registry's listing appends the published ones after this."""
         return []
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Nothing. Metadata describes an acquisition; the tensors here have
         nothing to do with each other and bring their own axes and shape."""
-        return {}
+        return metadata_record({})
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         """A typed miss; never ``self``.

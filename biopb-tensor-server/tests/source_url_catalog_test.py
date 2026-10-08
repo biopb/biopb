@@ -8,6 +8,10 @@ sites actually apply it.
 """
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, to_catalog_url
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 
 class TestToCatalogUrl:
@@ -76,8 +80,10 @@ class _StubAdapter(SourceAdapter):
     def list_tensors(self):
         return []
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def is_resident(self):
         # Avoid touching the filesystem for a fabricated path.

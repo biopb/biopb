@@ -11,6 +11,10 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     generate_source_id,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.sources.roots import RootKind
 
 from tests import make_manager
@@ -100,8 +104,10 @@ class _FailingMetadataDb(_FakeMetadataDb):
         super().__init__()
         self._fail_add = fail_add
         self._fail_remove = fail_remove
+        self.add_attempts = 0
 
     def sync_source_added(self, source_id, adapter, record=None):
+        self.add_attempts += 1
         if self._fail_add:
             raise RuntimeError("metadata add failed")
         super().sync_source_added(source_id, adapter)
@@ -1529,10 +1535,14 @@ class TestSourceManagerRegressions:
         (serving,) = _ClosingAdapter.built
 
         # The swap lands, then the catalog write fails.
-        manager._reconciler._metadata_db = _FailingMetadataDb(fail_add=True)
+        failing = _FailingMetadataDb(fail_add=True)
+        manager._reconciler._metadata_db = failing
         data_path.write_text("hello world")
         manager._handle_rescan()
 
+        # A sync that raised left the previous row as it was (one transaction),
+        # so the restore does not write it again.
+        assert failing.add_attempts == 1
         built = [a for a in _ClosingAdapter.built if a is not serving]
         assert len(built) == 1, "expected exactly one replacement to be built"
         assert built[0].closed == 1, "the replacement was dropped still open"
@@ -1930,8 +1940,10 @@ class _CatalogStubAdapter:
 
         return [TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class _CatalogStubRegistry(_FakeRegistry):

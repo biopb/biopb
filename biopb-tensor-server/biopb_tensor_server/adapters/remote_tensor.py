@@ -88,6 +88,10 @@ from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
 from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import LOCAL_ONLY, PYRAMID, read_mask
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -519,7 +523,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query, it seeds these so
-        # registration (sync_source_added -> list_tensors/get_metadata)
+        # registration (sync_source_added -> list_tensors/registration_record)
         # needs no per-source upstream RPC. None = not seeded (fall back to a live
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
@@ -564,7 +568,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         ``metadata_json`` and ``pyramid`` are cleared so the mirrored descriptor
         stays lean, exactly like a native adapter's: the LOCAL server fills both
-        itself on a ``GetFlightInfo`` (metadata from ``get_metadata()``; the
+        itself on a ``GetFlightInfo`` (metadata from ``registration_record``; the
         advertised pyramid from its own config). The upstream's ``get_descriptor``
         result carries them, so without clearing they would leak onto the proxy's
         catalog surface and the metadata would get double-wrapped on re-serialize.
@@ -681,7 +685,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added``
-        (``list_tensors`` + ``get_metadata``) needs no per-source
+        (``list_tensors`` + ``registration_record``) needs no per-source
         upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
         array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
@@ -755,7 +759,9 @@ class RemoteTensorAdapter(TensorAdapter):
                     )
         return changed
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Mirror the upstream source's metadata dict (OME etc.), best-effort.
 
         ``list_flights`` is deliberately lean and leaves
@@ -763,7 +769,7 @@ class RemoteTensorAdapter(TensorAdapter):
         (``GetFlightInfo(with_metadata=True)``) returns it *wrapped* in a
         ``{"type","dim_label","metadata"}`` envelope. Instead read it from the
         upstream's metadata catalog with a server-side SQL query: the DuckDB
-        ``sources.metadata_json`` column stores ``json.dumps(get_metadata())``
+        ``sources.metadata_json`` column stores ``json.dumps(registration_record)``
         verbatim -- the **raw** dict, no envelope -- which is exactly this
         method's contract (the LOCAL server adds the envelope when it serializes
         the response on a ``GetFlightInfo(with_metadata=True)``). Best-effort: an
@@ -774,7 +780,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
         if self._metadata_cache is not None:
-            return self._metadata_cache
+            return metadata_record(self._metadata_cache)
 
         sql = (
             "SELECT metadata_json FROM sources WHERE source_id = "
@@ -786,17 +792,17 @@ class RemoteTensorAdapter(TensorAdapter):
             logger.debug(
                 "upstream metadata query failed for %s: %s", self.source_id, exc
             )
-            return {}
+            return metadata_record({})
         if not rows:
-            return {}
+            return metadata_record({})
         raw = rows[0].get("metadata_json")
         if not raw:
-            return {}
+            return metadata_record({})
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+            return metadata_record({})
+        return metadata_record(parsed if isinstance(parsed, dict) else {})
 
     def list_tensors(self) -> List[TensorEntry]:
         """Mirror this one upstream source's tensor descriptor(s).

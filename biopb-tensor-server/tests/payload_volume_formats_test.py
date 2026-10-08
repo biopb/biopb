@@ -187,7 +187,12 @@ class TestQptiff:
             assert rebuilt.has_native_pyramid()
             assert rebuilt._find_level_for_scale((1, 2, 2)) == 1
             assert rebuilt.catalog_payload() is not None
-            assert rebuilt.get_metadata()["channels"][0] == "DAPI"
+            assert (
+                rebuilt.registration_record([], import_rois=False).metadata["channels"][
+                    0
+                ]
+                == "DAPI"
+            )
 
     def test_a_level_adapter_reads_through_a_handle_opened_on_demand(self, tmp_path):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -240,7 +245,9 @@ class TestDicom:
         rebuilt = hydrate(parsed, source)
         assert rebuilt._physical_scale() == parsed._physical_scale()
         assert rebuilt._physical_scale() is not None
-        assert rebuilt.get_metadata() == _row_view(parsed.get_metadata())
+        assert rebuilt.registration_record([], import_rois=False).metadata == _row_view(
+            parsed.registration_record([], import_rois=False).metadata
+        )
 
     def test_a_remote_file_is_parsed(self):
         from biopb_tensor_server.adapters import DicomAdapter
@@ -293,7 +300,9 @@ class TestDicomSeries:
         ]
         assert rebuilt.dicom_files[0].name == "slice_0.dcm"
         assert rebuilt._physical_scale() == parsed._physical_scale()
-        assert rebuilt.get_metadata() == _row_view(parsed.get_metadata())
+        assert rebuilt.registration_record([], import_rois=False).metadata == _row_view(
+            parsed.registration_record([], import_rois=False).metadata
+        )
 
 
 class TestNifti:
@@ -331,7 +340,9 @@ class TestNifti:
             nibabel, "load", lambda *a, **k: loads.append(1) or real(*a, **k)
         )
         assert rebuilt._physical_scale() == parsed._physical_scale()
-        assert rebuilt.get_metadata() == _row_view(parsed.get_metadata())
+        assert rebuilt.registration_record([], import_rois=False).metadata == _row_view(
+            parsed.registration_record([], import_rois=False).metadata
+        )
         assert loads == []
         shape = [4, 6, 8]
         for _ in range(2):

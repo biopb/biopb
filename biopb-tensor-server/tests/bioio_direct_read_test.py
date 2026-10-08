@@ -215,7 +215,7 @@ def test_nikon_metadata_failure_degrades_to_empty(tmp_path):
     )
     adapter = NikonAdapter(image, scene_index=None, source_id="source")
 
-    assert adapter.get_metadata() == {}
+    assert adapter.registration_record([], import_rois=False).metadata == {}
     assert adapter._physical_scale() is None
 
 

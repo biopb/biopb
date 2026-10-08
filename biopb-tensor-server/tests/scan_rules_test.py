@@ -203,7 +203,9 @@ class TestFailedRefresh:
         _touch(path)
         manager._handle_rescan()
 
-        assert len(calls) == 2  # the refresh, then the restore of what served
+        # Only the refresh: its write was one transaction, so the row of what
+        # served is intact and the restore does not write it again.
+        assert len(calls) == 1
         after = _catalog_row(server, sid)
         assert after[:2] == (True, None)
         assert after[3] == before[3]

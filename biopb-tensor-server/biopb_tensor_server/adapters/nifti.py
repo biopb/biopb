@@ -26,6 +26,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -435,14 +439,16 @@ class NiftiAdapter(TensorAdapter):
         except Exception:
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract NIfTI header metadata.
 
         Returns:
             Dictionary with format identifier, header fields, and affine matrix
         """
         if self._stored is not None:
-            return copy.deepcopy(self._stored["metadata"])
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
         metadata = {
             "format": "nifti",
             "header": {},
@@ -546,7 +552,7 @@ class NiftiAdapter(TensorAdapter):
             intent_code, f"code_{intent_code}"
         )
 
-        return metadata
+        return metadata_record(metadata)
 
     # ---- lifecycle ----------------------------------------------------------
 

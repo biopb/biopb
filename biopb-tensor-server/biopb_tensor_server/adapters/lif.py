@@ -46,6 +46,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -433,18 +437,24 @@ class LifAdapter(TensorAdapter):
         }
         return scale_by_label(self.dim_labels, values, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """This image's readlif-parsed acquisition summary."""
         if self.image_position is None:
-            return {"format": "lif", "images": len(self._layout.image_list)}
+            return metadata_record(
+                {"format": "lif", "images": len(self._layout.image_list)}
+            )
         info = self._layout.image_list[self.image_position]
-        return {
-            "format": "lif",
-            "name": info.get("name"),
-            "channels": info.get("channels"),
-            "bit_depth": list(info.get("bit_depth") or ()),
-            "settings": dict(info.get("settings") or {}),
-        }
+        return metadata_record(
+            {
+                "format": "lif",
+                "name": info.get("name"),
+                "channels": info.get("channels"),
+                "bit_depth": list(info.get("bit_depth") or ()),
+                "settings": dict(info.get("settings") or {}),
+            }
+        )
 
 
 __all__ = ["LifAdapter"]

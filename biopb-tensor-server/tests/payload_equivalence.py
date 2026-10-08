@@ -69,7 +69,7 @@ def _read_all(tensor) -> np.ndarray:
 def snapshot(adapter, *, read: bool = True) -> Dict[str, Any]:
     """Everything a client sees of a source before it asks for pixels, and the pixels."""
     out: Dict[str, Any] = {
-        "metadata": adapter.get_metadata(),
+        "metadata": adapter.registration_record([], import_rois=False).metadata,
         "content_version": adapter.content_version,
         "is_resolved": adapter.is_resolved(),
         "listing": [asdict(d) for d in adapter.list_tensors()],

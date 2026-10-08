@@ -73,7 +73,6 @@ from biopb.image.roi_pb2 import ROI
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
-from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
@@ -707,6 +706,10 @@ def _to_unix_ms(value: Optional[datetime]) -> int:
     if value.tzinfo is None:
         value = value.astimezone()
     return int(value.timestamp() * 1000)
+
+
+class _ImportedRoisFailed(Exception):
+    """The ROI half of a registration write failed; the row's half did not."""
 
 
 class MetadataDatabase:
@@ -1457,9 +1460,10 @@ class MetadataDatabase:
         the matching ``register_source`` so the catalog and the registry never
         silently disagree. Logging is the caller's responsibility.
 
-        Once the row is committed this calls
-        ``adapter.release_registration_cache()``: the catalog now holds the
-        metadata, so the adapter may drop whatever it kept only to produce it.
+        The row and the ROIs the file carries are one transaction, so a raise
+        leaves the previous row and ROIs both as they were. Only a failure of the
+        ROI write itself is the exception: it is logged, and the row is written
+        without them.
 
         Args:
             source_id: Unique source identifier
@@ -1479,7 +1483,6 @@ class MetadataDatabase:
         source_type = adapter.source_type
         is_resolved = adapter.is_resolved()
         catalog = self._catalog_tensors(source_id, adapter)
-        metadata = adapter.get_metadata()
 
         # Full per-tensor structural info (biopb/biopb#224): one struct per
         # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
@@ -1488,78 +1491,11 @@ class MetadataDatabase:
         # have no tensors -> empty list.
         tensors = self._tensor_rows(catalog)
 
-        # ROIs the file carries, filed in the reserved @ome set (#951). Derived
-        # HERE because this method is already the replace-on-rescan mechanism --
-        # re-registration is driven by the same stat signature content_version
-        # comes from -- so an imported set needs no freshness bookkeeping of its
-        # own, only the same lifecycle as the row below. It is also free here:
-        # get_metadata() has just been called, so this is a dict walk, not a
-        # second parse.
-        # The FORMAT decides whether its file carries annotations, because the
-        # server does not police what get_metadata() returns: a `rois` key in an
-        # EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
-        # format meant by it. getattr, because this method only duck-types its
-        # argument and several adapters supply that surface without inheriting
-        # the base -- which is also why they read as "carries nothing".
-        report = None
-        imported: Dict[str, List[RoiAnnotation]] = {}
-        get_embedded = (
-            getattr(adapter, "get_embedded_rois", None)
-            # A deployment that does not serve the annotation actions does not
-            # parse a file's ROIs either: the rows would be unreadable through
-            # every surface (the SQL one drops the table from allowed_tables
-            # too), so the work and the storage buy nothing. It also leaves
-            # `rois` in metadata_json, since nothing read them -- stripping is
-            # gated on a completed read, so that falls out.
-            if self._annotations_enabled
-            else None
-        )
-        try:
-            if get_embedded is not None:
-                imported, report = get_embedded(
-                    # `or {}`: get_metadata is typed -> dict, but an
-                    # upload-backed source returns whatever OME metadata it was
-                    # given, which may be None. The line below has always
-                    # tolerated that, so does this one.
-                    metadata or {},
-                    [(t.array_id, list(t.dim_labels)) for t in catalog],
-                    max_per_tensor=self._max_rois_per_tensor,
-                )
-        except Exception:
-            # Documented as a bug in the adapter, and still not fatal here: a
-            # source is its pixels first, and the next registration retries.
-            logger.exception("ome rois: could not read the set for %s", source_id)
-            imported, report = {}, None
-
-        if report:
-            logger.info("ome rois for %s: %s", source_id, report.summary())
-        # Only when the read completed. A wholesale failure leaves `rois` in the
-        # column rather than dropping the one copy that is left -- partial drops
-        # are counted in the report above, but this would be silent loss.
-        if report is not None and metadata and "rois" in metadata:
-            # The store owns them now. A second copy here would be duplicated
-            # bulk and would keep them in GET /api/sources/{id}/metadata, which
-            # is the surface the design says annotations do not appear on.
-            # Safe: the derivation above reads the adapter's fresh dict, never
-            # this column, so nothing rebuilds from what is dropped.
-            metadata = {k: v for k, v in metadata.items() if k != "rois"}
-        elif metadata and "rois" in metadata:
-            # report is None here either because annotations are off, or
-            # because get_embedded_rois raised (caught above) -- either way
-            # nothing dropped the whole `rois` key, so it stays. But a Mask's
-            # `bin_data` is arbitrary binary, unlike every other shape kind,
-            # and must never reach this SQL-queryable column regardless of
-            # why annotation import didn't run (biopb/biopb#1059 step 4,
-            # "Rasterizing OME masks").
-            metadata = strip_mask_bindata(metadata)
-
-        # Build row data
-        indexed_at = datetime.now()
-        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
-
         # Every source with a claim is persisted; the payload only lets a
         # restart skip the parse, so an adapter without one (or a cloud row, or
         # one that is not resolved) stores NULL and is rebuilt from its claim.
+        # Before the record, which is the adapter's cue to drop what it parked
+        # for it: the payload reads the same intermediates.
         payload = None
         if (
             record is not None
@@ -1569,41 +1505,62 @@ class MetadataDatabase:
         ):
             payload = adapter.catalog_payload()
 
-        self._upsert_source_row(
-            conn,
-            [
-                source_id,
-                source_url,
-                source_type,
-                indexed_at,
-                metadata_json,
-                is_resolved,
-                None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
-                tensors,
-                None,
-            ],
-            record,
-            payload,
+        # The file's metadata and ROIs (#951), built together by the adapter:
+        # the FORMAT decides whether its file carries annotations, because the
+        # server does not police what registration_record returns -- a `rois` key in
+        # an EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
+        # format meant by it. A server that does not serve the annotation actions
+        # does not parse a file's ROIs either: the rows would be unreadable
+        # through every surface, so the work and the storage buy nothing.
+        registration = adapter.registration_record(
+            [(t.array_id, list(t.dim_labels)) for t in catalog],
+            import_rois=self._annotations_enabled,
+            max_rois_per_tensor=self._max_rois_per_tensor,
+        )
+        if registration.report:
+            logger.info("ome rois for %s: %s", source_id, registration.report.summary())
+        indexed_at = datetime.now()
+        # Prepared before the write lock: nothing in it needs the connection.
+        rois = self._prepare_imported(
+            source_id, source_url, registration.rois, indexed_at
         )
 
-        # Deliberately AFTER the source row commits, and deliberately unable to
-        # raise. Registration failing here would cost a source its pixels over
-        # an annotation, which is the wrong way round: an imported set is
-        # disposable (the next registration rebuilds it, and open clears it
-        # anyway) where a source that will not register is an outage.
-        self._replace_imported(source_id, source_url, imported, indexed_at)
+        metadata = registration.metadata
+        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
-        # The row is committed, so the catalog -- not the adapter -- now owns this
-        # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
-        # parked on itself only to build the row; OME-TIFF's raw OME-XML is tens
-        # of MB on a per-plane acquisition (biopb/biopb#783). Best-effort: a
-        # balky release must not fail a registration that already succeeded.
+        row = [
+            source_id,
+            source_url,
+            source_type,
+            indexed_at,
+            metadata_json,
+            is_resolved,
+            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
+            tensors,
+            None,
+        ]
+
+        def replace_rois(c: duckdb.DuckDBPyConnection) -> None:
+            try:
+                self._replace_imported(c, source_id, rois)
+            except Exception as exc:
+                raise _ImportedRoisFailed from exc
+
+        # The row and the file's ROIs are one transaction, so they come from the
+        # same registration. DuckDB has no savepoints (a failed statement aborts
+        # the transaction), so when only the ROIs fail the whole write rolls back
+        # and the row goes in alone: no annotation is worth failing a
+        # registration, the previous set stays, and the next registration retries.
         try:
-            adapter.release_registration_cache()
-        except Exception:  # pragma: no cover - release is an optimization
-            logger.debug(
-                "release_registration_cache failed for %s", source_id, exc_info=True
+            self._upsert_source_row(conn, row, record, payload, also=replace_rois)
+        except _ImportedRoisFailed:
+            logger.exception(
+                "ome rois: could not store the imported set for %s; the source "
+                "is registered and serving, and the next registration retries",
+                source_id,
             )
+            self._upsert_source_row(conn, row, record, payload)
+
         logger.debug(f"Synced source to metadata database: {source_id}")
 
     def bind_registry(self, registry: Any) -> None:
@@ -1720,9 +1677,14 @@ class MetadataDatabase:
         row: List[Any],
         record: Optional[CatalogRecord] = None,
         payload: Optional[Dict[str, Any]] = None,
+        also: Optional[Callable[[duckdb.DuckDBPyConnection], None]] = None,
     ) -> None:
         """Insert or update a source's row (*row*, in ``_ROW_COLUMN_NAMES`` order),
         serializing writes with the lock.
+
+        One transaction with *also*, which runs after the row is written and
+        inside it: a raise from either leaves the previous row and whatever
+        *also* wrote exactly as they were.
 
         A ``source_id`` has one row, so a write cannot list a source twice. With a
         *record* (where the source sits, its claim and signature, and the adapter
@@ -1748,20 +1710,28 @@ class MetadataDatabase:
             update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
         with self._write_lock:
-            updated = conn.execute(
-                f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
-                set_values + [source_id],
-            ).fetchone()
-            if not updated or not updated[0]:
-                # A row that is there by now (the UPDATE did not see it) is
-                # overwritten, which is what was asked: a registration must not
-                # fail on the pending row its claim made.
-                conn.execute(
-                    f"INSERT INTO source_catalog ({_ALL_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * len(values))}) "
-                    f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
-                    values,
-                )
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                updated = conn.execute(
+                    f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
+                    set_values + [source_id],
+                ).fetchone()
+                if not updated or not updated[0]:
+                    # A row that is there by now (the UPDATE did not see it) is
+                    # overwritten, which is what was asked: a registration must
+                    # not fail on the pending row its claim made.
+                    conn.execute(
+                        f"INSERT INTO source_catalog ({_ALL_COLUMNS}) "
+                        f"VALUES ({', '.join('?' * len(values))}) "
+                        f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
+                        values,
+                    )
+                if also is not None:
+                    also(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def sync_pending_source(
         self,
@@ -2002,71 +1972,23 @@ class MetadataDatabase:
                 [root_id, root_url],
             )
 
-    def _replace_imported(
+    def _prepare_imported(
         self,
         source_id: str,
         source_url: str,
-        imported: Dict[str, List[RoiAnnotation]],
+        imported: Mapping[str, List[RoiAnnotation]],
         now: datetime,
-    ) -> None:
-        """Swap a source's reserved rows for the ones its file now carries.
-
-        Delete-then-insert scoped by ``source_id``, not per tensor: a tensor
-        whose ROIs were removed upstream has to lose its rows too, and it has no
-        entry in ``imported`` to drive that from.
+    ) -> List[List[Any]]:
+        """The ``rois`` rows a file's imported annotations become.
 
         No rev/created_at carry-forward, unlike :meth:`put_rois`. These rows are
         not edited, they are re-derived -- there is no history to preserve, and
         pretending otherwise would put a monotonic rev on a value that only ever
-        restates the file.
-
-        Never raises: its caller is source registration, and no annotation is
-        worth failing that (see the call site). One transaction all the same, so
-        a failure leaves the previous set rather than half of the new one.
+        restates the file. Needs no connection, so it runs before the write lock.
         """
-        conn = self._get_connection()
-        try:
-            with self._write_lock:
-                conn.execute("BEGIN TRANSACTION")
-                try:
-                    self._replace_imported_locked(
-                        conn, source_id, source_url, imported, now
-                    )
-                    conn.execute("COMMIT")
-                except BaseException:
-                    conn.execute("ROLLBACK")
-                    raise
-        except Exception:
-            logger.exception(
-                "ome rois: could not store the imported set for %s; the source "
-                "is registered and serving, and the next registration retries",
-                source_id,
-            )
-
-    def _replace_imported_locked(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        source_id: str,
-        source_url: str,
-        imported: Dict[str, List[RoiAnnotation]],
-        now: datetime,
-    ) -> None:
-        """The body of :meth:`_replace_imported`, inside the transaction."""
-        conn.execute(
-            "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
-            [source_id, RESERVED_SET_PREFIX],
-        )
-        if not imported:
-            return
-
-        insert_sql = (
-            "INSERT INTO rois "
-            f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
-            "rev, created_at, updated_at, source_url, last_seen_at) "
-            f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
-        )
-        for array_id, rows in imported.items():
-            for annotation in rows:
+        rows: List[List[Any]] = []
+        for array_id, found in imported.items():
+            for annotation in found:
                 # allow_reserved: this is the one writer the @ome namespace has.
                 # Still through _prepare_roi, so bbox and the canonical geometry
                 # JSON are derived exactly as they are for a hand-drawn row --
@@ -2077,19 +1999,44 @@ class MetadataDatabase:
                     # _prepare_roi stays the single authority on what is
                     # storable -- an over-long id, say -- so the importer skips
                     # what it refuses instead of carrying a second copy of the
-                    # rules. Python-side, so the transaction is still intact.
+                    # rules.
                     logger.debug(
                         "ome rois: %s rejected by the store", annotation.roi_id
                     )
                     continue
-                conn.execute(
-                    insert_sql,
+                rows.append(
                     [prep.roi_id, array_id, source_id]
                     + prep.column_values(self._ROI_CLIENT_COLUMNS)
                     # last_seen_at is `now` unconditionally: the source is being
                     # registered, which IS the sighting these rows record.
-                    + [1, now, now, source_url, now],
+                    + [1, now, now, source_url, now]
                 )
+        return rows
+
+    def _replace_imported(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_id: str,
+        rows: List[List[Any]],
+    ) -> None:
+        """Swap a source's reserved rows for *rows*, inside the caller's transaction.
+
+        Delete-then-insert scoped by ``source_id``, not per tensor: a tensor
+        whose ROIs were removed upstream has to lose its rows too, and it has no
+        entry in the import to drive that from.
+        """
+        conn.execute(
+            "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
+            [source_id, RESERVED_SET_PREFIX],
+        )
+        if rows:
+            conn.executemany(
+                "INSERT INTO rois "
+                f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
+                "rev, created_at, updated_at, source_url, last_seen_at) "
+                f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})",
+                rows,
+            )
 
     def source_row_ipc(self, source_id: str) -> Optional[bytes]:
         """One source's catalog row as an Arrow IPC stream, or ``None``.
@@ -2117,11 +2064,11 @@ class MetadataDatabase:
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
         """Return a source's stored metadata as a dict, or ``None`` when empty.
 
-        The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
+        The catalog stores ``json.dumps(adapter.registration_record)`` -- the **raw**
         dict, no envelope -- so the serve path can read metadata back with a
         cheap local ``SELECT`` instead of recomputing it on the adapter
         (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
-        the local mirror row directly, never ``adapter.get_metadata()``). The
+        the local mirror row directly, never ``adapter.registration_record``). The
         stored JSON is parsed here so callers get a ready dict.
 
         Returns ``None`` when the source has no usable stored metadata -- which is

@@ -76,7 +76,10 @@ class TestOmeZarrImage:
             ],
         )
 
-        assert rebuilt.get_metadata() == parsed.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == parsed.registration_record([], import_rois=False).metadata
+        )
         assert rebuilt.dim_labels == parsed.dim_labels
         assert rebuilt._source_type == parsed._source_type == "ome-zarr"
 
@@ -196,7 +199,10 @@ class TestOmeZarrPlate:
 
         assert rebuilt._is_hcs_plate
         assert rebuilt._source_type == "ome-zarr-hcs"
-        assert rebuilt.get_metadata() == parsed.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == parsed.registration_record([], import_rois=False).metadata
+        )
         assert rebuilt.channel_names == ["dapi", "gfp"]
 
 
@@ -247,7 +253,10 @@ class TestTiffSequence:
             parsed, source, monkeypatch=monkeypatch, opens=[(tifffile, "TiffFile")]
         )
 
-        assert rebuilt.get_metadata() == parsed.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == parsed.registration_record([], import_rois=False).metadata
+        )
         assert rebuilt._physical_scale() == parsed._physical_scale()
 
     def test_multipage_members_keep_their_page_axis(self, tmp_path, monkeypatch):
@@ -279,13 +288,17 @@ class TestTiffSequence:
         _write_tiff(tmp_path / "s1-9999_bf.tif", shape=(2, 8, 8))  # another page count
         source = _source(tmp_path, "tiff-sequence")
         parsed = TiffSequenceAdapter.create_from_config(source)
-        assert parsed.get_metadata().get("unstacked_files")
+        assert parsed.registration_record([], import_rois=False).metadata.get(
+            "unstacked_files"
+        )
 
         rebuilt = assert_hydrates_equivalently(
             parsed, source, monkeypatch=monkeypatch, opens=[(tifffile, "TiffFile")]
         )
 
-        assert rebuilt.get_metadata()["unstacked_files"] == ["s1-9999_bf.tif"]
+        assert rebuilt.registration_record([], import_rois=False).metadata[
+            "unstacked_files"
+        ] == ["s1-9999_bf.tif"]
 
 
 def _write_micromanager(root, positions=1, frames=2, channels=3, slices=2):

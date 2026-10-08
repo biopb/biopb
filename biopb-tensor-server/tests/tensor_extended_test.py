@@ -114,7 +114,7 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
             source_url=path,
         )
 
-        metadata = adapter.get_metadata()
+        metadata = adapter.registration_record([], import_rois=False).metadata
         assert isinstance(metadata, dict)
         assert len(metadata) > 0
 
@@ -193,7 +193,7 @@ class TestOmeZarrAdapter:
         arr = root["0"]
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-test")
-        metadata = adapter.get_metadata()
+        metadata = adapter.registration_record([], import_rois=False).metadata
 
         # Should return the OME-Zarr .zattrs content
         assert isinstance(metadata, dict)

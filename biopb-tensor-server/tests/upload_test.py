@@ -197,7 +197,7 @@ class TestCachedSourceAdapter:
             ome_metadata=ome_metadata,
         )
 
-        metadata = adapter.get_metadata()
+        metadata = adapter.registration_record([], import_rois=False).metadata
         assert "multiscales" in metadata
         assert len(metadata["multiscales"]) == 1
 

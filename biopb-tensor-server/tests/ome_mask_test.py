@@ -343,7 +343,7 @@ class TestFastMetadataRealBitmap:
         raw = bytes([0xFF, 0x00, 0xFE, 0x80, 0x01, 0x00])  # not valid UTF-8
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
-        metadata = adapter.get_metadata()
+        metadata = adapter._ome_metadata()
         assert metadata  # used to come back {} entirely
         assert metadata["images"][0]["id"] == "Image:0"
         mask = metadata["rois"][0]["union"]["masks"][0]
@@ -379,7 +379,7 @@ class TestFastMetadataRealBitmap:
         ]
         assert reg.resolve_tensor("src1", "Image:0/@labels/@ome") is label_set
 
-        adapter.release_registration_cache()
+        adapter._drop_registration_state()
 
         # The label adapter keeps the decoded bitmap, while the source retains
         # neither the base64 payload nor its parsed duplicate.
@@ -395,14 +395,14 @@ class TestFastMetadataRealBitmap:
             )[tuple([0] * (out.ndim - 2) + [2, 2])]
             == 1
         )
-        metadata_after_release = adapter.get_metadata()
+        metadata_after_release = adapter._ome_metadata()
         mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
         assert mask_after_release["bin_data"]["value"] == ""
 
     def test_release_survives_a_reduced_xml_the_stripper_cannot_parse(
         self, tmp_path, monkeypatch
     ):
-        """release_registration_cache() is documented to never raise. A reduced
+        """Dropping the registration state must never raise. A reduced
         XML the mask stripper's ET.fromstring rejects must not abort the raw-XML
         drop or the cascade to scene adapters below it -- it is left un-redacted
         instead (biopb/biopb#1081)."""
@@ -425,7 +425,7 @@ class TestFastMetadataRealBitmap:
             ome_tiff_module, "_strip_mask_bindata_payloads", _broken_strip
         )
 
-        adapter.release_registration_cache()  # must not raise
+        adapter._drop_registration_state()  # must not raise
 
         assert adapter._raw_ome_xml is None
         assert adapter._raw_ome_xml_released is True
@@ -451,8 +451,8 @@ class TestFastMetadataRealBitmap:
 
         monkeypatch.setattr(ome_tiff_module, "_fast_ome_metadata", counting)
 
-        adapter.get_metadata()
-        adapter._embedded_sets()  # calls self.get_metadata() again internally
-        adapter.get_metadata()
+        adapter._ome_metadata()
+        adapter._embedded_sets()  # calls self._ome_metadata() again internally
+        adapter._ome_metadata()
 
         assert len(calls) == 1

@@ -69,6 +69,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -610,8 +614,10 @@ class Nd2Adapter(TensorAdapter):
             return None
         return scale_by_label(self.dim_labels, self._layout.voxel_um, MICRON)
 
-    def get_metadata(self) -> dict:
-        return dict(self._layout.ome_summary)
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(dict(self._layout.ome_summary))
 
 
 __all__ = ["Nd2Adapter"]

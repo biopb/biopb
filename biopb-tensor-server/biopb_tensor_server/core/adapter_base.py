@@ -29,7 +29,6 @@ from typing import (
     Any,
     Dict,
     List,
-    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -84,6 +83,7 @@ from biopb_tensor_server.core.normalize import (
     to_native,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
+from biopb_tensor_server.core.registration import RegistrationRecord
 from biopb_tensor_server.core.retention import (
     computed_ladder,
     record_decode,
@@ -372,43 +372,36 @@ class SourceAdapter(ABC):
         """
 
     @abstractmethod
-    def get_metadata(self) -> dict:
-        """Return the source-level metadata as a dict. Usually OME metadata.
-
-        Called once per registered adapter, by
-        :meth:`MetadataDatabase.sync_source_added`, to populate
-        ``sources.metadata_json``; a changed file or a source that resolves
-        registers a new adapter. (A remote mirror's re-seed and a rolled-back
-        replace sync the same adapter again.) The serve path reads that row back,
-        never this method (biopb/biopb#253), and nothing else calls it: an adapter
-        that needs a value from its metadata keeps a private copy of that value.
-        The catalog is the cache, so this need not memoize. Genuinely per-tensor
-        metadata that the source row cannot represent is exposed on the tensor
-        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
-        """
-
-    def get_embedded_rois(
+    def registration_record(
         self,
-        metadata: Mapping[str, Any],
         tensors: Sequence[Tuple[str, Sequence[str]]],
         *,
-        max_per_tensor: Optional[int] = None,
-    ) -> Tuple[Dict[str, List[Any]], Any]:
-        """ROIs this source's own file carries, keyed by ``array_id``.
+        import_rois: bool = True,
+        max_rois_per_tensor: Optional[int] = None,
+    ) -> RegistrationRecord:
+        """Everything this source contributes to its catalog entry, built once.
 
-        Some formats store annotations beside their pixels -- OME-XML ``<ROI>``
-        elements, ImageJ overlays, a GeoJSON sidecar. Those land in the reserved
-        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951).
+        Called by :meth:`MetadataDatabase.sync_source_added`, which writes it in
+        one transaction with the row. *tensors* are the ``(array_id, dim_labels)``
+        the catalog lists, to key ROIs by; *import_rois* is false on a server that
+        does not serve annotations, so the file's are not parsed at all.
 
-        Returns:
-            ``(rois_by_array_id, report)``. The report is opaque to the caller
-            beyond having a ``summary()`` for the log, and may be ``None``.
+        A format that stores annotations beside its pixels -- OME-XML ``<ROI>``
+        elements -- returns them in ``rois``, which land in the read-only reserved
+        set (biopb/biopb#951), and the metadata without them. Failing to read them
+        is not fatal and not silent: the source is its pixels first, so the
+        metadata is kept whole and the next registration retries.
 
-        Raising is not fatal but IS a bug: the caller runs this inside source
-        registration and swallows failures, because a source is its pixels first
-        and an imported set is rebuilt on the next registration anyway.
+        The record is built from the adapter and held by no one, so an adapter
+        that parked an intermediate to produce it drops it here. A re-seeded
+        mirror and a rolled-back replace sync the same adapter again, so that
+        must be recoverable.
+
+        Source-level metadata is the format's own business: ``metadata`` is what
+        ``sources.metadata_json`` holds, and the serve path reads that row back,
+        never the adapter (biopb/biopb#253). Genuinely per-tensor metadata the
+        row cannot represent is :meth:`TensorAdapter.get_tensor_metadata`.
         """
-        return {}, None
 
     def is_resolved(self) -> bool:
         """Deterministic: is there a hydrated adapter backing this source?
@@ -480,15 +473,6 @@ class SourceAdapter(ABC):
         the meaning of one bumps ``SOURCE_CATALOG_FORMAT``. Optional.
         """
         return None
-
-    def release_registration_cache(  # noqa: B027 - concrete no-op default
-        self,
-    ) -> None:
-        """Drop whatever was held only to answer registration, keeping derived state.
-
-        Called by :meth:`MetadataDatabase.sync_source_added` once the catalog row
-        is committed.
-        """
 
 
 class TensorAdapter(SourceAdapter):
@@ -1230,7 +1214,7 @@ class TensorAdapter(SourceAdapter):
         """Per-tensor metadata fields the source-level catalog row does not carry.
 
         The serve path (``GetFlightInfo(with_metadata)``) reads a source's
-        metadata from the catalog row that :meth:`SourceAdapter.get_metadata`
+        metadata from the catalog row that :meth:`SourceAdapter.registration_record`
         produced once at registration -- the cache -- and **merges** this method's
         return over it (``row.update(get_tensor_metadata())``). So a tensor
         adapter returns only the *delta*: the cheap, per-tensor fields the
@@ -1256,7 +1240,7 @@ class TensorAdapter(SourceAdapter):
         Returns ``None`` when no physical sizes are known. This is the compact
         ~200-byte summary the tensor-load hot path needs (issue #31), so it must
         be **cheap** -- read it straight off the resident metadata model, never a
-        full ``get_metadata()`` dump. Default ``None``; format adapters that carry
+        full metadata dump. Default ``None``; format adapters that carry
         physical voxel sizes override it. There is no standalone public accessor:
         physical scale reaches clients only via the descriptor's
         ``physical_scale`` / ``physical_unit`` fields, filled by
@@ -1308,13 +1292,11 @@ _SOURCE_SCOPED_API = frozenset(
         "create_from_config",
         "create_from_payload",
         "list_tensors",
-        "get_metadata",
-        "get_embedded_rois",
+        "registration_record",
         "catalog_url",
         "is_resolved",
         "get_tensor_adapter",
         "close",
-        "release_registration_cache",
         "catalog_payload",
     }
 )

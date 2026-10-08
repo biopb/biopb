@@ -29,6 +29,10 @@ from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -956,7 +960,9 @@ class OmeZarrAdapter(ZarrAdapter):
             result.append(ch_info)
         return result
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return OME-Zarr .zattrs content directly.
 
         For an HCS plate this is the *plate* ``.zattrs`` (rows/columns/wells
@@ -964,7 +970,7 @@ class OmeZarrAdapter(ZarrAdapter):
         metadata is served per-tensor via
         :meth:`_HcsFieldAdapter.get_tensor_metadata` (biopb/biopb#253).
         """
-        return self.ome_metadata
+        return metadata_record(self.ome_metadata)
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the multiscales transforms.
