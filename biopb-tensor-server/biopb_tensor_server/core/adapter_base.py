@@ -61,7 +61,6 @@ from biopb_tensor_server.core.chunk import (
     split_chunk_version as _split_chunk_version,
 )
 from biopb_tensor_server.core.chunk_batch import (
-    CHUNK_WIRE_SCHEMA,
     pack_chunk_batch,
 )
 from biopb_tensor_server.core.downsample import (
@@ -252,7 +251,7 @@ def require_resolved(desc: TensorDescriptor) -> None:
 
     A descriptor is "resolved" iff it carries a concrete shape and dtype. An
     unresolved one (e.g. a not-yet-hydrated cloud source) would otherwise crash
-    deep in the planner -- ``np.dtype("")`` in ``get_arrow_schema`` or the
+    deep in the planner -- ``np.dtype("")`` in the planner or the
     pyramid/ndim logic in ``chunk`` -- with raw, illegible errors. Fail here
     with a clean ``SourceUnresolvedError`` instead.
     """
@@ -835,35 +834,6 @@ class TensorAdapter(SourceAdapter):
         finally:
             borrowed.release()
 
-    def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
-        """Get the Arrow schema for this tensor.
-
-        Schema format (the unified binary wire schema, biopb/biopb#293):
-        - data: binary - the chunk's raw C-contiguous bytes per row
-        - shape: list<int64> - shape tuple per chunk
-        - dtype: string - numpy dtype string (carries endianness) per chunk
-
-        Each RecordBatch has 1 row per chunk, making data self-describing. The
-        client reconstructs the array with ``np.frombuffer(data, dtype)``; see
-        ``CHUNK_WIRE_SCHEMA``.
-
-        Returns:
-            Arrow Schema with data, shape, and dtype fields
-        """
-        from biopb.tensor._wire_version import (
-            TENSOR_WIRE_PROTOCOL_VERSION,
-            WIRE_PROTOCOL_METADATA_KEY,
-        )
-
-        desc = desc or self.get_tensor_descriptor()
-        require_resolved(desc)
-
-        metadata = {
-            WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
-        }
-
-        return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
-
     def _retention_for_chunk(
         self, chunk_id: bytes, *, array_id: Optional[str] = None
     ) -> RetentionClass:
@@ -1313,7 +1283,6 @@ _TENSOR_SCOPED_API = frozenset(
         "get_data",
         "get_decimated_data",
         "get_scaled_data",
-        "get_arrow_schema",
         "resolve_chunk_data",
         "locate_chunk",
         "get_read_plan",

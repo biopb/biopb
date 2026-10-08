@@ -93,6 +93,7 @@ from biopb_tensor_server.core.chunk import (
     is_scaled_chunk,
     routing_array_id,
 )
+from biopb_tensor_server.core.chunk_batch import flight_info_schema
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.discovery import source_is_resident
 from biopb_tensor_server.core.errors import (
@@ -1570,7 +1571,7 @@ class TensorFlightServer(flight.FlightServerBase):
         try:
             read_plan = tensor_adapter.plan_flight_info(read_opt, self._pyramid_config)
 
-            schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
+            schema = flight_info_schema()
 
             source_adapter = self.sources.get_registered(source_id)
 
