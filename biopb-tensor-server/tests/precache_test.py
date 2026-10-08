@@ -229,7 +229,7 @@ class TestWarming:
             # Rebuild the same read plan and assert every chunk now locates on
             # disk -- i.e. a future do_get is a warm hit, no decode needed.
             adapter = server.sources.get("warm-src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
             assert scale == [8, 8]
@@ -313,7 +313,7 @@ class TestWarming:
                 # A caching-proxy source advertises a grpc:// source_url.
                 source_url = "grpc://upstream:8815/img"
 
-                def list_tensor_descriptors(self):
+                def list_tensors(self):
                     listed.append(True)  # must NOT be reached
                     return []
 
@@ -558,7 +558,7 @@ def _located_all(server, cache_manager, source_ids):
 
     for sid in source_ids:
         adapter = server.sources.get(sid)
-        td = adapter.list_tensor_descriptors()[0]
+        td = adapter.list_tensors()[0]
         ta = adapter.get_tensor_adapter(td.array_id)
         scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
         req = TensorDescriptor(
@@ -811,7 +811,7 @@ class TestBacklogWarming:
             # before warming any chunk.
             worker._queue.put("live")
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
@@ -831,7 +831,7 @@ class TestBacklogWarming:
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
             preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
@@ -850,7 +850,7 @@ class TestBacklogWarming:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
             # Empty live queue + plenty of headroom -> warms, no preempt.
             preempted = worker._process_tensor("src", td, cm, backlog=True)
@@ -974,7 +974,7 @@ class TestSkipUnscaledCoarsestLevel:
             )
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             cm = CacheManager.get_instance()
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             preempted = worker._process_tensor("src", td, cm)
             assert preempted is False
             return cm.stats().misses

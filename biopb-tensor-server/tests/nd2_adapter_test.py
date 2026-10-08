@@ -191,7 +191,7 @@ def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
     source = registry.get_adapter_for_type("nd2").create_from_config(_source(path))
     assert isinstance(source, Nd2Adapter)
 
-    descriptors = source._list_native_descriptors()
+    descriptors = source._list_native_tensors()
     assert [d.array_id for d in descriptors] == ["nd2/P:0", "nd2/P:1"]
     for desc in descriptors:
         assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
@@ -241,7 +241,7 @@ def test_single_position_file_has_one_field_with_no_p_axis(tmp_path, monkeypatch
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, sizes={"T": 3, "Z": 2, "C": 1, "Y": 4, "X": 5})
     source = Nd2Adapter.create_from_config(_source(path))
-    descriptors = source._list_native_descriptors()
+    descriptors = source._list_native_tensors()
     assert len(descriptors) == 1
     desc = descriptors[0]
     assert desc.array_id == "nd2/P:0"

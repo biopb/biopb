@@ -253,7 +253,7 @@ class TestNormalizedDescriptorAndData:
             tensors = reg.catalog_tensors("wrapped", reg.register("wrapped", adapter))
             assert [list(t.dim_labels) for t in tensors] == [["z", "y", "x"]]
             assert [list(t.shape) for t in tensors] == [[4, 3, 2]]
-            assert [list(t.dim_labels) for t in adapter.list_tensor_descriptors()] == [
+            assert [list(t.dim_labels) for t in adapter.list_tensors()] == [
                 ["z", "y", "x"]
             ]
 

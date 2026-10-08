@@ -45,7 +45,11 @@ from biopb_tensor_server.adapters._ome_rois import (
     tensors_by_image_order,
 )
 from biopb_tensor_server.core import chunk as chunk_policy
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
     content_version_from_path,
@@ -344,7 +348,7 @@ class _BioioAdapterBase(TensorAdapter):
         """
         if self.scene_index is not None:
             return None
-        entries = self._list_native_descriptors()
+        entries = self._list_native_tensors()
         if not entries or len(entries) > _PAYLOAD_MAX_SCENES:
             return None
         listing, scenes = [], []
@@ -411,7 +415,7 @@ class _BioioAdapterBase(TensorAdapter):
         self.source_id = source_id
 
         # Serializes every touch of the shared BioImage. Reentrant because the
-        # guarded methods nest -- list_tensor_descriptors reaches _bio_image
+        # guarded methods nest -- list_tensors reaches _bio_image
         # both directly and through _metadata_for_listing.
         # Source-level creates lock, scene-level receives from source
         if io_lock is not None:
@@ -447,7 +451,7 @@ class _BioioAdapterBase(TensorAdapter):
         # subclasses that keep one warm. None here means "not shared yet";
         # whoever needs it makes it (see NikonAdapter._reader_handle).
         self._shared_handle: Any = shared_handle
-        self._cached_descriptors = None  # cached on first list_tensor_descriptors
+        self._cached_descriptors = None  # cached on first list_tensors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
         # attribute exists; a per-instance dict, never a class attribute, for the
@@ -543,7 +547,7 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: the default (first) scene -- answered by the adapter
         # bound to it, not read back off the catalog listing, which carries no
         # transfer grid (biopb/biopb#812).
-        entries = self._list_native_descriptors()
+        entries = self._list_native_tensors()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no scenes",
@@ -599,7 +603,7 @@ class _BioioAdapterBase(TensorAdapter):
         with self._io_lock:
             return self._bio_image.ome_metadata
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """List every scene as a structural catalog entry.
 
         Uses OME metadata for shapes without scene switching when possible, else
@@ -612,16 +616,13 @@ class _BioioAdapterBase(TensorAdapter):
             List of TensorDescriptor for all scenes in this source
         """
         # Source-level: use cached descriptors if available
-        if self._cached_descriptors is not None:
-            return self._cached_descriptors
-
-        with self._io_lock:
-            # Re-check: another thread may have built these while this one
-            # waited for the lock.
-            if self._cached_descriptors is not None:
-                return self._cached_descriptors
-            self._cached_descriptors = self._build_tensor_descriptors()
-        return self._cached_descriptors
+        if self._cached_descriptors is None:
+            with self._io_lock:
+                # Re-check: another thread may have built these while this one
+                # waited for the lock.
+                if self._cached_descriptors is None:
+                    self._cached_descriptors = self._build_tensor_descriptors()
+        return [catalog_entry(d) for d in self._cached_descriptors]
 
     def _build_tensor_descriptors(self) -> List[TensorDescriptor]:
         """Enumerate every scene's descriptor. Caller holds ``_io_lock``."""
@@ -711,7 +712,7 @@ class _BioioAdapterBase(TensorAdapter):
         descriptors are in series/scene order, so the position IS the scene
         index, and bioio's ``set_scene`` takes that int directly. Falls
         back to enumerating scenes when no descriptors are cached (e.g. a read
-        without a prior list_tensor_descriptors).
+        without a prior list_tensors).
         """
         if self._cached_descriptors is not None:
             for i, d in enumerate(self._cached_descriptors):
@@ -739,7 +740,7 @@ class _BioioAdapterBase(TensorAdapter):
         # Populate _cached_descriptors before resolving the scene index. Idempotent
         # (cached), and it closes the latent list(self._bio_image.scenes) parse in
         # _scene_index_for_field for a read that skipped registration.
-        self._list_native_descriptors()
+        self._list_native_tensors()
 
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).

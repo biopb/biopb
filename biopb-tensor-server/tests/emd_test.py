@@ -99,13 +99,12 @@ class TestEmdAdapter:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p, shape=(2, 3, 8, 8), chunks=(1, 1, 8, 8))
             with _emd_adapter(p) as adapter:
-                descs = adapter.list_tensor_descriptors()
+                descs = adapter.list_tensors()
                 assert len(descs) == 1
                 d = descs[0]
                 # array_id is source_id/field
                 assert d.array_id == f"{adapter.source_id}/0"
                 assert list(d.shape) == [8, 8, 3, 2]
-                assert d.chunk_shape == []  # structural listing (biopb/biopb#812)
 
                 # chunk_shape is the transfer grid (biopb/biopb#809), answered by the
                 # signal-bound adapter: seeded by the native HDF5 blocks and reversed
@@ -128,9 +127,7 @@ class TestEmdAdapter:
             with _emd_adapter(p) as adapter:
                 expected = _emd_expected(p)
 
-                field = adapter._within_source_field(
-                    adapter.list_tensor_descriptors()[0].array_id
-                )
+                field = adapter._within_source_field(adapter.list_tensors()[0].array_id)
                 ta = adapter.get_tensor_adapter(field)
                 assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
 
@@ -222,7 +219,7 @@ class TestEmdAdapterHandle:
             rebuilt = hydrate(parsed, source)
             parsed.close()
             try:
-                assert rebuilt.list_tensor_descriptors()
+                assert rebuilt.list_tensors()
                 assert not _file_is_held(p)  # built from the row, nothing opened
                 np.testing.assert_array_equal(self._read(rebuilt), before)
                 assert _file_is_held(p)
@@ -271,7 +268,7 @@ class TestEmdAdapterIntegration:
             with _emd_adapter(p) as adapter:
                 source_id = adapter.source_id
                 expected = np.asarray(_emd_expected(p))
-                array_id = adapter.list_tensor_descriptors()[0].array_id
+                array_id = adapter.list_tensors()[0].array_id
 
                 server = catalog_server("localhost:0")
                 register_and_catalog(server, source_id, adapter)

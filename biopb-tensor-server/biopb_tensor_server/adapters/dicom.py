@@ -22,6 +22,7 @@ from biopb_tensor_server.adapters._scale import (
 from biopb_tensor_server.adapters._signature_memo import SignatureMemo
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -611,7 +612,7 @@ class DicomAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property
@@ -983,7 +984,7 @@ class DicomSeriesAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property

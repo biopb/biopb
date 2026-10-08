@@ -74,7 +74,7 @@ def test_has_native_pyramid_derives_from_levels_by_default():
         def create_from_config(cls, source, credentials_config=None):  # abstract
             raise NotImplementedError
 
-        def _list_native_descriptors(self):  # abstract
+        def _list_native_tensors(self):  # abstract
             raise NotImplementedError
 
         def get_metadata(self):  # abstract
@@ -126,7 +126,7 @@ def test_close_default_is_a_harmless_no_op():
     class _Handleless(SourceAdapter):
         source_id = "x"
 
-        def _list_native_descriptors(self):
+        def _list_native_tensors(self):
             return []
 
         def get_metadata(self):

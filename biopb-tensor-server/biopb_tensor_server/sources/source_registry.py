@@ -18,9 +18,11 @@ import logging
 import threading
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
-from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    TensorAdapter,
+    TensorEntry,
+)
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.normalize import log_reordering
 
@@ -242,7 +244,7 @@ class SourceRegistry:
 
     def catalog_tensors(
         self, source_id: str, adapter: Optional[SourceAdapter] = None
-    ) -> List[TensorDescriptor]:
+    ) -> List[TensorEntry]:
         """A source's tensors as the catalog stores them: the format's own, then
         its attached fields and label sets (:meth:`Attachments.catalog_tensors`).
 
@@ -338,7 +340,7 @@ def _log_reordering(source_id: str, adapter: SourceAdapter) -> None:
     if not getattr(adapter, "_normalizable_axes", False):
         return
     try:
-        log_reordering(source_id, adapter._list_native_descriptors())
+        log_reordering(source_id, adapter._list_native_tensors())
     except Exception:
         logger.debug(
             "axis normalization: could not inspect %r", source_id, exc_info=True

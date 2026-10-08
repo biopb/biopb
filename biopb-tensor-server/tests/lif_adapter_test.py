@@ -51,12 +51,11 @@ def test_local_lif_claims_natively_and_reads_through_readlif(tmp_path):
     source = registry.get_adapter_for_type("lif").create_from_config(_source(path))
     assert isinstance(source, LifAdapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == 1
     assert list(descriptors[0].dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptors[0].shape) == [2, 2, 5, 24, 32]
     # The listing is structural: the grid is the bound image's (biopb/biopb#812).
-    assert list(descriptors[0].chunk_shape) == []
 
     image = source.get_tensor_adapter(descriptors[0].array_id)
     # readlif has no ROI -- the native unit is one whole plane.
@@ -70,7 +69,7 @@ def test_local_lif_claims_natively_and_reads_through_readlif(tmp_path):
 def test_interior_crop_reads_only_the_requested_window(tmp_path):
     path, expected = create_leica_lif(str(tmp_path), n_c=2, n_z=4, image_shape=(24, 32))
     source = _native(path)
-    image = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     bounds = ChunkBounds(start=[0, 1, 1, 5, 7], stop=[1, 2, 3, 20, 30])
     np.testing.assert_array_equal(
@@ -83,7 +82,7 @@ def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path):
         str(tmp_path), n_t=2, n_z=6, n_c=2, image_shape=(24, 32)
     )
     source = _native(path)
-    image = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[2, 2, 6, 24, 32])
     step = (1, 1, 2, 2, 3)
@@ -96,7 +95,7 @@ def test_eight_bit_image_reads_as_uint8(tmp_path):
         str(tmp_path), n_t=1, n_z=3, n_c=1, image_shape=(16, 16), bit_depth=8
     )
     source = _native(path)
-    descriptor = source.list_tensor_descriptors()[0]
+    descriptor = source.list_tensors()[0]
     assert descriptor.dtype == np.dtype(np.uint8).str
 
     image = source.get_tensor_adapter(descriptor.array_id)
@@ -111,7 +110,7 @@ def test_read_block_shape_is_full_rank_and_floors_at_one_plane(tmp_path):
     silently defeating the whole-plane floor for a scaled/streamed read."""
     path, _ = create_leica_lif(str(tmp_path), n_t=2, n_c=2, n_z=5, image_shape=(24, 32))
     source = _native(path)
-    image = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     shape = image.get_tensor_descriptor().shape
     block = image.read_block_shape
@@ -122,7 +121,7 @@ def test_read_block_shape_is_full_rank_and_floors_at_one_plane(tmp_path):
 def test_physical_scale_reports_readlif_pixel_size(tmp_path):
     path, _ = create_leica_lif(str(tmp_path), n_z=3, image_shape=(16, 16))
     source = _native(path)
-    image = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
     scale, unit = image._physical_scale()
     labels = image.dim_labels
     for axis, label in enumerate(labels):

@@ -19,11 +19,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
     strip_source_prefix,
 )
@@ -150,25 +149,28 @@ class Attachments:
         self._view = (parent, view)
         return view
 
-    def normalized_tensors(self, parent: SourceAdapter) -> Dict[str, TensorDescriptor]:
+    def normalized_tensors(self, parent: SourceAdapter) -> Dict[str, TensorEntry]:
         """*parent*'s tensors by ``array_id``, in canonical axis order.
 
         What a label set is checked against, and read once per check rather
-        than per set -- ``list_tensor_descriptors`` re-derives on an HCS plate.
+        than per set -- ``list_tensors`` re-derives on an HCS plate.
         The uploaded fields are in it because a set may bind to one: a field is
         a tensor of this source like any other, and only its bytes live
         elsewhere.
         """
-        descs = list(parent.list_tensor_descriptors())
-        descs += [t.get_tensor_descriptor() for t in self.attached_fields().values()]
-        return {d.array_id: d for d in descs}
+        entries = list(parent.list_tensors())
+        entries += [
+            catalog_entry(t.get_tensor_descriptor())
+            for t in self.attached_fields().values()
+        ]
+        return {e.array_id: e for e in entries}
 
     def label_binding_error(
         self,
         parent: SourceAdapter,
         field: str,
-        desc: TensorDescriptor,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
+        desc: TensorEntry,
+        images: Optional[Dict[str, TensorEntry]] = None,
     ) -> Optional[str]:
         """Why a set of *desc* cannot be served at label *field*, or None.
 
@@ -193,8 +195,8 @@ class Attachments:
         self,
         parent: SourceAdapter,
         field: str,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
-    ) -> Optional[TensorDescriptor]:
+        images: Optional[Dict[str, TensorEntry]] = None,
+    ) -> Optional[TensorEntry]:
         """The image a label *field* binds to, normalized, or None if it has none.
 
         What the extent is measured against, and what the upload kind reads to
@@ -209,15 +211,12 @@ class Attachments:
 
     # -- the listing -------------------------------------------------------------
 
-    def catalog_tensors(self, parent: SourceAdapter) -> List[TensorDescriptor]:
+    def catalog_tensors(self, parent: SourceAdapter) -> List[TensorEntry]:
         """*parent*'s tensors as the catalog stores them.
 
-        The catalog invariant's enforcement point: the one path into the DuckDB
-        ``sources.tensors`` column goes through here, so a listing that still
-        carries a serving field cannot reach a client (biopb/biopb#812).
-        Re-applies :func:`catalog_entry` even though implementations are asked
-        to, because a source that forgets must not be able to publish a grid it
-        guessed.
+        The one path into the DuckDB ``sources.tensors`` column. Entries are
+        :class:`TensorEntry` records, which have no field for a serving fact
+        (biopb/biopb#812); a bound tensor's descriptor is projected onto one.
 
         The attached tensors are listed **after** the format's own: a source's
         first tensor is the one every listing reads as its picture -- the
@@ -226,7 +225,7 @@ class Attachments:
         A scratch source has no tensors of its own, so its whole listing is
         fields, the same path a discovered source's uploaded fields take.
         """
-        tensors = [catalog_entry(t) for t in parent.list_tensor_descriptors()]
+        tensors = list(parent.list_tensors())
         for tensor in self.attached_fields().values():
             tensors.append(catalog_entry(tensor.get_tensor_descriptor()))
         for tensor in self.label_sets(parent).values():

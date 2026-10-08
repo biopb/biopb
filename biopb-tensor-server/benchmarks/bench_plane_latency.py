@@ -92,7 +92,7 @@ def _open_adapter(path: Path):
     else:
         sys.exit(f"no adapter wired for {suffix} in this benchmark")
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     descriptor = descriptors[0]
     adapter = source.get_tensor_adapter(descriptor.array_id)
     return adapter, descriptor

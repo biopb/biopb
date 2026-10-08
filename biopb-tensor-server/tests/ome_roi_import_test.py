@@ -418,7 +418,7 @@ class _FakeAdapter:
     def is_resolved(self):
         return True
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         return [
             TensorDescriptor(
                 array_id=f"{SOURCE_ID}/{scene}",

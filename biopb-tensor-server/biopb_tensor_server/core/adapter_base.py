@@ -82,6 +82,7 @@ from biopb_tensor_server.core.normalize import (
     invert,
     permute_bounds,
     permute_descriptor,
+    permute_entry,
     permute_level,
     to_canonical,
     to_native,
@@ -168,32 +169,32 @@ def strip_source_prefix(source_id: str, array_id: Optional[str]) -> Optional[str
     return array_id
 
 
-def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
-    """Project a descriptor onto the **structural catalog entry** a source lists.
+@dataclass(frozen=True)
+class TensorEntry:
+    """What a *source* lists about one of its tensors: the **structural** facts.
 
-    The catalog surface and the serving surface are different facts about a
-    tensor, and only one of them a *source* can answer (biopb/biopb#812):
-
-    * Structural -- ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype``. Stable
-      per tensor, derivable from the container's own index, and what
-      ``ListFlights`` and the DuckDB ``sources.tensors`` rows carry.
-    * Serving -- above all the transfer ``chunk_shape``, plus the pyramid and the
-      physical scale. These belong to the *tensor-bound* adapter that will
-      actually serve the read: the grid can depend on the bound scene's Dask
-      chunks, its own backend block, its native pyramid level, and the request's
-      scale. A source-level adapter that answers for them is guessing on behalf
-      of a scene it has not selected, and the guess is published as fact.
-
-    So a source lists this projection, and ``GetFlightInfo`` -- which resolves
-    the tensor adapter first -- is the one place a grid is published. Keeping
-    ``TensorDescriptor`` as the wire type for both (rather than splitting the
-    proto message) makes the invariant "``chunk_shape`` is empty on every
-    catalog entry", enforced here and re-applied by ``Attachments.catalog_tensors``.
+    ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype`` -- stable per tensor,
+    derivable from the container's own index, and what the DuckDB
+    ``sources.tensors`` rows carry. Never a wire type: the one
+    ``TensorDescriptor`` a client receives comes from the bound tensor's
+    :meth:`TensorAdapter.get_tensor_descriptor`, because the serving facts (the
+    transfer grid, the pyramid, the physical scale) depend on a selection a
+    source-level adapter has not made (biopb/biopb#812). A record with no field
+    for them cannot publish a guess at them.
     """
-    return TensorDescriptor(
+
+    array_id: str
+    dim_labels: Tuple[str, ...] = ()
+    shape: Tuple[int, ...] = ()
+    dtype: str = ""
+
+
+def catalog_entry(desc: Any) -> TensorEntry:
+    """Project a descriptor (or anything shaped like one) onto a :class:`TensorEntry`."""
+    return TensorEntry(
         array_id=desc.array_id,
-        dim_labels=desc.dim_labels,
-        shape=desc.shape,
+        dim_labels=tuple(str(label) for label in desc.dim_labels),
+        shape=tuple(int(dim) for dim in desc.shape),
         dtype=desc.dtype,
     )
 
@@ -418,28 +419,28 @@ class SourceAdapter(ABC):
             An instance of a SourceAdapter subclass initialized with the provided config
         """
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """This source's tensors as structural catalog entries, in canonical
+    def list_tensors(self) -> List[TensorEntry]:
+        """This source's tensors as :class:`TensorEntry` records, in canonical
         axis order (biopb/biopb#596).
 
         Each entry is normalized by its **own** labels rather than the source's:
         a multi-tensor source (HCS fields, a multi-scene file) may hold tensors
         of differing rank and labelling. Subclasses implement
-        :meth:`_list_native_descriptors`.
+        :meth:`_list_native_tensors`.
         """
         out = []
-        for d in self._list_native_descriptors():
-            perm = self._permutation_of(d)
-            out.append(d if perm is None else permute_descriptor(d, perm))
+        for entry in self._list_native_tensors():
+            perm = self._permutation_of(entry)
+            out.append(entry if perm is None else permute_entry(entry, perm))
         return out
 
-    def _permutation_of(self, desc: TensorDescriptor) -> Optional[Tuple[int, ...]]:
+    def _permutation_of(self, desc: Any) -> Optional[Tuple[int, ...]]:
         """The permutation ``desc``'s own labels imply, or None for identity --
         always None for a source whose order is owned elsewhere."""
         return descriptor_permutation(desc) if self._normalizable_axes else None
 
     @abstractmethod
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """List this source's tensors as **structural catalog entries**, in the
         order its reader emits them.
 
@@ -902,7 +903,7 @@ class TensorAdapter(SourceAdapter):
         """Return the full **serving** descriptor for this bound tensor, in the
         order the reader emits.
 
-        The counterpart to :meth:`SourceAdapter.list_tensor_descriptors`, which
+        The counterpart to :meth:`SourceAdapter.list_tensors`, which
         answers the structural half for every tensor without binding any of them.
         This is called on an adapter that ``get_tensor_adapter(array_id)`` has
         already bound to one tensor -- a bioio/CZI scene, an OME-Zarr HCS field,
@@ -1830,7 +1831,7 @@ _SOURCE_SCOPED_API = frozenset(
         "claim",
         "create_from_config",
         "create_from_payload",
-        "list_tensor_descriptors",
+        "list_tensors",
         "get_metadata",
         "get_embedded_rois",
         "catalog_url",

@@ -172,19 +172,19 @@ tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
 
 | Method | Returns |
 |--------|---------|
-| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors, as structural catalog entries |
+| `list_tensors()` | `list[TensorEntry]` — the source's tensors (`array_id`, `dim_labels`, `shape`, `dtype`) |
 | `get_tensor_descriptor()` | `TensorDescriptor` proto — the full serving descriptor of one *bound* tensor |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
 
 ### Catalog entry vs serving descriptor (biopb/biopb#812)
 
-The two descriptor methods answer different questions, and the split runs all the
+The source and tensor roles answer different questions, and the split runs all the
 way to the wire:
 
 - **Structural** — `array_id`, `dim_labels`, `shape`, `dtype`. Stable per tensor
   and derivable from the container's index without opening one, so a *source*
-  answers for all its tensors at once. This is what `list_tensor_descriptors()`
+  answers for all its tensors at once. This is what `list_tensors()`
   returns and what the DuckDB `sources.tensors` STRUCT stores — the row is the
   only representation of a source that crosses the wire.
 - **Serving** — above all the transfer `chunk_shape`, plus `pyramid` and
@@ -193,10 +193,11 @@ way to the wire:
   scale. Only the adapter `get_tensor_adapter(array_id)` returns can answer them,
   and `GetFlightInfo` — which binds first — is where they reach a client.
 
-`adapter_base.catalog_entry()` is the projection, and `catalog_tensors()`
-re-applies it as the row is written, so no adapter can publish a read plan into
-the catalog. A client that needs a grid describes the tensor; an empty
-`chunk_shape` is not a fallback to plan on.
+A source lists `TensorEntry` records, a plain dataclass with no field for a
+serving fact, so no source can publish a read plan into the catalog.
+`catalog_tensors()` is the one path into the row. The only `TensorDescriptor`
+that reaches a client is `get_tensor_descriptor()`'s. A client that needs a grid
+describes the tensor.
 
 ### Canonical axis order (biopb/biopb#596)
 
@@ -215,7 +216,7 @@ vocabulary but have no canonical place, so they ride with the unlabeled.
 The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` holds the
 permutation helpers and `TensorAdapter` applies them. A leaf adapter implements
 the `_native_*` hooks (`_native_descriptor`, `_read_native`,
-`_list_native_descriptors`, `_decimated_native`, `_native_read_block_shape`,
+`_list_native_tensors`, `_decimated_native`, `_native_read_block_shape`,
 `_native_pyramid_levels`) in its reader's order; the public methods present them
 canonical, so the planner, scaled and streamed reads and the pyramid all work in
 canonical order with no translation of their own. Inside a leaf, `self` speaks

@@ -24,7 +24,7 @@ def _descriptors(adapter):
     """Everything a read plan takes from a source: its listing, and each tensor's
     grid and scale."""
     out = []
-    for entry in adapter.list_tensor_descriptors():
+    for entry in adapter.list_tensors():
         scene = adapter.get_tensor_adapter(entry.array_id)
         d = scene.get_tensor_descriptor()
         out.append(
@@ -83,9 +83,7 @@ class TestOmeTiff:
 
     def test_a_scene_adapter_has_no_payload(self, tmp_path):
         adapter = self._masked(tmp_path)
-        scene = adapter.get_tensor_adapter(
-            adapter.list_tensor_descriptors()[0].array_id
-        )
+        scene = adapter.get_tensor_adapter(adapter.list_tensors()[0].array_id)
         assert scene.catalog_payload() is None
 
 
@@ -171,7 +169,5 @@ class TestCzi:
         assert rebuilt.get_metadata() == czi_adapter.get_metadata()
 
     def test_a_scene_adapter_has_no_payload(self, czi_adapter):
-        scene = czi_adapter.get_tensor_adapter(
-            czi_adapter.list_tensor_descriptors()[0].array_id
-        )
+        scene = czi_adapter.get_tensor_adapter(czi_adapter.list_tensors()[0].array_id)
         assert scene.catalog_payload() is None

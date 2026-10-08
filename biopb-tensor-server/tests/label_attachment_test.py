@@ -232,7 +232,7 @@ class TestANativeSetIsATensorOfItsImage:
         raw = _adapter(image)
         reg = SourceRegistry()
         reg.register("oz1", raw)
-        assert [t.array_id for t in raw.list_tensor_descriptors()] == ["oz1"]
+        assert [t.array_id for t in raw.list_tensors()] == ["oz1"]
         assert reg.resolve_tensor("oz1", None).array_id == "oz1"
         assert reg.resolve_chunk_adapter("oz1", "1").array_id == "oz1/1"
 

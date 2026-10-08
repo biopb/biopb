@@ -36,7 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import axes_scale
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter, TensorEntry
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -340,13 +340,13 @@ class EmdAdapter(TensorAdapter):
         """Within-source field for a signal. The signal index is the field."""
         return str(index)
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """One structural entry per EMD signal (no grid -- biopb/biopb#812)."""
         return [
-            TensorDescriptor(
+            TensorEntry(
                 array_id=f"{self.source_id}/{self._field_for(i)}",
-                dim_labels=self._labels_for(sig),
-                shape=list(sig["data"].shape),
+                dim_labels=tuple(self._labels_for(sig)),
+                shape=tuple(int(dim) for dim in sig["data"].shape),
                 dtype=np.dtype(sig["data"].dtype).str,
             )
             for i, sig in enumerate(self._signals)

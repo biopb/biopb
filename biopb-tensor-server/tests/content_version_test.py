@@ -543,7 +543,7 @@ class _VersionedStubAdapter(TensorAdapter):
     def create_from_config(cls, source, credentials_config=None):
         raise NotImplementedError
 
-    def _list_native_descriptors(self):
+    def _list_native_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def get_metadata(self):

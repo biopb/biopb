@@ -30,7 +30,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._ome_rois import Tensor
 from biopb_tensor_server.adapters.labels import NearestPyramidMixin
-from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    catalog_entry,
+)
 from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.errors import WriteNotSupportedError
@@ -298,7 +302,7 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             "OmeTiffAdapter.get_embedded_labels(), not from config"
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     def _native_descriptor(self) -> TensorDescriptor:

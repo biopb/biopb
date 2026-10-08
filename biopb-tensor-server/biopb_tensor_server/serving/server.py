@@ -1516,7 +1516,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if field is None:
             default_adapter = self._registered(source_id)
             if default_adapter is not None:
-                descriptors = default_adapter.list_tensor_descriptors()
+                descriptors = default_adapter.list_tensors()
                 if descriptors:
                     field = self._field_within_source(
                         source_id, descriptors[0].array_id

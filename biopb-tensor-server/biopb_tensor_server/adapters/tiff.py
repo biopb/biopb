@@ -25,6 +25,7 @@ from biopb_tensor_server.adapters._scale import (
 )
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -776,7 +777,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     def _read_padded_plane(
@@ -1479,7 +1480,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property

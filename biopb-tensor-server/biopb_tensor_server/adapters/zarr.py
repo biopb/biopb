@@ -558,5 +558,5 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             dtype=self.zarr_array.dtype.str,
         )
 
-    def _list_native_descriptors(self):
+    def _list_native_tensors(self):
         return [catalog_entry(self._native_descriptor())]

@@ -1176,7 +1176,7 @@ def test_get_metadata_mirrors_an_upstreams_catalog(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.list_tensor_descriptors()  # reachable -> mirrored
+        assert adapter.list_tensors()  # reachable -> mirrored
         assert adapter.get_metadata() == {"ome": {"channel": "DAPI"}}
     finally:
         upstream.shutdown()
@@ -1983,7 +1983,7 @@ class TestUnreachableUpstream:
             upstream_source_id="img",
         )
         # no raise: empty placeholder catalog row
-        assert adapter.list_tensor_descriptors() == []
+        assert adapter.list_tensors() == []
         assert adapter.is_resident() is False  # never local, up or down
 
     def test_serve_surface_still_raises_when_unreachable(self):
@@ -2019,14 +2019,14 @@ class TestUnreachableUpstream:
             upstream_location=f"grpc://localhost:{port}",
             upstream_source_id="img",
         )
-        assert adapter.list_tensor_descriptors() == []  # down -> placeholder
+        assert adapter.list_tensors() == []  # down -> placeholder
 
         # bring an upstream up on that same port; the SAME adapter now serves live
         upstream = catalog_server(f"localhost:{port}")
         register_and_catalog(upstream, "img", ZarrAdapter(arr, "img", ["y", "x"]))
         _serve(upstream)
         try:
-            descs = adapter.list_tensor_descriptors()
+            descs = adapter.list_tensors()
             assert len(descs) == 1
             assert descs[0].array_id == "lab__img"  # localized
             # Recovery shows in the catalog surface, never in residency.
@@ -2303,7 +2303,7 @@ def test_seed_catalog_sets_content_version_from_indexed_at():
 
 
 def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
-    """A seeded proxy answers list_tensor_descriptors/get_metadata from the seed,
+    """A seeded proxy answers list_tensors/get_metadata from the seed,
     localizing array_ids, without ever dialing the upstream."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
@@ -2332,7 +2332,7 @@ def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
         {"ome": "meta"},
     )
 
-    descs = adapter.list_tensor_descriptors()
+    descs = adapter.list_tensors()
     assert [d.array_id for d in descs] == ["lab__img", "lab__img/A2"]
     assert list(descs[0].shape) == [4, 4]
     assert descs[1].dtype == "uint16"
@@ -2440,9 +2440,8 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
     )
 
     # the mirrored catalog surface is structural, and complete
-    listed = adapter.list_tensor_descriptors()
+    listed = adapter.list_tensors()
     assert [d.array_id for d in listed] == ["lab__img", "lab__img/A2"]
-    assert all(list(d.chunk_shape) == [] for d in listed)
 
     # default (first) tensor
     desc = adapter.get_tensor_descriptor()
@@ -2474,7 +2473,7 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
         upstream_source_id="u",
     )
     adapter.seed_catalog([], None)  # unresolved upstream source: no tensors
-    assert adapter.list_tensor_descriptors() == []
+    assert adapter.list_tensors() == []
     assert adapter.get_metadata() == {}
     assert adapter._client is None
 
@@ -2896,7 +2895,7 @@ class _CatalogRowAdapter:
     def is_resolved(self):
         return self._resolved
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [TensorDescriptor(**t) for t in self._tensors]
@@ -2920,7 +2919,7 @@ def test_seed_catalog_carries_resolution_and_detects_change():
 
     changed = adapter.seed_catalog([], None, is_resolved=False)
     assert changed is True
-    assert adapter.list_tensor_descriptors() == []
+    assert adapter.list_tensors() == []
     assert adapter.is_resolved() is False  # mirrors the upstream's own flag
     assert adapter._client is None
 
@@ -2945,7 +2944,7 @@ def test_seed_catalog_carries_resolution_and_detects_change():
     assert adapter.is_resolved() is True
     # Resolution upstream does not make anything local here.
     assert adapter.is_resident() is False
-    assert [d.array_id for d in adapter.list_tensor_descriptors()] == ["lab__cloud"]
+    assert [d.array_id for d in adapter.list_tensors()] == ["lab__cloud"]
     assert adapter._client is None
 
 

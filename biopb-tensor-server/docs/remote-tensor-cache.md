@@ -85,7 +85,7 @@ adapter, so the proxy inherits the persistent file cache, eviction, crash
 recovery and the `chunk_locate` mmap fast path unchanged — it adds no caching
 code of its own.
 
-- **Catalog surface** (`list_tensor_descriptors`, `get_metadata`,
+- **Catalog surface** (`list_tensors`, `get_metadata`,
   `get_tensor_descriptor`) mirrors the upstream with `array_id` rewritten
   local-ward, and degrades to an empty placeholder rather than raising when the
   upstream is unreachable — see *Unreachable upstream* below.
@@ -203,7 +203,7 @@ not just silence.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
 download, so recovery is transparent — there is no unresolved-source consent
-step. The catalog surface degrades to a placeholder (`list_tensor_descriptors`
+step. The catalog surface degrades to a placeholder (`list_tensors`
 / `get_metadata` return empty, so registration's metadata-DB sync succeeds
 with a row of no tensors) while the serve surface stays live and raises a
 retryable error on a miss, dropping the dead upstream connection so the next

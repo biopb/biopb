@@ -45,6 +45,7 @@ from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TT
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -412,7 +413,7 @@ class CziAdapter(TensorAdapter):
             dtype=layout.dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         # Structural entries only: every scene shares one layout here, so the
         # grid would be right -- but the catalog is not where a grid is
         # published, whoever could compute it (biopb/biopb#812).

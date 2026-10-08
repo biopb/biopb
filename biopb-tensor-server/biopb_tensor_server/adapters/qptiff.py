@@ -50,6 +50,7 @@ from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -365,7 +366,7 @@ class QptiffAdapter(TensorAdapter):
         )
         return self._cached_descriptor
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     # ---- reads --------------------------------------------------------------

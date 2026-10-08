@@ -15,6 +15,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._scale import scale_from_payload, scale_to_payload
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -314,7 +315,7 @@ class NiftiAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     def _read_native(self, bounds: ChunkBounds) -> np.ndarray:

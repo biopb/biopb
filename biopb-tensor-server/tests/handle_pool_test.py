@@ -84,16 +84,14 @@ def test_a_rebuilt_adapter_reuses_its_predecessors_handle(tmp_path):
 
     def read():
         source = OmeTiffAdapter.create_from_config(config)
-        scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+        scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
         out = scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 3, 32, 32]))
         return source, out
 
     first, out = read()
     np.testing.assert_array_equal(out.reshape(data.shape), data)
     pool = ome_tiff_module._store_pool
-    key = first.get_tensor_adapter(
-        first.list_tensor_descriptors()[0].array_id
-    )._pool_key()
+    key = first.get_tensor_adapter(first.list_tensors()[0].array_id)._pool_key()
     handle = pool._handles[key]
     del first
     _, again = read()

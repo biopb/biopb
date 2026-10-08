@@ -56,6 +56,7 @@ from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -418,7 +419,7 @@ class Nd2Adapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(self._layout.n_positions)

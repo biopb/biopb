@@ -46,6 +46,7 @@ has not cannot be silently mis-served.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, List, Optional, Sequence, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -137,19 +138,29 @@ def permute_descriptor(
     return out
 
 
-def descriptor_permutation(desc: TensorDescriptor) -> Optional[Tuple[int, ...]]:
-    """The permutation ``desc``'s own labels imply, or None for identity."""
+def permute_entry(entry: Any, perm: Tuple[int, ...]) -> Any:
+    """A copy of a ``TensorEntry`` with its axes reordered by ``perm``."""
+    return replace(
+        entry,
+        dim_labels=tuple(to_canonical(entry.dim_labels, perm)),
+        shape=tuple(to_canonical(entry.shape, perm)),
+    )
+
+
+def descriptor_permutation(desc: Any) -> Optional[Tuple[int, ...]]:
+    """The permutation the labels of ``desc`` (a descriptor or a ``TensorEntry``)
+    imply, or None for identity."""
     return canonical_permutation(desc.dim_labels, desc.shape)
 
 
-def log_reordering(source_id: str, descriptors: Sequence[TensorDescriptor]) -> None:
+def log_reordering(source_id: str, entries: Sequence[Any]) -> None:
     """Say, at INFO, which of a source's tensors are served reordered.
 
     Reordering is a visible behavior change -- it is what a client sees, and it
     costs the zero-copy read for that tensor -- so the only evidence of it should
-    not be the transposed data itself. Takes the **native** descriptors.
+    not be the transposed data itself. Takes the **native** entries.
     """
-    for d in descriptors:
+    for d in entries:
         perm = descriptor_permutation(d)
         if perm is not None:
             native = list(d.dim_labels)

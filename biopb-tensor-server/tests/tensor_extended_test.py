@@ -69,10 +69,10 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
 
         assert adapter.source_id == "test-embedded"
         # AicsImageIoAdapter is multi-tensor, list descriptors to get shape
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert len(descriptors) == 1
         # bioio uses TCZYX dimension order, so shape is (T=1, C=3, Z=1, Y=128, X=128)
-        assert descriptors[0].shape == [1, 3, 1, 128, 128]
+        assert descriptors[0].shape == (1, 3, 1, 128, 128)
 
     def test_get_tensor_descriptor(self, tiled_ome_tiff):
         """Test descriptor with embedded metadata."""
@@ -88,8 +88,8 @@ class TestAicsImageIoAdapterEmbeddedMetadata:
             source_url=path,
         )
 
-        # For multi-scene AicsImageIoAdapter, use list_tensor_descriptors
-        descriptors = adapter.list_tensor_descriptors()
+        # For multi-scene AicsImageIoAdapter, use list_tensors
+        descriptors = adapter.list_tensors()
         assert len(descriptors) == 1
         desc = descriptors[0]
         # array_id is the globally-unique source_id/field (identity policy); the

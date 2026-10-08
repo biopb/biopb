@@ -35,6 +35,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -301,7 +302,7 @@ class LifAdapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(len(self._layout.image_list))
@@ -310,7 +311,7 @@ class LifAdapter(TensorAdapter):
     def _native_descriptor(self) -> TensorDescriptor:
         if self.image_position is not None:
             return self._descriptor_for(self.image_position)
-        entries = self._list_native_descriptors()
+        entries = self._list_native_tensors()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no images",

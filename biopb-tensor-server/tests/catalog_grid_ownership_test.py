@@ -7,7 +7,7 @@ request's scale. A source lists every tensor without binding any of them, so any
 grid it names there is a guess about a scene it never selected, published to
 every client as fact (biopb/biopb#812).
 
-So the boundary is: ``SourceAdapter.list_tensor_descriptors`` -> structural entry
+So the boundary is: ``SourceAdapter.list_tensors`` -> structural entry
 (array_id / dim_labels / shape / dtype), and ``TensorAdapter.get_tensor_descriptor``
 -> the full serving descriptor, reached only through ``get_tensor_adapter``.
 These tests hold both halves, at the adapter, the catalog, and the wire.
@@ -27,6 +27,7 @@ from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
@@ -67,7 +68,7 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
     (ome-tiff) -- the three ways a listing is produced in this registry.
     """
     source = live_sources[family]
-    entries = source.list_tensor_descriptors()
+    entries = source.list_tensors()
     assert entries
 
     for entry in entries:
@@ -75,8 +76,8 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
         assert entry.array_id
         assert list(entry.shape)
         assert entry.dtype
-        # ...and no read plan.
-        assert list(entry.chunk_shape) == []
+        # ...and no read plan: a TensorEntry has no field to put one in.
+        assert isinstance(entry, TensorEntry)
 
         # The bound tensor answers for the grid, sized to its own shape.
         served = source.get_tensor_adapter(entry.array_id).get_tensor_descriptor()
@@ -87,18 +88,18 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
         assert all(1 <= g <= dim for g, dim in zip(grid, entry.shape, strict=True))
 
 
-def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
-    """The projection enforces it, not each adapter's good behaviour.
+def test_the_catalog_lists_entries_that_cannot_name_a_grid():
+    """A source that lists nothing but structure cannot publish a guessed grid.
 
-    ``SourceRegistry.catalog_tensors`` is the only path into the DuckDB row, and the row is the
-    only representation of a source that crosses the wire -- so an adapter that
-    still names a grid cannot reach a client through it.
+    ``SourceRegistry.catalog_tensors`` is the only path into the DuckDB row, and
+    what it returns is a :class:`TensorEntry` -- a record with no field for the
+    serving facts.
     """
 
-    class _LeakyAdapter(SourceAdapter):
-        source_id = "leaky"
-        _source_url = "/data/leaky.zarr"
-        _catalog_url = "file:///data/leaky.zarr"
+    class _Adapter(SourceAdapter):
+        source_id = "listed"
+        _source_url = "/data/listed.zarr"
+        _catalog_url = "file:///data/listed.zarr"
         _source_type = "zarr"
 
         @classmethod
@@ -111,22 +112,21 @@ def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
         def is_resident(self):
             return True
 
-        def _list_native_descriptors(self):
+        def _list_native_tensors(self):
             return [
-                TensorDescriptor(
-                    array_id="leaky",
-                    dim_labels=["y", "x"],
-                    shape=[64, 64],
-                    chunk_shape=[16, 16],
+                TensorEntry(
+                    array_id="listed",
+                    dim_labels=("y", "x"),
+                    shape=(64, 64),
                     dtype="uint8",
                 )
             ]
 
     reg = SourceRegistry()
-    (tensor,) = reg.catalog_tensors("leaky", reg.register("leaky", _LeakyAdapter()))
-    assert list(tensor.shape) == [64, 64]  # structure survives
+    (tensor,) = reg.catalog_tensors("listed", reg.register("listed", _Adapter()))
+    assert isinstance(tensor, TensorEntry)
+    assert tensor.shape == (64, 64)
     assert tensor.dtype == "uint8"
-    assert list(tensor.chunk_shape) == []  # the read plan does not
 
 
 def test_catalog_entry_keeps_structure_and_drops_every_serving_field():
@@ -148,19 +148,12 @@ def test_catalog_entry_keeps_structure_and_drops_every_serving_field():
     full.physical_unit[:] = ["micrometer"] * 3
     full.pyramid.append(PyramidLevel(scale_hint=[1, 1, 1], reduction_method="area"))
 
-    entry = catalog_entry(full)
-
-    assert entry.array_id == "s/A1"
-    assert list(entry.dim_labels) == ["z", "y", "x"]
-    assert list(entry.shape) == [8, 64, 64]
-    assert entry.dtype == "uint16"
-    assert list(entry.chunk_shape) == []
-    assert list(entry.pyramid) == []
-    assert list(entry.physical_scale) == []
-    assert entry.metadata_json == ""
-    assert not entry.HasField("slice_hint")
-    assert list(entry.scale_hint) == []
-    assert entry.reduction_method == ""
+    assert catalog_entry(full) == TensorEntry(
+        array_id="s/A1",
+        dim_labels=("z", "y", "x"),
+        shape=(8, 64, 64),
+        dtype="uint16",
+    )
 
 
 # --- no scene-0 state may leak into another scene ---------------------------
@@ -228,12 +221,12 @@ def _multi_scene_source():
 def test_no_scene_state_leaks_into_a_sibling_scene():
     """Each scene's grid is derived from that scene's own facts, only."""
     source = _multi_scene_source()
-    entries = source.list_tensor_descriptors()
+    entries = source.list_tensors()
     assert [e.array_id for e in entries] == ["multi/A1", "multi/A2", "multi/A3"]
 
     served = {}
     for entry in entries:
-        assert list(entry.chunk_shape) == []
+        assert isinstance(entry, TensorEntry)
         desc = source.get_tensor_adapter(entry.array_id).get_tensor_descriptor()
         served[entry.array_id] = desc
 
@@ -260,7 +253,7 @@ def test_no_scene_state_leaks_into_a_sibling_scene():
 def test_source_level_descriptor_binds_the_default_scene():
     """A source that also fills the tensor role must bind, not read its listing.
 
-    Reading ``list_tensor_descriptors()[0]`` back used to be how this answered;
+    Reading ``list_tensors()[0]`` back used to be how this answered;
     that entry now carries no grid, so answering from it would hand the read
     planner an empty one.
     """

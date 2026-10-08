@@ -399,7 +399,7 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_id = descriptors[0].array_id
 
         server = TensorFlightServer("localhost:0")
@@ -444,7 +444,7 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_id = descriptors[0].array_id
 
         server = TensorFlightServer("localhost:0")
@@ -514,7 +514,7 @@ class TestOmeTiffIntegration:
             },
         )
         adapter = OmeTiffAdapter(path, "ome213")
-        array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
+        array_id = adapter.list_tensors()[0].array_id  # registration
 
         server = TensorFlightServer("localhost:0")
         server.register_source("ome213", adapter)
@@ -551,7 +551,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "multi-series-test")
 
         # List all tensors (series)
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert len(descriptors) == series_info["n_series"]
 
         # Each descriptor should have a unique array_id
@@ -567,7 +567,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_ids = [d.array_id for d in descriptors]
 
         # Access each series and verify data
@@ -604,7 +604,7 @@ class TestMultiSeriesOmeTiffIntegration:
             assert "multi-series-server" in source_ids(client)
 
             # Get actual scene IDs
-            descriptors = adapter.list_tensor_descriptors()
+            descriptors = adapter.list_tensors()
             first_scene_id = descriptors[0].array_id
 
             # first_scene_id is the source-qualified array_id (e.g. 'multi-series-server/Image:0')
@@ -633,7 +633,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         first_scene_id = descriptors[0].array_id
 
         # Get first series adapter
@@ -850,7 +850,7 @@ class TestBioioReadPath:
         src = adapter_cls(
             BioImage(path), scene_index=None, source_id="s", source_url=path
         )
-        descs = src.list_tensor_descriptors()
+        descs = src.list_tensors()
         assert descs, "bioio produced no tensor descriptors"
         scene = src.get_tensor_adapter(descs[0].array_id)
         desc = scene.get_tensor_descriptor()

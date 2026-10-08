@@ -224,8 +224,8 @@ class TestRows:
         before = _row(db)
 
         class _WithAField(_Restorable):
-            def list_tensor_descriptors(self):
-                (own,) = super().list_tensor_descriptors()
+            def list_tensors(self):
+                (own,) = super().list_tensors()
                 field = type(own)(array_id="s1/@fields/f", shape=[4, 4], dtype="uint8")
                 return [own, field]
 

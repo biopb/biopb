@@ -63,7 +63,7 @@ class MockMultifieldAdapter(TensorAdapter):
             dtype=first_spec[2],
         )
 
-    def _list_native_descriptors(self):
+    def _list_native_tensors(self):
         """Return descriptors for all tensors - multifield override."""
         descriptors = []
         for tensor_id, shape, dtype in self.tensor_specs:
@@ -128,7 +128,7 @@ class MockSingleTensorAdapter(TensorAdapter):
             dtype=self.dtype,
         )
 
-    def _list_native_descriptors(self):
+    def _list_native_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def _read_native(self, bounds) -> np.ndarray:
@@ -148,8 +148,8 @@ class MockSingleTensorAdapter(TensorAdapter):
 class TestMultifieldSourceLevel:
     """Tests for source-level methods in multifield adapters."""
 
-    def test_list_tensor_descriptors_returns_all_tensors(self):
-        """list_tensor_descriptors() should return all tensor descriptors."""
+    def test_list_tensors_returns_all_tensors(self):
+        """list_tensors() should return all tensor descriptors."""
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
             ("tensor_1", (128, 128), "uint8"),
@@ -157,7 +157,7 @@ class TestMultifieldSourceLevel:
         ]
         adapter = MockMultifieldAdapter("multifield-source", tensor_specs)
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert len(descriptors) == 3
         assert descriptors[0].array_id == "tensor_0"
@@ -197,7 +197,6 @@ class TestMultifieldSourceLevel:
         assert adapter.source_type == "mock-multifield"
         entries = SourceRegistry().catalog_tensors("multifield-source", adapter)
         assert [t.array_id for t in entries] == ["tensor_0", "tensor_1"]
-        assert all(not t.chunk_shape for t in entries)  # #812
 
 
 class TestMultifieldServerClient:
@@ -524,7 +523,7 @@ class TestMultifieldDifferentDtypes:
         ]
         adapter = MockMultifieldAdapter("mixed-dtype-source", tensor_specs)
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert descriptors[0].dtype == "uint8"
         assert descriptors[1].dtype == "float32"
@@ -537,7 +536,7 @@ class MockImage0Adapter(TensorAdapter):
     Models a single-scene aicsimageio file: every such file names its one
     tensor "Image:0", so two distinct sources share a *non-unique* bare
     array_id. It also mirrors aicsimageio's two array_id forms (issue #45
-    fault 2): list_tensor_descriptors() advertises the bare "Image:0", while
+    fault 2): list_tensors() advertises the bare "Image:0", while
     the tensor-level get_tensor_descriptor() carries the source-qualified
     "source_id/Image:0".
     """
@@ -569,7 +568,7 @@ class MockImage0Adapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def _list_native_descriptors(self):
+    def _list_native_tensors(self):
         # Source-level listing: bare array_id, like aicsimageio.
         return [
             TensorDescriptor(

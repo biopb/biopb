@@ -19,7 +19,7 @@ from biopb_tensor_server.adapters.zarr import (
     is_unfinished_upload,
     is_upload_subsystem_store,
 )
-from biopb_tensor_server.core.adapter_base import catalog_entry
+from biopb_tensor_server.core.adapter_base import TensorEntry, catalog_entry
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
@@ -732,7 +732,7 @@ class OmeZarrAdapter(ZarrAdapter):
                     "shape": [int(s) for s in d.shape],
                     "dtype": d.dtype,
                 }
-                for d in self._list_native_descriptors()
+                for d in self._list_native_tensors()
             ],
         }
 
@@ -1035,19 +1035,19 @@ class OmeZarrAdapter(ZarrAdapter):
             )
         return levels or None
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """List all tensors available in this source.
 
         For HCS plates: Returns flattened list of field tensors.
         For single images: Returns the single tensor descriptor.
 
         Returns:
-            List of TensorDescriptor for all tensors in this source.
+            List of TensorEntry for all tensors in this source.
         """
         if self._is_hcs_plate:
             if self._hcs_descriptors is None:
                 self._hcs_descriptors = self._enumerate_hcs_fields()
-            return list(self._hcs_descriptors)
+            return [catalog_entry(d) for d in self._hcs_descriptors]
         else:
             # Single multiscale image
             return [catalog_entry(self._native_descriptor())]

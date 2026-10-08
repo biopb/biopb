@@ -165,7 +165,7 @@ class TestCachedSourceAdapter:
         )
         assert adapter._physical_scale() is None
 
-    def test_list_tensor_descriptors_single(self):
+    def test_list_tensors_single(self):
         """Cache sources are single-tensor."""
         adapter = CachedSourceAdapter(
             source_id="test",
@@ -174,7 +174,7 @@ class TestCachedSourceAdapter:
             chunk_shape=[50, 50],
         )
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert len(descriptors) == 1
         assert descriptors[0].array_id == "test"
 

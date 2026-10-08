@@ -251,7 +251,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     def get_tensor_adapter(self, tensor_id: str) -> "_TifffileAdapterBase":
         """Create a scene adapter of the same native type."""
-        descriptors = self._list_native_descriptors()
+        descriptors = self._scene_descriptors()
         field = self._within_source_field(tensor_id)
         scene_index = self._scene_index_for_field(field)
         if field in self._tensor_adapters:

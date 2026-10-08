@@ -344,7 +344,7 @@ class SourceConfig:
     """Configuration for a single data source.
 
     A source may contain multiple tensors (multifield support) - the adapter
-    handles tensor enumeration via list_tensor_descriptors() at runtime.
+    handles tensor enumeration via list_tensors() at runtime.
 
     Remote/cloud source features are EXPERIMENTAL: remote URLs, ``cloud = true``
     synced-folder roots, the ``tensor-server`` proxy type, its ``alias``, and

@@ -301,7 +301,7 @@ class TestQptiffAdapter:
                 assert lvl.source_url == adapter._source_url
                 assert lvl.source_type == "qptiff"
                 assert lvl.source_id == adapter.source_id
-                assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
+                assert [d.array_id for d in lvl.list_tensors()] == [
                     f"{adapter.source_id}/1"
                 ]
                 # Cached: repeated calls return the same instance.

@@ -68,6 +68,7 @@ from google.protobuf.field_mask_pb2 import FieldMask
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     TensorReadPlan,
     catalog_entry,
 )
@@ -517,7 +518,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query, it seeds these so
-        # registration (sync_source_added -> list_tensor_descriptors/get_metadata)
+        # registration (sync_source_added -> list_tensors/get_metadata)
         # needs no per-source upstream RPC. None = not seeded (fall back to a live
         # per-source fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
@@ -679,11 +680,11 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added``
-        (``list_tensor_descriptors`` + ``get_metadata``) needs no per-source
+        (``list_tensors`` + ``get_metadata``) needs no per-source
         upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
         array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
-        ``list_tensor_descriptors`` (default field only), this seeds **all** of the
+        ``list_tensors`` (default field only), this seeds **all** of the
         source's tensors, so a multi-field upstream mirrors completely.
 
         ``is_resolved`` is the upstream *source*'s own flag (from its row): an
@@ -796,7 +797,7 @@ class RemoteTensorAdapter(TensorAdapter):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """Mirror this one upstream source's tensor descriptor(s).
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
@@ -821,7 +822,7 @@ class RemoteTensorAdapter(TensorAdapter):
         """
         # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
         if self._descriptors_cache is not None:
-            return self._descriptors_cache
+            return [catalog_entry(d) for d in self._descriptors_cache]
 
         try:
             # Structural mirror only -- metadata is served from this proxy's own

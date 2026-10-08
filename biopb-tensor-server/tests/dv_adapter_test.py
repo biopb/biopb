@@ -54,7 +54,7 @@ def test_local_dv_claims_natively_and_reads_through_mrc_dvfile(tmp_path):
     )
     assert isinstance(source, DeltaVisionAdapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == 1
     desc = descriptors[0]
     # Native loop order for a single-channel Z-stack (see mrc.DVFile.axes).

@@ -45,6 +45,7 @@ from biopb_tensor_server.adapters._signature_memo import Signature, SignatureMem
 from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_by_image
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -731,7 +732,7 @@ class OmeTiffAdapter(TensorAdapter):
         geometry, and is handed straight to the scene adapter by
         :meth:`get_tensor_adapter` -- the one object the listing and the read
         agree on. Internal: the catalog surface is
-        :meth:`list_tensor_descriptors`, which projects these.
+        :meth:`list_tensors`, which projects these.
 
         Returns an empty list when the source is not a tifffile-readable local
         OME-TIFF (remote, custom dim_labels, non-OME, exotic axes) -- ``claim``
@@ -743,7 +744,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._cached_descriptors = descriptors if descriptors is not None else []
         return self._cached_descriptors
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """Structural catalog entries for every scene (no grid, #812)."""
         return [catalog_entry(d) for d in self._scene_descriptors()]
 

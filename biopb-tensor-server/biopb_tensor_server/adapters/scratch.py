@@ -17,9 +17,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
-from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    TensorAdapter,
+    TensorEntry,
+)
 from biopb_tensor_server.core.errors import TensorNotFound
 
 __all__ = ["DEFAULT_SCRATCH_TTL", "SCRATCH_SOURCE_ID", "ScratchSource"]
@@ -83,7 +85,7 @@ class ScratchSource(SourceAdapter):
             "the scratch source is the server's own, never configured as a data source"
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """None of its own: every tensor here was uploaded, and
         the registry's listing appends the published ones after this."""
         return []

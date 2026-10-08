@@ -29,6 +29,7 @@ from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TT
 from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -427,7 +428,7 @@ class NdTiffAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """List all tensors - single tensor source."""
         return [catalog_entry(self._native_descriptor())]
 

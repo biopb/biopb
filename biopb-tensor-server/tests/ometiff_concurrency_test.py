@@ -30,7 +30,7 @@ def test_concurrent_reads_are_correct(tmp_path, monkeypatch):
         str(tmp_path), n_series=3, series_shape=(2, 64, 64)
     )
     source = OmeTiffAdapter(path, "conc")
-    fields = [d.array_id.split("/", 1)[1] for d in source.list_tensor_descriptors()]
+    fields = [d.array_id.split("/", 1)[1] for d in source.list_tensors()]
     scenes = [source.get_tensor_adapter(f) for f in fields]
 
     def read(task):
@@ -54,7 +54,7 @@ def test_default_reads_are_correct_and_serialized(tmp_path, monkeypatch):
         str(tmp_path), n_series=3, series_shape=(2, 64, 64)
     )
     source = OmeTiffAdapter(path, "serial")
-    fields = [d.array_id.split("/", 1)[1] for d in source.list_tensor_descriptors()]
+    fields = [d.array_id.split("/", 1)[1] for d in source.list_tensors()]
     scenes = [source.get_tensor_adapter(f) for f in fields]
 
     def read(task):
@@ -97,7 +97,7 @@ def _scene(tmp_path, source_id):
         str(tmp_path), n_series=1, series_shape=(2, 64, 64)
     )
     source = OmeTiffAdapter(path, source_id)
-    field = source.list_tensor_descriptors()[0].array_id.split("/", 1)[1]
+    field = source.list_tensors()[0].array_id.split("/", 1)[1]
     return source, source.get_tensor_adapter(field)
 
 
