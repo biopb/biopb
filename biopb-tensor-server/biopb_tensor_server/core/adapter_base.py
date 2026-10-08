@@ -396,9 +396,9 @@ class SourceAdapter(ABC):
         served in canonical order (biopb/biopb#596), each entry normalized by its
         own labels.
 
-        The source-listing/discovery surface: what the DuckDB catalog stores and
-        what ``ListFlights`` publishes. It returns lightweight entries without
-        expensive operations like scene switching or chunk-layout computation.
+        The source-listing/discovery surface: what the DuckDB catalog stores in
+        ``sources.tensors``. It returns lightweight entries without expensive
+        operations like scene switching or chunk-layout computation.
 
         Returns:
             List of :class:`TensorEntry`, each a :func:`catalog_entry` projection:
