@@ -435,15 +435,16 @@ class SourceAdapter(ABC):
     def get_metadata(self) -> dict:
         """Return the source-level metadata as a dict. Usually OME metadata.
 
-        Called by :meth:`MetadataDatabase.sync_source_added` whenever the source's
-        catalog row is built -- at registration, and again on a re-sync (a source
-        that resolves, a file that changed) -- to populate
-        ``sources.metadata_json``. The serve path reads that row back, never this
-        method (biopb/biopb#253), and nothing else calls it: an adapter that needs
-        a value from its metadata keeps a private copy of that value. The catalog
-        is the cache, so this need not memoize. Genuinely per-tensor metadata that
-        the source row cannot represent is exposed on the tensor adapter via
-        :meth:`TensorAdapter.get_tensor_metadata` instead.
+        Called once per registered adapter, by
+        :meth:`MetadataDatabase.sync_source_added`, to populate
+        ``sources.metadata_json``; a changed file or a source that resolves
+        registers a new adapter. (A remote mirror's re-seed and a rolled-back
+        replace sync the same adapter again.) The serve path reads that row back,
+        never this method (biopb/biopb#253), and nothing else calls it: an adapter
+        that needs a value from its metadata keeps a private copy of that value.
+        The catalog is the cache, so this need not memoize. Genuinely per-tensor
+        metadata that the source row cannot represent is exposed on the tensor
+        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
         """
 
     def get_embedded_rois(
