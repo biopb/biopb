@@ -297,31 +297,13 @@ class Attachments:
         attached = self.for_field(parent, field)
         if attached is not None:
             return attached
-        return parent.get_tensor_adapter(tensor_id)
-
-    def resolve_chunk_adapter(
-        self, parent: SourceAdapter, field: Optional[str]
-    ) -> TensorAdapter:
-        """The adapter that serves a chunk whose route carries *field*.
-
-        A within-source suffix on a chunk names either a native pyramid level
-        (OME-Zarr / QPTIFF precompute) or a tensor field, and for a label set
-        either of those *under* the set: ``labels/nuclei/1`` is level ``1`` of
-        set ``nuclei``.
-        """
         parsed = split_label_field(field)
-        label_set = (
-            self._label_set_for(parent, parsed.set_field)
-            if parsed is not None
-            else None
-        )
-        if label_set is not None:
-            level = label_set.get_level_adapter(parsed.level) if parsed.level else None
-            return level or label_set
-        attached = self.for_field(parent, field)
-        if attached is not None:
-            return attached
-        return parent.resolve_chunk_adapter(field)
+        if parsed is not None and parsed.level:
+            # a native level of a label set rides under the set's own field
+            label_set = self._label_set_for(parent, parsed.set_field)
+            if label_set is not None:
+                return label_set.get_tensor_adapter(tensor_id)
+        return parent.get_tensor_adapter(tensor_id)
 
     def capability_token(self, array_id: Optional[str]) -> Optional[str]:
         """The grant the tensor *array_id* carries, or None. The only reader of

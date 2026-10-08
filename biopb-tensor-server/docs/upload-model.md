@@ -116,8 +116,7 @@ A field and a label set are both **attached tensors**. `SourceRegistry` owns
 one `Attachments` per source id (`core/attachments.py`), scanned from disk once
 at boot and independent of the adapter, so an adapter rebuilt by a refresh
 leaves the tensors and an upload in flight where they were. Adapters know
-nothing of them: the registry resolves a tensor id (`resolve_tensor`,
-`resolve_chunk_adapter`), lists a source (`catalog_tensors`) and answers the
+nothing of them: the registry resolves a tensor id (`resolve_tensor`), lists a source (`catalog_tensors`) and answers the
 capability token. `label_sets`, `label_uploads` and `attached_fields` are
 checked views over the index -- `label_sets` is the attached tensors whose
 field parses as a set, plus the file's own, each checked against

@@ -966,8 +966,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # A within-source suffix names a native pyramid level, a tensor
             # field, or a label set (and a level under it); the registry
-            # decides which (``SourceRegistry.resolve_chunk_adapter``).
-            adapter = self.sources.resolve_chunk_adapter(source_id, rest)
+            # decides which.
+            adapter = self.sources.resolve_tensor(source_id, rest)
         except (
             SourceUnresolvedError,
             TensorResolutionError,

@@ -264,16 +264,6 @@ class SourceRegistry:
             return None
         return self.attached_to(source_id).resolve_tensor(adapter, tensor_id)
 
-    def resolve_chunk_adapter(
-        self, source_id: str, field: Optional[str]
-    ) -> Optional[TensorAdapter]:
-        """The adapter that serves a chunk whose route is ``source_id/<field>``,
-        None for an unknown source. Raises what :meth:`get_registered` raises."""
-        adapter = self.get_registered(source_id)
-        if adapter is None:
-            return None
-        return self.attached_to(source_id).resolve_chunk_adapter(adapter, field)
-
     def tensor_capability_token(
         self, source_id: str, array_id: Optional[str]
     ) -> Optional[str]:
