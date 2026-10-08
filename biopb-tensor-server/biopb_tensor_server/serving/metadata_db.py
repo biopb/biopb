@@ -1457,6 +1457,9 @@ class MetadataDatabase:
         the matching ``register_source`` so the catalog and the registry never
         silently disagree. Logging is the caller's responsibility.
 
+        The row and the ROIs the file carries are one transaction, so a raise
+        leaves the previous row and ROIs both as they were.
+
         Once the row is committed this calls
         ``adapter.release_registration_cache()``: the catalog now holds the
         metadata, so the adapter may drop whatever it kept only to produce it.
@@ -1584,14 +1587,14 @@ class MetadataDatabase:
             ],
             record,
             payload,
+            # The same transaction as the row, so the two always come from one
+            # registration and a raise leaves the previous pair intact. A store
+            # that cannot take an annotation cannot be trusted with the row
+            # either; what the importer merely refuses is skipped inside.
+            also=lambda c: self._replace_imported_locked(
+                c, source_id, source_url, imported, indexed_at
+            ),
         )
-
-        # Deliberately AFTER the source row commits, and deliberately unable to
-        # raise. Registration failing here would cost a source its pixels over
-        # an annotation, which is the wrong way round: an imported set is
-        # disposable (the next registration rebuilds it, and open clears it
-        # anyway) where a source that will not register is an outage.
-        self._replace_imported(source_id, source_url, imported, indexed_at)
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
         # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
@@ -1720,9 +1723,14 @@ class MetadataDatabase:
         row: List[Any],
         record: Optional[CatalogRecord] = None,
         payload: Optional[Dict[str, Any]] = None,
+        also: Optional[Callable[[duckdb.DuckDBPyConnection], None]] = None,
     ) -> None:
         """Insert or update a source's row (*row*, in ``_ROW_COLUMN_NAMES`` order),
         serializing writes with the lock.
+
+        One transaction with *also*, which runs after the row is written and
+        inside it: a raise from either leaves the previous row and whatever
+        *also* wrote exactly as they were.
 
         A ``source_id`` has one row, so a write cannot list a source twice. With a
         *record* (where the source sits, its claim and signature, and the adapter
@@ -1748,20 +1756,28 @@ class MetadataDatabase:
             update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
         with self._write_lock:
-            updated = conn.execute(
-                f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
-                set_values + [source_id],
-            ).fetchone()
-            if not updated or not updated[0]:
-                # A row that is there by now (the UPDATE did not see it) is
-                # overwritten, which is what was asked: a registration must not
-                # fail on the pending row its claim made.
-                conn.execute(
-                    f"INSERT INTO source_catalog ({_ALL_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * len(values))}) "
-                    f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
-                    values,
-                )
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                updated = conn.execute(
+                    f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
+                    set_values + [source_id],
+                ).fetchone()
+                if not updated or not updated[0]:
+                    # A row that is there by now (the UPDATE did not see it) is
+                    # overwritten, which is what was asked: a registration must
+                    # not fail on the pending row its claim made.
+                    conn.execute(
+                        f"INSERT INTO source_catalog ({_ALL_COLUMNS}) "
+                        f"VALUES ({', '.join('?' * len(values))}) "
+                        f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
+                        values,
+                    )
+                if also is not None:
+                    also(conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def sync_pending_source(
         self,
@@ -2002,8 +2018,9 @@ class MetadataDatabase:
                 [root_id, root_url],
             )
 
-    def _replace_imported(
+    def _replace_imported_locked(
         self,
+        conn: duckdb.DuckDBPyConnection,
         source_id: str,
         source_url: str,
         imported: Dict[str, List[RoiAnnotation]],
@@ -2020,38 +2037,8 @@ class MetadataDatabase:
         pretending otherwise would put a monotonic rev on a value that only ever
         restates the file.
 
-        Never raises: its caller is source registration, and no annotation is
-        worth failing that (see the call site). One transaction all the same, so
-        a failure leaves the previous set rather than half of the new one.
+        Runs inside the row's transaction (:meth:`_upsert_source_row`).
         """
-        conn = self._get_connection()
-        try:
-            with self._write_lock:
-                conn.execute("BEGIN TRANSACTION")
-                try:
-                    self._replace_imported_locked(
-                        conn, source_id, source_url, imported, now
-                    )
-                    conn.execute("COMMIT")
-                except BaseException:
-                    conn.execute("ROLLBACK")
-                    raise
-        except Exception:
-            logger.exception(
-                "ome rois: could not store the imported set for %s; the source "
-                "is registered and serving, and the next registration retries",
-                source_id,
-            )
-
-    def _replace_imported_locked(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        source_id: str,
-        source_url: str,
-        imported: Dict[str, List[RoiAnnotation]],
-        now: datetime,
-    ) -> None:
-        """The body of :meth:`_replace_imported`, inside the transaction."""
         conn.execute(
             "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
             [source_id, RESERVED_SET_PREFIX],

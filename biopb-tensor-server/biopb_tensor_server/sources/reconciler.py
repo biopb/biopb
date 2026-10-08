@@ -1748,6 +1748,7 @@ class Reconciler:
             record = self._catalog_record(claim, adapter=adapter)
 
         registered = False
+        synced = False
         displaced: Optional[Any] = None
         try:
             if replace:
@@ -1773,6 +1774,7 @@ class Reconciler:
                     self._metadata_db.sync_source_added(
                         claim.source_id, adapter, record
                     )
+                    synced = True
                 else:
                     self._relist_tensors(claim.source_id, adapter)
 
@@ -1798,7 +1800,9 @@ class Reconciler:
             if registered and displaced is not None:
                 # A failed REBUILD must not cost the working source: put the
                 # adapter that was serving back, and its catalog row with it.
-                self._restore_displaced_source(claim.source_id, displaced)
+                self._restore_displaced_source(
+                    claim.source_id, displaced, row_replaced=synced
+                )
             elif registered and self.is_pending(claim.source_id):
                 # A claimed source still waiting to register keeps its claim and
                 # its pending row: only the adapter this call put in goes.
@@ -1844,11 +1848,18 @@ class Reconciler:
         if held is not None and len(held) == 5 and adapter.content_version is not None:
             adapter._content_version = f"{held[3]}:{held[2]}".encode()
 
-    def _restore_displaced_source(self, source_id: str, displaced: Any) -> None:
-        """Put a swapped-out adapter back after a failed replace (best-effort)."""
+    def _restore_displaced_source(
+        self, source_id: str, displaced: Any, row_replaced: bool
+    ) -> None:
+        """Put a swapped-out adapter back after a failed replace (best-effort).
+
+        The row is written back only when *row_replaced*: a sync that raised left
+        the previous row and its ROIs as they were (one transaction), so only a
+        failure after it has a new row to undo.
+        """
         try:
             self._server.swap_source(source_id, displaced)
-            if self._metadata_db is not None:
+            if self._metadata_db is not None and row_replaced:
                 # State still holds the claim and signature the adapter served under.
                 with self._lock:
                     previous = self._state.claims.get(source_id)
