@@ -86,6 +86,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import LOCAL_ONLY, PYRAMID, read_mask
 from biopb_tensor_server.core.registration import (
     RegistrationRecord,
@@ -856,6 +857,11 @@ class RemoteTensorAdapter(TensorAdapter):
         catalog fetch, so nothing said otherwise) stays True.
         """
         return self._upstream_resolved is not False
+
+    @property
+    def categorical(self) -> bool:
+        """The upstream does not say, so read it off the id it minted."""
+        return split_label_field(self._tensor_name) is not None
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):
         """Return a tensor-layer view bound to the requested within-source field."""

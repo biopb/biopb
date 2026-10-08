@@ -102,7 +102,6 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
-from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import (
     IS_RESIDENT,
     METADATA_JSON,
@@ -1765,9 +1764,7 @@ class TensorFlightServer(flight.FlightServerBase):
             )
             # A label set over a real network compresses 25-50x (biopb#1111);
             # anything else goes raw, keeping the zero-copy path.
-            compressed = split_label_field(
-                array_id.partition("/")[2]
-            ) is not None and _peer_is_remote(context.peer())
+            compressed = adapter.categorical and _peer_is_remote(context.peer())
             return flight.RecordBatchStream(
                 reader, options=WIRE_WRITE_OPTIONS if compressed else None
             )

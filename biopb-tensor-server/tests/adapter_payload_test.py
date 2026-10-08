@@ -58,7 +58,7 @@ class TestOmeTiff:
         assert mask["parent_array_id"] == "src1/Image:0"
 
         # The descriptor is the one the label adapter would serve.
-        label = adapter.get_embedded_labels()[mask["field"]].get_tensor_descriptor()
+        label = adapter._embedded_sets()[mask["field"]].get_tensor_descriptor()
         assert mask["dim_labels"] == list(label.dim_labels)
         assert mask["shape"] == list(label.shape)
 
@@ -66,7 +66,7 @@ class TestOmeTiff:
         adapter = self._masked(tmp_path)
         adapter.catalog_payload()
         assert adapter._mask_payloads_transferred is False
-        adapter.get_embedded_labels()
+        adapter._embedded_sets()
         assert adapter._mask_payloads_transferred is True
 
     def test_a_plain_file_reports_neither(self, tmp_path):

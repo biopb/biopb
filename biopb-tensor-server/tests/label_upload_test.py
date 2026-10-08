@@ -3,7 +3,7 @@
 The third upload kind: selected by an ``array_id`` with no ``kind:`` prefix
 and a ``/@labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
-look an upload up (the source's ``label_uploads``, not the upload registry) and a
+look an upload up (the source's attachment index, not the upload registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
 ``setup_array_upload`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.

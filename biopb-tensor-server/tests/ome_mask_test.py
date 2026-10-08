@@ -349,7 +349,7 @@ class TestFastMetadataRealBitmap:
         mask = metadata["rois"][0]["union"]["masks"][0]
         assert base64.b64decode(mask["bin_data"]["value"]) == raw
 
-    def test_get_embedded_labels_end_to_end(self, tmp_path):
+    def test_the_mask_set_is_a_tensor_of_the_source(self, tmp_path):
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
         from biopb_tensor_server.sources.source_registry import SourceRegistry
 
@@ -359,7 +359,7 @@ class TestFastMetadataRealBitmap:
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
 
-        sets = adapter.get_embedded_labels()
+        sets = adapter._embedded_sets()
         assert list(sets.keys()) == ["Image:0/@labels/@ome"]
         label_set = sets["Image:0/@labels/@ome"]
         assert label_set.array_id == "src1/Image:0/@labels/@ome"
@@ -370,11 +370,14 @@ class TestFastMetadataRealBitmap:
         assert out[tuple([0] * (out.ndim - 2) + [2, 2])] == 1
         assert out[tuple([0] * (out.ndim - 2) + [0, 0])] == 0
 
-        # And through the base SourceAdapter machinery: extent must match.
+        # And as the source's own tensor: listed after the image, routed by id.
         reg = SourceRegistry()
         adapter = reg.register("src1", adapter)
-        attached = reg.attached_to("src1")
-        assert "Image:0/@labels/@ome" in attached.label_sets(adapter)
+        assert [t.array_id for t in adapter.list_tensors()] == [
+            "src1/Image:0",
+            "src1/Image:0/@labels/@ome",
+        ]
+        assert reg.resolve_tensor("src1", "Image:0/@labels/@ome") is label_set
 
         adapter._drop_registration_state()
 
@@ -385,7 +388,7 @@ class TestFastMetadataRealBitmap:
         assert adapter._parsed_metadata_probed is False
         for scene in adapter._tensor_adapters.values():
             assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
-        cached_label_set = attached.label_sets(adapter)["Image:0/@labels/@ome"]
+        cached_label_set = adapter.get_tensor_adapter("src1/Image:0/@labels/@ome")
         assert (
             cached_label_set.get_data(
                 ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
@@ -413,7 +416,7 @@ class TestFastMetadataRealBitmap:
         raw = np.packbits(raw_bitmap.flatten(), bitorder="big").tobytes()
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
-        adapter.get_embedded_labels()  # sets _mask_payloads_transferred
+        adapter._embedded_sets()  # sets _mask_payloads_transferred
 
         def _broken_strip(ome_xml):
             raise ET.ParseError("boom")
@@ -430,7 +433,7 @@ class TestFastMetadataRealBitmap:
         assert base64.b64encode(raw).decode("ascii") in adapter._reduced_ome_xml
 
     def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
-        """get_embedded_labels() calls get_metadata() internally, and so does
+        """building the label sets calls get_metadata() internally, and so does
         the registration path (metadata_db.py) -- the parsed dict is cached so
         that doesn't cost a second ome-types parse."""
         import biopb_tensor_server.adapters.ome_tiff as ome_tiff_module
@@ -449,7 +452,7 @@ class TestFastMetadataRealBitmap:
         monkeypatch.setattr(ome_tiff_module, "_fast_ome_metadata", counting)
 
         adapter._ome_metadata()
-        adapter.get_embedded_labels()  # calls self._ome_metadata() again internally
+        adapter._embedded_sets()  # calls self._ome_metadata() again internally
         adapter._ome_metadata()
 
         assert len(calls) == 1

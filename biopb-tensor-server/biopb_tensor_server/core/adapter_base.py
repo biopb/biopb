@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -403,23 +403,6 @@ class SourceAdapter(ABC):
         row cannot represent is :meth:`TensorAdapter.get_tensor_metadata`.
         """
 
-    # -- attached tensors (biopb/biopb#1059) -----------------------------------
-    # The tensors the upload path attached to a source -- uploaded fields, label
-    # sets -- belong to the registry (``core.attachments``), not to the adapter.
-
-    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
-        """Label sets this source's own file carries, keyed by within-source field.
-
-        The pixel counterpart of the ROIs in :meth:`registration_record`: a format that stores
-        labels beside its image -- an OME-Zarr's NGFF ``labels/`` group -- says
-        here how to read them. Read once per adapter by the registry's label-set view.
-        Default: none. Keys are ``[<image field>/]labels/<name>``
-        (:func:`~biopb_tensor_server.core.labels.label_field`); values are
-        tensor adapters bound to the set, in the format's own axis order --
-        the base normalizes them.
-        """
-        return {}
-
     def is_resolved(self) -> bool:
         """Deterministic: is there a hydrated adapter backing this source?
 
@@ -522,6 +505,11 @@ class TensorAdapter(SourceAdapter):
     @capability_token.setter
     def capability_token(self, value: Optional[str]) -> None:
         self._capability_token = value
+
+    #: Whether the values are ids, not measurements -- a label set. Averaging
+    #: ids produces ids that exist nowhere, so a categorical tensor's computed
+    #: pyramid is ``nearest`` whatever the server is configured to.
+    categorical: bool = False
 
     @property
     def array_id(self) -> str:
@@ -1212,6 +1200,8 @@ class TensorAdapter(SourceAdapter):
             levels = None
         if levels is None:
             cfg = pyramid_config
+            if self.categorical:
+                cfg = replace(cfg, reduction_method="nearest")
             levels = build_pyramid_plan(
                 list(base_desc.shape),
                 list(base_desc.dim_labels),
@@ -1308,13 +1298,13 @@ _SOURCE_SCOPED_API = frozenset(
         "get_tensor_adapter",
         "close",
         "catalog_payload",
-        "get_embedded_labels",
     }
 )
 _TENSOR_SCOPED_API = frozenset(
     {
         "capability_token",
         "array_id",
+        "categorical",
         "content_version",
         "check_chunk_version",
         "put_chunk",
