@@ -1165,7 +1165,7 @@ class TensorAdapter(SourceAdapter):
            loses the cache-sourced path.
 
         Args:
-            bounds: Chunk bounds, in this adapter's own axis order.
+            bounds: Chunk bounds, in canonical axis order.
             scale_hint: Per-axis reduction factor, same order as ``bounds``.
             reduction_method: Normalized method, decoded from the chunk_id.
             cache_manager: The chunk cache, when the caller has one.
@@ -1668,7 +1668,9 @@ class TensorAdapter(SourceAdapter):
     def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """:meth:`_native_pyramid_levels`, in canonical axis order."""
         levels = self._native_pyramid_levels()
-        perm = self._axis_perm() if levels is not None else None
+        if levels is None:
+            return None
+        perm = self._axis_perm()
         if perm is None:
             return levels
         out = []
