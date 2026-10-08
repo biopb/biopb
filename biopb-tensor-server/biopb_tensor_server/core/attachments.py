@@ -291,14 +291,10 @@ class Attachments:
 
         An id under a marked segment that names nothing attached here is handed
         to the format anyway rather than refused: a proxy's upstream may serve
-        it, and a format that cannot raises its own ``TensorNotFound``. A source
-        that holds no tensors of its own (``serves_attached_only``) answers an
-        unnamed id with its first published field.
+        it, and a format that cannot raises its own ``TensorNotFound``.
         """
         field = strip_source_prefix(self.source_id, tensor_id)
         attached = self.for_field(parent, field)
-        if attached is None and not field and parent.serves_attached_only:
-            attached = next(iter(self.attached_fields().values()), None)
         if attached is not None:
             return attached
         return parent.get_tensor_adapter(tensor_id)

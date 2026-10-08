@@ -53,8 +53,6 @@ class ScratchSource(SourceAdapter):
 
     _source_type = "scratch"
 
-    serves_attached_only = True
-
     def __init__(
         self,
         max_upload_ttl: Optional[float] = None,
@@ -98,9 +96,8 @@ class ScratchSource(SourceAdapter):
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         """A typed miss; never ``self``.
 
-        Reached only after the attachments have missed, so a named field here
-        names nothing, and an unnamed one asks for the first published field --
-        of which an empty scratch source has none.
+        Reached only after the attachments have missed, so a field named here
+        names nothing, and an unnamed id has no tensor to resolve to.
         """
         field = self._within_source_field(tensor_id)
         if field:

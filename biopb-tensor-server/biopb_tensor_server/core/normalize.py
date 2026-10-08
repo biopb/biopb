@@ -245,7 +245,7 @@ def _wrap_listing(fn: Callable) -> Callable:
     def list_tensors(self):
         out = []
         for entry in fn(self):
-            perm = self._permutation_of(entry)
+            perm = permutation_of(self, entry)
             out.append(entry if perm is None else permute_entry(entry, perm))
         return out
 
@@ -283,6 +283,12 @@ def is_canonical(adapter: Any) -> bool:
     """Whether ``adapter`` (an instance or a class) is served in canonical order."""
     cls = adapter if isinstance(adapter, type) else type(adapter)
     return bool(getattr(cls, "_canonical_axes", False))
+
+
+def permutation_of(adapter: Any, desc: Any) -> Optional[Tuple[int, ...]]:
+    """The permutation ``desc``'s own labels imply, or None for identity --
+    always None for an adapter that is not served canonical."""
+    return descriptor_permutation(desc) if is_canonical(adapter) else None
 
 
 def unwrapped(method: Callable) -> Callable:

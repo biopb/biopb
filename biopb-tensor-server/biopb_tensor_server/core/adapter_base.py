@@ -78,8 +78,7 @@ from biopb_tensor_server.core.errors import (
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.normalize import (
-    descriptor_permutation,
-    is_canonical,
+    permutation_of,
     permute_descriptor,
     to_canonical,
     to_native,
@@ -390,11 +389,6 @@ class SourceAdapter(ABC):
             An instance of a SourceAdapter subclass initialized with the provided config
         """
 
-    def _permutation_of(self, desc: Any) -> Optional[Tuple[int, ...]]:
-        """The permutation ``desc``'s own labels imply, or None for identity --
-        always None for a source that is not served canonical."""
-        return descriptor_permutation(desc) if is_canonical(self) else None
-
     @abstractmethod
     def list_tensors(self) -> List[TensorEntry]:
         """List this source's tensors as **structural catalog entries**. A
@@ -492,10 +486,6 @@ class SourceAdapter(ABC):
     # -- attached tensors (biopb/biopb#1059) -----------------------------------
     # The tensors the upload path attached to a source -- uploaded fields, label
     # sets -- belong to the registry (``core.attachments``), not to the adapter.
-
-    #: A source with no tensors of its own: an unnamed id resolves to its first
-    #: published attached field.
-    serves_attached_only: bool = False
 
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         """Label sets this source's own file carries, keyed by within-source field.
@@ -856,7 +846,7 @@ class TensorAdapter(SourceAdapter):
         adapters -- small next to the read it precedes.
         """
         try:
-            return self._permutation_of(self._native_descriptor())
+            return permutation_of(self, self._native_descriptor())
         except Exception:
             return None
 
@@ -865,7 +855,7 @@ class TensorAdapter(SourceAdapter):
         axis order for a ``@canonical_axes`` class. Subclasses implement
         :meth:`_native_descriptor`."""
         desc = self._native_descriptor()
-        perm = self._permutation_of(desc)
+        perm = permutation_of(self, desc)
         return desc if perm is None else permute_descriptor(desc, perm)
 
     @abstractmethod
@@ -1770,7 +1760,6 @@ _SOURCE_SCOPED_API = frozenset(
         "release_registration_cache",
         "catalog_payload",
         # attached tensors (biopb/biopb#1059)
-        "serves_attached_only",
         "get_embedded_labels",
         "resolve_chunk_adapter",
         # the level lookup of the chunk route, which is source-scoped
