@@ -306,5 +306,5 @@ class TestTheStoreFollowsThePlan:
 
         assert None not in tokens.values()
         assert tokens["a"] != tokens["b"]
-        assert tokens["a"] != parent.content_version
+        assert tokens["a"] != parent._content_version
         assert first.array_id != second.array_id

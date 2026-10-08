@@ -266,40 +266,11 @@ class SourceAdapter(ABC):
         """The display URL the catalog row carries -- what clients group the tree by."""
         return self._catalog_url or to_catalog_url(self._source_url)
 
-    @property
-    def content_version(self) -> Optional[bytes]:
-        """Opaque content-version token folded into this adapter's chunk_ids, or
-        None when its content is unversioned (see ``_content_version``).
-        """
-        return self._content_version
-
     def check_readable(self) -> None:  # noqa: B027 - concrete no-op default
         """Raise if this source cannot answer a pixel read right now.
 
         Usually a noop. An unfinished upload is a notable exception.
         """
-
-    def check_chunk_version(self, chunk_id: bytes) -> None:
-        """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
-
-        Pure in-memory comparison and a cheap guard ahead of an actual read.
-        A unversioned chunk_id (``held_version`` None) always passes.
-
-        :class:`RemoteTensorAdapter` overrides this to compare the proxy
-        envelope's own version instead -- it never mints a plain (non-envelope)
-        chunk_id, so this base implementation would misparse one of its chunk_ids.
-        """
-        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
-        stale_content = (
-            held_version is not None and held_version != self.content_version
-        )
-        if stale_content or held_epoch != current_epoch():
-            raise StaleChunkError(
-                f"chunk_id for {self.array_id!r} was minted against a "
-                "version this source no longer serves; re-request the "
-                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
-                reason="stale_content_version",
-            )
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
@@ -542,6 +513,35 @@ class TensorAdapter(SourceAdapter):
         if self._tensor_name is None:
             return self.source_id
         return f"{self.source_id}/{self._tensor_name}"
+
+    @property
+    def content_version(self) -> Optional[bytes]:
+        """This tensor's content-version token, folded into the chunk_ids it
+        mints, or None when its content is unversioned (see ``_content_version``).
+        """
+        return self._content_version
+
+    def check_chunk_version(self, chunk_id: bytes) -> None:
+        """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
+
+        Pure in-memory comparison and a cheap guard ahead of an actual read.
+        A unversioned chunk_id (``held_version`` None) always passes.
+
+        :class:`RemoteTensorAdapter` overrides this to compare the proxy
+        envelope's own version instead -- it never mints a plain (non-envelope)
+        chunk_id, so this base implementation would misparse one of its chunk_ids.
+        """
+        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
+        stale_content = (
+            held_version is not None and held_version != self.content_version
+        )
+        if stale_content or held_epoch != current_epoch():
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against a "
+                "version this source no longer serves; re-request the "
+                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
 
     def put_chunk(
         self,
@@ -1506,8 +1506,6 @@ _SOURCE_SCOPED_API = frozenset(
     {
         "source_url",
         "source_type",
-        "content_version",
-        "check_chunk_version",
         "check_readable",
         "claim",
         "create_from_config",
@@ -1532,6 +1530,8 @@ _TENSOR_SCOPED_API = frozenset(
     {
         "capability_token",
         "array_id",
+        "content_version",
+        "check_chunk_version",
         "put_chunk",
         "get_tensor_descriptor",
         "get_transfer_chunk_size",

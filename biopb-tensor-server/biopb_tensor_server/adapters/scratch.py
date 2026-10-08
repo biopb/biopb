@@ -46,10 +46,9 @@ class ScratchSource(SourceAdapter):
     tensor list -- so the base resolves and lists what is attached to it exactly
     as it does for a discovered source.
 
-    Its ``content_version`` is None, the base's word for content this adapter
-    does not serve. Every member carries its own token, minted when it is
-    uploaded, so a name reclaimed after a discard never inherits the chunk-id
-    namespace of what held it before.
+    It has no content version of its own: every member carries its own token,
+    minted when it is uploaded, so a name reclaimed after a discard never
+    inherits the chunk-id namespace of what held it before.
     """
 
     _source_type = "scratch"
