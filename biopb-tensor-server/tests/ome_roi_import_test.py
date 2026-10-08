@@ -671,7 +671,7 @@ class TestRegistrationSurvivesABadImport:
         # The one remaining copy is not dropped when nothing read it.
         assert "rois" in db.get_metadata_json(SOURCE_ID)
 
-    def test_a_failed_write_leaves_the_previous_row_and_set(self, monkeypatch):
+    def test_a_failed_roi_write_leaves_the_previous_set(self, monkeypatch):
         db = MetadataDatabase()
         db.sync_source_added(SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=1, y=1))))
         assert _reserved(db) == ["Shape:0"]
@@ -679,17 +679,13 @@ class TestRegistrationSurvivesABadImport:
         def boom(*args, **kwargs):
             raise RuntimeError("write failed")
 
-        before = db.get_metadata_json(SOURCE_ID)
         monkeypatch.setattr(MetadataDatabase, "_replace_imported", boom)
-        with pytest.raises(RuntimeError, match="write failed"):
-            db.sync_source_added(
-                SOURCE_ID,
-                _FakeAdapter(_meta(_shape("points", x=9, y=9, id="Shape:1"))),
-            )
+        db.sync_source_added(
+            SOURCE_ID, _FakeAdapter(_meta(_shape("points", x=9, y=9, id="Shape:1")))
+        )
 
-        # The row and the set both come from the previous registration.
-        assert _reserved(db) == ["Shape:0"]
-        assert db.get_metadata_json(SOURCE_ID) == before
+        assert _reserved(db) == ["Shape:0"]  # rolled back, not half-applied
+        assert db.get_metadata_json(SOURCE_ID) is not None
 
 
 class TestTheFormatDecides:

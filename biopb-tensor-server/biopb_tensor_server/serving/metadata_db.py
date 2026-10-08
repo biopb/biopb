@@ -708,6 +708,10 @@ def _to_unix_ms(value: Optional[datetime]) -> int:
     return int(value.timestamp() * 1000)
 
 
+class _ImportedRoisFailed(Exception):
+    """The ROI half of a registration write failed; the row's half did not."""
+
+
 class MetadataDatabase:
     """In-memory DuckDB for source metadata filtering.
 
@@ -1457,7 +1461,9 @@ class MetadataDatabase:
         silently disagree. Logging is the caller's responsibility.
 
         The row and the ROIs the file carries are one transaction, so a raise
-        leaves the previous row and ROIs both as they were.
+        leaves the previous row and ROIs both as they were. Only a failure of the
+        ROI write itself is the exception: it is logged, and the row is written
+        without them.
 
         Args:
             source_id: Unique source identifier
@@ -1522,27 +1528,38 @@ class MetadataDatabase:
         metadata = registration.metadata
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
-        self._upsert_source_row(
-            conn,
-            [
+        row = [
+            source_id,
+            source_url,
+            source_type,
+            indexed_at,
+            metadata_json,
+            is_resolved,
+            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
+            tensors,
+            None,
+        ]
+
+        def replace_rois(c: duckdb.DuckDBPyConnection) -> None:
+            try:
+                self._replace_imported(c, source_id, rois)
+            except Exception as exc:
+                raise _ImportedRoisFailed from exc
+
+        # The row and the file's ROIs are one transaction, so they come from the
+        # same registration. DuckDB has no savepoints (a failed statement aborts
+        # the transaction), so when only the ROIs fail the whole write rolls back
+        # and the row goes in alone: no annotation is worth failing a
+        # registration, the previous set stays, and the next registration retries.
+        try:
+            self._upsert_source_row(conn, row, record, payload, also=replace_rois)
+        except _ImportedRoisFailed:
+            logger.exception(
+                "ome rois: could not store the imported set for %s; the source "
+                "is registered and serving, and the next registration retries",
                 source_id,
-                source_url,
-                source_type,
-                indexed_at,
-                metadata_json,
-                is_resolved,
-                None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
-                tensors,
-                None,
-            ],
-            record,
-            payload,
-            # The same transaction as the row, so the two always come from one
-            # registration and a raise leaves the previous pair intact. A store
-            # that cannot take an annotation cannot be trusted with the row
-            # either; what the importer merely refuses is skipped inside.
-            also=lambda c: self._replace_imported(c, source_id, rois),
-        )
+            )
+            self._upsert_source_row(conn, row, record, payload)
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
