@@ -264,6 +264,9 @@ _WRAPPERS: Dict[str, Callable] = {
 def canonical_axes(cls):
     """Class decorator: serve ``cls`` in canonical axis order (#596).
 
+    The decorator is the only thing that marks a class canonical
+    (:func:`is_canonical`); an undecorated adapter is served as it is.
+
     Wraps the public methods ``cls`` itself defines -- inherited ones are already
     wrapped by whichever class defined them, so a decorated subclass overriding
     one must not call ``super()`` into a decorated parent for it.
@@ -274,6 +277,12 @@ def canonical_axes(cls):
             setattr(cls, name, wrap(member))
     cls._canonical_axes = True
     return cls
+
+
+def is_canonical(adapter: Any) -> bool:
+    """Whether ``adapter`` (an instance or a class) is served in canonical order."""
+    cls = adapter if isinstance(adapter, type) else type(adapter)
+    return bool(getattr(cls, "_canonical_axes", False))
 
 
 def unwrapped(method: Callable) -> Callable:

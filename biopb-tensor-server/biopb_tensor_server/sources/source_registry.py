@@ -24,7 +24,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorEntry,
 )
 from biopb_tensor_server.core.attachments import Attachments
-from biopb_tensor_server.core.normalize import log_reordering, unwrapped
+from biopb_tensor_server.core.normalize import is_canonical, log_reordering, unwrapped
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +337,7 @@ def _log_reordering(source_id: str, adapter: SourceAdapter) -> None:
     Never fails a registration: a duck-typed double, or an adapter that cannot
     list yet (an unresolved cloud source), just reports nothing.
     """
-    if not getattr(adapter, "_canonical_axes", False):
+    if not is_canonical(adapter):
         return
     try:
         log_reordering(source_id, unwrapped(type(adapter).list_tensors)(adapter))

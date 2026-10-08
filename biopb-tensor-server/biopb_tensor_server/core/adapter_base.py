@@ -79,6 +79,7 @@ from biopb_tensor_server.core.errors import (
 )
 from biopb_tensor_server.core.normalize import (
     descriptor_permutation,
+    is_canonical,
     permute_descriptor,
     to_canonical,
     to_native,
@@ -262,17 +263,6 @@ class SourceAdapter(ABC):
     # purely cosmetic and needs no re-index.
     _catalog_url: Optional[str] = None
 
-    # Whether this source is served in canonical axis order (biopb/biopb#596).
-    # Set by ``@canonical_axes`` (``core.normalize``) on a leaf that reads its own
-    # bytes and so can transpose them. Left False where another party owns the
-    # axis order and has aligned the rest of its state to it -- the remote proxy,
-    # whose upstream mints the chunk_ids, plans the reads (biopb/biopb#295) and
-    # sizes the grid. Permuting behind such an owner is the same
-    # desynchronization the write path refuses at ``add_tensor``, so those
-    # sources are validated and refused at their read boundary instead. See
-    # ``core.axes.noncanonical_order``.
-    _canonical_axes: bool = False
-
     @property
     def source_url(self) -> Optional[str]:
         """The source's real, addressable URL/path: a filesystem path this
@@ -363,19 +353,6 @@ class SourceAdapter(ABC):
                 reason="stale_content_version",
             )
 
-    @property
-    def array_id(self) -> str:
-        """Tensor identifier used in chunk encoding.
-
-        For single-tensor adapters: returns source_id
-        For multi-tensor adapters: returns source_id/tensor_name
-
-        This is used in chunk_id encoding to identify which tensor the chunk belongs to.
-        """
-        if self._tensor_name is None:
-            return self.source_id
-        return f"{self.source_id}/{self._tensor_name}"
-
     @classmethod
     def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
         """Claim a filesystem path as a data source.
@@ -416,7 +393,7 @@ class SourceAdapter(ABC):
     def _permutation_of(self, desc: Any) -> Optional[Tuple[int, ...]]:
         """The permutation ``desc``'s own labels imply, or None for identity --
         always None for a source that is not served canonical."""
-        return descriptor_permutation(desc) if self._canonical_axes else None
+        return descriptor_permutation(desc) if is_canonical(self) else None
 
     @abstractmethod
     def list_tensors(self) -> List[TensorEntry]:
@@ -827,6 +804,15 @@ class TensorAdapter(SourceAdapter):
     @capability_token.setter
     def capability_token(self, value: Optional[str]) -> None:
         self._capability_token = value
+
+    @property
+    def array_id(self) -> str:
+        """This tensor's identifier, the one chunk ids are minted from:
+        ``source_id``, or ``source_id/<tensor name>`` for a multi-tensor source.
+        """
+        if self._tensor_name is None:
+            return self.source_id
+        return f"{self.source_id}/{self._tensor_name}"
 
     # Whether timing ``get_data`` measures what re-producing the chunk would
     # cost -- the premise the measured retention rule rests on, since "cheap"
@@ -1764,7 +1750,6 @@ class TensorAdapter(SourceAdapter):
 # excluded.
 _SOURCE_SCOPED_API = frozenset(
     {
-        "array_id",
         "source_url",
         "source_type",
         "content_version",
@@ -1795,6 +1780,7 @@ _SOURCE_SCOPED_API = frozenset(
 _TENSOR_SCOPED_API = frozenset(
     {
         "capability_token",
+        "array_id",
         "get_tensor_descriptor",
         "get_transfer_chunk_size",
         "read_block_shape",

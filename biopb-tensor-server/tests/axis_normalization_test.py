@@ -259,7 +259,7 @@ class TestEveryAdapterDeclaresItsOrder:
     def test_the_opt_outs_are_not_canonical(self):
         for cls in self._adapter_classes():
             if cls.__name__ in self.NOT_CANONICAL:
-                assert not cls._canonical_axes, cls.__name__
+                assert not _normalize.is_canonical(cls), cls.__name__
 
 
 @requires_zarr
@@ -691,13 +691,13 @@ def _proxy_adapter(upstream_port, source_id="m", upstream_source_id="u"):
 def _legacy_upstream(tmp, arr, labels, name="u"):
     """A server advertising ``labels`` verbatim -- i.e. a pre-#596 upstream.
 
-    The adapter opts out of normalizing, which is what makes it advertise its
+    The adapter is not canonical-marked, which is what makes it advertise its
     native order: what is under test is a *downstream* facing a server that
     never learned the guarantee.
     """
     server = TensorFlightServer("localhost:0")
     adapter = _zarr_adapter(tmp, arr, labels, name)
-    adapter._canonical_axes = False
+    adapter.__class__ = type("_Legacy", (type(adapter),), {"_canonical_axes": False})
     server.sources._sources[name] = adapter
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
