@@ -8,6 +8,7 @@ importing the adapter layer that calls it.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -33,6 +34,22 @@ CHUNK_WIRE_SCHEMA = pa.schema(
         pa.field("dtype", pa.string()),
     ]
 )
+
+
+@functools.cache
+def flight_info_schema() -> pa.Schema:
+    """The schema ``GetFlightInfo`` advertises: :data:`CHUNK_WIRE_SCHEMA`
+    stamped with the wire protocol version, which a client checks before it
+    reads a chunk. Fixed for every tensor -- dtype and shape are columns of the
+    chunk, not part of the schema."""
+    from biopb.tensor._wire_version import (
+        TENSOR_WIRE_PROTOCOL_VERSION,
+        WIRE_PROTOCOL_METADATA_KEY,
+    )
+
+    return CHUNK_WIRE_SCHEMA.with_metadata(
+        {WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION)}
+    )
 
 
 def pack_chunk_batch(arr: np.ndarray) -> pa.RecordBatch:

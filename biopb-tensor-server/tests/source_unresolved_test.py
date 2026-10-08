@@ -11,6 +11,7 @@ import tempfile
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.core.adapter_base import _get_read_plan, require_resolved
+from biopb_tensor_server.core.chunk_batch import flight_info_schema
 from biopb_tensor_server.core.discovery import source_is_resident
 from biopb_tensor_server.core.errors import SourceUnresolvedError
 
@@ -79,8 +80,7 @@ class TestResolvedAdapterRegression:
             adapter = self._make_adapter(tmpdir)
             plan = adapter.get_read_plan(adapter.get_tensor_descriptor())
             assert list(plan.descriptor.shape) == [100, 200]
-            schema = adapter.get_arrow_schema()
-            assert schema is not None
+            assert flight_info_schema() is not None
 
     def test_local_source_is_resident(self):
         with tempfile.TemporaryDirectory() as tmpdir:
