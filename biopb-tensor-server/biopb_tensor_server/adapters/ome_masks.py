@@ -11,7 +11,7 @@ index of the mask's ROI in that image's own ``roi_refs`` order.
 Pure by design, like its sibling: dict in (the OME metadata), a list of
 :class:`_MaskShape` per image out (:func:`masks_by_image`).
 :class:`RasterizedMaskAdapter` is the tensor adapter. Read-only.
-Built only by ``OmeTiffAdapter.get_embedded_labels``.
+Built only by ``OmeTiffAdapter._embedded_sets``.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._ome_rois import Tensor
-from biopb_tensor_server.adapters.labels import NearestPyramidMixin
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
@@ -230,7 +229,7 @@ def masks_by_image(
     return out
 
 
-class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
+class RasterizedMaskAdapter(TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
     Computed, not stored -- there is no backend to read again, only the
@@ -244,6 +243,8 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     *label* (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`), so the
     singleton channel is just another axis painted across.
     """
+
+    categorical = True
 
     def __init__(
         self,
@@ -289,16 +290,13 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     def get_metadata(self) -> dict:
         return {}
 
-    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
-        return {}  # a set has no sets of its own
-
     @classmethod
     def create_from_config(
         cls, source, credentials_config=None
     ) -> RasterizedMaskAdapter:
         raise NotImplementedError(
             "RasterizedMaskAdapter is built from a parent's OME metadata by "
-            "OmeTiffAdapter.get_embedded_labels(), not from config"
+            "OmeTiffAdapter._embedded_sets(), not from config"
         )
 
     def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:

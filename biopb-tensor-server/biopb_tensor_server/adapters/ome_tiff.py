@@ -50,6 +50,8 @@ from biopb_tensor_server.core.adapter_base import (
     catalog_entry,
     strip_source_prefix,
 )
+from biopb_tensor_server.core.attached import MARKER
+from biopb_tensor_server.core.axes import canonical_permutation
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -57,7 +59,7 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.labels import label_extent, label_field
-from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.normalize import canonical_axes, permute
 
 logger = logging.getLogger(__name__)
 
@@ -531,15 +533,16 @@ class OmeTiffAdapter(TensorAdapter):
         # The dict _reduced_ome_xml parses into (biopb/biopb#1059 step 4): a pure
         # function of that already-cached string, so caching it costs nothing in
         # correctness and saves a second ome-types parse when both get_metadata
-        # and get_embedded_labels run in the same registration (metadata_db.py
+        # and the label sets run in the same registration (metadata_db.py
         # calls the former directly; the latter is the registry's one-time call per adapter).
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
-        # Set only after get_embedded_labels has handed every usable bitmap to
+        # Set only after _embedded_sets has handed every usable bitmap to
         # its RasterizedMaskAdapter.  release_registration_cache may also run
         # on an adapter that has never entered label discovery, in which case
         # its metadata must remain complete for that later discovery.
         self._mask_payloads_transferred = False
+        self._label_set_cache: Optional[Dict[str, TensorAdapter]] = None
 
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -749,8 +752,12 @@ class OmeTiffAdapter(TensorAdapter):
         return self._cached_descriptors
 
     def list_tensors(self) -> List[TensorEntry]:
-        """Structural catalog entries for every scene (no grid, #812)."""
-        return [catalog_entry(d) for d in self._scene_descriptors()]
+        """Structural catalog entries for every scene (no grid, #812), then the
+        mask sets the file carries."""
+        return [catalog_entry(d) for d in self._scene_descriptors()] + [
+            catalog_entry(s.get_tensor_descriptor())
+            for s in self._embedded_sets().values()
+        ]
 
     def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Build (and cache) the scene adapter for a within-source field.
@@ -760,6 +767,10 @@ class OmeTiffAdapter(TensorAdapter):
         """
         descriptors = self._scene_descriptors()
         field = strip_source_prefix(self.source_id, tensor_id)
+        if field and MARKER in field:
+            label_set = self._embedded_sets().get(field)
+            if label_set is not None:
+                return label_set
         scene_idx = self._scene_index_for_field(field)
 
         if field in self._tensor_adapters:
@@ -818,7 +829,7 @@ class OmeTiffAdapter(TensorAdapter):
         hand rather than re-opening the file for a string it would strip again --
         and the *dict* that parse produces is itself cached (``_parsed_metadata``),
         since it is a pure function of that same string: a caller that also
-        touches ``get_embedded_labels`` in the same registration (the registry's label-set view)
+        builds its label sets in the same registration
         gets the one parse already done, not a second one.
         """
         return self._ome_metadata()
@@ -846,16 +857,27 @@ class OmeTiffAdapter(TensorAdapter):
             max_per_tensor=max_per_tensor,
         )
 
-    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+    def _embedded_sets(self) -> Dict[str, TensorAdapter]:
         """The ``@ome`` set: this file's own ``<Mask>`` ROI shapes, rasterized.
 
         One tensor per scene that carries at least one mask, keyed
-        ``[<scene field>/]labels/@ome`` (see ``adapters/ome_masks.py``). Same
+        ``[<scene field>/]@labels/@ome`` (see ``adapters/ome_masks.py``). Same
         OME-image-id join as :meth:`get_embedded_rois` (``tensors_by_field``):
         the field half of a scene's ``array_id`` IS the OME image id for this
-        format, so the match is string equality, not inference.
+        format, so the match is string equality, not inference. Built once per
+        source adapter, which is what hands each set its mask payloads.
         """
-        plan = self._mask_label_plan()
+        if self.scene_index is not None:
+            return {}
+        if self._label_set_cache is None:
+            self._label_set_cache = self._build_embedded_sets()
+        return self._label_set_cache
+
+    def _build_embedded_sets(self) -> Dict[str, TensorAdapter]:
+        # A listing must not pay for the strip and parse of the OME-XML, so a
+        # file whose document names no mask is answered without either.
+        xml = self._reduced_ome_xml or self._raw_ome_xml
+        plan = self._mask_label_plan() if xml is None or "<Mask" in xml else None
         if not plan:
             self._mask_payloads_transferred = True
             return {}
@@ -888,6 +910,9 @@ class OmeTiffAdapter(TensorAdapter):
             if not masks:
                 continue
             dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
+            perm = canonical_permutation(dim_labels, shape)
+            if perm is not None:
+                dim_labels, shape = permute(dim_labels, perm), permute(shape, perm)
             field = label_field(
                 strip_source_prefix(self.source_id, desc.array_id) or "", OME_SET_NAME
             )

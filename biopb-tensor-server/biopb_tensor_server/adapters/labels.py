@@ -26,7 +26,7 @@ What a set adds over a plain OME-Zarr image:
   write outright; replacement is a new name, or a delete first.
 
 Three ways a set reaches a parent: :func:`native_label_sets` for an image
-group's ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``),
+group's ``labels/`` (called from ``OmeZarrAdapter._embedded_sets``),
 :func:`sidecar_label_sets` for the finished stores under
 ``<write_dir>/labels/<source_id>/``, which the server scans at boot, and
 :func:`create_label_upload` for a set arriving over the wire.
@@ -38,15 +38,14 @@ from the upload's create and from ``Attachments.label_sets``).
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import numpy as np
-from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.adapters._writable import (
     folded_match,
@@ -66,7 +65,7 @@ from biopb_tensor_server.adapters.zarr import (
     upload_state,
     with_upload_state,
 )
-from biopb_tensor_server.core.config import PyramidConfig
+from biopb_tensor_server.core.adapter_base import strip_source_prefix
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.core.labels import (
     LABELS_SEGMENT,
@@ -82,7 +81,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "LabelSetAdapter",
-    "NearestPyramidMixin",
     "create_label_upload",
     "labels_root",
     "native_label_sets",
@@ -101,27 +99,10 @@ logger = logging.getLogger(__name__)
 SIDECAR_ATTR = "labels"
 
 
-class NearestPyramidMixin:
-    """Every computed pyramid level of a label set is ``nearest``.
-
-    Averaging label ids produces ids that exist nowhere, so no label-set
-    adapter -- whatever backs it -- ever advertises a computed ``area``
-    level. Native levels (if any) are unaffected; ``super()`` still decides
-    those. Mixed in ahead of the real base in the MRO (``class
-    LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter)``) so one
-    implementation serves every backend instead of each repeating it.
-    """
-
-    def _advertised_pyramid(
-        self, base_desc: TensorDescriptor, pyramid_config: PyramidConfig
-    ) -> List[PyramidLevel]:
-        return super()._advertised_pyramid(
-            base_desc, dataclasses.replace(pyramid_config, reduction_method="nearest")
-        )
-
-
-class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
+class LabelSetAdapter(OmeZarrAdapter):
     """An NGFF label image, bound as tensor *field* of source *source_id*."""
+
+    categorical = True
 
     def __init__(
         self,
@@ -148,7 +129,7 @@ class LabelSetAdapter(NearestPyramidMixin, OmeZarrAdapter):
         self._content_version = content_version
         self._parent_array_id = parent_array_id
 
-    def get_embedded_labels(self) -> Dict[str, Any]:
+    def _embedded_sets(self) -> Dict[str, Any]:
         return {}  # a set has no sets, and never looks for a labels/ of its own
 
     def get_tensor_metadata(self) -> Optional[dict]:
@@ -209,8 +190,7 @@ def open_label_set(
     """A :class:`LabelSetAdapter` on the NGFF label group at *group*, or None.
 
     None, with a warning, for anything that cannot be opened as labels: no
-    readable ``.zattrs``, no level-0 array, or a dtype that is not an integer
-    (a label is an id; there is nothing a float set could mean here). Pass an
+    readable ``.zattrs`` or no level-0 array. Pass an
     already-parsed *zattrs* when the caller has one, so *group*'s root file
     is not read twice.
     """
@@ -226,9 +206,6 @@ def open_label_set(
         arr = zarr.open_array(os.path.join(str(group), level0), mode="r")
     except Exception as e:
         logger.warning(f"labels: cannot open {group}/{level0}: {e}; skipped")
-        return None
-    if arr.dtype.kind not in "ui":
-        logger.warning(f"labels: {group} is {arr.dtype}, not an integer dtype; skipped")
         return None
     return LabelSetAdapter(
         arr,
@@ -434,7 +411,17 @@ def create_label_upload(
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
     # a host cannot tell from the first.
-    taken = folded_match(field, (*attached.label_sets(parent), *attached.tensors))
+    taken = folded_match(
+        field,
+        (
+            *(
+                strip_source_prefix(parent.source_id, e.array_id)
+                for e in parent.list_tensors()
+            ),
+            *attached.label_sets(parent),
+            *attached.tensors,
+        ),
+    )
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "

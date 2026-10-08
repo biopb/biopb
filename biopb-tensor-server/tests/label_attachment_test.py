@@ -95,7 +95,7 @@ def _write_label_group(
 def image(tmp_path):
     """An OME-Zarr image with a ``labels/`` group: ``nuclei`` (two levels),
     ``flat`` (one level), ``xy`` (non-canonical axes), ``bad`` (float) and
-    ``small`` (does not span the image)."""
+    ``small`` (does not span the image): the file's own, all served as they are."""
     zarr_path, _, _ = create_multiresolution_ome_zarr(
         str(tmp_path / "img"), n_levels=2, base_shape=SHAPE, chunk_size=CHUNK
     )
@@ -131,9 +131,13 @@ def registered(reg):
     return reg.get("oz1")
 
 
-NATIVE = {"@labels/nuclei", "@labels/flat", "@labels/xy"}
-# Also in the fixture, listed but 32x32 on a 64x64 image: it refuses to be read.
-STALE_NATIVE = {"@labels/small"}
+NATIVE = {
+    "@labels/nuclei",
+    "@labels/flat",
+    "@labels/xy",
+    "@labels/bad",
+    "@labels/small",
+}
 
 
 class TestTheFieldShape:
@@ -203,7 +207,7 @@ class TestANativeSetIsATensorOfItsImage:
     def test_listed_after_the_image_and_readable_by_id(self, registered, reg):
         ids = [t.array_id for t in reg.catalog_tensors("oz1", registered)]
         assert ids[0] == "oz1"
-        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE | STALE_NATIVE}
+        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE}
 
         nuclei = reg.resolve_tensor("oz1", "oz1/@labels/nuclei")
         assert isinstance(nuclei, LabelSetAdapter)
@@ -212,17 +216,13 @@ class TestANativeSetIsATensorOfItsImage:
         desc = nuclei.get_tensor_descriptor()
         assert (list(desc.shape), desc.dtype) == ([64, 64], "<u4")
 
-    def test_a_set_that_does_not_span_is_listed_and_refuses_to_be_read(
-        self, registered, reg
-    ):
-        """``bad`` is a float (the reader skips it); ``small`` is 32x32 on a
-        64x64 image: listed, but a read says why instead of serving it
-        misaligned. The image registers either way."""
-        sets = reg.attached_to("oz1").label_sets(registered)
-        assert set(sets) == NATIVE | STALE_NATIVE
-        with pytest.raises(AttachedTensorMismatch, match="does not span"):
-            reg.resolve_tensor("oz1", "@labels/small")
-        assert reg.resolve_tensor("oz1", "oz1").array_id == "oz1"
+    def test_the_files_own_sets_are_served_unchecked(self, registered, reg):
+        """``bad`` is a float and ``small`` is 32x32 on a 64x64 image: the file
+        is the user's, so both are listed and read as they are."""
+        bad = reg.resolve_tensor("oz1", "@labels/bad")
+        assert bad.get_tensor_descriptor().dtype == "<f4"
+        small = reg.resolve_tensor("oz1", "@labels/small")
+        assert list(small.get_tensor_descriptor().shape) == [32, 32]
 
     def test_an_unknown_set_is_the_formats_miss(self, registered, reg):
         with pytest.raises(TensorNotFound):
@@ -232,7 +232,7 @@ class TestANativeSetIsATensorOfItsImage:
         raw = _adapter(image)
         reg = SourceRegistry()
         reg.register("oz1", raw)
-        assert [t.array_id for t in raw.list_tensors()] == ["oz1"]
+        assert [t.array_id for t in raw.list_tensors()][0] == "oz1"
         assert reg.resolve_tensor("oz1", None).array_id == "oz1"
         assert reg.resolve_tensor("oz1", "1").array_id == "oz1/1"
 
@@ -368,9 +368,7 @@ class TestASidecarIsAttachedAtRegistration:
         reg = _adopting(labels_dir)
         adapter = reg.register("oz1", _adapter(image))
 
-        assert set(
-            reg.attached_to("oz1").label_sets(adapter)
-        ) == NATIVE | STALE_NATIVE | {"@labels/mine"}
+        assert set(reg.attached_to("oz1").label_sets(adapter)) == {"@labels/mine"}
         mine = reg.resolve_tensor("oz1", "oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
@@ -390,7 +388,7 @@ class TestASidecarIsAttachedAtRegistration:
 
         stale = {"@labels/small", "@labels/extra", "Image:9/@labels/orphan"}
         assert set(reg.attached_to("oz1").label_sets(adapter)) == (
-            NATIVE | {"@labels/fits"} | stale
+            {"@labels/fits"} | stale
         )
         for name in sorted(stale):
             with pytest.raises(AttachedTensorMismatch):
@@ -444,7 +442,7 @@ class TestOwningField:
     """Attached fields route by longest prefix, so a level rides with its tensor."""
 
     def test_the_longest_key_wins_and_a_prefix_must_end_at_a_slash(self):
-        from biopb_tensor_server.core.attachments import _owning_field
+        from biopb_tensor_server.core.attached import owning_field as _owning_field
 
         keys = ["@fields/raw", "@fields/raw/@labels/nuclei", "@fields/ra"]
         assert _owning_field("@fields/raw", keys) == "@fields/raw"

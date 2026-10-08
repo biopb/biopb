@@ -87,9 +87,9 @@ discovery root, otherwise the label is listed twice under two ids.
 
 ### Attachment to the parent
 
-Sets are tensors *of the parent source*, not sources. A format says which sets
-its own file carries with `get_embedded_labels()` (`OmeZarrAdapter` reads its
-NGFF `labels/` group there). The rest are attached to the source id in the
+Sets are tensors *of the parent source*, not sources. A format lists the sets
+its own file carries as its own tensors (`OmeZarrAdapter` reads its NGFF
+`labels/` group), served unchecked: the file is the user's. The rest are attached to the source id in the
 registry (`SourceRegistry.attach` / `detach`; `adopt` at boot) and the upload
 kind attaches and detaches them (at READY; discard).
 
@@ -131,7 +131,7 @@ memoized per adapter, and the ordinary chunk cache holds the painted output.
 `TheC` is inert here (channel distinction is never carried), as is a pin
 naming an axis the image does not have.
 
-OME-TIFF only, via `OmeTiffAdapter.get_embedded_labels`; a bioio-backed format
+OME-TIFF only, via `OmeTiffAdapter`; a bioio-backed format
 carrying OME-XML does not rasterize its masks. The fast metadata path
 (`_fast_ome_metadata`) base64-encodes a `Mask`'s `bin_data.value`
 (`_b64_encode_mask_bindata`) before dumping the metadata dict, since a raw

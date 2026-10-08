@@ -24,6 +24,7 @@ from biopb_tensor_server.core.adapter_base import (
     catalog_entry,
     strip_source_prefix,
 )
+from biopb_tensor_server.core.attached import MARKER, owning_field
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
@@ -534,6 +535,8 @@ class OmeZarrAdapter(ZarrAdapter):
         # and registration asks for it several times. An adapter is rebuilt, not
         # mutated, when its source changes, so one listing is good for its life.
         self._hcs_descriptors = None
+        # The label sets the file carries, read once (:meth:`_embedded_sets`).
+        self._label_set_cache: Optional[dict] = None
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
         # Each native level's shape, when it is known without opening the level
@@ -907,13 +910,19 @@ class OmeZarrAdapter(ZarrAdapter):
 
         return descriptors
 
-    def get_embedded_labels(self) -> Dict[str, "TensorAdapter"]:
+    def _embedded_sets(self) -> Dict[str, "TensorAdapter"]:
         """The NGFF ``labels/`` group of the image, or of every plate field.
 
-        Each set binds to the tensor whose group it sits under: ``labels/<name>``
-        on a single image, ``<well>/<field>/labels/<name>`` on a plate. Local
+        Tensors of this source like any other, under the marked field
+        ``[<image field>/]@labels/<name>``: ``labels/<name>`` on a single image,
+        ``<well>/<field>/labels/<name>`` on a plate. Read once per adapter. Local
         stores only, like the plate's own field serving.
         """
+        if self._label_set_cache is None:
+            self._label_set_cache = self._read_embedded_sets()
+        return self._label_set_cache
+
+    def _read_embedded_sets(self) -> Dict[str, "TensorAdapter"]:
         from biopb_tensor_server.adapters.labels import native_label_sets
 
         root = self._group_root_path
@@ -1042,7 +1051,15 @@ class OmeZarrAdapter(ZarrAdapter):
         return levels or None
 
     def list_tensors(self) -> List[TensorEntry]:
-        return self._native_entries()
+        """The image tensors, then the label sets the file carries.
+
+        A set's entry is its served descriptor, already canonical, which the
+        listing wrapper leaves as it is.
+        """
+        sets = self._embedded_sets()
+        return self._native_entries() + [
+            catalog_entry(s.get_tensor_descriptor()) for s in sets.values()
+        ]
 
     def _native_entries(self) -> List[TensorEntry]:
         """List all tensors available in this source.
@@ -1073,6 +1090,18 @@ class OmeZarrAdapter(ZarrAdapter):
         Returns:
             TensorAdapter for the specific tensor with tensor context set
         """
+        field = strip_source_prefix(self.source_id, tensor_id)
+        if field and MARKER in field:
+            sets = self._embedded_sets()
+            key = owning_field(field, sets)
+            if key is not None:
+                label_set = sets[key]
+                return (
+                    label_set
+                    if field == key
+                    else label_set.get_tensor_adapter(tensor_id)
+                )
+
         if not self._is_hcs_plate:
             # Single image: a native level of it, else the base behavior
             level = self._level_path(strip_source_prefix(self.source_id, tensor_id))

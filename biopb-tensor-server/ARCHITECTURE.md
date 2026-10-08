@@ -161,13 +161,15 @@ one object. A source that is not resolved yet (a cloud source, or one whose
 registration is pending) has no adapter at all: a catalog row and a claim, until
 `resolve` builds its adapter.
 
-A source can also answer for **label sets** it did not produce (biopb/biopb#1059):
-`SourceAdapter.label_sets` merges what the format reads from its own file
-(`get_embedded_labels`, an OME-Zarr's NGFF `labels/` group) with what was
+A source answers for **label sets** (biopb/biopb#1059) under the marked field
+`.../@labels/<name>`. The ones its own file carries (an OME-Zarr's NGFF `labels/`
+group, an OME-TIFF's masks) are the format's tensors: `list_tensors` lists them
+after the images and `get_tensor_adapter` resolves them, unchecked. The ones
 attached to it (finished sidecars under `write_dir/labels/<source_id>/`, by a
-registration hook), each checked to span the image it binds to. The serve path resolves tensors through `resolve_tensor`, which tries a `.../@labels/<name>` field against the sets
-before delegating to the format; `catalog_tensors` lists sets after the image
-tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
+registration hook) are checked to span the image they bind to. The serve path
+resolves tensors through `resolve_tensor`, which matches a marked field against
+the attached tensors by longest prefix before delegating to the format;
+`catalog_tensors` lists attached sets after the image tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
 
 | Method | Returns |
 |--------|---------|
