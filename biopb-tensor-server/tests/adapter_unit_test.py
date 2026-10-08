@@ -22,6 +22,7 @@ from biopb_tensor_server import (
 from biopb_tensor_server.core import downsample as _ds
 from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.config import parse_config
+from biopb_tensor_server.core.errors import TensorNotFound
 
 
 def _zarr_available() -> bool:
@@ -1885,19 +1886,18 @@ class TestSliceConversion:
         assert _convert_slice_to_level(None, [4, 2]) is None
 
 
-class TestGetLevelAdapterContract:
-    """``get_level_adapter`` is a TensorAdapter contract, not a sniffed method.
+class TestLevelRouting:
+    """A native pyramid level resolves through ``get_tensor_adapter``.
 
-    The server's chunk dispatch asks every source adapter for a native pyramid
-    level; a non-native adapter answers ``None`` and the read falls back to the
-    tensor field. This replaces the old ``hasattr(adapter, "get_level_adapter")``
-    duck-typing, whose mere-presence test mis-routed an HCS ``well/field`` chunk
-    to a (non-existent) level store (biopb/biopb#557).
+    The server's chunk dispatch asks the source for the id in the chunk's route
+    and gets a level, a tensor field or a typed miss from the one lookup. An
+    HCS ``well/field`` chunk must not be mistaken for a level store
+    (biopb/biopb#557).
     """
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_plain_tensor_adapter_returns_none(self):
-        """A format with no native pyramid uses the base default (None)."""
+    def test_plain_tensor_adapter_has_no_levels(self):
+        """A format with no native pyramid refuses a level path."""
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1909,10 +1909,11 @@ class TestGetLevelAdapterContract:
                 dtype="uint8",
             )
             adapter = ZarrAdapter(arr, "plain", ["y", "x"])
-            assert adapter.get_level_adapter("1") is None
+            with pytest.raises(TensorNotFound):
+                adapter.get_tensor_adapter("plain/1")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_hcs_plate_returns_none(self):
+    def test_hcs_plate_has_no_levels(self):
         """An HCS plate has no native pyramid: a suffix is a field id, not a level."""
         from biopb_tensor_server.core.config import SourceConfig
 
@@ -1922,14 +1923,14 @@ class TestGetLevelAdapterContract:
                 SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
             )
             assert plate._is_hcs_plate
-            assert plate.get_level_adapter("A/1/0") is None
+            assert plate._level_path("A/1/0") is None
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_hcs_field_chunk_routes_to_field_adapter(self):
         """An HCS field chunk resolves to the field adapter, not a level store.
 
         Regression: under the old ``hasattr`` dispatch this landed on
-        ``get_level_adapter("well/field")`` and failed to open a level.
+        a level lookup of ``well/field`` that failed to open a level.
         """
         from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.core.config import SourceConfig
@@ -2354,7 +2355,7 @@ class TestOmeZarrStorePathResolution:
             adapter = ome_zarr_mod.OmeZarrAdapter(base, "test")
             assert len(calls) == 1  # __init__
 
-            level = adapter.get_level_adapter("1")
+            level = adapter.get_tensor_adapter("1")
             assert len(calls) == 1  # the level rode on __init__'s root
             assert list(level.get_tensor_descriptor().shape) == [20, 20]
 

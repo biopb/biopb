@@ -263,7 +263,7 @@ class TestQptiffAdapter:
                 plan = adapter.get_read_plan(req)
                 # Chunk_ids carry the level suffix so DoGet dispatches to the level.
                 assert plan.chunk_endpoints
-                level_adapter = adapter.get_level_adapter("1")
+                level_adapter = adapter.get_tensor_adapter("1")
                 assert level_adapter.get_tensor_descriptor().array_id == (
                     f"{adapter.source_id}/1"
                 )
@@ -287,7 +287,7 @@ class TestQptiffAdapter:
             create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
             adapter = _adapter(p)
             try:
-                lvl = adapter.get_level_adapter("1")
+                lvl = adapter.get_tensor_adapter("1")
 
                 assert isinstance(lvl, SourceAdapter) and isinstance(lvl, TensorAdapter)
                 # Identity is built by the base array_id property from source_id +
@@ -305,7 +305,7 @@ class TestQptiffAdapter:
                     f"{adapter.source_id}/1"
                 ]
                 # Cached: repeated calls return the same instance.
-                assert adapter.get_level_adapter("1") is lvl
+                assert adapter.get_tensor_adapter("1") is lvl
             finally:
                 adapter.close()
 
@@ -491,7 +491,7 @@ class TestQptiffHandleReaper:
         path = tmp_path / "s.qptiff"
         create_synthetic_qptiff(path)
         adapter = self._open(path)
-        level = adapter.get_level_adapter("1")
+        level = adapter.get_tensor_adapter("1")
         bounds = ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8])
         before = level.get_data(bounds)
 

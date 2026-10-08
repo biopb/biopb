@@ -1,7 +1,7 @@
 """Label sets are tensors of their image (biopb/biopb#1059 step 2).
 
 The registry answers for them -- ``attached_to(...).label_sets``,
-``resolve_tensor``, ``resolve_chunk_adapter`` -- so the format's own listing
+``resolve_tensor`` -- so the format's own listing
 and routing stay untouched, the catalog lists them after the image tensors, and
 the serve path reaches them by ``array_id`` like any tensor. Two origins here:
 an OME-Zarr's NGFF ``labels/`` group (read by the format) and a finished
@@ -234,18 +234,18 @@ class TestANativeSetIsATensorOfItsImage:
         reg.register("oz1", raw)
         assert [t.array_id for t in raw.list_tensors()] == ["oz1"]
         assert reg.resolve_tensor("oz1", None).array_id == "oz1"
-        assert reg.resolve_chunk_adapter("oz1", "1").array_id == "oz1/1"
+        assert reg.resolve_tensor("oz1", "1").array_id == "oz1/1"
 
     def test_a_native_level_routes_under_the_set(self, registered, reg):
         """``nuclei``'s arrays carry their own ``.zattrs``, which used to stop
         the level-opening walk one directory too early."""
         nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
 
-        level = reg.resolve_chunk_adapter("oz1", "@labels/nuclei/1")
+        level = reg.resolve_tensor("oz1", "@labels/nuclei/1")
         assert level.array_id == "oz1/@labels/nuclei/1"
         assert list(level.get_tensor_descriptor().shape) == [32, 32]
         assert level.content_version == nuclei.content_version
-        assert reg.resolve_chunk_adapter("oz1", "@labels/nuclei") is nuclei
+        assert reg.resolve_tensor("oz1", "@labels/nuclei") is nuclei
 
     def test_content_version_is_the_images_for_set_and_levels_alike(
         self, registered, reg
@@ -254,8 +254,7 @@ class TestANativeSetIsATensorOfItsImage:
         assert nuclei.content_version == registered.content_version is not None
         # The image's own native levels share it too: one token per source.
         assert (
-            reg.resolve_chunk_adapter("oz1", "1").content_version
-            == registered.content_version
+            reg.resolve_tensor("oz1", "1").content_version == registered.content_version
         )
 
     def test_the_ladder_is_native_or_nearest_never_area(self, registered, reg):

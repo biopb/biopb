@@ -249,7 +249,7 @@ class OmeZarrAdapter(ZarrAdapter):
     Note: This adapter can be used in multiple ways:
     1. Source-level (HCS plate): Manages wells/fields, get_tensor_adapter() returns
        ZarrAdapter instances for specific fields
-    2. Source-level (single image): Manages resolution levels, get_level_adapter() returns
+    2. Source-level (single image): Manages resolution levels, _level_adapter() returns
        ZarrAdapter instances for specific levels
     3. Level-specific: Created with a specific level array, acts as single-tensor
     """
@@ -773,7 +773,7 @@ class OmeZarrAdapter(ZarrAdapter):
                 try:
                     levels[path] = [
                         int(s)
-                        for s in self.get_level_adapter(path)._native_descriptor().shape
+                        for s in self._level_adapter(path)._native_descriptor().shape
                     ]
                 except Exception:
                     logger.debug(
@@ -1022,7 +1022,7 @@ class OmeZarrAdapter(ZarrAdapter):
                 continue
             try:
                 level_shape = self._level_shapes.get(path) or list(
-                    self.get_level_adapter(path)._native_descriptor().shape
+                    self._level_adapter(path)._native_descriptor().shape
                 )
             except Exception:
                 logger.exception(
@@ -1074,7 +1074,10 @@ class OmeZarrAdapter(ZarrAdapter):
             TensorAdapter for the specific tensor with tensor context set
         """
         if not self._is_hcs_plate:
-            # Single image: use base class behavior
+            # Single image: a native level of it, else the base behavior
+            level = self._level_path(strip_source_prefix(self.source_id, tensor_id))
+            if level is not None:
+                return self._level_adapter(level)
             return super().get_tensor_adapter(tensor_id)
 
         # Accept either the within-source field ('well/field') or the full
@@ -1231,25 +1234,27 @@ class OmeZarrAdapter(ZarrAdapter):
         """
         return list(self._get_level_scale(level))
 
-    def get_level_adapter(self, path: str) -> Optional[ZarrAdapter]:
-        """Get adapter for a specific precomputed level (single-image only).
+    def _level_path(self, field: Optional[str]) -> Optional[str]:
+        """The multiscales dataset path *field* names under this tensor, or None.
 
-        Returns ``None`` for an HCS plate: a plate has no native pyramid, so a
-        within-source suffix on one of its chunks is a ``well/field`` tensor id,
-        not a level path. Returning ``None`` routes the server's chunk dispatch
-        back to :meth:`get_tensor_adapter` (the field adapter) instead of trying
-        to open a non-existent level store (biopb/biopb#557).
+        A level rides under its tensor's own field: ``1`` for an image,
+        ``@labels/nuclei/1`` for a label set. A plate has no native pyramid.
+        """
+        if self._is_hcs_plate or not field:
+            return None
+        prefix = "" if self._tensor_name is None else f"{self._tensor_name}/"
+        if not field.startswith(prefix):
+            return None
+        path = field[len(prefix) :]
+        datasets = (self.ome_metadata.get("multiscales") or [{}])[0].get("datasets", [])
+        return path if any(ds.get("path") == path for ds in datasets) else None
+
+    def _level_adapter(self, path: str) -> ZarrAdapter:
+        """Adapter for the precomputed level at dataset *path* (single image only).
 
         Args:
             path: Level path (e.g., "0", "1", "2" for OME-Zarr)
-
-        Returns:
-            ZarrAdapter for the level array with tensor context set, or ``None``
-            for an HCS plate.
         """
-        if self._is_hcs_plate:
-            return None
-
         if path in self._level_adapters:
             return self._level_adapters[path]
 

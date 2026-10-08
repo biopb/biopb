@@ -427,23 +427,6 @@ class SourceAdapter(ABC):
         """
         return {}
 
-    def resolve_chunk_adapter(self, field: Optional[str]) -> TensorAdapter:
-        """The adapter that serves a chunk whose route carries *field*, for the
-        source's own tensors.
-        """
-        level = self.get_level_adapter(field) if field is not None else None
-        return level or self.get_tensor_adapter(field)
-
-    def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
-        """Backend adapter for native pyramid level ``path``, or ``None``.
-
-        A native-pyramid adapter overrides this to return the level's own
-        backend adapter, whose ``array_id`` is ``source_id/{level}``.
-        ``source_id/<field>`` is split before the lookup. The default ``None``
-        means "no native levels".
-        """
-        return None
-
     def is_resolved(self) -> bool:
         """Deterministic: is there a hydrated adapter backing this source?
 
@@ -1095,7 +1078,7 @@ class TensorAdapter(SourceAdapter):
         Overridden by native-pyramid adapters. The key is opaque to the shared
         routing -- an OME-Zarr dataset path, a QPTIFF integer index -- and only
         round-trips through :meth:`_level_downsample_factors` and
-        :meth:`get_level_adapter`. The default advertises no native levels.
+        the pyramid adapter's level lookup. The default advertises no native levels.
         """
         return None
 
@@ -1115,10 +1098,10 @@ class TensorAdapter(SourceAdapter):
 
         The level adapter's descriptor carries ``array_id = source_id/{level}``, so
         the base planner encodes that into every chunk_id and ``DoGet`` dispatches
-        back through :meth:`get_level_adapter`. The returned descriptor's
+        back through :meth:`get_tensor_adapter`. The returned descriptor's
         ``array_id`` is reset to this tensor's, so the client still sees one tensor.
         """
-        level_adapter = self.get_level_adapter(str(level))
+        level_adapter = self.get_tensor_adapter(f"{self.array_id}/{level}")
         level_desc = level_adapter.get_tensor_descriptor()
         request = TensorDescriptor(
             array_id=level_desc.array_id,
@@ -1344,8 +1327,6 @@ _SOURCE_SCOPED_API = frozenset(
         "release_registration_cache",
         "catalog_payload",
         "get_embedded_labels",
-        "resolve_chunk_adapter",
-        "get_level_adapter",
     }
 )
 _TENSOR_SCOPED_API = frozenset(

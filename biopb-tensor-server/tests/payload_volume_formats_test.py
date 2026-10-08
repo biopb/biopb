@@ -194,9 +194,9 @@ class TestQptiff:
 
         parsed, source = self._parsed(tmp_path)
         rebuilt = hydrate(parsed, source)
-        level = rebuilt.get_level_adapter("1")
+        level = rebuilt.get_tensor_adapter("1")
         shape = list(level.get_tensor_descriptor().shape)
-        want = parsed.get_level_adapter("1").get_data(
+        want = parsed.get_tensor_adapter("1").get_data(
             ChunkBounds(start=[0] * len(shape), stop=shape)
         )
         got = level.get_data(ChunkBounds(start=[0] * len(shape), stop=shape))

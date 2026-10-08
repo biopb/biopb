@@ -97,8 +97,8 @@ kind attaches and detaches them (at READY; discard).
 filling, and the tombstones of ones it gave up on. Routable but never listed,
 and what the DoPut boundary looks an upload up in and the reclaim sweep walks.
 
-`SourceRegistry.resolve_tensor(source_id, tensor_id)` and `resolve_chunk_adapter(source_id, field)` are the two
-lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
+`SourceRegistry.resolve_tensor(source_id, tensor_id)` is the
+lookup the serve path uses (`get_flight_info`, `do_get`, the precache): a
 `.../@labels/<name>[/<level>]` field answers from the label sets, everything
 else delegates to the format. `SourceRegistry.catalog_tensors` appends the sets after
 `list_tensors`, so a source's first tensor -- what every listing

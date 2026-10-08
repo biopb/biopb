@@ -27,7 +27,7 @@ is a **native-pyramid** adapter -- only the second after ``OmeZarrAdapter``:
 - ``get_read_plan()`` routes a ``precompute`` + ``scale_hint`` request to the
   matching level's ``aszarr`` store; each level's chunks are encoded with
   ``array_id = source_id/{level}`` so ``DoGet`` dispatches back through
-  ``get_level_adapter`` (the same mechanism OME-Zarr uses).
+  ``get_tensor_adapter`` (the same mechanism OME-Zarr uses).
 
 v1 exposes only the baseline pyramidal multichannel image as one tensor
 (``c,y,x``); the auxiliary Thumbnail/Overview/Label series are surfaced in
@@ -53,6 +53,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorEntry,
     bounds_to_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
@@ -437,25 +438,25 @@ class QptiffAdapter(TensorAdapter):
         """
         return self._scale_for(self._level_shape(0), self._level_shape(level))
 
-    def get_level_adapter(self, path: str) -> ZarrAdapter:
-        """Full backend adapter for a native level, keyed by its integer index.
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """A native level for ``<source>/<level>``, else the base behavior."""
+        field = strip_source_prefix(self.source_id, tensor_id)
+        if field and field.isdigit() and int(field) < self._n_levels():
+            return self._level_adapter(int(field))
+        return super().get_tensor_adapter(tensor_id)
 
-        Reached by ``DoGet`` for ``precompute`` chunks (``array_id`` suffix
-        ``/{level}``) via the ``get_level_adapter`` contract on ``TensorAdapter``
-        (biopb/biopb#557).
+    def _level_adapter(self, level: int) -> ZarrAdapter:
+        """Full backend adapter for a native level, keyed by its integer index.
 
         Each level's ``aszarr`` store is already a real ``zarr`` array, so -- like
         ``OmeZarrAdapter`` -- the level adapter is a bare ``ZarrAdapter`` over it
         with ``source_id`` inherited and ``_tensor_name = str(level)``. The base
         ``array_id`` property then yields ``source_id/{level}``; nothing hardcodes
-        the identifier. This keeps the level adapter a genuine ``TensorAdapter``
-        -- which is itself a ``SourceAdapter`` -- so any caller that treats it as a full
-        source -- metadata-DB sync, source-level ops -- finds the attributes it
-        expects. All levels share the parent's one open ``tifffile`` handle (the
-        ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle of its
-        own, so the parent's ``close()`` remains the single owner of teardown.
+        the identifier. All levels share the parent's one open ``tifffile`` handle
+        (the ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle
+        of its own, so the parent's ``close()`` remains the single owner of
+        teardown.
         """
-        level = int(path)
         cached = self._level_adapters.get(level)
         if cached is not None:
             return cached

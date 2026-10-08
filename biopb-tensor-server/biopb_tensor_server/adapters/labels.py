@@ -7,7 +7,7 @@ a sidecar the server minted for an upload. :class:`LabelSetAdapter` is
 group and bound as a tensor of the *parent* source -- same ``source_id``, field
 ``[<image field>/]labels/<name>`` -- so its chunk ids, catalog entry and
 ``get_flight_info`` answer are the parent's, and its native levels ride under
-its own field (``OmeZarrAdapter.get_level_adapter`` composes the level's name
+its own field (``OmeZarrAdapter._level_adapter`` composes the level's name
 from the set's).
 
 What a set adds over a plain OME-Zarr image:
