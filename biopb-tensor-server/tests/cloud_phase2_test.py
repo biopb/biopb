@@ -625,7 +625,7 @@ class TestCloudRegistrationEndToEnd:
         # An explicit resolve builds the real adapter and writes the concrete row.
         reconciler.materialize("cloud1")
         adapter = server.registered["cloud1"]
-        assert [list(t.shape) for t in adapter.list_tensor_descriptors()] == [[32, 48]]
+        assert [list(t.shape) for t in adapter.list_tensors()] == [[32, 48]]
         assert [sid for sid, _ in server._metadata_db.added] == ["cloud1"]
         assert not reconciler.is_pending("cloud1")
         assert reconciler.unregistered_count() == 0

@@ -191,7 +191,7 @@ def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
     source = registry.get_adapter_for_type("nd2").create_from_config(_source(path))
     assert isinstance(source, Nd2Adapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source._list_native_tensors()
     assert [d.array_id for d in descriptors] == ["nd2/P:0", "nd2/P:1"]
     for desc in descriptors:
         assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
@@ -200,7 +200,9 @@ def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
 
     field = source.get_tensor_adapter(descriptors[1].array_id)
     expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
-    whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(descriptors[1].shape)))
+    whole = field._read_native(
+        ChunkBounds(start=[0] * 5, stop=list(descriptors[1].shape))
+    )
     np.testing.assert_array_equal(whole, expected)
 
 
@@ -213,7 +215,7 @@ def test_interior_crop_reads_only_the_requested_window(tmp_path, monkeypatch):
     expected, _ = _expected_field(_DEFAULT_SIZES, 0, ("P", "T", "Z"))
 
     bounds = ChunkBounds(start=[1, 0, 0, 1, 1], stop=[3, 2, 2, 3, 4])
-    got = field.get_data(bounds)
+    got = field._read_native(bounds)
     np.testing.assert_array_equal(got, expected[1:3, 0:2, 0:2, 1:3, 1:4])
 
 
@@ -225,10 +227,10 @@ def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path, monke
     field = source.get_tensor_adapter("P:1")
     expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
 
-    field_shape = field.get_tensor_descriptor().shape
+    field_shape = field._native_descriptor().shape
     bounds = ChunkBounds(start=[0] * 5, stop=list(field_shape))
     step = (2, 1, 1, 1, 2)
-    decimated = field.get_decimated_data(bounds, step)
+    decimated = field._decimated_native(bounds, step)
     np.testing.assert_array_equal(decimated, expected[::2, :, :, :, ::2])
 
 
@@ -239,7 +241,7 @@ def test_single_position_file_has_one_field_with_no_p_axis(tmp_path, monkeypatch
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, sizes={"T": 3, "Z": 2, "C": 1, "Y": 4, "X": 5})
     source = Nd2Adapter.create_from_config(_source(path))
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source._list_native_tensors()
     assert len(descriptors) == 1
     desc = descriptors[0]
     assert desc.array_id == "nd2/P:0"
@@ -247,7 +249,7 @@ def test_single_position_file_has_one_field_with_no_p_axis(tmp_path, monkeypatch
     assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
 
     field = source.get_tensor_adapter(desc.array_id)
-    whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(desc.shape)))
+    whole = field._read_native(ChunkBounds(start=[0] * 5, stop=list(desc.shape)))
     assert whole.shape == tuple(desc.shape)
 
 

@@ -312,7 +312,7 @@ class TestHydrateFromPayload:
         (run.monitored / "img.nd2").write_bytes(b"\x00")
         run.manager._handle_rescan()
         (sid,) = run.rows()
-        tensors = run.server.sources.get(sid).list_tensor_descriptors()
+        tensors = run.server.sources.get(sid).list_tensors()
         run.stop()
         return sid, [t.array_id for t in tensors]
 
@@ -325,7 +325,7 @@ class TestHydrateFromPayload:
         adapter = run.server.sources.get_registered(sid)
 
         assert len(probes) == 1  # the layout came from the row
-        assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
+        assert [t.array_id for t in adapter.list_tensors()] == array_ids
         run.stop()
 
     def test_a_hydrated_source_leaves_its_row_alone_and_unconfirmed_until_the_walk(
@@ -367,7 +367,7 @@ class TestHydrateFromPayload:
         assert targets == [str(tmp_path / "monitored" / "img.nd2")]
         assert len(probes) == 1  # no parse
         adapter = run.server.sources.get(sid)
-        assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
+        assert [t.array_id for t in adapter.list_tensors()] == array_ids
         assert run.rows()[sid]["is_resolved"]
         assert not run.reconciler.is_pending(sid)
         assert run.db.source_row_ipc(sid) is not None

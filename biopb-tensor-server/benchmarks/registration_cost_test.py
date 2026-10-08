@@ -3,7 +3,7 @@
 Registering a source opens and parses its file; on a large site that is hours.
 This scans a tree with the real ``SourceManager`` and records, per source type,
 how long each step took (the adapter's ``claim`` probes, ``create_from_config``,
-``normalize_adapter``, the catalog row write) and how large the catalog row is,
+the catalog row write) and how large the catalog row is,
 so the cost of a start is read from numbers rather than guessed. The timers wrap
 the production calls from outside; the server carries no instrumentation.
 
@@ -24,7 +24,6 @@ from typing import Dict, List
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.sources import reconciler as reconciler_module
 from tests import catalog_server, make_manager
 
 from benchmarks.utils import (
@@ -95,11 +94,6 @@ def test_registration_cost_by_source_type(tree, monkeypatch):
                 samples, step, adapter_cls.__name__, getattr(adapter_cls, name)
             )
             monkeypatch.setattr(adapter_cls, name, staticmethod(wrapped))
-    monkeypatch.setattr(
-        reconciler_module,
-        "normalize_adapter",
-        _timed(samples, "normalize", "all", reconciler_module.normalize_adapter),
-    )
     server = catalog_server("localhost:0")
     db = server.metadata_db
     monkeypatch.setattr(
@@ -131,7 +125,7 @@ def test_registration_cost_by_source_type(tree, monkeypatch):
 
     # A step with no samples means a wrapper above no longer sits on the call path.
     assert len(server.sources) > 0, f"nothing was registered under {tree}"
-    for step in ("claim", "create", "normalize", "row_write"):
+    for step in ("claim", "create", "row_write"):
         assert samples[step], f"no {step} was timed"
     print(
         f"\nRegistration cost under {tree} ({len(server.sources)} sources, "

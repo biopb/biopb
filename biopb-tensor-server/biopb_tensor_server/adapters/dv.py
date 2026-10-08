@@ -48,6 +48,7 @@ from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -190,7 +191,7 @@ class DeltaVisionAdapter(TensorAdapter):
         self._persistent_last_access = 0.0
         self._active_reads = 0
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -202,26 +203,26 @@ class DeltaVisionAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: the mapping has no block structure to align a tile to."""
         return None
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
-        super().get_data(bounds)
+        super()._read_native(bounds)
         return self._copy_out(self._bounds_to_slices(bounds))
 
-    def get_decimated_data(
+    def _decimated_native(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """A strided slice of the same mapping -- see MrcAdapter for why this
         is cheap: indexing a memmap computes byte offsets, so the copy shrinks
         by the product of the strides."""
-        super().get_data(bounds)
+        super()._read_native(bounds)
         return self._copy_out(self._bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:

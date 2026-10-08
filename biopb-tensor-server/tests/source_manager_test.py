@@ -1900,7 +1900,7 @@ class _CatalogStubAdapter:
     """Adapter whose descriptor/metadata the real MetadataDatabase can index.
 
     Unlike _FakeAdapter (returns a bare dict), this implements the
-    catalog_url / source_type / is_resident / list_tensor_descriptors /
+    catalog_url / source_type / is_resident / list_tensors /
     get_metadata surface that MetadataDatabase.sync_source_added reads, so a
     static source can flow through the real registration + catalog-sync path.
     """
@@ -1925,7 +1925,7 @@ class _CatalogStubAdapter:
     def is_resolved(self):
         return True
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")]

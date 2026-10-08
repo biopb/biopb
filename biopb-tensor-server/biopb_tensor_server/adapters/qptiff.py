@@ -50,6 +50,7 @@ from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -160,8 +161,8 @@ class _QptiffLevelAdapter(ZarrAdapter):
         self._parent = parent
         self._level = level
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        super(ZarrAdapter, self).get_data(bounds)  # validate against the level
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+        super(ZarrAdapter, self)._read_native(bounds)  # validate against the level
         slices = self._bounds_to_slices(bounds)
         with self._parent._file() as handle:
             return np.asarray(handle.level_store(self._level)[0][slices])
@@ -344,7 +345,7 @@ class QptiffAdapter(TensorAdapter):
 
     # ---- descriptors --------------------------------------------------------
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         if self._stored is not None:
             return self._stored["descriptor"]
         if self._cached_descriptor is not None:
@@ -365,14 +366,14 @@ class QptiffAdapter(TensorAdapter):
         )
         return self._cached_descriptor
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     # ---- reads --------------------------------------------------------------
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region of the baseline (full-resolution) image."""
-        super().get_data(bounds)  # validate against the base descriptor
+        super()._read_native(bounds)  # validate against the base descriptor
         return self._read_level(0, bounds)
 
     # ---- native pyramid -----------------------------------------------------
@@ -392,7 +393,7 @@ class QptiffAdapter(TensorAdapter):
             logger.debug("qptiff: level enumeration failed", exc_info=True)
             return False
 
-    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+    def _native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """One ``precompute`` level per on-disk resolution (level 0 = full res).
 
         Each level's ``scale_hint`` is its integer downsample factor vs level 0 --
@@ -460,7 +461,7 @@ class QptiffAdapter(TensorAdapter):
             level,
             za,
             source_id=self.source_id,
-            dim_labels=list(self.get_tensor_descriptor().dim_labels),
+            dim_labels=list(self._native_descriptor().dim_labels),
         )
         level_adapter._tensor_name = str(level)
         # Point provenance at the real file + this format, not ZarrAdapter's
@@ -504,7 +505,7 @@ class QptiffAdapter(TensorAdapter):
             if um_per_unit is None:
                 return None
 
-            labels = self.get_tensor_descriptor().dim_labels
+            labels = self._native_descriptor().dim_labels
             sizes = {
                 axis: d * um_per_unit
                 for axis, d in (
@@ -530,7 +531,7 @@ class QptiffAdapter(TensorAdapter):
         meta: dict = {"format": "qptiff"}
         try:
             with self._file() as handle:
-                base = self.get_tensor_descriptor()
+                base = self._native_descriptor()
                 labels = list(base.dim_labels)
                 n_channels = int(base.shape[labels.index("c")]) if "c" in labels else 1
                 # One entry per channel, positionally (None where a page has no

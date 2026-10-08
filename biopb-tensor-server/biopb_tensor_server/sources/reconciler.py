@@ -67,7 +67,6 @@ from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
     UpstreamConfigError,
 )
-from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import (
     build_entry_signature,
@@ -1750,12 +1749,6 @@ class Reconciler:
         registered = False
         displaced: Optional[Any] = None
         try:
-            # Normalize the axis order here rather than leaning on what
-            # register_source hands back (biopb/biopb#596): the catalog row
-            # below must describe the same tensors the serve path will hand
-            # out, and the wrap is idempotent, so the registry re-applying it
-            # is a no-op.
-            adapter = normalize_adapter(adapter)
             if replace:
                 adapter, displaced = self._server.swap_source(claim.source_id, adapter)
             else:

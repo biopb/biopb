@@ -222,6 +222,20 @@ def transfer_target(monkeypatch):
     return _set
 
 
+@pytest.fixture(autouse=True)
+def _baseline_epoch(monkeypatch):
+    """Run every test under epoch 0.
+
+    Tests build chunk_ids by hand (``encode_chunk_id``) and compare them with the
+    ones a planner mints; the epoch header the server really runs under would
+    make the two differ for a reason none of them is about. Tests of the epoch
+    itself set it through :func:`epoch`.
+    """
+    from biopb_tensor_server.core import chunk
+
+    monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", 0)
+
+
 @pytest.fixture
 def epoch(monkeypatch):
     """Set the serving-semantics epoch for the duration of a test.

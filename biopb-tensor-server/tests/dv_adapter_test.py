@@ -54,7 +54,7 @@ def test_local_dv_claims_natively_and_reads_through_mrc_dvfile(tmp_path):
     )
     assert isinstance(source, DeltaVisionAdapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == 1
     desc = descriptors[0]
     # Native loop order for a single-channel Z-stack (see mrc.DVFile.axes).
@@ -176,9 +176,9 @@ def test_close_releases_the_mapping_and_a_later_read_reopens(tmp_path):
     expected = expected.transpose(1, 0, 2, 3, 4)
 
     bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 4, 8, 8])
-    first = source.get_data(bounds)
+    first = source._read_native(bounds)
     source.close()
     assert source._persistent_handle is None
-    second = source.get_data(bounds)
+    second = source._read_native(bounds)
     np.testing.assert_array_equal(first, expected)
     np.testing.assert_array_equal(second, expected)

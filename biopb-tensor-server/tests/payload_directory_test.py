@@ -179,7 +179,7 @@ class TestOmeZarrPlate:
         root = _write_plate(str(tmp_path / "plate.zarr"))
         source = _source(root, "ome-zarr")
         parsed = OmeZarrAdapter.create_from_config(source)
-        assert parsed._is_hcs_plate and len(parsed.list_tensor_descriptors()) == 6
+        assert parsed._is_hcs_plate and len(parsed.list_tensors()) == 6
 
         rebuilt = assert_hydrates_equivalently(
             parsed,

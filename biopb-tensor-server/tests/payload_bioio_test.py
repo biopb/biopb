@@ -93,14 +93,14 @@ class TestThroughBioio:
         payload = parsed.catalog_payload()
         assert json.loads(json.dumps(payload)) == payload
         assert [e["field"] for e in payload["listing"]] == [
-            e.array_id.split("/", 1)[1] for e in parsed.list_tensor_descriptors()
+            e.array_id.split("/", 1)[1] for e in parsed.list_tensors()
         ]
 
     def test_a_scene_adapter_has_no_payload(self, tmp_path):
         pytest.importorskip("bioio_czi")
         path, _ = create_zeiss_lsm(str(tmp_path))
         parsed = ZeissAdapter.create_from_config(_source(path, ZeissAdapter))
-        scene = parsed.get_tensor_adapter(parsed.list_tensor_descriptors()[0].array_id)
+        scene = parsed.get_tensor_adapter(parsed.list_tensors()[0].array_id)
         assert scene.catalog_payload() is None
 
     def test_a_source_with_too_many_scenes_stores_none(self, tmp_path, monkeypatch):
@@ -108,7 +108,7 @@ class TestThroughBioio:
         path, _ = create_zeiss_lsm(str(tmp_path))
         parsed = ZeissAdapter.create_from_config(_source(path, ZeissAdapter))
         monkeypatch.setattr(bioio_module, "_PAYLOAD_MAX_SCENES", 1)
-        assert len(parsed.list_tensor_descriptors()) == 2
+        assert len(parsed.list_tensors()) == 2
         assert parsed.catalog_payload() is None
 
     def test_a_remote_source_is_parsed(self):
@@ -236,7 +236,7 @@ class TestSharedBase:
         _FakeBioImage.opened = 0
 
         rebuilt = OlympusAdapter.create_from_payload(source, payload, metadata, None)
-        entries = rebuilt.list_tensor_descriptors()
+        entries = rebuilt.list_tensors()
         scene = rebuilt.get_tensor_adapter(entries[1].array_id)
         scene.get_tensor_descriptor()
         scene._physical_scale()
@@ -268,9 +268,7 @@ class TestEmbeddedRois:
         return parsed, source, payload, metadata
 
     def _tensors(self, adapter):
-        return [
-            (t.array_id, list(t.dim_labels)) for t in adapter.list_tensor_descriptors()
-        ]
+        return [(t.array_id, list(t.dim_labels)) for t in adapter.list_tensors()]
 
     def test_a_file_with_rois_is_read_for_them_when_asked(self, tmp_path, monkeypatch):
         parsed, source, payload, metadata = self._sources(tmp_path, monkeypatch, True)
@@ -363,7 +361,7 @@ class TestLif:
 
         path, _ = create_leica_lif(str(tmp_path))
         parsed = LifAdapter.create_from_config(_source(path, LifAdapter))
-        image = parsed.get_tensor_adapter(parsed.list_tensor_descriptors()[0].array_id)
+        image = parsed.get_tensor_adapter(parsed.list_tensors()[0].array_id)
         assert image.catalog_payload() is None
 
 

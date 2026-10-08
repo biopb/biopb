@@ -67,7 +67,7 @@ class TestPlainTiff:
             tw.write(np.ones((2, 16, 16), "uint16"))
             tw.write(np.full((3, 8, 8), 7, "uint16"))
         parsed, rebuilt = _check(TiffAdapter, path, "tiff", monkeypatch)
-        assert len(rebuilt.list_tensor_descriptors()) == 2
+        assert len(rebuilt.list_tensors()) == 2
 
     def test_the_rebuilt_source_stores_again_without_opening_the_file(
         self, tmp_path, monkeypatch
@@ -122,7 +122,7 @@ class TestOmeTiff:
 
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
         parsed, rebuilt = _check(OmeTiffAdapter, path, "ome-tiff", monkeypatch)
-        assert len(rebuilt.list_tensor_descriptors()) == 3
+        assert len(rebuilt.list_tensors()) == 3
 
     def test_a_tiled_file(self, tmp_path, monkeypatch):
         from biopb_tensor_server.fixtures import create_tiled_ome_tiff
@@ -161,9 +161,7 @@ class TestOmeTiff:
         assert rebuilt.catalog_payload() == parsed.catalog_payload()
 
         # The ROIs and the label tensor come from the file, when asked.
-        tensors = [
-            (t.array_id, list(t.dim_labels)) for t in rebuilt.list_tensor_descriptors()
-        ]
+        tensors = [(t.array_id, list(t.dim_labels)) for t in rebuilt.list_tensors()]
         rois, _ = rebuilt.get_embedded_rois(rebuilt.get_metadata(), tensors)
         expected, _ = parsed.get_embedded_rois(parsed.get_metadata(), tensors)
         assert {k: len(v) for k, v in rois.items()} == {

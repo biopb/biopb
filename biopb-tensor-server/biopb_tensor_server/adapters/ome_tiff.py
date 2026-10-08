@@ -45,6 +45,7 @@ from biopb_tensor_server.adapters._signature_memo import Signature, SignatureMem
 from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_by_image
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -625,7 +626,7 @@ class OmeTiffAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One whole page -- the same expression that seeds the grid below.
 
         The read path opens ``series.aszarr(level=0, chunkmode="page")``, and
@@ -641,13 +642,13 @@ class OmeTiffAdapter(TensorAdapter):
         gives up). It is the right mode for reading a page, so the page is the
         block.
         """
-        descriptor = self.get_tensor_descriptor()
+        descriptor = self._native_descriptor()
         return tuple(
             int(size) if str(label).upper() in {"Y", "X", "S"} else 1
             for label, size in zip(descriptor.dim_labels, descriptor.shape, strict=True)
         )
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 
         The read holds a lease on the pooled store, so it is never closed
@@ -662,7 +663,7 @@ class OmeTiffAdapter(TensorAdapter):
         if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super().get_data(bounds)  # validate bounds against the descriptor
+        super()._read_native(bounds)  # validate bounds against the descriptor
         slices = self._bounds_to_slices(bounds)
 
         with self._leased_store() as handle:
@@ -718,7 +719,7 @@ class OmeTiffAdapter(TensorAdapter):
 
     # ---- descriptors --------------------------------------------------------
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Scene-level: the handed-down tifffile descriptor. Source-level: scene 0."""
         if self.scene_index is not None:
             return self._tifffile_descriptor
@@ -731,7 +732,7 @@ class OmeTiffAdapter(TensorAdapter):
         geometry, and is handed straight to the scene adapter by
         :meth:`get_tensor_adapter` -- the one object the listing and the read
         agree on. Internal: the catalog surface is
-        :meth:`list_tensor_descriptors`, which projects these.
+        :meth:`list_tensors`, which projects these.
 
         Returns an empty list when the source is not a tifffile-readable local
         OME-TIFF (remote, custom dim_labels, non-OME, exotic axes) -- ``claim``
@@ -743,7 +744,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._cached_descriptors = descriptors if descriptors is not None else []
         return self._cached_descriptors
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """Structural catalog entries for every scene (no grid, #812)."""
         return [catalog_entry(d) for d in self._scene_descriptors()]
 

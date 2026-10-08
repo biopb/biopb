@@ -50,7 +50,7 @@ class MockAdapter:
     def is_resolved(self):
         return True
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [

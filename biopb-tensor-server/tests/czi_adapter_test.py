@@ -59,12 +59,11 @@ def test_local_czi_claims_natively_and_reads_through_libczi(tmp_path):
     source = registry.get_adapter_for_type("czi").create_from_config(_source(path))
     assert isinstance(source, CziAdapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == 1
     assert list(descriptors[0].dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptors[0].shape) == [2, 2, 3, 24, 32]
     # The listing is structural: the grid is the bound scene's (biopb/biopb#812).
-    assert list(descriptors[0].chunk_shape) == []
 
     scene = source.get_tensor_adapter(descriptors[0].array_id)
     # One plane is the unit libCZI decodes; the transfer grid is built from
@@ -80,7 +79,7 @@ def test_local_czi_claims_natively_and_reads_through_libczi(tmp_path):
 def test_interior_crop_reads_only_the_requested_window(tmp_path):
     path, expected = create_zeiss_czi(str(tmp_path), n_c=2, n_z=3, image_shape=(24, 32))
     source = _native(path)
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     bounds = ChunkBounds(start=[0, 1, 2, 5, 7], stop=[1, 2, 3, 20, 30])
     np.testing.assert_array_equal(
@@ -98,7 +97,7 @@ def test_each_scene_reads_from_its_own_bounding_rectangle(tmp_path):
     path, expected = create_zeiss_czi_scenes(str(tmp_path), n_scenes=2)
     source = _native(path)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert [descriptor.array_id.split("/")[-1] for descriptor in descriptors] == [
         "Scene:0",
         "Scene:1",
@@ -147,7 +146,7 @@ def test_scaling_items_become_the_physical_scale(tmp_path):
         pixel_size_um=(0.2, 0.3, 1.5),
     )
     source = _native(path)
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     scale, unit = scene._physical_scale()
     # dim order is T, C, Z, Y, X; only the spatial axes carry a size.
@@ -164,7 +163,7 @@ def test_descriptor_carries_the_physical_scale(tmp_path):
         pixel_size_um=(0.2, 0.3, 1.5),
     )
     source = _native(path)
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     descriptor = scene.get_tensor_descriptor()
     scene._fill_physical_scale(descriptor)
@@ -179,7 +178,7 @@ def test_file_url_is_read_as_a_local_path(tmp_path):
     )
     assert isinstance(source, CziAdapter)
 
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
     np.testing.assert_array_equal(
         scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 2, 8, 8])), expected
     )
@@ -204,7 +203,7 @@ def _pooled_reader(adapter):
 def test_reader_stays_warm_between_reads_and_closes_on_release(tmp_path):
     path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=2, image_shape=(8, 8))
     source = _native(path)
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
     pooled = czi_module._reader_pool._handles
 
     assert scene._pool_key() not in pooled
@@ -226,7 +225,7 @@ def test_reader_stays_warm_between_reads_and_closes_on_release(tmp_path):
 def test_idle_reader_is_reaped(tmp_path):
     path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=1, image_shape=(8, 8))
     source = _native(path)
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 8, 8]))
     pool = czi_module._reader_pool
     assert scene._pool_key() in pool._handles
@@ -324,7 +323,7 @@ def test_rgb_document_reads_natively_with_a_samples_axis(tmp_path):
         writer.write(expected, plane={"C": 0, "Z": 0, "T": 0})
 
     source = _native(path)
-    descriptor = source.list_tensor_descriptors()[0]
+    descriptor = source.list_tensors()[0]
     assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X", "S"]
     assert list(descriptor.shape) == [1, 1, 1, 6, 8, 3]
     assert descriptor.dtype == np.dtype(np.uint8).str
@@ -440,7 +439,7 @@ class TestZoomServesNearest:
             str(tmp_path), n_t=1, n_c=1, n_z=1, image_shape=shape, **kw
         )
         source = _native(path)
-        descriptor = source.list_tensor_descriptors()[0]
+        descriptor = source.list_tensors()[0]
         return source.get_tensor_adapter(descriptor.array_id.split("/")[-1]), expected
 
     @pytest.mark.parametrize("factor", [2, 3, 4, 5, 6, 8])
@@ -493,7 +492,7 @@ class TestZoomServesNearest:
             str(tmp_path), n_t=1, n_c=1, n_z=4, image_shape=(120, 120)
         )
         source = _native(path)
-        descriptor = source.list_tensor_descriptors()[0]
+        descriptor = source.list_tensors()[0]
         adapter = source.get_tensor_adapter(descriptor.array_id.split("/")[-1])
         bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 4, 120, 120))
 

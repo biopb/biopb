@@ -385,10 +385,10 @@ class TestEmptyChunkShapeFallback:
                 dim_labels=list(dim_labels),
             )
 
-        def get_tensor_descriptor(self):
+        def _native_descriptor(self):
             return self._desc
 
-        def get_data(self, bounds):  # pragma: no cover - not exercised here
+        def _read_native(self, bounds):  # pragma: no cover - not exercised here
             raise NotImplementedError
 
         # The source half of the role, inherited since TensorAdapter subclasses
@@ -398,7 +398,7 @@ class TestEmptyChunkShapeFallback:
         def create_from_config(cls, source, credentials_config=None):
             raise NotImplementedError
 
-        def list_tensor_descriptors(self):
+        def _list_native_tensors(self):
             return [self._desc]
 
         def get_metadata(self):
@@ -1499,12 +1499,12 @@ class TestGetPhysicalScale:
                 autospec=True,
                 side_effect=OmeZarrAdapter._enumerate_hcs_fields,
             ) as enumerate_fields:
-                first = plate.list_tensor_descriptors()
+                first = plate.list_tensors()
                 first.clear()  # a caller's edit must not reach the cache
-                assert len(plate.list_tensor_descriptors()) == 1
+                assert len(plate.list_tensors()) == 1
                 assert enumerate_fields.call_count == 1
 
-                build(path).list_tensor_descriptors()
+                build(path).list_tensors()
                 assert enumerate_fields.call_count == 2
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -1544,7 +1544,7 @@ class TestGetPhysicalScale:
             assert plate._physical_scale() is None
 
             # Bind the field by its full array_id (well/field).
-            field_id = plate.list_tensor_descriptors()[0].array_id
+            field_id = plate.list_tensors()[0].array_id
             field = plate.get_tensor_adapter(field_id)
             scale, unit = field._physical_scale()
             assert scale == [0.0, 0.5, 0.5]
@@ -1581,7 +1581,7 @@ class TestGetPhysicalScale:
             assert "_field_adapters" in vars(a)
             assert "_field_adapters" in vars(b)
 
-            field_id = a.list_tensor_descriptors()[0].array_id
+            field_id = a.list_tensors()[0].array_id
             fa = a.get_tensor_adapter(field_id)
             fb = b.get_tensor_adapter(field_id.split("/", 1)[1])
             assert fa is not fb
@@ -1938,7 +1938,7 @@ class TestGetLevelAdapterContract:
             plate = OmeZarrAdapter.create_from_config(
                 SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
             )
-            field_id = plate.list_tensor_descriptors()[0].array_id
+            field_id = plate.list_tensors()[0].array_id
             field = plate.get_tensor_adapter(field_id)
             chunk_id = (
                 field.get_read_plan(field.get_tensor_descriptor())

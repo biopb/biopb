@@ -36,7 +36,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import axes_scale
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter, TensorEntry
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -340,13 +340,13 @@ class EmdAdapter(TensorAdapter):
         """Within-source field for a signal. The signal index is the field."""
         return str(index)
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """One structural entry per EMD signal (no grid -- biopb/biopb#812)."""
         return [
-            TensorDescriptor(
+            TensorEntry(
                 array_id=f"{self.source_id}/{self._field_for(i)}",
-                dim_labels=self._labels_for(sig),
-                shape=list(sig["data"].shape),
+                dim_labels=tuple(self._labels_for(sig)),
+                shape=tuple(int(dim) for dim in sig["data"].shape),
                 dtype=np.dtype(sig["data"].dtype).str,
             )
             for i, sig in enumerate(self._signals)
@@ -375,7 +375,7 @@ class EmdAdapter(TensorAdapter):
             dtype=np.dtype(data.dtype).str,
         )
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         if self.signal_index is not None:
             desc = self._serving_descriptor(self.signal_index)
             # This adapter's own identity: the bound field name is authoritative
@@ -435,16 +435,16 @@ class EmdAdapter(TensorAdapter):
             self._handle._release_persistent_handle()
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The dask block -- the ``native=`` seed of this field's grid."""
         chunksize = getattr(self._data, "chunksize", None)
         return tuple(int(size) for size in chunksize) if chunksize else None
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region from this signal's dask array (native h5py read)."""
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._handle.array(self.signal_index)[slices].compute()

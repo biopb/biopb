@@ -61,7 +61,7 @@ class _Churn:
         self.config = SourceConfig(url=self.path, source_id="s0")
         self.lock = threading.Lock()
         adapter = OmeTiffAdapter.create_from_config(self.config)
-        self.array_id = adapter.list_tensor_descriptors()[0].array_id
+        self.array_id = adapter.list_tensors()[0].array_id
         self.db = MetadataDatabase()
         self.db.sync_roots([("r", "file:///")])
         claim = SourceClaim(

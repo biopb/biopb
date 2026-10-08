@@ -13,6 +13,7 @@ the metadata is the row's, not the adapter's.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
@@ -70,9 +71,9 @@ def snapshot(adapter, *, read: bool = True) -> Dict[str, Any]:
         "metadata": adapter.get_metadata(),
         "content_version": adapter.content_version,
         "is_resolved": adapter.is_resolved(),
-        "listing": [MessageToDict(d) for d in adapter.list_tensor_descriptors()],
+        "listing": [asdict(d) for d in adapter.list_tensors()],
     }
-    for entry in adapter.list_tensor_descriptors():
+    for entry in adapter.list_tensors():
         tensor = adapter.get_tensor_adapter(entry.array_id)
         facts: Dict[str, Any] = {
             "descriptor": MessageToDict(tensor.get_tensor_descriptor()),

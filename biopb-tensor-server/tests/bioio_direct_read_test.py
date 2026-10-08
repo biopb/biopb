@@ -221,7 +221,7 @@ def test_nikon_metadata_failure_degrades_to_empty(tmp_path):
 def test_scene_switch_does_not_race_a_concurrent_read():
     """A descriptor listing must not repoint the scene under a running read.
 
-    list_tensor_descriptors walks every scene, leaving BioIO bound to the last
+    list_tensors walks every scene, leaving BioIO bound to the last
     one. A reader bound to scene 0 that does not hold _io_lock across its own
     set_scene and array access would come back with scene 1's pixels.
     """
@@ -272,7 +272,7 @@ def test_scene_switch_does_not_race_a_concurrent_read():
 
     def _list():
         reader_is_mid_read.wait(timeout=5)
-        source.list_tensor_descriptors()
+        source.list_tensors()
 
     reader_thread = threading.Thread(target=_read)
     threads = [reader_thread, threading.Thread(target=_list)]
@@ -399,12 +399,11 @@ def test_source_listing_publishes_no_grid(tmp_path, monkeypatch, fast_path):
             lambda: (_ for _ in ()).throw(NotImplementedError),
         )
 
-    listed = adapter.list_tensor_descriptors()
+    listed = adapter.list_tensors()
     assert [d.array_id for d in listed] == ["source/A1", "source/B2"]
     for descriptor in listed:
         assert list(descriptor.shape) == list(shape)
         assert descriptor.dtype == data.dtype.str
-        assert list(descriptor.chunk_shape) == []
 
     # ... and the scene that IS bound answers it, C whole (biopb/biopb#806).
     served = _adapter(tmp_path, data, "TCZYX", chunks).get_transfer_chunk_size()

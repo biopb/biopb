@@ -22,6 +22,7 @@ from biopb_tensor_server.adapters._scale import (
 from biopb_tensor_server.adapters._signature_memo import SignatureMemo
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -598,7 +599,7 @@ class DicomAdapter(TensorAdapter):
         else:
             self.dim_labels = ["y", "x"]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -611,11 +612,11 @@ class DicomAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One frame, which is the least a decode can hand back.
 
         ``get_data`` decodes per frame and crops, so a Y/X window costs its whole
@@ -640,7 +641,7 @@ class DicomAdapter(TensorAdapter):
         else:
             yield str(self._source_url)
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM pixel data.
 
         Only the frames the bounds cover are decoded: ``pydicom.pixels`` parses
@@ -659,7 +660,7 @@ class DicomAdapter(TensorAdapter):
         """
         from pydicom.pixels import iter_pixels, pixel_array
 
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
@@ -967,7 +968,7 @@ class DicomSeriesAdapter(TensorAdapter):
         # Store first dataset for metadata extraction
         self._first_ds = first_full
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -983,15 +984,15 @@ class DicomSeriesAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One slice -- the ``native=`` seed above, and pydicom's decode unit."""
         return tuple([1] * (len(self._shape) - 2) + [self._rows, self._cols])
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM series.
 
         Reads multiple slices if needed and stacks them into a contiguous array.
@@ -1007,7 +1008,7 @@ class DicomSeriesAdapter(TensorAdapter):
         """
         from pydicom.pixels import pixel_array
 
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])

@@ -692,9 +692,7 @@ class TensorFlightServer(flight.FlightServerBase):
         The registry only -- cataloguing is the caller's second step, see
         ``metadata_db``.
 
-        Returns the adapter as registered: the registry normalizes a
-        non-canonical axis order on the way in (biopb/biopb#596), so a caller
-        that keeps using the adapter afterwards must use the returned one.
+        Returns the adapter, as passed.
         """
         return self.sources.register(source_id, adapter)
 
@@ -703,7 +701,7 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
         """Replace a registered source's adapter in place (delegates to ``sources``).
 
-        Returns ``(registered, displaced)``. Upload state is deliberately NOT
+        Returns ``(adapter, displaced)``. Upload state is deliberately NOT
         forgotten: the source is not going away, only its adapter is being
         rebuilt against the current bytes. The displaced adapter is left open
         for the caller to close once in-flight reads have drained.
@@ -1516,7 +1514,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if field is None:
             default_adapter = self._registered(source_id)
             if default_adapter is not None:
-                descriptors = default_adapter.list_tensor_descriptors()
+                descriptors = default_adapter.list_tensors()
                 if descriptors:
                     field = self._field_within_source(
                         source_id, descriptors[0].array_id

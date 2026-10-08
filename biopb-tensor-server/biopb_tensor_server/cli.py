@@ -1232,7 +1232,7 @@ def list_tensors(
         for source in sources:
             try:
                 adapter = _create_source_adapter(source)
-                tensor_descs = adapter.list_tensor_descriptors()
+                tensor_descs = adapter.list_tensors()
                 if len(tensor_descs) == 1:
                     desc = tensor_descs[0]
                     table.add_row(

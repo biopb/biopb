@@ -52,7 +52,7 @@ class MockAdapter:
     def is_resolved(self):
         return self._is_resolved
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [
@@ -201,7 +201,7 @@ class TestSourceSync:
         swallowed, so the registration path can roll back (issue #223)."""
 
         class FailingAdapter(MockAdapter):
-            def list_tensor_descriptors(self):
+            def list_tensors(self):
                 raise RuntimeError("Simulated failure")
 
         db = MetadataDatabase()
@@ -254,7 +254,7 @@ class MultiTensorAdapter:
     def is_resolved(self):
         return self._is_resolved
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [TensorDescriptor(**t) for t in self._tensors]
@@ -914,7 +914,7 @@ class TestNoResidencyColumn:
         def is_resolved(self):
             return False
 
-        def list_tensor_descriptors(self):
+        def list_tensors(self):
             return []  # nothing to say about shape or dtype yet
 
         def get_metadata(self):

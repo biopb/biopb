@@ -251,7 +251,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     def get_tensor_adapter(self, tensor_id: str) -> "_TifffileAdapterBase":
         """Create a scene adapter of the same native type."""
-        descriptors = self.list_tensor_descriptors()
+        descriptors = self._scene_descriptors()
         field = self._within_source_field(tensor_id)
         scene_index = self._scene_index_for_field(field)
         if field in self._tensor_adapters:
@@ -342,7 +342,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             return None
 
         try:
-            labels = self.dim_labels or list(self.get_tensor_descriptor().dim_labels)
+            labels = self.dim_labels or list(self._native_descriptor().dim_labels)
             import tifffile
 
             with tifffile.TiffFile(path) as tiff:

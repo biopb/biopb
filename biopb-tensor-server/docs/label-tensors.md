@@ -101,7 +101,7 @@ and what the DoPut boundary looks an upload up in and the reclaim sweep walks.
 lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
 `.../@labels/<name>[/<level>]` field answers from the label sets, everything
 else delegates to the format. `SourceRegistry.catalog_tensors` appends the sets after
-`list_tensor_descriptors`, so a source's first tensor -- what every listing
+`list_tensors`, so a source's first tensor -- what every listing
 reads as its picture -- is never a set.
 
 A set's adapter is `LabelSetAdapter` (`adapters/labels.py`): `OmeZarrAdapter`

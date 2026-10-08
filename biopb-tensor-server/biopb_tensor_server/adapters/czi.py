@@ -45,6 +45,7 @@ from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TT
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -412,7 +413,7 @@ class CziAdapter(TensorAdapter):
             dtype=layout.dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         # Structural entries only: every scene shares one layout here, so the
         # grid would be right -- but the catalog is not where a grid is
         # published, whoever could compute it (biopb/biopb#812).
@@ -421,7 +422,7 @@ class CziAdapter(TensorAdapter):
             for position in range(len(self._layout.scenes))
         ]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return self._descriptor_for(
             0 if self.scene_position is None else self.scene_position
         )
@@ -460,7 +461,7 @@ class CziAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: a libCZI ROI read composes only the subblocks it touches.
 
         Deliberately *not* the ``native=`` plane that seeds the transfer grid.
@@ -472,7 +473,7 @@ class CziAdapter(TensorAdapter):
         """
         return None
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read the requested region, one libCZI read per plane coordinate."""
         return self._read_planes(bounds, factor=None)
 
@@ -503,6 +504,13 @@ class CziAdapter(TensorAdapter):
         sidesteps the reduction rather than swapping which one runs. This must
         not become the reason that route never lands (#799).
         """
+        if self._axis_perm() is not None:
+            # The zoom read is positional in this adapter's own plane order; a
+            # non-canonical document takes the default, which reads through the
+            # permuting seam.
+            return super().get_scaled_data(
+                bounds, scale_hint, reduction_method, cache_manager
+            )
         factor = self._zoom_factor(bounds, scale_hint, reduction_method)
         if factor is not None:
             try:
@@ -574,7 +582,7 @@ class CziAdapter(TensorAdapter):
         if self.scene_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super().get_data(bounds)  # validate bounds against the descriptor
+        super()._read_native(bounds)  # validate bounds against the descriptor
         scene = self._scene()
         layout = self._layout
         starts = [int(value) for value in bounds.start]

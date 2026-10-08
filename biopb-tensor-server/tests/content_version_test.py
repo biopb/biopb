@@ -525,7 +525,7 @@ class _VersionedStubAdapter(TensorAdapter):
         self._shape = list(shape)
         self._content_version = content_version
 
-    def get_tensor_descriptor(self):
+    def _native_descriptor(self):
         return TensorDescriptor(
             array_id=self.array_id,
             shape=self._shape,
@@ -534,8 +534,8 @@ class _VersionedStubAdapter(TensorAdapter):
             dim_labels=["y", "x"][: len(self._shape)],
         )
 
-    def get_data(self, bounds):
-        super().get_data(bounds)
+    def _read_native(self, bounds):
+        super()._read_native(bounds)
         shape = tuple(b - a for a, b in zip(bounds.start, bounds.stop, strict=True))
         return np.zeros(shape, dtype="uint8")
 
@@ -543,7 +543,7 @@ class _VersionedStubAdapter(TensorAdapter):
     def create_from_config(cls, source, credentials_config=None):
         raise NotImplementedError
 
-    def list_tensor_descriptors(self):
+    def _list_native_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def get_metadata(self):

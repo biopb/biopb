@@ -61,7 +61,7 @@ class _SingleTensorAdapter(TensorAdapter):
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-single"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=["y", "x"],
@@ -70,14 +70,14 @@ class _SingleTensorAdapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def list_tensor_descriptors(self):
+    def _list_native_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def get_metadata(self) -> dict:
         return {}
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        super().get_data(bounds)
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+        super()._read_native(bounds)
         shape = tuple(
             int(s - a) for a, s in zip(bounds.start, bounds.stop, strict=True)
         )
@@ -306,7 +306,7 @@ class TestSceneTotality:
 
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
         adapter = OmeTiffAdapter(path, "idx")
-        adapter.list_tensor_descriptors()
+        adapter.list_tensors()
 
         with pytest.raises(TensorNotFound) as ei:
             adapter.get_tensor_adapter("idx/Image:999")
@@ -395,9 +395,7 @@ class TestEmdTotality:
 
     def test_valid_signal_index_resolves(self, tmp_path):
         adapter = self._emd_adapter(tmp_path)
-        field = adapter._within_source_field(
-            adapter.list_tensor_descriptors()[0].array_id
-        )
+        field = adapter._within_source_field(adapter.list_tensors()[0].array_id)
         ta = adapter.get_tensor_adapter(field)
         assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
 
@@ -472,7 +470,7 @@ class TestGetFlightInfoBoundary:
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
         server = TensorFlightServer("localhost:0")
         adapter = OmeTiffAdapter(path, "idx")
-        adapter.list_tensor_descriptors()
+        adapter.list_tensors()
         server.register_source("idx", adapter)
 
         # bare source_id and empty both resolve; the first tensor's array_id is

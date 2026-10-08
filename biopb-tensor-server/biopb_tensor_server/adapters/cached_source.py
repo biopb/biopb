@@ -37,7 +37,11 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    catalog_entry,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_of,
     decode_chunk_id,
@@ -280,7 +284,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             for chunk, dim in zip(self._chunk_shape, shape, strict=True)
         )
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this cache source.
 
         ``chunk_shape`` is the uploader's write grid, verbatim and unnegotiable.
@@ -301,9 +305,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_tensors(self) -> List[TensorEntry]:
         """Cache sources are single-tensor."""
-        return [catalog_entry(self.get_tensor_descriptor())]
+        return [catalog_entry(self._native_descriptor())]
 
     def get_metadata(self) -> dict:
         """Return OME metadata."""
@@ -323,7 +327,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             return None
         return list(self._physical_scale_vec), list(self._physical_unit_vec)
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """The region at *bounds*, assembled from the chunks that were uploaded.
 
         There is no backend: an upload's cache entries are its only copy, so
@@ -347,8 +351,8 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         off it (only the ``cache:`` kind allows one) -- and it is what keeps a
         misplanned read returning the pixels rather than a blank frame.
         """
-        # Validate bounds via the base TensorAdapter.get_data contract.
-        super().get_data(bounds)
+        # Validate bounds via the base TensorAdapter._read_native contract.
+        super()._read_native(bounds)
 
         exact = mint_chunk_id(
             self.array_id, bounds, content_version=self.content_version

@@ -31,7 +31,7 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     )
     assert isinstance(source, TiffAdapter)
 
-    descriptor = source.list_tensor_descriptors()[0]
+    descriptor = source.list_tensors()[0]
     assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptor.shape) == [1, 1, 5, 8, 9]
     assert source.get_metadata() == {"shape": [5, 8, 9]}
@@ -52,7 +52,7 @@ def test_native_store_persistence_starts_at_page_threshold(tmp_path):
     source = TiffAdapter.create_from_config(
         SourceConfig(url=str(path), type="tiff", source_id="threshold")
     )
-    scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    scene = source.get_tensor_adapter(source.list_tensors()[0].array_id)
 
     assert _PERSISTENT_PAGE_THRESHOLD == 16_384
     scene._tifffile_page_count = _PERSISTENT_PAGE_THRESHOLD - 1
@@ -70,7 +70,7 @@ def test_plain_tiff_labels_come_from_the_format(tmp_path):
     source = TiffAdapter.create_from_config(
         SourceConfig(url=str(path), type="tiff", source_id="native")
     )
-    descriptor = source.list_tensor_descriptors()[0]
+    descriptor = source.list_tensors()[0]
     assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
     assert list(descriptor.shape) == [1, 1, 5, 8, 9]
 
@@ -88,7 +88,7 @@ def test_unknown_axes_claim_and_read_natively(tmp_path):
     source = registry.get_adapter_for_type("tiff").create_from_config(
         SourceConfig(url=str(path), type="tiff", source_id="unknown")
     )
-    descriptor = source.list_tensor_descriptors()[0]
+    descriptor = source.list_tensors()[0]
     assert list(descriptor.dim_labels) == list("QQQQYX")
     assert list(descriptor.shape) == list(shape)
 
@@ -131,7 +131,7 @@ def test_named_axes_are_claimed_natively_and_kept_in_descriptor(tmp_path):
         source = registry.get_adapter_for_type("tiff").create_from_config(
             SourceConfig(url=str(path), type="tiff", source_id=name)
         )
-        descriptor = source.list_tensor_descriptors()[0]
+        descriptor = source.list_tensors()[0]
         assert list(descriptor.dim_labels) == labels
         assert list(descriptor.shape) == expected_shape
 
