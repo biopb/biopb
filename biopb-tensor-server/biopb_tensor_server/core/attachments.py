@@ -79,22 +79,12 @@ class Attachments:
 
     # -- the views ---------------------------------------------------------------
 
-    def _labels(self, *, published: bool) -> Dict[str, TensorAdapter]:
+    def _published_labels(self) -> Dict[str, TensorAdapter]:
         return {
             field: tensor
             for field, tensor in self.tensors.items()
-            if split_label_field(field) is not None
-            and is_published(tensor) is published
+            if split_label_field(field) is not None and is_published(tensor)
         }
-
-    def label_uploads(self) -> Dict[str, TensorAdapter]:
-        """Label sets the upload path is still filling, by field.
-
-        Plus the tombstones of ones it gave up on: routable, so a status poll
-        and a straggler's write both find their adapter, but never listed. A set
-        reaches :meth:`label_sets` by becoming readable, not by being moved.
-        """
-        return self._labels(published=False)
 
     def attached_fields(self) -> Dict[str, TensorAdapter]:
         """The published fields uploaded onto this source, keyed by field.
@@ -125,14 +115,15 @@ class Attachments:
         tensors are unknown before that.
 
         This is the *published* view -- what the catalog lists and what a read
-        resolves first. A set still being uploaded is in :meth:`label_uploads`
-        and joins this one when its upload reaches READY.
+        resolves first. A set still being uploaded, or the tombstone of one that
+        was discarded, is routable through ``tensors`` and joins this view when
+        its upload reaches READY.
         """
         if self._view is not None and self._view[0] is parent:
             return self._view[1]
         if not parent.is_resolved():
             return {}
-        candidates = self._labels(published=True)
+        candidates = self._published_labels()
         images = self.normalized_tensors(parent) if candidates else {}
         view: Dict[str, TensorAdapter] = {}
         self._mismatch = {}
@@ -306,5 +297,5 @@ class Attachments:
         if not self.tensors:
             return None
         field = strip_source_prefix(self.source_id, array_id)
-        key = owning_field(field, self.tensors) if field else None
+        key = owning_field(field, self.tensors) if field and MARKER in field else None
         return self.tensors[key].capability_token if key is not None else None

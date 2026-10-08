@@ -524,8 +524,7 @@ class TensorAdapter(SourceAdapter):
 
     #: Whether the values are ids, not measurements -- a label set. Averaging
     #: ids produces ids that exist nowhere, so a categorical tensor's computed
-    #: pyramid is ``nearest`` whatever the server is configured to, and it
-    #: compresses on the wire (the one tensor kind that does).
+    #: pyramid is ``nearest`` whatever the server is configured to.
     categorical: bool = False
 
     @property

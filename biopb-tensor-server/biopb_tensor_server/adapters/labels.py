@@ -26,7 +26,7 @@ What a set adds over a plain OME-Zarr image:
   write outright; replacement is a new name, or a delete first.
 
 Three ways a set reaches a parent: :func:`native_label_sets` for an image
-group's ``labels/`` (called from ``OmeZarrAdapter._embedded_sets``),
+group's ``labels/`` (called from ``OmeZarrAdapter._read_embedded_sets``),
 :func:`sidecar_label_sets` for the finished stores under
 ``<write_dir>/labels/<source_id>/``, which the server scans at boot, and
 :func:`create_label_upload` for a set arriving over the wire.
@@ -411,16 +411,11 @@ def create_label_upload(
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
     # a host cannot tell from the first.
+    native = [
+        strip_source_prefix(parent.source_id, e.array_id) for e in parent.list_tensors()
+    ]
     taken = folded_match(
-        field,
-        (
-            *(
-                strip_source_prefix(parent.source_id, e.array_id)
-                for e in parent.list_tensors()
-            ),
-            *attached.label_sets(parent),
-            *attached.tensors,
-        ),
+        field, (*native, *attached.label_sets(parent), *attached.tensors)
     )
     if taken is not None:
         raise ValueError(

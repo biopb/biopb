@@ -93,9 +93,9 @@ its own file carries as its own tensors (`OmeZarrAdapter` reads its NGFF
 registry (`SourceRegistry.attach` / `detach`; `adopt` at boot) and the upload
 kind attaches and detaches them (at READY; discard).
 
-`Attachments.label_uploads()` is the second, smaller view: sets the upload path is still
-filling, and the tombstones of ones it gave up on. Routable but never listed,
-and what the DoPut boundary looks an upload up in and the reclaim sweep walks.
+Sets the upload path is still filling, and the tombstones of ones it gave up
+on, are routable through the attachment index but never listed; that is what
+the DoPut boundary looks an upload up in and the reclaim sweep walks.
 
 `SourceRegistry.resolve_tensor(source_id, tensor_id)` is the
 lookup the serve path uses (`get_flight_info`, `do_get`, the precache): a

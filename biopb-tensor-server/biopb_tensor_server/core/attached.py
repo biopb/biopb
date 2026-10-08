@@ -20,7 +20,7 @@ half of the grammar is :mod:`biopb_tensor_server.core.labels`.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Container, Optional
 
 __all__ = [
     "FIELDS_SEGMENT",
@@ -65,19 +65,17 @@ def split_attached_field(field: Optional[str]) -> Optional[str]:
     return name
 
 
-def owning_field(field: str, keys: Iterable[str]) -> Optional[str]:
+def owning_field(field: str, keys: Container[str]) -> Optional[str]:
     """The longest of *keys* that is *field* or a ``/``-delimited prefix of it.
 
     How a tensor is found for an id that may name something under it: a native
     level of a label set rides under the set's own field.
     """
-    owner = None
-    for key in keys:
-        if (field == key or field.startswith(f"{key}/")) and (
-            owner is None or len(key) > len(owner)
-        ):
-            owner = key
-    return owner
+    while field:
+        if field in keys:
+            return field
+        field, _, _ = field.rpartition("/")
+    return None
 
 
 def is_published(adapter: object) -> bool:

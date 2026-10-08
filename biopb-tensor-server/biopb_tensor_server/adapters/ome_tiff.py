@@ -59,7 +59,7 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.labels import label_extent, label_field
-from biopb_tensor_server.core.normalize import canonical_axes, permute
+from biopb_tensor_server.core.normalize import canonical_axes, to_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -537,7 +537,7 @@ class OmeTiffAdapter(TensorAdapter):
         # calls the former directly; the latter is the registry's one-time call per adapter).
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
-        # Set only after _embedded_sets has handed every usable bitmap to
+        # Set only after _build_embedded_sets has handed every usable bitmap to
         # its RasterizedMaskAdapter.  release_registration_cache may also run
         # on an adapter that has never entered label discovery, in which case
         # its metadata must remain complete for that later discovery.
@@ -911,8 +911,10 @@ class OmeTiffAdapter(TensorAdapter):
                 continue
             dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
             perm = canonical_permutation(dim_labels, shape)
-            if perm is not None:
-                dim_labels, shape = permute(dim_labels, perm), permute(shape, perm)
+            dim_labels, shape = (
+                to_canonical(dim_labels, perm),
+                to_canonical(shape, perm),
+            )
             field = label_field(
                 strip_source_prefix(self.source_id, desc.array_id) or "", OME_SET_NAME
             )
