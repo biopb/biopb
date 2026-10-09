@@ -151,8 +151,8 @@ def _image_with_axes(root, axes, shape, source_id="img"):
 
     types = {"t": "time", "c": "channel", "z": "space", "y": "space", "x": "space"}
     store = Path(root) / f"{source_id}.ome.zarr"
-    group = zarr.open_group(str(store), mode="w")
-    group.create_dataset("0", shape=shape, chunks=shape, dtype="uint8")
+    group = zarr.open_group(str(store), mode="w", zarr_format=2)
+    group.create_array("0", shape=shape, chunks=shape, dtype="uint8")
     meta = {
         "multiscales": [
             {

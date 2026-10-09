@@ -1374,7 +1374,7 @@ function Invoke-BiopbInstall {
     # network.
     #
     # 3.12 is the ceiling: the biopb packages declare requires-python
-    # ">=3.10,<3.13", and the CZI reader (pylibczirw / aicspylibczi) has no cp313
+    # ">=3.12,<3.13", and the CZI reader (pylibczirw / aicspylibczi) has no cp313
     # wheel, so 3.13 would build it from source (cmake + libCZI + MSVC) on a fresh
     # Windows box. $pythonSpec is what `uv tool install --python` gets below;
     # pinning it keeps uv from discovering a system Python of its own.

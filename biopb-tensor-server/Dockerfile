@@ -17,9 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY wheels/biopb-*.whl /app/wheels/
 COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 
-# Install the wheels with extras. Dependency bounds (zarr<3, the tifffile
-# Zarr-2 window) live in each wheel's own metadata, so no manual pre-pin is
-# needed. The tensor server depends on core `biopb`, so install that wheel first
+# Install the wheels with extras. Dependency bounds live in each wheel's
+# own metadata, so no manual pre-pin is needed. The tensor server depends on core `biopb`, so install that wheel first
 # (its own deps resolve from PyPI). The `web` extra pulls the sidecar's ASGI
 # stack (fastapi/uvicorn) — kept so BIOPB_ENABLE_HTTP_SIDECAR=1 still works;
 # `tls` pulls cryptography for `serve --tls` self-signed cert generation (the

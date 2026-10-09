@@ -465,10 +465,10 @@ def create_label_upload(
             f"a crashed upload, or upload under another name."
         ) from None
     grid = upload_grid(desc)
-    group = zarr.open_group(str(store), mode="w")
-    arr = group.create_dataset(
+    group = zarr.open_group(str(store), mode="w", zarr_format=2)
+    arr = group.create_array(
         "0",
-        shape=list(desc.shape),
+        shape=tuple(desc.shape),
         chunks=grid,
         dtype=desc.dtype,
     )

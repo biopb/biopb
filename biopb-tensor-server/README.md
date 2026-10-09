@@ -152,7 +152,7 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
 
 ### Requirements
 
-- Python >= 3.10, < 3.13
+- Python >= 3.12, < 3.13
 - pyarrow >= 14.0.0
 
 ### Setup

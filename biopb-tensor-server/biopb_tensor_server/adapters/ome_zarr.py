@@ -9,15 +9,16 @@ import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
 from biopb_tensor_server.adapters.zarr import (
     ZarrAdapter,
     _LazyZarrArray,
+    _store_filesystem_path,
     is_unfinished_upload,
     is_upload_subsystem_store,
+    remote_zarr_store,
 )
 from biopb_tensor_server.core.adapter_base import (
     TensorEntry,
@@ -42,32 +43,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _store_filesystem_path(store) -> str:
-    """Resolve a zarr store to the local filesystem path it is rooted at.
-
-    One definition, one caller (biopb/biopb#530): ``__init__`` walks up from here
-    to find the group/plate ``.zattrs`` and keeps the root it lands on, which is
-    what ``_open_level_array`` then hangs a pyramid level off. Two callers each
-    enumerating store shapes was the original bug -- a store carrying ``root``
-    but not ``path`` resolved correctly in one and degraded to ``str(store)``, a
-    repr rather than a path, in the other -- and the second derivation is gone.
-
-    ``path`` is the zarr-2 attribute (``DirectoryStore`` / ``FSStore``); ``root`` is
-    the zarr-3 ``LocalStore`` one, unreachable under the current ``zarr<3`` pin and
-    kept so the 2->3 port cannot reintroduce the split.
-    """
-    store_str = str(store)
-    if store_str.startswith("file://"):
-        return str(urlparse(store_str).path)
-    path = getattr(store, "path", None)
-    if path is not None:
-        return str(path)
-    root = getattr(store, "root", None)
-    if root is not None:
-        return str(root)
-    return store_str
 
 
 def _physical_scale_from_multiscales(
@@ -354,7 +329,7 @@ class OmeZarrAdapter(ZarrAdapter):
         Handles both regular OME-Zarr multiscale images and HCS plate datasets.
         The plate/well/field ``.zattrs`` navigation is written once against the
         unified :class:`ClaimContext` fs seam (local ``Path`` or remote
-        ``RemoteStore``) rather than a hand-forked fsspec/``DirectoryStore`` pair
+        ``RemoteStore``) rather than a hand-forked fsspec/local store pair
         (issue #558). The already-parsed top-level ``.zattrs`` and the local root
         are threaded into ``__init__`` so it does not re-walk the store back up to
         the root it just descended from.
@@ -407,7 +382,7 @@ class OmeZarrAdapter(ZarrAdapter):
         :class:`RemoteStore` — the same fs abstraction discovery and the base
         ``ZarrAdapter`` already use — so credential handling stays in one place.
         """
-        import zarr
+        from zarr.storage import LocalStore
 
         if source.is_remote:
             from biopb_tensor_server.core.remote import RemoteStore
@@ -417,11 +392,10 @@ class OmeZarrAdapter(ZarrAdapter):
                 credentials_config=credentials_config,
                 profile_name=source.credentials_profile,
             )
-            zarr_store = zarr.FSStore(store.path, fs=store.fs)
-            return ClaimContext("", store), zarr_store
+            return ClaimContext("", store), remote_zarr_store(store)
 
         zarr_path = str(source.url)
-        return ClaimContext(Path(zarr_path)), zarr.DirectoryStore(zarr_path)
+        return ClaimContext(Path(zarr_path)), LocalStore(zarr_path, read_only=True)
 
     @staticmethod
     def _read_json_sidecar(ctx: ClaimContext, name: str) -> Optional[dict]:
@@ -472,7 +446,7 @@ class OmeZarrAdapter(ZarrAdapter):
         """Open a plate field's resolution array (or the store root fallback).
 
         Preserves the store rooting each mode had: remote opens through the shared
-        ``FSStore`` + ``path=``; local opens the absolute directory so
+        ``FsspecStore`` + ``path=``; local opens the absolute directory so
         ``arr.store`` (hence the catalog ``source_url``) roots where it did before.
         """
         import zarr

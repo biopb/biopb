@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import fsspec
 import pytest
@@ -542,12 +543,18 @@ class TestZarrAdapterRemote:
         """Create in-memory zarr dataset."""
         import numpy as np
         import zarr
-        from zarr.storage import FSStore
+        from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
+        from zarr.storage import FsspecStore
 
         fs = fsspec.filesystem("memory")
-        store = FSStore("test.zarr", fs=fs)
         arr = zarr.open_array(
-            store, mode="w", shape=(10, 10), chunks=(5, 5), dtype="i4"
+            FsspecStore(
+                AsyncFileSystemWrapper(fs, asynchronous=True), path="test.zarr"
+            ),
+            mode="w",
+            shape=(10, 10),
+            chunks=(5, 5),
+            dtype="i4",
         )
         arr[:] = np.arange(100).reshape(10, 10)
         yield fs, "test.zarr"
@@ -555,16 +562,14 @@ class TestZarrAdapterRemote:
     def test_zarr_adapter_memory_fs(self, memory_zarr):
         """ZarrAdapter works with memory filesystem."""
         import zarr
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter, remote_zarr_store
         from biopb_tensor_server.core.remote import RemoteStore
-        from zarr.storage import FSStore
 
         fs, path = memory_zarr
 
         # Create adapter using RemoteStore
         store = RemoteStore("memory:///test.zarr")
-        zarr_store = FSStore(store.path, fs=store.fs)
-        arr = zarr.open_array(zarr_store, mode="r")
+        arr = zarr.open_array(remote_zarr_store(store), mode="r")
 
         adapter = ZarrAdapter(arr, "test-zarr")
 
@@ -577,12 +582,11 @@ class TestZarrAdapterRemote:
         import numpy as np
         import zarr
         from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.zarr import ZarrAdapter
-        from zarr.storage import FSStore
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter, remote_zarr_store
 
         fs, path = memory_zarr
 
-        store = FSStore(path, fs=fs)
+        store = remote_zarr_store(SimpleNamespace(fs=fs, path=path))
         arr = zarr.open_array(store, mode="r")
         adapter = ZarrAdapter(arr, "test-zarr")
 

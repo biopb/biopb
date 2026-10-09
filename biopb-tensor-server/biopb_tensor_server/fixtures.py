@@ -270,7 +270,7 @@ def create_multiresolution_ome_zarr(
     zarr_path.mkdir(parents=True, exist_ok=True)
 
     # Create a zarr group first
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
 
     level_paths = []
     datasets = []
@@ -286,7 +286,7 @@ def create_multiresolution_ome_zarr(
             continue  # Skip levels with zero-size dimensions
 
         # Create level array within the group
-        arr = root.create_dataset(
+        arr = root.create_array(
             str(level),
             shape=level_shape,
             chunks=chunk_size,
@@ -667,6 +667,7 @@ def create_zarr_array(
     arr = zarr.open_array(
         str(zarr_path),
         mode="w",
+        zarr_format=2,
         shape=shape,
         chunks=chunks,
         dtype=dtype,

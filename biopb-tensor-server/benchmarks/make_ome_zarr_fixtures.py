@@ -83,7 +83,7 @@ def _write_store(
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True)
-    root = zarr.open_group(str(path), mode="w")
+    root = zarr.open_group(str(path), mode="w", zarr_format=2)
     compressor = numcodecs.Blosc(cname="zstd", clevel=3) if compressed else None
 
     rng = np.random.default_rng(0)
@@ -97,12 +97,12 @@ def _write_store(
         # chunk, and stopping the ladder there would leave the deepest scales --
         # exactly the ones a browser opens at -- with no stored level to serve.
         level_chunk = min(chunk, size)
-        arr = root.create_dataset(
+        arr = root.create_array(
             str(level),
             shape=(size, size),
             chunks=(level_chunk, level_chunk),
             dtype=dtype,
-            compressor=compressor,
+            compressors=compressor,
         )
         # Row-block at a time: an 8192^2 uint16 level is 128 MiB, and holding the
         # whole thing plus its compressed buffers is avoidable.

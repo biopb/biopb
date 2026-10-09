@@ -1333,11 +1333,11 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/7] Ensuring Python..."
 
-    # biopb-mcp (always installed) requires Python >= 3.10.
-    MIN_MINOR=10
+    # biopb-mcp (always installed) requires Python >= 3.12.
+    MIN_MINOR=12
 
     # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
-    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
+    # requires-python ">=3.12,<3.13", so 3.13+ is refused at resolution. (2) The
     # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
     # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
     # libCZI), which fails on a fresh machine without a C++ toolchain. If the

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb-tensor-server"
 dynamic = ["version"]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "BioPB Tensor Arrow Flight server for multi-dimensional array storage"
 readme = "README.md"
@@ -18,8 +18,6 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
@@ -45,16 +43,13 @@ dependencies = [
   # through 24). Below it, the batch could pin the handle and unlink would fail
   # with WinError 32. Do not lower without re-running the version sweep.
   "pyarrow >= 14.0.0",
-  "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port.
+  "zarr >= 3.0.8",  # the adapters mint zarr_format=2 stores (their .zattrs are read and written by hand)
   "dask[array] >= 2024.0.0",
   "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
-  "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
+  "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FsspecStore
   # Lower bound: numpy-2 safe (older tifffile called the removed ndarray.newbyteorder).
-  # Upper bound: tifffile 2025.5.21 dropped Zarr 2 support and requires Zarr 3
-  # (2025.5.10 is the last release that reads via a Zarr-2 store). OmeTiffAdapter's
-  # read path opens series.aszarr() as a Zarr-2 store, matching the zarr<3 pin
-  # above, so tifffile must stay on the Zarr-2 line.
-  "tifffile >= 2024.8.10, < 2025.5.21",
+  # 2025.5.21 is the first release whose aszarr() store zarr 3 accepts.
+  "tifffile >= 2025.5.21",
   # OmeTiffAdapter parses OME-XML with it (ome_tiff.py:310), and that adapter is
   # always registered because tifffile is a core dep -- so this is a core
   # dependency too. It went undeclared while bioio-ome-tiff / bioio-czi happened
@@ -129,12 +124,10 @@ dependencies = [
     # its pylibczirw dep ships no Intel-macOS wheel, so bundling it would
     # source-build libCZI (and fail) on every Intel Mac. install.sh adds [czi] on
     # all platforms except Intel macOS; a direct install that wants CZI uses [aics,czi].
-    # NOTE: bioio-ome-zarr is deliberately NOT listed. (1) It is redundant --
-    # biopb reads OME-Zarr/Zarr via its own OmeZarrAdapter/ZarrAdapter, which win
-    # in the registry ahead of the generic bioio fallback, so a .zarr store never
-    # reaches a bioio reader. (2) It requires zarr>=3, which collides with the
-    # zarr<3 pin above; adopting it is the same trigger as the deferred zarr 2->3
-    # port.
+    # NOTE: bioio-ome-zarr is deliberately NOT listed: it is redundant. biopb
+    # reads OME-Zarr/Zarr via its own OmeZarrAdapter/ZarrAdapter, which win in the
+    # registry ahead of the generic bioio fallback, so a .zarr store never reaches
+    # a bioio reader.
   ]
   # Zeiss CZI reader, split out of [aics]: bioio-czi -> pylibczirw publishes
   # arm64-macOS / Linux / Windows wheels but NO Intel-macOS wheel (any version),
@@ -185,11 +178,9 @@ dependencies = [
   # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
   # from rosettasciio's header and served from an own np.memmap. rosettasciio[hdf5]
   # pulls h5py for the EMD path. 0.15's lazy EMD reader keeps the HDF5 file open
-  # until the idle reaper or EmdAdapter.close() releases it (#822); earlier versions read eagerly. 0.15 ships no
-  # cp310 wheel, so 3.10 stays on 0.14 rather than building it from source.
+  # until the idle reaper or EmdAdapter.close() releases it (#822); earlier versions read eagerly.
   em = [
-    "rosettasciio[hdf5] >= 0.15; python_version >= '3.11'",
-    "rosettasciio[hdf5] < 0.15; python_version < '3.11'",
+    "rosettasciio[hdf5] >= 0.15",
   ]
 
 [project.scripts]

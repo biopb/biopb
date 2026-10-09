@@ -297,8 +297,8 @@ class TestOmeZarrIntegration:
 
         # OME-Zarr with real physical units (the fixture uses relative scales).
         zarr_path = os.path.join(temp_dir, "phys.ome.zarr")
-        root = zarr.open_group(zarr_path, mode="w")
-        root.create_dataset("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
+        root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+        root.create_array("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
         zattrs = {
             "multiscales": [
                 {

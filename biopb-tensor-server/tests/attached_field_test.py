@@ -38,7 +38,7 @@ def _their_file(tmp_path, name="theirs", shape=SHAPE):
     store = tmp_path / "data" / f"{name}.zarr"
     if not store.exists():
         store.parent.mkdir(parents=True, exist_ok=True)
-        zarr.create(store=zarr.DirectoryStore(str(store)), shape=shape, dtype="uint16")
+        zarr.create_array(str(store), shape=shape, dtype="uint16", zarr_format=2)
     return ZarrAdapter(zarr.open_array(str(store), mode="r"), name)
 
 
