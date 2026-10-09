@@ -91,6 +91,7 @@ from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import LOCAL_ONLY, PYRAMID, read_mask
 from biopb_tensor_server.core.registration import (
     RegistrationRecord,
+    metadata_record,
 )
 
 if TYPE_CHECKING:
@@ -279,7 +280,7 @@ class MirrorSeed:
             row.get("tensors") or [],
             row.get("source_url"),
             row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
-            RegistrationRecord(
+            metadata_record(
                 metadata if isinstance(metadata, dict) else {},
                 # Whether that row describes a real source yet. True for an
                 # upstream predating the column.
@@ -563,9 +564,8 @@ class RemoteTensorAdapter(TensorAdapter):
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
         # the whole upstream catalog in one query, it seeds the tensors so
         # registration (sync_source_added -> list_tensors) needs no per-source
-        # upstream RPC. The upstream row's metadata and resolved flag never come
-        # here: the reconciler hands them to the catalog write itself. None = not seeded (fall back to a live
-        # per-source fetch). See seed_catalog().
+        # upstream RPC. None = not seeded (fall back to a live per-source
+        # fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
         # ((array_id, content_version), native) for has_native_pyramid().
         self._native_pyramid_memo: Optional[tuple] = None
@@ -719,8 +719,8 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added`` (``list_tensors``)
-        needs no per-source upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
-        array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
+        needs no per-source upstream RPC. ``upstream_tensors`` is the row's
+        ``tensors`` STRUCT[] (upstream array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
         ``list_tensors`` (default field only), this seeds **all** of the
         source's tensors, so a multi-field upstream mirrors completely.
@@ -732,9 +732,12 @@ class RemoteTensorAdapter(TensorAdapter):
         ``indexed_at`` is the upstream source's register timestamp; it becomes this
         mirror's ``content_version`` (``b"iat:<ts>"``, biopb/biopb#178), folded into
         every minted proxy envelope so the chunk cache re-namespaces when the
-        upstream re-registers the source. It is set unconditionally and deliberately NOT part of the ``changed`` result: a re-sync
-        re-stamps the LOCAL ``indexed_at``, so gating re-sync on it would churn; the
-        content_version only needs to ride the adapter for minting, not the catalog.
+        upstream re-registers the source. It is set unconditionally and
+        deliberately NOT part of the ``changed`` result: a re-sync re-stamps the
+        LOCAL ``indexed_at``, so gating re-sync on it would churn; the
+        content_version only needs to ride the adapter for minting, not the
+        catalog. Idempotent and re-appliable: the reconcile re-seeds a mirrored
+        source whenever its upstream ``indexed_at`` moves.
 
         We just queried the upstream, so mark it reachable. Returns whether the
         seeded catalog surface actually changed, so the caller can skip a
@@ -781,9 +784,9 @@ class RemoteTensorAdapter(TensorAdapter):
     ) -> RegistrationRecord:
         """No metadata: a mirror's is the upstream row's.
 
-        The reconciler writes it with the row (``sync_source_added(registration=)``,
-        from :class:`MirrorSeed`), so the adapter holds no copy and asks the
-        upstream nothing.
+        Every mirror registers through a :class:`MirrorSeed`, whose record the
+        reconciler hands to ``sync_source_added(registration=)``, so the adapter
+        holds no copy and asks the upstream nothing.
         """
         return RegistrationRecord({})
 

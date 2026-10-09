@@ -1589,7 +1589,7 @@ class MetadataDatabase:
         )
         if found is None:
             return True
-        stored = json.loads(found[1]) if found[1] else {}
+        stored = self._loads_metadata(found[1], source_id) or {}
         return bool(found[0]) != registration.is_resolved or stored != dict(
             registration.metadata or {}
         )
@@ -2125,11 +2125,15 @@ class MetadataDatabase:
             )
             raise
 
-        if row is None or not row[0]:
-            return None
+        return self._loads_metadata(row[0], source_id) if row else None
 
+    @staticmethod
+    def _loads_metadata(raw: Optional[str], source_id: str) -> Optional[dict]:
+        """A stored ``metadata_json`` as a dict, or ``None`` for empty or invalid."""
+        if not raw:
+            return None
         try:
-            parsed = json.loads(row[0])
+            parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError, ValueError):
             logger.warning(
                 "stored metadata_json for source %s is not valid JSON", source_id

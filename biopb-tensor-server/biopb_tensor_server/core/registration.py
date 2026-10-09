@@ -27,13 +27,17 @@ class RegistrationRecord:
     is_resolved: bool = True
 
 
-def metadata_record(metadata: Optional[Mapping[str, Any]]) -> RegistrationRecord:
+def metadata_record(
+    metadata: Optional[Mapping[str, Any]], is_resolved: bool = True
+) -> RegistrationRecord:
     """A :class:`RegistrationRecord` of just *metadata*, minus any mask bitmaps.
 
     For a format whose catalog entry is its metadata dict and nothing else; a
     mask's bitmap is arbitrary binary and never reaches the SQL-queryable column.
     """
-    return RegistrationRecord(strip_mask_bindata(metadata or {}))
+    return RegistrationRecord(
+        strip_mask_bindata(metadata or {}), is_resolved=is_resolved
+    )
 
 
 def strip_mask_bindata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:

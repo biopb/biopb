@@ -1757,13 +1757,13 @@ class Reconciler:
                 if not from_payload:
                     # A mirror's row is the upstream's: its registration comes
                     # with the seed, not from the adapter.
-                    extra = (
-                        {"registration": catalog_seed.registration}
-                        if catalog_seed is not None
-                        else {}
-                    )
                     self._metadata_db.sync_source_added(
-                        claim.source_id, adapter, record, **extra
+                        claim.source_id,
+                        adapter,
+                        record,
+                        registration=catalog_seed.registration
+                        if catalog_seed
+                        else None,
                     )
                     synced = True
                 else:

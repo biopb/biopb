@@ -339,7 +339,7 @@ class TestHydrateFromPayload:
         monkeypatch.setattr(
             run.db,
             "sync_source_added",
-            lambda source_id, adapter, record=None: (
+            lambda source_id, adapter, record=None, registration=None: (
                 rewrites.append(source_id) or real(source_id, adapter, record)
             ),
         )
@@ -427,7 +427,7 @@ class TestHydrateFromPayload:
         monkeypatch.setattr(
             run.db,
             "sync_source_added",
-            lambda source_id, adapter, record=None: (
+            lambda source_id, adapter, record=None, registration=None: (
                 rewrites.append(source_id) or real(source_id, adapter, record)
             ),
         )
