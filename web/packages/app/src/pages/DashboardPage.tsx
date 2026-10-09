@@ -3,8 +3,6 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 import { catalogIsFilling } from "../utils/catalogHealth";
 import { sessionFetch } from "../utils/sessionFetch";
-import type { BrowseResponse } from "@biopb/tensor-flight-client";
-import { FileBrowser } from "../components/admin/FileBrowser";
 import {
   authRequired,
   captureUrlToken,
@@ -89,11 +87,6 @@ export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
   const [agents, setAgents] = useState<AgentRec[] | null>(null);
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
-  // Adding a local script runs code, so the control offers it only when
-  // loopback-bound; default off until the first listing says otherwise.
-  const [canAddScript, setCanAddScript] = useState(false);
-  // The server-file chooser behind "Add local", while it is open.
-  const [browsing, setBrowsing] = useState(false);
   const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
@@ -186,7 +179,6 @@ export default function DashboardPage() {
     try {
       const data = await (await sessionFetch(withBase("/api/algorithms"))).json();
       setAlgos((data && data.servers) || []);
-      setCanAddScript(!!(data && data.can_add_script));
     } catch {
       /* keep last */
     }
@@ -231,27 +223,12 @@ export default function DashboardPage() {
     if (name === null) return;
     algoEdit("/api/algorithms/register", { url: url.trim(), name: name.trim() || undefined });
   };
-  // Stable identity: FileBrowser reloads (and resets to its start folder) when
-  // this changes, so an inline function would undo every navigation.
-  const browseAlgoFiles = useCallback(async (path?: string): Promise<BrowseResponse> => {
-    const q = path ? "?path=" + encodeURIComponent(path) : "";
-    const r = await sessionFetch(withBase("/api/algorithms/browse" + q));
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body?.error ?? "HTTP " + r.status);
-    return body as BrowseResponse;
-  }, []);
-  const addLocal = () => setBrowsing(true);
+  // A script entry is a file on the control's machine: the control starts and
+  // stops it, and the entry itself is managed on disk.
+  const algoVerb = (s: AlgoRec, verb: "ensure" | "stop") =>
+    algoEdit("/api/algorithms/" + verb + "?name=" + encodeURIComponent(s.name));
   const deregister = (s: AlgoRec) => {
-    const running = s.kind === "script" && ["up", "starting", "installing"].includes(s.state);
-    const msg =
-      "Deregister " +
-      s.name +
-      "?" +
-      (running ? " Its running server will be stopped." : "") +
-      (s.kind === "script"
-        ? " The server file itself is not deleted, and the entry is kept as _" + s.name + ".py in the registry folder."
-        : "");
-    if (confirm(msg))
+    if (confirm("Deregister " + s.name + "?"))
       algoEdit("/api/algorithms/deregister?name=" + encodeURIComponent(s.name));
   };
 
@@ -554,18 +531,6 @@ export default function DashboardPage() {
             <button className="mini" disabled={algosBusy} onClick={registerRemote}>
               Register remote
             </button>
-            <button
-              className="mini"
-              disabled={algosBusy || !canAddScript}
-              title={
-                canAddScript
-                  ? undefined
-                  : "Running a local server file needs a loopback-bound control"
-              }
-              onClick={addLocal}
-            >
-              Add local
-            </button>
           </h2>
           <ul>
             {algos == null ? (
@@ -574,7 +539,13 @@ export default function DashboardPage() {
               <li className="empty">no algorithm servers configured</li>
             ) : (
               algos.map((s) => (
-                <AlgoRow key={s.name} s={s} busy={algosBusy} onDeregister={deregister} />
+                <AlgoRow
+                  key={s.name}
+                  s={s}
+                  busy={algosBusy}
+                  onDeregister={deregister}
+                  onVerb={algoVerb}
+                />
               ))
             )}
           </ul>
@@ -698,17 +669,6 @@ export default function DashboardPage() {
           ) : null}
         </div>
       </main>
-      {browsing && (
-        <FileBrowser
-          browse={browseAlgoFiles}
-          filesOnly
-          onPick={(path) => {
-            setBrowsing(false);
-            algoEdit("/api/algorithms/register", { path });
-          }}
-          onClose={() => setBrowsing(false)}
-        />
-      )}
       <style>{DASH_CSS}</style>
     </div>
   );
@@ -721,10 +681,12 @@ function AlgoRow({
   s,
   busy,
   onDeregister,
+  onVerb,
 }: {
   s: AlgoRec;
   busy: boolean;
   onDeregister: (s: AlgoRec) => void;
+  onVerb: (s: AlgoRec, verb: "ensure" | "stop") => void;
 }) {
   const serving = s.state === "up";
   // A script entry that is installed but not running is healthy: it starts
@@ -754,9 +716,19 @@ function AlgoRow({
         </span>
       ) : null}
       <span className="agent-btns">
-        <button className="danger" disabled={busy} onClick={() => onDeregister(s)}>
-          Deregister
-        </button>
+        {s.kind === "url" ? (
+          <button className="danger" disabled={busy} onClick={() => onDeregister(s)}>
+            Deregister
+          </button>
+        ) : ["new", "stopped", "failed"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "ensure")}>
+            Start
+          </button>
+        ) : ["up", "starting"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "stop")}>
+            Stop
+          </button>
+        ) : null}
       </span>
     </li>
   );

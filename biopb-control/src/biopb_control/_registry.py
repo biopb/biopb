@@ -19,9 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import shutil
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -192,101 +190,21 @@ def register_url(
     return name
 
 
-def register_script(
-    source: str, name: Optional[str] = None, directory: Optional[Path] = None
-) -> str:
-    """Add a script entry for the server file at *source*; answer its name.
-
-    The entry is a symlink, so edits to the file take effect; a copy where
-    symlinks are unavailable. Raises ValueError when *source* is not a ``.py``
-    file or the name is unusable or taken.
-    """
-    path = Path(source).expanduser()
-    if path.suffix != ".py" or not path.is_file():
-        raise ValueError(f"{source} is not a .py file")
-    directory = directory or registry_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    name = _new_name(name or path.stem, directory)
-    link = directory / f"{name}.py"
-    try:
-        link.symlink_to(path.resolve())
-    except OSError:
-        shutil.copyfile(path, link)
-    return name
-
-
 def deregister(name: str, directory: Optional[Path] = None) -> None:
-    """Remove the entry named *name*; KeyError when there is none.
+    """Remove the url entry named *name*; KeyError when there is none.
 
-    Touches only the registry's own file, never the server file a script entry
-    links to. A script entry is renamed with a ``_`` prefix, which the registry
-    skips, so it can be restored by renaming it back; a url entry is deleted.
+    ValueError for a script entry: that is a file on this machine, managed there.
     """
     directory = directory or registry_dir()
-    paths = [
-        p
-        for p in (directory / f"{name}.py", directory / f"{name}.json")
-        if p.is_symlink() or p.exists()
-    ]
-    if name.startswith("_") or not paths:
+    script = directory / f"{name}.py"
+    path = directory / f"{name}.json"
+    if name.startswith("_") or not (
+        path.exists() or script.exists() or script.is_symlink()
+    ):
         raise KeyError(name)
-    for p in paths:
-        if p.suffix != ".py":
-            p.unlink()
-            continue
-        kept, n = directory / f"_{name}.py", 1
-        while kept.is_symlink() or kept.exists():
-            kept, n = directory / f"_{name}-{n}.py", n + 1
-        p.rename(kept)
-
-
-# Cap on one listing, so a directory of tens of thousands of files cannot make a
-# giant payload; the chooser notes the truncation and the user navigates in.
-_BROWSE_MAX_ENTRIES = 2000
-
-
-def browse(path: Optional[str] = None) -> dict:
-    """One directory of this machine, for choosing a server file to register.
-
-    Folders and ``.py`` files only: nothing else can be registered. *path* blank
-    starts at the home directory; a file resolves to its folder so the chooser
-    can navigate from it. Answers ``{path, parent, entries: [{name, is_dir}],
-    truncated}``, the shape of the tensor server's file chooser.
-
-    Raises ValueError for an unusable path, NotADirectoryError when there is no
-    folder to list, PermissionError for an unreadable one.
-    """
-    try:
-        base = (Path(path).expanduser() if path else Path.home()).resolve()
-        directory = base if base.is_dir() else base.parent
-        listable = directory.is_dir()
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"cannot access {path}: {exc}") from exc
-    if not listable:
-        raise NotADirectoryError(str(base))
-
-    entries: list[dict] = []
-    truncated = False
-    with os.scandir(directory) as it:
-        for de in it:
-            try:
-                is_dir = de.is_dir(follow_symlinks=True)
-            except OSError:
-                is_dir = False  # broken link or a race: a file, which .py filters
-            if not is_dir and not de.name.endswith(".py"):
-                continue
-            if len(entries) >= _BROWSE_MAX_ENTRIES:
-                truncated = True
-                break
-            entries.append({"name": de.name, "is_dir": is_dir})
-    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
-    parent = directory.parent
-    return {
-        "path": str(directory),
-        "parent": None if parent == directory else str(parent),
-        "entries": entries,
-        "truncated": truncated,
-    }
+    if script.exists() or script.is_symlink():
+        raise ValueError(f"{name} is a local server file; remove it from {directory}")
+    path.unlink()
 
 
 # --------------------------------------------------------------------------- #

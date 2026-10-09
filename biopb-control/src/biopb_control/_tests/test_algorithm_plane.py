@@ -404,97 +404,25 @@ def test_register_refuses_a_taken_or_reserved_name(registry):
         _registry.register_url("grpc://h:1", "_x", directory=registry)
 
 
-def test_register_script_links_the_file(tmp_path, registry):
-    src = tmp_path / "elsewhere" / "seg.py"
-    src.parent.mkdir()
-    src.write_text(_server())
-    assert _registry.register_script(str(src), directory=registry) == "seg"
-    assert (registry / "seg.py").read_text() == src.read_text()
-    assert [e["kind"] for e in _registry.entries(registry)] == ["script"]
-    with pytest.raises(ValueError, match=".py file"):
-        _registry.register_script(str(tmp_path / "nope.py"), directory=registry)
-
-
-def test_deregister_removes_the_entry_not_the_server_file(tmp_path, registry):
-    src = tmp_path / "seg.py"
-    src.write_text(_server())
-    _registry.register_script(str(src), directory=registry)
-    _registry.deregister("seg", directory=registry)
-    assert _registry.entries(registry) == []
-    assert src.exists()
-    # Kept under a prefix the registry skips, not deleted.
-    assert (registry / "_seg.py").is_symlink()
-    with pytest.raises(KeyError):
-        _registry.deregister("seg", directory=registry)
-
-
-def test_a_deregistered_script_can_be_restored_or_registered_again(tmp_path, registry):
-    src = tmp_path / "seg.py"
-    src.write_text(_server())
-    for _ in range(2):  # the second round must not clobber the first's kept file
-        _registry.register_script(str(src), directory=registry)
-        _registry.deregister("seg", directory=registry)
-    assert (registry / "_seg.py").exists() and (registry / "_seg-1.py").exists()
-    (registry / "_seg.py").rename(registry / "seg.py")
-    assert [e["name"] for e in _registry.entries(registry)] == ["seg"]
-
-
 def test_deregister_deletes_a_url_entry(registry):
     name = _registry.register_url("grpc://h:1", directory=registry)
     _registry.deregister(name, directory=registry)
     assert list(registry.iterdir()) == []
+    with pytest.raises(KeyError):
+        _registry.deregister(name, directory=registry)
 
 
-def test_browse_lists_folders_and_py_files_only(tmp_path):
-    (tmp_path / "b_dir").mkdir()
-    (tmp_path / "A_dir").mkdir()
-    (tmp_path / "z.py").write_text("")
-    (tmp_path / "a.py").write_text("")
-    (tmp_path / "notes.txt").write_text("")
-    got = _registry.browse(str(tmp_path))
-    assert got["path"] == str(tmp_path.resolve())
-    assert got["parent"] == str(tmp_path.resolve().parent)
-    assert not got["truncated"]
-    # Folders first, then files, each by name without regard to case.
-    assert [(e["name"], e["is_dir"]) for e in got["entries"]] == [
-        ("A_dir", True),
-        ("b_dir", True),
-        ("a.py", False),
-        ("z.py", False),
-    ]
-
-
-def test_browse_a_file_lists_its_folder(tmp_path):
-    f = tmp_path / "seg.py"
-    f.write_text("")
-    assert _registry.browse(str(f))["path"] == str(tmp_path.resolve())
-
-
-def test_browse_with_no_path_starts_at_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    assert _registry.browse()["path"] == str(tmp_path.resolve())
-
-
-def test_browse_caps_a_big_folder(tmp_path, monkeypatch):
-    monkeypatch.setattr(_registry, "_BROWSE_MAX_ENTRIES", 2)
-    for i in range(4):
-        (tmp_path / f"s{i}.py").write_text("")
-    got = _registry.browse(str(tmp_path))
-    assert len(got["entries"]) == 2 and got["truncated"]
-
-
-def test_browse_a_missing_path_is_not_a_directory(tmp_path):
-    with pytest.raises(NotADirectoryError):
-        _registry.browse(str(tmp_path / "nope" / "deeper" / "x.py"))
-
-
-def test_deregister_stops_a_running_script(plane, registry):
+def test_deregister_refuses_a_script_entry(registry):
     (registry / "seg.py").write_text(_server())
-    assert plane.ensure("seg", wait=60.0)["state"] == "up"
-    plane.deregister("seg")
-    assert plane.rows() == []
-    assert not (registry / "seg.py").exists()
+    with pytest.raises(ValueError, match="local server file"):
+        _registry.deregister("seg", directory=registry)
+    assert (registry / "seg.py").exists()
+
+
+def test_deregister_knows_no_reserved_name(registry):
+    (registry / "_x.py").write_text(_server())
+    with pytest.raises(KeyError):
+        _registry.deregister("_x", directory=registry)
 
 
 def _post_json(path, body):
@@ -516,52 +444,27 @@ def _post_json(path, body):
         return exc.code, json.loads(exc.read())
 
 
-def test_register_and_deregister_over_http(control, tmp_path, registry):
-    src = tmp_path / "seg.py"
-    src.write_text(_server())
+def test_register_and_deregister_over_http(control, registry):
     assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"}) == (
         200,
         {"name": "h-1"},
     )
-    assert _post_json("/api/algorithms/register", {"path": str(src)}) == (
+    assert _post_json(
+        "/api/algorithms/register", {"url": "grpc://h:2", "name": "mine"}
+    ) == (
         200,
-        {"name": "seg"},
+        {"name": "mine"},
     )
     assert _post_json("/api/algorithms/register", {"url": "http://h:1"})[0] == 400
     assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"path": "/x/seg.py"})[0] == 400
     assert _post_json("/api/algorithms/register", {})[0] == 400
 
     from biopb import _control as client
 
-    assert {r["name"] for r in client.algorithms()} == {"h-1", "seg"}
+    (registry / "seg.py").write_text(_server())
+    assert {r["name"] for r in client.algorithms()} == {"h-1", "mine", "seg"}
     assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 200
     assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 404
-    assert {r["name"] for r in client.algorithms()} == {"seg"}
-
-
-def test_browse_over_http(control, tmp_path):
-    import json
-    import urllib.error
-    import urllib.request
-
-    from biopb._control import _client
-
-    here = tmp_path / "pick"  # tmp_path also holds the fixtures' own folders
-    here.mkdir()
-    (here / "seg.py").write_text("")
-    (here / "skip.txt").write_text("")
-
-    def get(query):
-        try:
-            with urllib.request.urlopen(
-                _client.control_base_url() + "/api/algorithms/browse" + query,
-                timeout=10,
-            ) as resp:
-                return resp.status, json.loads(resp.read())
-        except urllib.error.HTTPError as exc:
-            return exc.code, json.loads(exc.read())
-
-    status, body = get("?path=" + str(here))
-    assert status == 200
-    assert [e["name"] for e in body["entries"]] == ["seg.py"]
-    assert get("?path=" + str(tmp_path / "nope" / "x.py"))[0] == 404
+    assert _post_json("/api/algorithms/deregister?name=seg", {})[0] == 400
+    assert {r["name"] for r in client.algorithms()} == {"mine", "seg"}

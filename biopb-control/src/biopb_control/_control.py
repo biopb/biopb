@@ -24,10 +24,8 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      its loopback url and token.
 - ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
-- ``POST /api/algorithms/register`` (``{url}`` or ``{path}``), ``POST
-  /api/algorithms/deregister`` (``?name=``) -> add or remove a registry entry;
-  ``GET /api/algorithms/browse`` (``?path=``) lists the folders and ``.py``
-  files to choose from (loopback-bound only).
+- ``POST /api/algorithms/register`` (``{url, name?}``), ``POST
+  /api/algorithms/deregister`` (``?name=``) -> add or remove a url entry.
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
 - ``POST /api/sessions/new``      -> launch a session on this machine; its
@@ -131,7 +129,6 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import _registry
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
@@ -1419,9 +1416,7 @@ def build_app(
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
-        # A script entry runs code, so adding one is offered only where chat,
-        # which also executes, is: a loopback-bound control.
-        return JSONResponse({"servers": servers, "can_add_script": loopback_bound})
+        return JSONResponse({"servers": servers})
 
     def _algorithm_verb(request: Request, verb) -> JSONResponse:
         # One entry's verb, by ?name=. An unknown name is 404; a verb a url
@@ -1450,32 +1445,15 @@ def build_app(
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def algorithms_register(request: Request) -> JSONResponse:
-        # Add an entry: {"url"} for a server someone else runs, {"path"} for a
-        # server file on this machine. Only the second runs code, so it is
-        # refused unless the control is loopback-bound (see api_algorithms).
+        # Add a url entry for a server someone else runs: {"url", "name"?}.
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = None
-        if not isinstance(body, dict):
-            return JSONResponse(
-                {"error": "body must be a JSON object"}, status_code=400
-            )
-        name = body.get("name") or None
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            return JSONResponse({"error": "give a url"}, status_code=400)
         try:
-            if isinstance(body.get("url"), str):
-                added = algorithms.register_url(body["url"], name)
-            elif isinstance(body.get("path"), str):
-                if not loopback_bound:
-                    return JSONResponse(
-                        {
-                            "error": "adding a local server file needs a loopback-bound control"
-                        },
-                        status_code=403,
-                    )
-                added = algorithms.register_script(body["path"], name)
-            else:
-                return JSONResponse({"error": "give a url or a path"}, status_code=400)
+            added = algorithms.register_url(body["url"], body.get("name") or None)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
@@ -1483,30 +1461,14 @@ def build_app(
             return JSONResponse({"error": str(exc)}, status_code=500)
         return JSONResponse({"name": added})
 
-    def algorithms_browse(request: Request) -> JSONResponse:
-        # A listing of this machine's folders and .py files, for choosing the
-        # file to add. Gated like registering one: it is the same filesystem.
-        if not loopback_bound:
-            return JSONResponse(
-                {"error": "browsing needs a loopback-bound control"}, status_code=403
-            )
-        try:
-            return JSONResponse(_registry.browse(request.query_params.get("path")))
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        except NotADirectoryError:
-            return JSONResponse({"error": "not a directory"}, status_code=404)
-        except PermissionError:
-            return JSONResponse({"error": "permission denied"}, status_code=403)
-        except OSError as exc:
-            return JSONResponse({"error": f"cannot list: {exc}"}, status_code=400)
-
     def algorithms_deregister(request: Request) -> JSONResponse:
-        # Remove an entry by ?name=; a script entry's server is stopped by the
-        # registry sync. Never touches the server file itself.
+        # Remove a url entry by ?name=; a script entry is a file on this machine
+        # and is refused (400).
         name = request.query_params.get("name", "")
         try:
             algorithms.deregister(name)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         except KeyError:
             return JSONResponse({"error": f"no algorithm {name!r}"}, status_code=404)
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
@@ -1835,7 +1797,6 @@ def build_app(
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
         Route("/api/algorithms/register", algorithms_register, methods=["POST"]),
-        Route("/api/algorithms/browse", algorithms_browse, methods=["GET"]),
         Route("/api/algorithms/deregister", algorithms_deregister, methods=["POST"]),
         Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
         Route("/api/algorithms/stop", algorithms_stop, methods=["POST"]),
