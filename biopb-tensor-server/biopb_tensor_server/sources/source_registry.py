@@ -453,8 +453,9 @@ class SourceRegistry:
     def replace(self, mapping: Dict[str, SourceAdapter]) -> None:
         """Atomically swap the whole map (used by tests to inject fixtures)."""
         with self._lock:
+            ids = {*self._sources, *mapping}
             self._sources = {sid: _Slot(a, False) for sid, a in mapping.items()}
-        for sid in mapping:
+        for sid in ids:
             self._rebind(sid)
 
     def __contains__(self, source_id: str) -> bool:

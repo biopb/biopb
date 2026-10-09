@@ -147,6 +147,49 @@ class TestRebindJudgesTheSets:
         gc.collect()
         assert gone() is None
 
+    def test_a_pass_that_a_rebind_overtook_does_not_write_its_verdict(self):
+        """A revalidate that read the old adapter must not overwrite the verdict
+        of the rebind that replaced it."""
+        holder = SimpleNamespace(parent=None)
+        att = Attachments(SRC, lambda: holder.parent)
+
+        class _Overtaken(_Parent):
+            def list_tensors(self):
+                holder.parent = _Parent(shape=(32, 32))  # the refresh lands...
+                att.rebind()  # ...and judges against it
+                return super().list_tensors()  # while this pass held the old one
+
+        att.attach(SET, _set())
+        holder.parent = _Overtaken()
+        att.revalidate()
+
+        assert "does not span" in att.error(SET)
+
+    def test_an_adapter_that_lists_nothing_yet_is_not_a_snapshot(self):
+        att = _bound(_Parent(shape=(64, 64)))
+        att.holder.parent = SimpleNamespace(list_tensors=list)
+        att.rebind()
+        att.attach(SET, _set())
+        assert att.error(SET) is None  # nothing to judge against: unjudged
+
+        att.holder.parent = _Parent()  # it resolved, with no re-registration
+        att.revalidate()
+        assert att.error(SET) is None
+        att.holder.parent = _Parent(shape=(32, 32))
+        att.rebind()
+        assert att.error(SET) is not None
+
+    def test_a_set_still_uploading_is_not_judged(self):
+        att = _bound(_Parent(shape=(32, 32)))
+        filling = _set(readable=False)
+        att.attach(SET, filling)
+        assert att.error(SET) is None
+        assert att.route(SET) is filling  # its producer keeps reaching it
+
+        filling.upload.is_readable = True
+        att.revalidate()
+        assert att.error(SET) is not None
+
 
 class TestASetBoundToAnUploadedField:
     def test_detaching_the_field_invalidates_the_set_and_attaching_heals_it(self):

@@ -141,15 +141,21 @@ class Attachments:
             with self._lock:
                 self._invalid = {}
             return
+        with self._lock:
+            generation = self._generation
         native = self._native_images()  # asks the registry: no lock held
         with self._lock:
+            if self._generation != generation:
+                return  # a rebind came in meanwhile; its own pass judges
             if native is None:  # no parent yet: the next rebind judges them
                 self._invalid = {}
                 return
             images = self._images(native)
             invalid: Dict[str, str] = {}
             for field, tensor in self._tensors.items():
-                if split_label_field(field) is None:
+                # Only a published set has a verdict: one still uploading, or the
+                # tombstone of one discarded, keeps answering its producer.
+                if split_label_field(field) is None or not is_published(tensor):
                     continue
                 why = self._binding_error(field, tensor.get_tensor_descriptor(), images)
                 if why is None:
@@ -287,6 +293,8 @@ class Attachments:
             if split_label_field(strip_source_prefix(self.source_id, e.array_id))
             is None
         }
+        if not native:  # lists nothing yet (unresolved): not a snapshot to keep
+            return None
         with self._lock:
             if self._generation == generation:
                 self._native = native
