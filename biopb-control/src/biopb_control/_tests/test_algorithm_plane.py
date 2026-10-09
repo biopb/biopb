@@ -422,8 +422,27 @@ def test_deregister_removes_the_entry_not_the_server_file(tmp_path, registry):
     _registry.deregister("seg", directory=registry)
     assert _registry.entries(registry) == []
     assert src.exists()
+    # Kept under a prefix the registry skips, not deleted.
+    assert (registry / "_seg.py").is_symlink()
     with pytest.raises(KeyError):
         _registry.deregister("seg", directory=registry)
+
+
+def test_a_deregistered_script_can_be_restored_or_registered_again(tmp_path, registry):
+    src = tmp_path / "seg.py"
+    src.write_text(_server())
+    for _ in range(2):  # the second round must not clobber the first's kept file
+        _registry.register_script(str(src), directory=registry)
+        _registry.deregister("seg", directory=registry)
+    assert (registry / "_seg.py").exists() and (registry / "_seg-1.py").exists()
+    (registry / "_seg.py").rename(registry / "seg.py")
+    assert [e["name"] for e in _registry.entries(registry)] == ["seg"]
+
+
+def test_deregister_deletes_a_url_entry(registry):
+    name = _registry.register_url("grpc://h:1", directory=registry)
+    _registry.deregister(name, directory=registry)
+    assert list(registry.iterdir()) == []
 
 
 def test_browse_lists_folders_and_py_files_only(tmp_path):

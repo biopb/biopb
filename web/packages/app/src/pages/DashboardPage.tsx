@@ -248,7 +248,9 @@ export default function DashboardPage() {
       s.name +
       "?" +
       (running ? " Its running server will be stopped." : "") +
-      (s.kind === "script" ? " The server file itself is not deleted." : "");
+      (s.kind === "script"
+        ? " The server file itself is not deleted, and the entry is kept as _" + s.name + ".py in the registry folder."
+        : "");
     if (confirm(msg))
       algoEdit("/api/algorithms/deregister?name=" + encodeURIComponent(s.name));
   };

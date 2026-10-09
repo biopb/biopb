@@ -218,8 +218,9 @@ def register_script(
 def deregister(name: str, directory: Optional[Path] = None) -> None:
     """Remove the entry named *name*; KeyError when there is none.
 
-    Removes only the registry file (the link, for a script entry), never the
-    server file it points at.
+    Touches only the registry's own file, never the server file a script entry
+    links to. A script entry is renamed with a ``_`` prefix, which the registry
+    skips, so it can be restored by renaming it back; a url entry is deleted.
     """
     directory = directory or registry_dir()
     paths = [
@@ -230,7 +231,13 @@ def deregister(name: str, directory: Optional[Path] = None) -> None:
     if name.startswith("_") or not paths:
         raise KeyError(name)
     for p in paths:
-        p.unlink()
+        if p.suffix != ".py":
+            p.unlink()
+            continue
+        kept, n = directory / f"_{name}.py", 1
+        while kept.is_symlink() or kept.exists():
+            kept, n = directory / f"_{name}-{n}.py", n + 1
+        p.rename(kept)
 
 
 # Cap on one listing, so a directory of tens of thousands of files cannot make a
