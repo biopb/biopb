@@ -79,6 +79,9 @@ class Attachments:
         self._native: Optional[Dict[str, TensorEntry]] = None
         # Why a label set cannot be read, by field.
         self._invalid: Dict[str, str] = {}
+        # Bumped by every rebind, so a snapshot read from the adapter it replaced
+        # is not stored.
+        self._generation = 0
 
     # -- state ------------------------------------------------------------------
 
@@ -101,7 +104,7 @@ class Attachments:
         """Make *tensor* answer for *field*."""
         with self._lock:
             self._tensors[field] = tensor
-            self._revalidate()
+        self.revalidate()
 
     def detach(self, field: str) -> Optional[TensorAdapter]:
         """Stop answering for *field*; returns what was attached, or None.
@@ -111,26 +114,52 @@ class Attachments:
         """
         with self._lock:
             removed = self._tensors.pop(field, None)
-            if removed is not None:
-                self._revalidate()
-            return removed
+        if removed is not None:
+            self.revalidate()
+        return removed
 
     def rebind(self) -> None:
         """The source's adapter is another one now: judge every label set again.
 
-        Called by the registry on every registration of the source. The parent's
-        tensors are read once, when there is a set to judge, and not again until
-        the next call.
+        Called by the registry on every registration and unregistration of the
+        source. The parent's tensors are read once, when there is a set to
+        judge, and not again until the next call.
         """
         with self._lock:
             self._native = None
-            self._revalidate()
+            self._generation += 1
+        self.revalidate()
 
     def revalidate(self) -> None:
-        """An attached tensor's state moved -- an upload reached READY, or was
-        discarded -- which changes which uploaded fields a set may bind to."""
+        """Judge every label set again.
+
+        Also for an attached tensor whose state moved -- an upload reached
+        READY, or was discarded -- which changes which uploaded fields a set may
+        bind to.
+        """
+        if not any(split_label_field(f) for f in list(self._tensors)):
+            with self._lock:
+                self._invalid = {}
+            return
+        native = self._native_images()  # asks the registry: no lock held
         with self._lock:
-            self._revalidate()
+            if native is None:  # no parent yet: the next rebind judges them
+                self._invalid = {}
+                return
+            images = self._images(native)
+            invalid: Dict[str, str] = {}
+            for field, tensor in self._tensors.items():
+                if split_label_field(field) is None:
+                    continue
+                why = self._binding_error(field, tensor.get_tensor_descriptor(), images)
+                if why is None:
+                    continue
+                invalid[field] = why
+                if self._invalid.get(field) != why:
+                    logger.error(
+                        f"labels: {self.source_id}/{field} cannot be read: {why}"
+                    )
+            self._invalid = invalid
 
     # -- reads ------------------------------------------------------------------
 
@@ -142,18 +171,24 @@ class Attachments:
         is routable through :meth:`route` and joins this list when its upload
         reaches READY.
         """
-        published = [(f, t) for f, t in self.items().items() if is_published(t)]
-        return [(f, t) for f, t in published if split_attached_field(f) is not None] + [
-            (f, t) for f, t in published if split_label_field(f) is not None
-        ]
+        fields: List[Tuple[str, TensorAdapter]] = []
+        sets: List[Tuple[str, TensorAdapter]] = []
+        for field, tensor in self.items().items():
+            if not is_published(tensor):
+                continue
+            if split_attached_field(field) is not None:
+                fields.append((field, tensor))
+            elif split_label_field(field) is not None:
+                sets.append((field, tensor))
+        return fields + sets
 
-    def route(self, field: Optional[str]) -> Optional[TensorAdapter]:
-        """The attached tensor answering for within-source *field*, or None.
+    def route(self, tensor_id: Optional[str]) -> Optional[TensorAdapter]:
+        """The attached tensor answering for *tensor_id*, or None.
 
         Only a **marked** field reaches one (:mod:`~biopb_tensor_server.core.attached`);
         everything else is the format's own routing, which is the whole of the
         rule -- the upload path mints no bare field. The tensor is the one whose
-        field is the longest prefix of *field*, and it resolves what remains
+        field is the longest prefix of the id's, and it resolves what remains
         itself, so a native level of a label set is routed like any other id.
 
         Any state is routable: a set being uploaded is addressable from
@@ -161,14 +196,15 @@ class Attachments:
         (biopb/biopb#1048). Raises :class:`AttachedTensorMismatch` for a label
         set that failed its check.
         """
-        if not field or MARKER not in field:
+        owner = self._owner(tensor_id)
+        if owner is None:
             return None
+        field, key = owner
         with self._lock:
-            key = owning_field(field, self._tensors)
-            if key is None:
-                return None
+            tensor = self._tensors.get(key)
             why = self._invalid.get(key)
-            tensor = self._tensors[key]
+        if tensor is None:  # detached since
+            return None
         if why is not None:
             raise AttachedTensorMismatch(f"{self.source_id}/{key} {why}")
         if field == key:
@@ -185,19 +221,31 @@ class Attachments:
         *source's* own token, so a source cannot gate what is attached to it --
         the tensors on one scratch source have different producers.
 
-        Read off the index rather than through :meth:`route`, so the auth path
-        asks no format to resolve anything and a tensor still uploading is gated
-        exactly as a published one is. Checked on every read, so a source with
-        nothing attached (the common case) returns before the field parse.
+        Owned by the same rule as :meth:`route` (:meth:`_owner`), but read off
+        the index rather than through it, so the auth path asks no format to
+        resolve anything and a tensor still uploading is gated exactly as a
+        published one is.
+        """
+        owner = self._owner(array_id)
+        if owner is None:
+            return None
+        with self._lock:
+            tensor = self._tensors.get(owner[1])
+        return tensor.capability_token if tensor is not None else None
+
+    def _owner(self, tensor_id: Optional[str]) -> Optional[Tuple[str, str]]:
+        """``(within-source field, the attached field that owns it)``, or None.
+
+        Checked on every read, so a source with nothing attached (the common
+        case) returns before the field parse.
         """
         if not self._tensors:
             return None
-        field = strip_source_prefix(self.source_id, array_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if not field or MARKER not in field:
             return None
-        with self._lock:
-            key = owning_field(field, self._tensors)
-            return self._tensors[key].capability_token if key is not None else None
+        key = owning_field(field, self._tensors)
+        return (field, key) if key is not None else None
 
     # -- the upload kind's check ---------------------------------------------------
 
@@ -211,8 +259,9 @@ class Attachments:
         sidecar's NGFF and chunk grid are built from. *desc* is in canonical
         order (the boundary refuses any other).
         """
+        native = self._native_images() or {}
         with self._lock:
-            images = self._images()
+            images = self._images(native)
         if not desc.dim_labels:
             image = self._image_of(field, images)
             if image is not None:
@@ -221,30 +270,37 @@ class Attachments:
 
     # -- the check ---------------------------------------------------------------
 
-    def _images(self) -> Dict[str, TensorEntry]:
-        """What a set may bind to: the parent's images and the published
-        uploaded fields, by array_id."""
-        self._load_native()
-        images = dict(self._native or {})
-        for field, tensor in self._tensors.items():
-            if split_attached_field(field) is not None and is_published(tensor):
-                entry = catalog_entry(tensor.get_tensor_descriptor())
-                images[entry.array_id] = entry
-        return images
-
-    def _load_native(self) -> None:
-        """Snapshot the parent's images, unless they are held or it has none."""
-        if self._native is not None or self._parent is None:
-            return
+    def _native_images(self) -> Optional[Dict[str, TensorEntry]]:
+        """The parent's image tensors by array_id, read once per registration;
+        None when there is no parent. Called without the lock held: reading the
+        parent asks the registry, which takes its own."""
+        with self._lock:
+            native, generation = self._native, self._generation
+        if native is not None or self._parent is None:
+            return native
         parent = self._parent()
         if parent is None:
-            return
-        self._native = {
+            return None
+        native = {
             e.array_id: e
             for e in parent.list_tensors()
             if split_label_field(strip_source_prefix(self.source_id, e.array_id))
             is None
         }
+        with self._lock:
+            if self._generation == generation:
+                self._native = native
+        return native
+
+    def _images(self, native: Dict[str, TensorEntry]) -> Dict[str, TensorEntry]:
+        """What a set may bind to: the parent's images and the published
+        uploaded fields, by array_id. Caller holds the lock."""
+        images = dict(native)
+        for field, tensor in self._tensors.items():
+            if split_attached_field(field) is not None and is_published(tensor):
+                entry = catalog_entry(tensor.get_tensor_descriptor())
+                images[entry.array_id] = entry
+        return images
 
     def _image_of(
         self, field: str, images: Dict[str, TensorEntry]
@@ -269,23 +325,3 @@ class Attachments:
             desc.dim_labels, desc.shape, image.dim_labels, image.shape
         )
         return f"does not span its image: {why}" if why is not None else None
-
-    def _revalidate(self) -> None:
-        """Recompute the verdict on every label set. Caller holds the lock."""
-        sets = {f: t for f, t in self._tensors.items() if split_label_field(f)}
-        if not sets:
-            self._invalid = {}
-            return
-        images = self._images()
-        if self._native is None:  # no parent yet: the next rebind judges them
-            self._invalid = {}
-            return
-        invalid: Dict[str, str] = {}
-        for field, tensor in sets.items():
-            why = self._binding_error(field, tensor.get_tensor_descriptor(), images)
-            if why is None:
-                continue
-            invalid[field] = why
-            if self._invalid.get(field) != why:
-                logger.error(f"labels: {self.source_id}/{field} cannot be read: {why}")
-        self._invalid = invalid

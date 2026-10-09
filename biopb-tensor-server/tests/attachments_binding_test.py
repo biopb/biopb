@@ -123,6 +123,30 @@ class TestRebindJudgesTheSets:
         reg.register(SRC, _Parent(shape=(32, 32)))
         assert "does not span" in reg.attached_to(SRC).error(SET)
 
+    def test_unregistering_clears_the_verdict(self):
+        reg = SourceRegistry()
+        reg.register(SRC, _Parent(shape=(32, 32)))
+        reg.attach(SRC, SET, _set())
+        assert reg.attached_to(SRC).error(SET) is not None
+        reg.unregister(SRC)
+        assert reg.attached_to(SRC).error(SET) is None
+
+    def test_judging_a_set_does_not_keep_an_evictable_adapter_alive(self):
+        import gc
+        import weakref
+
+        reg = SourceRegistry()
+        parent = _Parent()
+        gone = weakref.ref(parent)
+        reg.register(SRC, parent, evictable=True)
+        reg.attach(SRC, SET, _set())  # reads the parent's images
+        assert reg.attached_to(SRC).error(SET) is None
+
+        reg.release_idle(0, now=float("inf"))
+        del parent
+        gc.collect()
+        assert gone() is None
+
 
 class TestASetBoundToAnUploadedField:
     def test_detaching_the_field_invalidates_the_set_and_attaching_heals_it(self):

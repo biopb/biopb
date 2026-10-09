@@ -24,7 +24,6 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
-    strip_source_prefix,
 )
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.normalize import is_canonical, log_reordering, unwrapped
@@ -167,7 +166,7 @@ class SourceRegistry:
         # Every route to a live adapter -- first registration, a refresh's swap,
         # the restore after a failed one, the rebuild after eviction -- ends
         # here, so this is where the attached tensors are judged against it.
-        self.attached_to(source_id).rebind()
+        self._rebind(source_id)
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
@@ -187,6 +186,7 @@ class SourceRegistry:
         with self._lock:
             slot = self._sources.pop(source_id, None)
         adapter = slot.adapter if slot is not None else None
+        self._rebind(source_id)  # no parent now: nothing is judged against a stale one
         close_adapter(adapter)
         logger.debug(f"Unregistered source: {source_id}")
         return adapter
@@ -300,6 +300,16 @@ class SourceRegistry:
                 )
             return attachments
 
+    def _rebind(self, source_id: str) -> None:
+        """Tell the source's attachments, if it has any, that its adapter moved.
+
+        Outside the registry lock: judging reads the parent back through
+        :meth:`get`."""
+        with self._lock:
+            attachments = self._attachments.get(source_id)
+        if attachments is not None:
+            attachments.rebind()
+
     def adopt(self, index: Dict[str, Dict[str, TensorAdapter]]) -> None:
         """Take the attached tensors a previous life left on disk, by source id.
 
@@ -378,8 +388,10 @@ class SourceRegistry:
         """
         adapter = adapter if adapter is not None else self.get(source_id)
         tensors = list(adapter.list_tensors()) if adapter is not None else []
-        for _, tensor in self.attached_to(source_id).listed():
-            tensors.append(catalog_entry(tensor.get_tensor_descriptor()))
+        attachments = self._attachments.get(source_id)
+        if attachments is not None:
+            for _, tensor in attachments.listed():
+                tensors.append(catalog_entry(tensor.get_tensor_descriptor()))
         return tensors
 
     def resolve_tensor(
@@ -393,8 +405,8 @@ class SourceRegistry:
         # An id under a marked segment that names nothing attached here is handed
         # to the format anyway rather than refused: a proxy's upstream may serve
         # it, and a format that cannot raises its own ``TensorNotFound``.
-        field = strip_source_prefix(source_id, tensor_id)
-        attached = self.attached_to(source_id).route(field)
+        attachments = self._attachments.get(source_id)
+        attached = attachments.route(tensor_id) if attachments is not None else None
         if attached is not None:
             return attached
         return adapter.get_tensor_adapter(tensor_id)
@@ -443,7 +455,7 @@ class SourceRegistry:
         with self._lock:
             self._sources = {sid: _Slot(a, False) for sid, a in mapping.items()}
         for sid in mapping:
-            self.attached_to(sid).rebind()
+            self._rebind(sid)
 
     def __contains__(self, source_id: str) -> bool:
         with self._lock:
