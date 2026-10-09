@@ -106,13 +106,18 @@ def capture_view(view: str, max_edge: int = 1024, timeout: float = 30.0) -> dict
     try:
         # The control answers within *timeout*; the margin keeps its verdict from
         # arriving as a socket timeout.
-        return _request(
+        got = _request(
             "POST",
             "/api/viewer/capture",
             {},
             timeout + 5,
             {"view": view, "max_edge": max_edge, "timeout": timeout},
         )
+        if not isinstance(got, dict) or not got.get("png"):
+            raise CaptureError("the control answered without an image")
+        return got
+    except ValueError as exc:  # a body that is not JSON
+        raise CaptureError("the control did not answer in JSON") from exc
     except urllib.error.HTTPError as exc:
         try:
             reason = json.loads(exc.read().decode()).get("error")

@@ -55,6 +55,9 @@ class ViewerBroker:
         self._parked: dict[str, asyncio.Future] = {}
         self._pending: dict[str, asyncio.Future] = {}
         self._arrived = asyncio.Event()
+        # One capture at a time: a tab is un-parked while it renders, so a second
+        # request would find no page and wrongly report that none is open.
+        self._one = asyncio.Lock()
         self._ids = itertools.count(1)
 
     def tab_count(self) -> int:
@@ -108,6 +111,11 @@ class ViewerBroker:
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        async with self._one:
+            return await self._capture(view, max_edge, deadline)
+
+    async def _capture(self, view: str, max_edge: int, deadline: float) -> Capture:
+        loop = asyncio.get_running_loop()
         tab = self._pick()
         if tab is None:
             # The instant between one poll ending and the next arriving.

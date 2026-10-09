@@ -234,6 +234,9 @@ def _session_proxy_roots(
 # (GET/HEAD/OPTIONS) don't.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
+#: What a viewer page's answer must open with.
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
 # exempted (biopb/biopb#424 item 2) because biopb._control._launch had no way
 # to obtain the token — the control handed back the plane's endpoint but never a
@@ -1362,12 +1365,15 @@ def build_app(
         body = await request.body()
         if len(body) > MAX_PNG_BYTES:
             return JSONResponse({"error": "image too large"}, status_code=413)
+        error = query.get("error")
+        if not error and not body.startswith(_PNG_SIGNATURE):
+            error = "the viewer page sent no image"
         ok = viewer.resolve(
             request.path_params["req"],
             body,
             partial=query.get("partial") == "1",
             notes=query.getlist("note"),
-            error=query.get("error"),
+            error=error,
         )
         return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
@@ -1378,8 +1384,12 @@ def build_app(
             view = str(payload["view"])
             max_edge = int(payload.get("max_edge", 1024))
             timeout = float(payload.get("timeout", 25))
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             return JSONResponse({"error": "view is required"}, status_code=400)
+        # Not NaN-safe by comparison alone: a NaN fails both bounds and lands on
+        # the default.
+        max_edge = max_edge if 16 <= max_edge <= 4096 else 1024
+        timeout = timeout if 0 < timeout <= 60 else 25.0
         try:
             got = await viewer.capture(view, max_edge, timeout)
         except ViewerUnavailable as exc:

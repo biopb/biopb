@@ -30,8 +30,9 @@ export function fitWithin(
 
 /** The query string of a request's `view`, which may be a whole address. */
 export function viewParams(view: string): URLSearchParams {
-  const q = view.includes("?") ? view.slice(view.indexOf("?") + 1) : view;
-  return new URLSearchParams(q.replace(/^\?/, ""));
+  const noFragment = view.split("#", 1)[0] ?? "";
+  const q = noFragment.includes("?") ? noFragment.slice(noFragment.indexOf("?") + 1) : noFragment;
+  return new URLSearchParams(q);
 }
 
 export type Readiness =

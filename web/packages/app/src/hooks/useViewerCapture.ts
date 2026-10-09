@@ -84,6 +84,9 @@ export function useViewerCapture(): { capturing: boolean; cancel: () => void } {
           query.append("note", "timed out waiting for tiles");
         }
         if (params.get("lb")) await new Promise((r) => setTimeout(r, LABEL_SETTLE_MS));
+        if (cancelled.current) throw new Error("cancelled by the user");
+        // A hidden tab does not repaint: what it holds is the frame from before.
+        if (document.visibilityState !== "visible") throw new Error("the viewer tab was hidden");
         const png = await readCanvas(job.max_edge);
         await answer(job.req, png, query);
       } catch (err) {

@@ -22,6 +22,10 @@ describe("viewParams", () => {
   });
 });
 
+it("viewParams drops a fragment", () => {
+  expect(viewParams("http://h/viewer?id=a&z=2#frag").get("z")).toBe("2");
+});
+
 describe("readiness", () => {
   const base = { status: "ready", error: null, planeReady: true, roisPending: 0 };
   it("is ready only when the target, the plane and the overlays have landed", () => {

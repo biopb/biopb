@@ -20,6 +20,8 @@ from .test_control_front import (
     web_bundle,  # noqa: F401 - fixture
 )
 
+_PNG = b"\x89PNG\r\n\x1a\n" + b"data"
+
 
 def _run(coro):
     return asyncio.run(coro)
@@ -131,7 +133,7 @@ def test_the_routes_carry_a_capture_end_to_end(control):  # noqa: F811
         polled["job"] = json.loads(body)
         _call(
             f"{control}/api/viewer/answer/{polled['job']['req']}?partial=1&note=hi",
-            data=b"\x89PNG",
+            data=_PNG,
             method="POST",
         )
 
@@ -150,7 +152,7 @@ def test_the_routes_carry_a_capture_end_to_end(control):  # noqa: F811
     assert status == 200 and polled["job"]["view"] == "id=a"
     import base64
 
-    assert base64.b64decode(answer["png"]) == b"\x89PNG"
+    assert base64.b64decode(answer["png"]) == _PNG
     assert answer["partial"] is True and answer["notes"] == ["hi"]
 
 
@@ -165,3 +167,46 @@ def test_a_capture_without_a_view_is_a_400(control):  # noqa: F811
     with pytest.raises(urllib.error.HTTPError) as exc:
         _call(f"{control}/api/viewer/capture", data=b"{}", method="POST")
     assert exc.value.code == 400
+
+
+def test_an_answer_that_is_not_a_png_fails_the_capture(control):  # noqa: F811
+    polled = {}
+
+    def page():
+        _, body = _call(f"{control}/api/viewer/next?client=t2")
+        polled["job"] = json.loads(body)
+        _call(
+            f"{control}/api/viewer/answer/{polled['job']['req']}",
+            data=b"",
+            method="POST",
+        )
+
+    thread = threading.Thread(target=page)
+    thread.start()
+    import time
+
+    time.sleep(0.3)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _call(f"{control}/api/viewer/capture", data=b'{"view": "id=a"}', method="POST")
+    thread.join(5)
+    assert exc.value.code == 504 and b"sent no image" in exc.value.read()
+
+
+def test_two_captures_in_a_row_share_one_tab():
+    async def go():
+        broker = ViewerBroker()
+
+        async def page():
+            for _ in range(2):
+                job = await broker.next("t", timeout=5)
+                await asyncio.sleep(0.2)
+                broker.resolve(job["req"], b"x")
+
+        poll = asyncio.create_task(page())
+        await asyncio.sleep(0.05)
+        first = asyncio.create_task(broker.capture("id=a", 64, timeout=5))
+        second = asyncio.create_task(broker.capture("id=b", 64, timeout=5))
+        assert (await first).png == b"x" and (await second).png == b"x"
+        await poll
+
+    _run(go())
