@@ -11,6 +11,8 @@
 #   docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
 #   docker compose -f biopb-image-runtime/docker-compose.yaml up
 
+# 3.12: the bundled tensor server needs it. The package itself runs on 3.10+
+# without the tensor server.
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app

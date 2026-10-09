@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.12']
+        python-version: ['3.10', '3.11', '3.12']
     steps:
       - uses: actions/checkout@v6
         with:
@@ -68,16 +68,16 @@ jobs:
           setup_only: true
           github_token: ${{ github.token }}
 
-      # biopb and biopb-tensor-server are NOT on PyPI. The biopb-image-base
-      # [test] extra requires biopb-tensor-server, so install it (and biopb)
-      # editable from source FIRST — that satisfies the requirement and stops
-      # pip from trying (and failing) to fetch it from PyPI. The Ops server
-      # the tests spawn as a subprocess needs biopb-tensor-server at runtime.
+      # biopb is NOT on PyPI; install it editable from source first. The
+      # tensor server (also not on PyPI) is optional for the runtime and needs
+      # Python 3.12; without it the tests that return results by reference skip.
       - name: Install Python packages
         run: |
           python -m pip install --upgrade pip setuptools
           pip install -e ".[tensor]"
-          pip install -e "./biopb-tensor-server"
+          if [[ "${{ matrix.python-version }}" == "3.12" ]]; then
+            pip install -e "./biopb-tensor-server"
+          fi
           pip install -e "./biopb-image-runtime[test]"
 
       - name: Run tests

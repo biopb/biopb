@@ -45,7 +45,6 @@ stitch = [
 test = [
   "pytest >= 7.0",
   "biopb[tensor]",
-  "biopb-tensor-server",
   "scipy",
 ]
 

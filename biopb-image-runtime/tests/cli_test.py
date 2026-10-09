@@ -1,6 +1,7 @@
 """CLI integration tests for the biopb image commands, against an Ops server
 (the ``ops_server`` fixture in conftest.py)."""
 
+import importlib.util
 import json
 import pickle
 import subprocess
@@ -8,7 +9,15 @@ from pathlib import Path
 
 import imageio
 import numpy as np
+import pytest
 from biopb.tensor.serialized_pb2 import SerializedTensor
+
+# A result returned by reference goes through the embedded tensor server, which
+# is optional.
+needs_tensor_server = pytest.mark.skipif(
+    importlib.util.find_spec("biopb_tensor_server") is None,
+    reason="biopb-tensor-server is not installed",
+)
 
 
 def _biopb(*args, text=True, timeout=60):
@@ -57,6 +66,7 @@ class TestImageCliCall:
         assert result.returncode == 0, result.stderr
         assert imageio.imread(str(output)).shape == (256, 256)
 
+    @needs_tensor_server
     def test_a_large_result_comes_back_by_reference(self, ops_server, tmp_path):
         # Over the 64 MB inline cap, so the server returns it through its
         # embedded tensor server.
@@ -76,6 +86,7 @@ class TestImageCliCall:
         assert result.returncode == 0, result.stderr
         assert SerializedTensor.FromString(result.stdout).location.startswith("grpc://")
 
+    @needs_tensor_server
     def test_a_reference_as_pickle(self, ops_server, tmp_path):
         result = _biopb(
             "call",
