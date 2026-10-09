@@ -11,7 +11,7 @@ upstream's own catalog.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from biopb_tensor_server.adapters.remote_tensor import (
     RemoteTensorAdapter,
@@ -47,8 +47,6 @@ class MirrorSet:
         self._is_claimed = is_claimed
         self._endpoint = _split_grpc_url(root.url)[0]
         self._adapters: Dict[str, RemoteTensorAdapter] = {}
-        # Seeded from a row whose catalog write failed: read again next time.
-        self._unwritten: Set[str] = set()
         self._rooted = False
 
     def relist(self, credentials_config: Optional[Any]) -> bool:
@@ -81,8 +79,7 @@ class MirrorSet:
             stale = sorted(
                 source_id
                 for source_id, adapter in self._adapters.items()
-                if source_id in self._unwritten
-                or not adapter.is_current(versions[desired[source_id]].indexed_at)
+                if not adapter.is_current(versions[desired[source_id]].indexed_at)
             )
             wanted = [desired[source_id] for source_id in new + stale]
             sizes = {up: versions[up].size for up in wanted}
@@ -103,18 +100,16 @@ class MirrorSet:
         return bool(added or removed)
 
     def _apply(self, rows: Sequence[dict], credentials: Any) -> int:
-        """Seed an adapter from each of *rows*, register the new ones and write
-        the catalog rows. Returns how many sources were added.
+        """Register the new sources among *rows*, write all their catalog rows
+        and re-seed the known ones. Returns how many sources were added.
 
-        A row's tensors are resolved the way a registration resolves them: the
-        adapter's own, which the row seeds, and whatever the registry holds
-        attached to the id. A failed write takes the new adapters back out and
-        marks the known ones to be read again, so the catalog and the registry
-        agree and the next tick tries again.
+        A failure leaves the catalog and the registry agreeing: the new adapters
+        come back out and nothing is re-seeded, so the next tick finds the same
+        sources new or stale and tries again.
         """
         alias = self.root.alias
         fresh: Dict[str, RemoteTensorAdapter] = {}
-        seeded: List[RemoteTensorAdapter] = []
+        known: List[Tuple[RemoteTensorAdapter, dict]] = []
         entries: List[MirroredRow] = []
         for row in rows:
             upstream_id = row["source_id"]
@@ -138,11 +133,10 @@ class MirrorSet:
                     credentials=credentials,
                     alias=alias,
                 )
+                self._seed(adapter, row)
                 fresh[source_id] = adapter
-            adapter.seed_catalog(
-                row.get("tensors"), row.get("source_url"), row.get("indexed_at")
-            )
-            seeded.append(adapter)
+            else:
+                known.append((adapter, row))
             entries.append(self._entry(adapter, row))
 
         registered: List[str] = []
@@ -162,14 +156,18 @@ class MirrorSet:
             )
             for source_id in registered:
                 self._server.unregister_source(source_id)
-            self._unwritten.update(
-                a.source_id for a in seeded if a.source_id not in fresh
-            )
             return 0
 
         self._adapters.update(fresh)
-        self._unwritten.difference_update(a.source_id for a in seeded)
+        for adapter, row in known:
+            self._seed(adapter, row)
         return len(fresh)
+
+    @staticmethod
+    def _seed(adapter: RemoteTensorAdapter, row: dict) -> None:
+        adapter.seed_catalog(
+            row.get("tensors"), row.get("source_url"), row.get("indexed_at")
+        )
 
     def _entry(self, adapter: RemoteTensorAdapter, row: dict) -> MirroredRow:
         """The catalog row of a mirror: the upstream's, with its ids made local.
@@ -185,14 +183,8 @@ class MirrorSet:
             row.get("metadata_json") or None,
             # An upstream predating the column has only resolved sources.
             bool(row.get("is_resolved", True)),
-            self._tensors(adapter, row),
+            adapter.local_tensor_rows(row.get("tensors")),
         )
-
-    def _tensors(self, adapter: RemoteTensorAdapter, row: dict) -> list:
-        """The ``tensors`` column of a seeded mirror."""
-        if self._metadata_db is None:
-            return adapter.local_tensor_rows(row.get("tensors"))
-        return self._metadata_db.tensor_rows(adapter.source_id, adapter)
 
     def _ensure_root(self) -> None:
         """Have the catalog know the root before a row sits under it."""
