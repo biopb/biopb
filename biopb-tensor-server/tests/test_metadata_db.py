@@ -51,9 +51,6 @@ class MockAdapter:
     def source_type(self):
         return self._source_type
 
-    def is_resolved(self):
-        return self._is_resolved
-
     def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -68,7 +65,10 @@ class MockAdapter:
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        return metadata_record({"test_key": "test_value", "nested": {"a": 1, "b": 2}})
+        return RegistrationRecord(
+            {"test_key": "test_value", "nested": {"a": 1, "b": 2}},
+            is_resolved=self._is_resolved,
+        )
 
 
 class TestMetadataDatabaseInit:
@@ -257,9 +257,6 @@ class MultiTensorAdapter:
     def source_type(self):
         return self._source_type
 
-    def is_resolved(self):
-        return self._is_resolved
-
     def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -268,7 +265,7 @@ class MultiTensorAdapter:
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        return metadata_record({})
+        return RegistrationRecord({}, is_resolved=self._is_resolved)
 
 
 class TestPerTensorCatalog:
@@ -916,16 +913,13 @@ class TestNoResidencyColumn:
         def catalog_url(self):
             return self._source_url
 
-        def is_resolved(self):
-            return False
-
         def list_tensors(self):
             return []  # nothing to say about shape or dtype yet
 
         def registration_record(
             self, tensors, *, import_rois=True, max_rois_per_tensor=None
         ) -> RegistrationRecord:
-            return metadata_record({})
+            return RegistrationRecord({}, is_resolved=False)
 
     def test_the_column_is_gone(self):
         import duckdb

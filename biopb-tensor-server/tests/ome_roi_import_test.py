@@ -424,9 +424,6 @@ class _FakeAdapter:
     def is_resident(self):
         return True
 
-    def is_resolved(self):
-        return True
-
     def list_tensors(self):
         return [
             TensorDescriptor(

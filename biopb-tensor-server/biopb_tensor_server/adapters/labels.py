@@ -397,11 +397,6 @@ def create_label_upload(
     why = unsafe_store_name(parsed.name)
     if why is not None:
         raise ValueError(f"{array_id!r}: the set's name {why}.")
-    if not parent.is_resolved():
-        raise ValueError(
-            f"{array_id!r}: source {parent.source_id!r} is not resolved, so "
-            f"there is no image extent to check a set against; resolve it first."
-        )
     if np.dtype(desc.dtype).kind != "u":
         raise ValueError(
             f"{array_id!r}: a label set is unsigned integer ids with 0 for "

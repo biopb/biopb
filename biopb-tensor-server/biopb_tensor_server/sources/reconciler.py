@@ -79,6 +79,7 @@ from biopb_tensor_server.sources.roots import Root, RootKind, Roots, path_under_
 from biopb_tensor_server.sources.source_registry import close_adapter
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.adapters.remote_tensor import MirrorSeed
     from biopb_tensor_server.core.config import (
         SourceConfig as _SourceConfig,  # noqa: F401
     )
@@ -1069,7 +1070,7 @@ class Reconciler:
     def _commit_add_claim(
         self,
         claim: SourceClaim,
-        catalog_seed: Optional[tuple] = None,
+        catalog_seed: Optional[MirrorSeed] = None,
         catalog_url: Optional[str] = None,
         keep_failed: bool = False,
     ) -> bool:
@@ -1284,6 +1285,7 @@ class Reconciler:
         current = the tensor-server claims already mirrored from this endpoint.
         """
         from biopb_tensor_server.adapters.remote_tensor import (
+            MirrorSeed,
             _split_grpc_url,
             close_upstream_client,
             fetch_upstream_rows,
@@ -1355,7 +1357,7 @@ class Reconciler:
             for rows in fetch_upstream_rows(client, wanted, sizes):
                 for row in rows:
                     source_id = namespaced_source_id(alias, row["source_id"])
-                    seed = self._row_to_seed(row)
+                    seed = MirrorSeed.from_row(row)
                     if source_id in added:
                         self._commit_add_claim(
                             SourceClaim(
@@ -1381,31 +1383,17 @@ class Reconciler:
         # Whether the mirrored set moved -- drives the adaptive re-list cadence.
         return bool(added or removed)
 
-    @staticmethod
-    def _row_to_seed(row: dict) -> tuple:
-        """(tensors, metadata, is_resolved, source_url, indexed_at) for
-        ``seed_catalog``."""
-        raw = row.get("metadata_json")
-        try:
-            metadata = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, TypeError, ValueError):
-            metadata = {}
-        return (
-            row.get("tensors") or [],
-            metadata,
-            # Whether that row describes a real source yet. True for an upstream
-            # predating the column.
-            bool(row.get("is_resolved", True)),
-            row.get("source_url"),
-            row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
-        )
-
     def _refresh_mirrored_source(
-        self, source_id: str, adapter: Any, seed: tuple
+        self, source_id: str, adapter: Any, seed: MirrorSeed
     ) -> None:
         """Re-seed an already-mirrored source and re-sync its catalog row if the
         seed changed (so a steady re-list does not churn ``indexed_at``)."""
-        if adapter.seed_catalog(*seed) and self._metadata_db is not None:
+        changed = seed.seed(adapter)
+        if self._metadata_db is None:
+            return
+        if changed or self._metadata_db.registration_differs(
+            source_id, seed.registration
+        ):
             try:
                 claim = self._state.claims.get(source_id)
                 record = (
@@ -1413,7 +1401,9 @@ class Reconciler:
                     if claim is not None
                     else None
                 )
-                self._metadata_db.sync_source_added(source_id, adapter, record)
+                self._metadata_db.sync_source_added(
+                    source_id, adapter, record, registration=seed.registration
+                )
             except Exception:
                 logger.warning(
                     "failed to refresh mirrored catalog row for %s",
@@ -1613,7 +1603,7 @@ class Reconciler:
     def _register_source_claim(
         self,
         claim: SourceClaim,
-        catalog_seed: Optional[tuple] = None,
+        catalog_seed: Optional[MirrorSeed] = None,
         catalog_url: Optional[str] = None,
         replace: bool = False,
         error_sink: Optional[List[str]] = None,
@@ -1647,9 +1637,8 @@ class Reconciler:
         and its catalog row deleted for the length of the rebuild, and gone for
         good if the rebuild then failed.
 
-        ``catalog_seed`` (biopb/biopb#266) is an optional
-        ``(tensors, metadata, is_resolved, source_url)`` tuple from a bulk upstream
-        ``query``; when the adapter supports it (the remote proxy), it is
+        ``catalog_seed`` (biopb/biopb#266) is an optional :class:`MirrorSeed` from a
+        bulk upstream ``query``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
         upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
         ``source_url`` on the adapter *before* register/sync so both ListFlights
@@ -1706,12 +1695,7 @@ class Reconciler:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata, is_resolved, source_url, indexed_at = (
-                        catalog_seed
-                    )
-                    adapter.seed_catalog(
-                        tensors, metadata, is_resolved, source_url, indexed_at
-                    )
+                    catalog_seed.seed(adapter)
         except UpstreamConfigError as e:
             if error_sink is not None:
                 error_sink.append(str(e))
@@ -1771,8 +1755,15 @@ class Reconciler:
             # the tensors.
             if self._metadata_db is not None:
                 if not from_payload:
+                    # A mirror's row is the upstream's: its registration comes
+                    # with the seed, not from the adapter.
                     self._metadata_db.sync_source_added(
-                        claim.source_id, adapter, record
+                        claim.source_id,
+                        adapter,
+                        record,
+                        registration=catalog_seed.registration
+                        if catalog_seed
+                        else None,
                     )
                     synced = True
                 else:
