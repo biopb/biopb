@@ -48,7 +48,7 @@ dependencies = [
   "zarr >= 3.0.8",  # the adapters mint zarr_format=2 stores (their .zattrs are read and written by hand)
   "dask[array] >= 2024.0.0",
   "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
-  "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FsspecStore
+  "fsspec >= 2024.12.0",  # remote sources (S3/GCS/HTTP); the zarr FsspecStore wraps a sync fs with AsyncFileSystemWrapper (2024.12+)
   # Lower bound: numpy-2 safe (older tifffile called the removed ndarray.newbyteorder).
   # 2025.5.21 is the first release whose aszarr() store zarr 3 accepts.
   "tifffile >= 2025.5.21",
