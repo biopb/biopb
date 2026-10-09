@@ -31,6 +31,7 @@ from biopb_tensor_server.adapters.remote_tensor import (
     open_upstream_client,
     resolve_upstream_credentials,
 )
+from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
 from biopb_tensor_server.sources.resolve import namespaced_source_id
 from biopb_tensor_server.sources.roots import Root
@@ -63,7 +64,7 @@ class MirrorSet:
         # all a mirror needs besides its catalog row to be rebuilt.
         self._versions: Dict[str, Tuple[str, object]] = {}
         # The rows themselves, for a set with no catalog to read them back from.
-        self._held: Dict[str, Tuple[str, List[dict]]] = {}
+        self._held: Dict[str, Tuple[str, List[dict], bool]] = {}
         self._credentials: Any = None
         self._build_lock = threading.Lock()
 
@@ -87,6 +88,10 @@ class MirrorSet:
         """Give a mirror its adapter, from the row the catalog holds. Returns whether
         the source has one: False for an id this set does not mirror.
 
+        Whether the source is resolved is the row's to say, and the adapter does not
+        change it: a row the upstream has not resolved gets no adapter, and the read
+        is refused as unresolved.
+
         Single-flight, and the adapter is registered evictable, so an idle one is
         let go of and built again by the next read.
         """
@@ -102,7 +107,12 @@ class MirrorSet:
                 row = self._held.get(source_id)
             if row is None:
                 return False
-            url, tensors = row
+            url, tensors, resolved = row
+            if not resolved:
+                raise SourceUnresolvedError(
+                    f"source {source_id!r} is not resolved on its upstream "
+                    f"{self._endpoint}"
+                )
             upstream_id, indexed_at = entry
             adapter = RemoteTensorAdapter(
                 source_id,
@@ -185,7 +195,7 @@ class MirrorSet:
         versions: Dict[str, Tuple[str, object]] = {}
         by_source: Dict[str, dict] = {}
         entries: List[MirroredRow] = []
-        held: Dict[str, Tuple[str, List[dict]]] = {}
+        held: Dict[str, Tuple[str, List[dict], bool]] = {}
         added = 0
         for row in rows:
             upstream_id = row["source_id"]
@@ -205,7 +215,11 @@ class MirrorSet:
             versions[source_id] = (upstream_id, row.get("indexed_at"))
             by_source[source_id] = row
             if self._metadata_db is None:
-                held[source_id] = (self._url(upstream_id, row), entry.tensors)
+                held[source_id] = (
+                    self._url(upstream_id, row),
+                    entry.tensors,
+                    entry.is_resolved,
+                )
 
         if self._metadata_db is not None and entries:
             try:

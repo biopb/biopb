@@ -2905,6 +2905,12 @@ def test_an_idle_mirror_is_let_go_and_built_again_at_the_same_version(
             assert manager.unregistered_sources() == 0
             assert len(proxy.sources) + manager.unregistered_sources() == 1
 
+            # Resolving a mirror that has no adapter builds it too.
+            assert manager.resolve_source("lab__img", lambda path: None) is True
+            assert proxy.sources.get("lab__img") is not None
+            assert proxy.sources.release_idle(0.0, now=1e12) == 1
+            gc.collect()
+
             again = proxy.sources.get_registered("lab__img")
 
             assert again.content_version == version and again.catalog_url == url
@@ -3120,6 +3126,15 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             resolved, tensors = _row()
             assert resolved is False  # unresolved mirror, not advertised readable
             assert tensors == []
+
+            # A read is refused as unresolved: the row says so, and the read does
+            # not change it by giving the source an adapter.
+            from biopb_tensor_server.core.errors import SourceUnresolvedError
+
+            with pytest.raises(SourceUnresolvedError):
+                proxy.sources.get_registered("lab__cloud")
+            assert proxy.sources.get("lab__cloud") is None
+            assert _row() == (False, [])
 
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(

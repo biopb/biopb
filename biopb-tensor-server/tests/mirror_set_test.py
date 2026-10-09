@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from biopb_tensor_server.adapters.remote_tensor import UpstreamVersion
 from biopb_tensor_server.core.config import SourceConfig
+from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
 from biopb_tensor_server.sources import mirror as mirror_module
 from biopb_tensor_server.sources.mirror import MirrorSet
@@ -289,6 +290,19 @@ class TestMirrorSet:
         assert mirrors.unbuilt() == 0
         assert mirrors.materialize("lab__a") is True
         assert server.sources["lab__a"] is adapter  # not built twice
+
+    def test_a_row_the_upstream_has_not_resolved_gets_no_adapter(self, upstream):
+        upstream.put("a", resolved=False)
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        assert _row(db, "lab__a")["is_resolved"] is False
+
+        with pytest.raises(SourceUnresolvedError):
+            mirrors.materialize("lab__a")
+
+        assert server.sources == {}
+        assert _row(db, "lab__a")["is_resolved"] is False  # the row's to say
 
     def test_an_id_the_set_does_not_mirror_is_not_built(self, upstream):
         mirrors, server = _mirrors(MetadataDatabase())
