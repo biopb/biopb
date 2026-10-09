@@ -293,7 +293,8 @@ class Reconciler:
         """Sources in the catalog whose registration has not completed, failed
         ones included."""
         with self._lock:
-            return len(self._pending)
+            pending = len(self._pending)
+        return pending + sum(m.unbuilt() for m in list(self._mirrors.values()))
 
     def is_pending(self, source_id: str) -> bool:
         # A dict membership test is atomic, so this takes no lock: it is asked
@@ -690,6 +691,10 @@ class Reconciler:
         resolved, so a read rebuilds the adapter here, once (the registration
         is single-flight), instead of asking a client to resolve it.
         """
+        for mirrors in list(self._mirrors.values()):
+            if mirrors.owns(source_id):
+                mirrors.materialize(source_id)
+                return
         with self._lock:
             restored = source_id in self._restored
         if (restored or not self.is_pending(source_id)) and self.ensure_registered(
