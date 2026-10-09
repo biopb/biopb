@@ -1232,7 +1232,8 @@ async def start_kernel() -> str:
     it -- a ready kernel is a no-op.
 
     It BLOCKS until the kernel is ready (or the bring-up fails), so on return
-    you can use execute_code / take_screenshot / inspect_object directly, with
+    you can use execute_code / inspect_object directly (and take_screenshot where
+    there is a napari viewer), with
     no polling.
 
     It is also the recovery path: after a failed start, a dead kernel, or the
