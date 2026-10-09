@@ -28,7 +28,7 @@ answer -- and the matrix is sparse (3.10 and 3.11 on Linux only), so 4 of 9
 combinations are unscreened. Worse, each cell runs pytest independently, so
 "failed on 1 of 5" is not knowable anywhere, which is what made all-or-nothing
 the only rule the old shape could express. `compile` resolves for an interpreter
-and platform that are not present, so all nine run from one job, in one process,
+and platform that are not present, so every cell runs from one job, in one process,
 where a per-cell verdict can actually be rendered. About a second a cell.
 
 **`--only-binary`, scoped to the declared package.** Refusing an sdist is the
@@ -66,15 +66,15 @@ from .conftest import (
 
 # What a user installs, resolved from this checkout rather than from PyPI: the
 # published biopb-mcp yields napari 0.8.0 where the source pins napari[all]
-# 0.7.0, so PyPI would answer for the last release instead of this branch. The
+# 0.9.2, so PyPI would answer for the last release instead of this branch. The
 # SDK comes from the checkout too, as the installer ships it paired with mcp.
 REPO = Path(__file__).resolve().parents[5]
 WORKSPACE = REPO / "biopb-mcp"
 
-# What `install.sh` accepts (MIN_MINOR/MAX_MINOR), crossed with the three
-# platforms the catalog ships to. Nine cells, not the CI matrix's five: there is
-# no reason to leave macOS-3.10 unscreened when the answer costs a second.
-PYTHONS = ("3.10", "3.11", "3.12")
+# The interpreters biopb-mcp's `requires-python` admits, crossed with the three
+# platforms the catalog ships to. Nine cells, not the CI matrix's: there is no
+# reason to leave macOS-3.14 unscreened when the answer costs a second.
+PYTHONS = ("3.12", "3.13", "3.14")
 PLATFORMS = ("linux", "macos", "windows")
 
 _WORKSPACE_DISTS = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}

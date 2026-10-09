@@ -486,6 +486,7 @@ def test_gzip_only_integer_outputs_off_loopback():
 @pytest.fixture
 def plane(tmp_path: Path):
     """A writable tensor server with its scratch source, as the control runs."""
+    pytest.importorskip("biopb_tensor_server")
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
@@ -570,6 +571,7 @@ def test_ambient_scheduler_detects_a_distributed_client():
 
 
 def test_embedded_sink(tmp_path: Path, monkeypatch):
+    pytest.importorskip("biopb_tensor_server")
     import biopb_image_base.ops as ops
     from biopb_image_base.server import start_embedded_cache
     from biopb_tensor_server.cache import CacheManager

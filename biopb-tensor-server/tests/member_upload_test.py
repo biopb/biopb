@@ -229,7 +229,7 @@ class TestWhatItRefuses:
         import zarr
 
         store = tmp_path / "theirs.zarr"
-        zarr.create(store=zarr.DirectoryStore(str(store)), shape=(4, 4), dtype="uint16")
+        zarr.create_array(str(store), shape=(4, 4), dtype="uint16", zarr_format=2)
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
         adapter = ZarrAdapter(zarr.open_array(str(store), mode="r"), "theirs")

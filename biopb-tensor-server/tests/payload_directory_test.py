@@ -72,7 +72,7 @@ class TestOmeZarrImage:
             opens=[
                 (zarr, "open_array"),
                 (zarr, "open_group"),
-                (zarr, "DirectoryStore"),
+                (zarr.storage, "LocalStore"),
             ],
         )
 
@@ -191,7 +191,7 @@ class TestOmeZarrPlate:
             opens=[
                 (zarr, "open_array"),
                 (zarr, "open_group"),
-                (zarr, "DirectoryStore"),
+                (zarr.storage, "LocalStore"),
                 (OmeZarrAdapter, "_read_zattrs_at"),
                 (ome_zarr.json, "load"),
             ],

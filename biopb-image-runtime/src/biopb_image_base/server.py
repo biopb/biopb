@@ -1,6 +1,7 @@
 """The embedded tensor cache: a server returns large results through its own
 TensorFlight server, from a file-based cache with a TTL."""
 
+import importlib.util
 import logging
 import os
 import re
@@ -431,9 +432,16 @@ def start_embedded_cache(
 ) -> Optional[EmbeddedTensorCache]:
     """Start the embedded tensor server a remote deployment returns results through.
 
-    Answers ``None`` where pyarrow cannot run, so the server serves inline
-    results only.
+    Answers ``None`` where pyarrow cannot run or ``biopb-tensor-server`` is not
+    installed, so the server serves inline results only.
     """
+    if importlib.util.find_spec("biopb_tensor_server") is None:
+        logger.warning(
+            "biopb-tensor-server is not installed; only eager image data is "
+            "supported and lazy (dask) input/output will be rejected."
+        )
+        return None
+
     if not _pyarrow_available():
         # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
         # unavailable. Do not start the tensor server -- it would crash. Lazy

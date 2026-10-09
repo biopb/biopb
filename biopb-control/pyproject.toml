@@ -17,13 +17,13 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-# Match the rest of the stack (biopb / biopb-tensor-server / biopb-mcp are all
-# >=3.10,<3.13). The control is deliberately lean: it *supervises* the durable
+# Match the rest of the stack (biopb-tensor-server and biopb-mcp are both
+# >=3.12,<3.15). The control is deliberately lean: it *supervises* the durable
 # planes as subprocesses and never imports them. Its deps are the
 # dependency-light core SDK (for the shared control-endpoint location,
 # biopb._endpoints) plus a light ASGI stack for the Layer-3 single-origin
@@ -31,7 +31,7 @@ classifiers = [
 # httpx reverse-proxies the supervised tensor server's HTTP sidecar.
 # None of these drag in napari / dask / Qt / pyarrow / tensor-server / mcp, so
 # the lean-control discipline holds.
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     # The algorithm Ops protocol (biopb.image); .dev0 admits a pre-tag dev build.
     "biopb >= 0.11.1",

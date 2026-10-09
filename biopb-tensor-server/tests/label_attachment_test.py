@@ -57,10 +57,13 @@ def _write_label_group(
     array_attrs=None,
 ):
     """An NGFF label image at *group*: ``levels`` arrays plus its ``.zattrs``."""
-    g = zarr.open_group(str(group), mode="w")
+    g = zarr.open_group(str(group), mode="w", zarr_format=2)
     for i in range(levels):
-        arr = g.create_dataset(
-            str(i), shape=tuple(s >> i for s in shape), chunks=CHUNK, dtype=dtype
+        arr = g.create_array(
+            str(i),
+            shape=tuple(s >> i for s in shape),
+            chunks=(1,) * (len(shape) - len(CHUNK)) + CHUNK,
+            dtype=dtype,
         )
         arr[:] = fill if i == 0 else fill + i
         if array_attrs:

@@ -15,6 +15,9 @@ from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_image_base.server import RESULT_TTL_S, EmbeddedTensorCache
 
+# The embedded cache is an optional runtime piece: the tests need the server.
+pytest.importorskip("biopb_tensor_server")
+
 
 def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

@@ -402,7 +402,20 @@ def _describe(tool):
     description = tool.description or ""
     if tool.name != "execute_code":
         return description
-    return description.replace(_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH)
+    # Python 3.13 strips a docstring's indentation at compile time, so the
+    # paragraph is also matched in its unindented form.
+    for old, new in (
+        (_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH),
+        (_unindent(_server.PROMOTE_PARAGRAPH), _unindent(_CHAT_RUN_PARAGRAPH)),
+    ):
+        if old in description:
+            return description.replace(old, new)
+    return description
+
+
+def _unindent(paragraph):
+    """*paragraph* with the four-space docstring indent off its continuation lines."""
+    return paragraph.replace("\n    ", "\n")
 
 
 async def tool_payload():

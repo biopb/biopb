@@ -564,14 +564,14 @@ def get(
                 )
 
         elif fmt == "zarr":
-            # Zarr format: realized array. Import lazily so that a missing or
-            # broken zarr/numcodecs install only affects this output format
-            # rather than the whole CLI.
+            # Zarr format: realized array. zarr is not a dependency of the SDK;
+            # import it here so a missing or broken install only affects this
+            # output format rather than the whole CLI.
             try:
                 import zarr
             except ImportError as exc:
                 raise typer.BadParameter(
-                    f"zarr output requires the 'zarr' package (install biopb[tensor]): {exc}"
+                    f"zarr output requires the 'zarr' package (pip install zarr): {exc}"
                 )
 
             arr = client.get_tensor(array_id, slice_hint=selection)

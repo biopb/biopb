@@ -55,7 +55,7 @@ BIOPB_PINNED_RELEASE=""
 # each release's versions.json as `install_schema`; a release declaring another,
 # or none, is refused with a pointer to the installer shipped alongside it. Bump
 # it when a change to the release makes an earlier installer wrong for it.
-INSTALL_SCHEMA=2
+INSTALL_SCHEMA=3
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -1333,15 +1333,15 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/7] Ensuring Python..."
 
-    # biopb-mcp (always installed) requires Python >= 3.10.
-    MIN_MINOR=10
+    # biopb-mcp (always installed) requires Python >= 3.12.
+    MIN_MINOR=12
 
-    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
-    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
-    # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
-    # libCZI), which fails on a fresh machine without a C++ toolchain. If the
-    # system Python is newer we fall back to a uv-managed 3.12 below.
+    # Upper bound: the packages run on 3.12-3.14, but this is the interpreter the
+    # installer is tested with, and the default `czi` extra pulls the CZI reader
+    # (aicspylibczi), which ships no cp314 wheel yet — on 3.14 pip would build it
+    # from source (cmake + libCZI), which fails on a fresh machine without a C++
+    # toolchain. If the system Python is newer we fall back to a uv-managed 3.12
+    # below.
     MAX_MINOR=12
 
     # PYTHON_SPEC is the interpreter we hand to `uv tool install` below via --python.
@@ -1371,7 +1371,7 @@ install_biopb() {
                     PYTHON_VERSION=""
                 fi
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
-                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (the installer is tested with 3.$MAX_MINOR; the CZI reader has no 3.14 wheel yet)"
                 PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"

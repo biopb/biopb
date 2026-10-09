@@ -132,7 +132,7 @@ def generate_synthetic_hcs_plate(
     zarr_path = Path(path) / "plate.ome.zarr"
     zarr_path.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
     well_names = []
 
     # Create plate metadata
@@ -248,7 +248,7 @@ def generate_multiresolution_zarr(
     zarr_path = Path(path) / "pyramid.ome.zarr"
     zarr_path.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
     level_shapes = []
     datasets = []
 

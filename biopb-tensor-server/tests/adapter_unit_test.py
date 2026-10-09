@@ -869,8 +869,8 @@ class TestGetPhysicalScale:
         import zarr
 
         zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-        root = zarr.open_group(zarr_path, mode="w")
-        root.create_dataset("0", shape=shape, chunks=chunks, dtype="uint8")
+        root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+        root.create_array("0", shape=shape, chunks=chunks, dtype="uint8")
         with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
             json.dump(zattrs, f)
         root = zarr.open_group(zarr_path, mode="r")
@@ -1620,12 +1620,12 @@ class TestOmeZarrPrecompute:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create OME-Zarr structure with multiscales
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
             # Create level arrays
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
-            root.create_dataset("2", shape=(25, 25), chunks=(12, 12), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("2", shape=(25, 25), chunks=(12, 12), dtype="uint8")
 
             # Create .zattrs with multiscales
             zattrs = {
@@ -1682,13 +1682,13 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
             # Create and populate level arrays
-            arr0 = root.create_dataset(
+            arr0 = root.create_array(
                 "0", shape=(100, 100), chunks=(50, 50), dtype="uint8"
             )
-            arr1 = root.create_dataset(
+            arr1 = root.create_array(
                 "1", shape=(50, 50), chunks=(25, 25), dtype="uint8"
             )
             arr0[:] = 1
@@ -1754,10 +1754,10 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
 
             zattrs = {
                 "multiscales": [
@@ -1809,10 +1809,10 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
 
             zattrs = {
                 "multiscales": [
@@ -2303,11 +2303,13 @@ class TestOmeZarrStorePathResolution:
             def __repr__(self):
                 return self._repr
 
-        # file:// URL wins over everything (checked first, as __init__ did).
-        assert _store_filesystem_path(_Store("file:///data/p.zarr")) == "/data/p.zarr"
-        # zarr 2: DirectoryStore / FSStore expose .path
-        assert _store_filesystem_path(_Store("<DirectoryStore>", path="/d/a")) == "/d/a"
-        # zarr 3: LocalStore exposes .root -- the case _open_level_array omitted
+        # A store with no path or root falls back to parsing its file:// URL.
+        assert Path(_store_filesystem_path(_Store("file:///data/p.zarr"))) == Path(
+            "/data/p.zarr"
+        )
+        # FsspecStore exposes .path
+        assert _store_filesystem_path(_Store("<FsspecStore>", path="/d/a")) == "/d/a"
+        # LocalStore exposes .root and no .path
         assert _store_filesystem_path(_Store("<LocalStore>", root="/d/b")) == "/d/b"
         # Nothing recognizable: the repr, same degraded behaviour as before.
         assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
@@ -2327,9 +2329,9 @@ class TestOmeZarrStorePathResolution:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
-            root.create_dataset("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
-            root.create_dataset("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+            root.create_array("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
+            root.create_array("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
             zattrs = {
                 "multiscales": [
                     {

@@ -24,11 +24,9 @@ platform wheels for other platforms but none compatible with the target -- the
 cryptography-49 shape. Pure-Python packages (a ``py3-none-any`` wheel, or no wheel
 at all) are ignored.
 
-Limitation: matching is by platform tag only, not by Python-version tag; a package
-whose only target-platform wheels are for a different Python version is not
-flagged. In practice uv has already proven a target-compatible dist exists (the
-resolve succeeded), so this only misses the rare "wheel exists but for another
-interpreter" case.
+A wheel counts only if its interpreter tags also fit ``--python-version``: a
+pure-Python tag (``py3``), the exact ``cpXY``, or an ``abi3`` wheel built for that
+minor or an earlier one.
 """
 
 from __future__ import annotations
@@ -75,6 +73,18 @@ def installer_requirements(target: str) -> list[str]:
 _INSTALL_SH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "install.sh"
 )
+
+_MAX_MINOR = re.compile(r"^\s*MAX_MINOR=(\d+)\s*$", re.M)
+
+
+def installer_python_version(install_sh: str = _INSTALL_SH) -> str:
+    """The interpreter install.sh installs on (``3.12``): its MAX_MINOR."""
+    with open(install_sh, encoding="utf-8") as fh:
+        match = _MAX_MINOR.search(fh.read())
+    if match is None:
+        raise SystemExit(f"no MAX_MINOR= in {install_sh}")
+    return f"3.{match.group(1)}"
+
 
 # The single `printf ... > "$WHEELS_DIR/overrides.txt"` install.sh writes its
 # --overrides file with.
@@ -189,11 +199,25 @@ def resolve(target: str, python_version: str) -> dict[str, str]:
     return pinned
 
 
-def wheel_platform_tags(name: str, version: str) -> dict | None:
+def interpreter_fits(python_tag: str, abi_tag: str, python_version: str) -> bool:
+    """Whether a wheel's python/abi tags can run on ``python_version`` (``3.12``)."""
+    minor = int(python_version.split(".")[1])
+    for py in python_tag.split("."):
+        if py.startswith("py"):
+            return True
+        if py.startswith("cp3"):
+            built = int(py[3:])
+            if built == minor or (built < minor and "abi3" in abi_tag.split(".")):
+                return True
+    return False
+
+
+def wheel_platform_tags(name: str, version: str, python_version: str) -> dict | None:
     """Fetch the wheel platform tags for ``name==version`` from PyPI.
 
-    Returns {"has_any": bool, "tags": [platform-tag, ...]}, or None if the package
-    is not on PyPI (a local/unpublished package -> nothing to check).
+    Returns {"has_any": bool, "has_wheel": bool, "tags": [platform-tag, ...]}, or
+    None if the package is not on PyPI (a local/unpublished package -> nothing to
+    check). ``tags`` holds only the wheels that fit ``python_version``.
     """
     url = f"https://pypi.org/pypi/{name}/{version}/json"
     try:
@@ -205,25 +229,29 @@ def wheel_platform_tags(name: str, version: str) -> dict | None:
         raise
     tags: list[str] = []
     has_any = False
+    has_wheel = False
     for f in data.get("urls", []):
         fn = f.get("filename", "")
         if not fn.endswith(".whl"):
             continue
-        # wheel = name-version[-build]-python-abi-platform.whl; the platform field
-        # (last) may be a '.'-joined set of tags.
-        platform_field = fn[:-4].rsplit("-", 1)[-1]
+        # wheel = name-version[-build]-python-abi-platform.whl; each of the last
+        # three fields may be a '.'-joined set of tags.
+        python_tag, abi_tag, platform_field = fn[:-4].split("-")[-3:]
+        has_wheel = True
+        if not interpreter_fits(python_tag, abi_tag, python_version):
+            continue
         for tag in platform_field.split("."):
             if tag == "any":
                 has_any = True
             tags.append(tag)
-    return {"has_any": has_any, "tags": tags}
+    return {"has_any": has_any, "has_wheel": has_wheel, "tags": tags}
 
 
-def missing_wheel(name: str, version: str, compatible) -> bool:
-    info = wheel_platform_tags(name, version)
+def missing_wheel(name: str, version: str, compatible, python_version: str) -> bool:
+    info = wheel_platform_tags(name, version, python_version)
     if info is None:  # local / not on PyPI
         return False
-    if not info["tags"]:  # sdist-only pure Python -> builds anywhere
+    if not info["has_wheel"]:  # sdist-only pure Python -> builds anywhere
         return False
     if info["has_any"]:  # py3-none-any wheel -> installable everywhere
         return False
@@ -233,7 +261,11 @@ def missing_wheel(name: str, version: str, compatible) -> bool:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", required=True, choices=sorted(TARGETS))
-    ap.add_argument("--python-version", default="3.12")
+    ap.add_argument(
+        "--python-version",
+        default=installer_python_version(),
+        help="default: the interpreter install.sh installs on (its MAX_MINOR)",
+    )
     args = ap.parse_args()
 
     compatible = TARGETS[args.target]
@@ -249,7 +281,10 @@ def main() -> None:
             for (n, v), bad in zip(
                 pinned.items(),
                 pool.map(
-                    lambda kv: missing_wheel(kv[0], kv[1], compatible), pinned.items()
+                    lambda kv: missing_wheel(
+                        kv[0], kv[1], compatible, args.python_version
+                    ),
+                    pinned.items(),
                 ),
                 strict=True,
             )

@@ -122,7 +122,7 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 $script:BiopbPinnedRelease = ''
 
 # Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
-$script:InstallSchema = 2
+$script:InstallSchema = 3
 
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
@@ -1373,10 +1373,10 @@ function Invoke-BiopbInstall {
     # The download is ~30 MB and cached, and uv and the wheels already need the
     # network.
     #
-    # 3.12 is the ceiling: the biopb packages declare requires-python
-    # ">=3.10,<3.13", and the CZI reader (pylibczirw / aicspylibczi) has no cp313
-    # wheel, so 3.13 would build it from source (cmake + libCZI + MSVC) on a fresh
-    # Windows box. $pythonSpec is what `uv tool install --python` gets below;
+    # 3.12 is the interpreter the installer is tested with: the biopb packages
+    # run on 3.12-3.14, but the CZI reader (aicspylibczi) has no cp314 wheel, so
+    # 3.14 would build it from source (cmake + libCZI + MSVC) on a fresh Windows
+    # box. $pythonSpec is what `uv tool install --python` gets below;
     # pinning it keeps uv from discovering a system Python of its own.
     #
     # install.sh deliberately still prefers a system python3 in range: a POSIX box

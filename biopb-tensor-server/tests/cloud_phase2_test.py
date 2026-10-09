@@ -1574,9 +1574,9 @@ class TestZarrOmeZarrPriority:
         import zarr
 
         store = tmp_path / "img.zarr"
-        g = zarr.open_group(str(store), mode="w")
+        g = zarr.open_group(str(store), mode="w", zarr_format=2)
         g.attrs["multiscales"] = [{"datasets": [{"path": "0"}]}]
-        g.create_dataset("0", shape=(4, 4), chunks=(4, 4), dtype="uint8")
+        g.create_array("0", shape=(4, 4), chunks=(4, 4), dtype="uint8")
 
         claims = self._registry().get_claims_for_path(
             ClaimContext(store), DiscoveryState()

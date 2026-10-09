@@ -78,11 +78,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            python-version: '3.10'
-          - os: ubuntu-latest
-            python-version: '3.11'
-          - os: ubuntu-latest
             python-version: '3.12'
+          - os: ubuntu-latest
+            python-version: '3.13'
+          - os: ubuntu-latest
+            python-version: '3.14'
           - os: macos-latest
             python-version: '3.12'
           - os: windows-latest
@@ -120,10 +120,20 @@ jobs:
           # no runner is Intel macOS.
           # All platforms incl. Windows, so the ndtiff path-resolution
           # assertion is exercised cross-platform too.
-          pip install -e "./biopb-tensor-server[test,aics,czi,medical,ndtiff,em]"
+          # 3.14 has no aicspylibczi wheel, so it runs without [czi] and without
+          # the tests that need the CZI reader.
+          if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
+            pip install -e "./biopb-tensor-server[test,aics,medical,ndtiff,em]"
+          else
+            pip install -e "./biopb-tensor-server[test,aics,czi,medical,ndtiff,em]"
+          fi
 
       - name: Run Python tests
-        run: pytest --timeout=300 --timeout-method=thread biopb-tensor-server/tests/
+        run: |
+          if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
+            deselect=(-k "not czi")
+          fi
+          pytest --timeout=300 --timeout-method=thread "${deselect[@]}" biopb-tensor-server/tests/
 
   # CI build: verify the wheels + Docker image compile. Never pushes — the actual
   # publish is the publish job below on `release-v*`. The uploaded artifacts are a
@@ -142,7 +152,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Setup buf
         uses: bufbuild/buf-action@v1

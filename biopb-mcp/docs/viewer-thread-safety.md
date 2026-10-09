@@ -62,7 +62,7 @@ asserts every reachable handle is wrapped, following **public attribute
 access** — fields plus properties — because that is what agent code has,
 and a field-only walk misses the overlays for the reason above. A future
 napari that adds a model or list method **breaks CI, not production**; the
-pinned `napari[all]==0.7.0` (`versions.json`) means the test certifies
+pinned `napari[all]==0.9.2` (`versions.json`) means the test certifies
 exactly the graph that ships.
 
 ## Gotchas
