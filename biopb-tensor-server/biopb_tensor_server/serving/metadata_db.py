@@ -59,6 +59,7 @@ from typing import (
     Iterable,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -185,6 +186,18 @@ def _confirmation_view_ddl(run_epoch: int) -> str:
         "AS confirmed "
         "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id"
     )
+
+
+class MirroredRow(NamedTuple):
+    """A mirrored source's row as :meth:`MetadataDatabase.sync_mirrored_rows` takes
+    it: the upstream's, with the ids already local. ``rel`` is the path beneath
+    the upstream's root."""
+
+    source_id: str
+    rel: str
+    metadata_json: Optional[str]
+    is_resolved: bool
+    tensors: List[Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -1475,8 +1488,7 @@ class MetadataDatabase:
                 adapter's ``catalog_payload`` when it is resolved and has one;
                 without one the row's claim, if it has one, is left as it was.
             registration: What the row holds besides its tensors, from a caller
-                that already has it -- a mirror's is the upstream row, which the
-                adapter never holds. Without one the adapter builds it
+                that already has it. Without one the adapter builds it
                 (:meth:`SourceAdapter.registration_record`).
         """
         conn = self._get_connection()
@@ -1570,29 +1582,72 @@ class MetadataDatabase:
 
         logger.debug(f"Synced source to metadata database: {source_id}")
 
-    def registration_differs(
-        self, source_id: str, registration: RegistrationRecord
-    ) -> bool:
-        """Whether the row holds other metadata or another ``is_resolved`` than
-        *registration*, or no row at all.
+    # What makes a mirrored row worth writing again: any column the upstream's
+    # row decides. ``indexed_at`` is the write's own clock and is not one.
+    _MIRROR_CHANGED = " OR ".join(
+        f"source_catalog.{c} IS DISTINCT FROM excluded.{c}"
+        for c in (
+            "source_type",
+            "metadata_json",
+            "is_resolved",
+            "tensors",
+            "root_id",
+            "rel",
+        )
+    )
 
-        What a mirror's re-list asks before rewriting a row: the row is the only
-        place its metadata lives, so it is the one to compare against.
+    def sync_mirrored_rows(
+        self, root_id: str, source_type: str, rows: Sequence[MirroredRow]
+    ) -> None:
+        """Write *rows*, mirrored from an upstream, in one transaction.
+
+        The rows are the upstream's own: nothing is read off an adapter or
+        re-encoded, so ``metadata_json`` goes in as the upstream wrote it. A row
+        already there with the same content is left alone, ``indexed_at``
+        included, so a steady re-list of an unversioned upstream does not churn
+        the catalog. The root must be known (:meth:`ensure_root`).
         """
-        found = (
-            self._get_cursor()
-            .execute(
-                "SELECT is_resolved, metadata_json FROM sources WHERE source_id = ?",
-                [source_id],
+        if not rows:
+            return
+        conn = self._get_connection()
+        now = datetime.now()
+        statements = []
+        for i in range(0, len(rows), self._PENDING_CHUNK):
+            chunk = rows[i : i + self._PENDING_CHUNK]
+            params: List[Any] = []
+            for r in chunk:
+                params += [
+                    r.source_id,
+                    source_type,
+                    now,
+                    r.metadata_json,
+                    r.is_resolved,
+                    None,  # a mirror's reason is the upstream's, and is_resolved says it
+                    r.tensors,
+                    None,
+                ]
+                params += self._placement(
+                    CatalogRecord(None, {}, root_id, r.rel), r.rel, None, now
+                )
+            width = len(params) // len(chunk)
+            statements.append(
+                (
+                    f"INSERT INTO source_catalog ({_ALL_COLUMNS}) VALUES "
+                    + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
+                    + f" ON CONFLICT (source_id) DO UPDATE SET {_UPSERT_SET}"
+                    + f" WHERE {self._MIRROR_CHANGED}",
+                    params,
+                )
             )
-            .fetchone()
-        )
-        if found is None:
-            return True
-        stored = self._loads_metadata(found[1], source_id) or {}
-        return bool(found[0]) != registration.is_resolved or stored != dict(
-            registration.metadata or {}
-        )
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                for sql, params in statements:
+                    conn.execute(sql, params)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def bind_registry(self, registry: Any) -> None:
         """List tensors through *registry*, which holds the ones attached to a source."""

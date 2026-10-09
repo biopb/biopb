@@ -254,45 +254,6 @@ def is_bare_host_upstream_url(url: str) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class MirrorSeed:
-    """One upstream catalog row, split by where each part is written.
-
-    ``tensors``, ``source_url`` and ``indexed_at`` seed the adapter
-    (:meth:`RemoteTensorAdapter.seed_catalog`); ``registration`` -- the row's
-    metadata and whether the upstream source has resolved -- goes straight to the
-    catalog write, since nothing else reads it.
-    """
-
-    tensors: List[dict]
-    source_url: Optional[str]
-    indexed_at: object
-    registration: RegistrationRecord
-
-    @classmethod
-    def from_row(cls, row: dict) -> MirrorSeed:
-        raw = row.get("metadata_json")
-        try:
-            metadata = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, TypeError, ValueError):
-            metadata = {}
-        return cls(
-            row.get("tensors") or [],
-            row.get("source_url"),
-            row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
-            metadata_record(
-                metadata if isinstance(metadata, dict) else {},
-                # Whether that row describes a real source yet. True for an
-                # upstream predating the column.
-                is_resolved=bool(row.get("is_resolved", True)),
-            ),
-        )
-
-    def seed(self, adapter: RemoteTensorAdapter) -> bool:
-        """Seed *adapter* with the part it holds; whether that changed anything."""
-        return adapter.seed_catalog(self.tensors, self.source_url, self.indexed_at)
-
-
 def mirrorable_upstream_id(source_id: str) -> bool:
     """Whether an upstream source is one this server mirrors.
 
@@ -561,7 +522,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         self._client = None  # lazy TensorFlightClient to the upstream
 
-        # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
+        # Bulk-seeded catalog surface (biopb/biopb#266). When a MirrorSet fetches
         # the whole upstream catalog in one query, it seeds the tensors so
         # registration (sync_source_added -> list_tensors) needs no per-source
         # upstream RPC. None = not seeded (fall back to a live per-source
@@ -682,7 +643,7 @@ class RemoteTensorAdapter(TensorAdapter):
             alias=source.alias,
         )
 
-    def _display_source_url(self, upstream_source_url: Optional[str]) -> str:
+    def display_url(self, upstream_source_url: Optional[str]) -> str:
         """Build the catalog ``source_url`` so a browser can tree a mirror by path.
 
         Embeds the upstream source's REAL location under the (aliased) endpoint --
@@ -708,6 +669,19 @@ class RemoteTensorAdapter(TensorAdapter):
         re-read on every re-list."""
         version = content_version_for(indexed_at)
         return version is not None and version == self._content_version
+
+    def local_tensor_rows(self, upstream_tensors: Optional[List[dict]]) -> List[dict]:
+        """An upstream row's ``tensors`` as this mirror lists them: the same
+        structure with the source_id prefix of each ``array_id`` swapped."""
+        return [
+            {
+                "array_id": self._to_local_array_id(t["array_id"]),
+                "dim_labels": list(t.get("dim_labels") or []),
+                "shape": [int(n) for n in t.get("shape") or []],
+                "dtype": t.get("dtype") or "",
+            }
+            for t in upstream_tensors or []
+        ]
 
     def seed_catalog(
         self,
@@ -747,18 +721,17 @@ class RemoteTensorAdapter(TensorAdapter):
         # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
         # envelope carries an empty cv, exactly as before this plumbing.
         self._content_version = content_version_for(indexed_at)
-        descs: List[TensorDescriptor] = []
-        for t in upstream_tensors or []:
-            descs.append(
-                TensorDescriptor(
-                    array_id=self._to_local_array_id(t["array_id"]),
-                    dim_labels=t.get("dim_labels") or [],
-                    shape=t.get("shape") or [],
-                    dtype=t.get("dtype") or "",
-                )
+        descs = [
+            TensorDescriptor(
+                array_id=t["array_id"],
+                dim_labels=t["dim_labels"],
+                shape=t["shape"],
+                dtype=t["dtype"],
             )
+            for t in self.local_tensor_rows(upstream_tensors)
+        ]
         # Mirror the upstream's real path into the display url (biopb/biopb#297).
-        new_url = self._display_source_url(source_url)
+        new_url = self.display_url(source_url)
         changed = descs != self._descriptors_cache or new_url != self._source_url
         self._descriptors_cache = descs
         self._source_url = new_url
@@ -782,13 +755,38 @@ class RemoteTensorAdapter(TensorAdapter):
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        """No metadata: a mirror's is the upstream row's.
+        """The upstream source's metadata dict (OME etc.), read live, best-effort.
 
-        Every mirror registers through a :class:`MirrorSeed`, whose record the
-        reconciler hands to ``sync_source_added(registration=)``, so the adapter
-        holds no copy and asks the upstream nothing.
+        Only a source configured on its own (``grpc://host:port/<id>``) registers
+        through here: a bare-host upstream's rows are written from the upstream's
+        rows (:class:`~biopb_tensor_server.sources.mirror.MirrorSet`), which
+        already carry the metadata.
+
+        ``list_flights`` is deliberately lean and leaves ``metadata_json`` empty, and
+        the only live RPC that fills it (``GetFlightInfo(with_metadata=True)``)
+        returns it *wrapped* in a ``{"type","dim_label","metadata"}`` envelope.
+        Read it from the upstream's metadata catalog instead: the DuckDB
+        ``sources.metadata_json`` column stores the **raw** dict, which is this
+        method's contract. An unreachable upstream, a DB-less one or a source not
+        yet synced all degrade to ``{}``: metadata is non-critical for serving.
         """
-        return RegistrationRecord({})
+        sql = (
+            "SELECT metadata_json FROM sources WHERE source_id = "
+            f"{sql_literal(self._upstream_source_id)}"
+        )
+        try:
+            rows = self.client.query(sql, format="records")
+        except Exception as exc:
+            logger.debug(
+                "upstream metadata query failed for %s: %s", self.source_id, exc
+            )
+            return metadata_record({})
+        raw = rows[0].get("metadata_json") if rows else None
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return metadata_record({})
+        return metadata_record(parsed if isinstance(parsed, dict) else {})
 
     def list_tensors(self) -> List[TensorEntry]:
         """Mirror this one upstream source's tensor descriptor(s).

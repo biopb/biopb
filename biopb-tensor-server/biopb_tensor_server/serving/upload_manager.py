@@ -673,6 +673,12 @@ class UploadManager:
                 f"{SCRATCH_SOURCE_ID!r} for a result that belongs to no source "
                 f"of yours."
             )
+        if parent.source_type == "tensor-server":
+            raise flight.FlightServerError(
+                f"add_tensor: {source_id!r} is a mirror of another server's source, "
+                f"which owns its tensors. Upload to that server, or use "
+                f"{SCRATCH_SOURCE_ID!r} for a result of your own."
+            )
 
         if split_label_field(field) is not None:
             if scheme != "zarr":

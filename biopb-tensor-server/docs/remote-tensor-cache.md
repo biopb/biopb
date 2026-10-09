@@ -60,7 +60,7 @@ degrading to TOFU — see *Misconfiguration is not unreachability* below.
 
 `resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
 frozen, hashable `UpstreamCredentials` from the source + profile, and every
-dial site — the adapter's pooled client, the reconciler's bulk catalog fetch,
+dial site — the adapter's pooled client, the mirror's re-list,
 and the bare-host expansion — uses it, so a `grpcs://` upstream's configured CA
 is honored everywhere it is dialed, not just on the adapter's own connection.
 
@@ -178,6 +178,17 @@ fallback: if the query fails the re-list raises, the mirrored catalog is left as
 it is, and the next tick retries. Enumerating ids and syncing each source over
 its own RPC would put two round trips per source on an upstream that is already
 down, slow or refusing us.
+
+**A mirror is not a claim.** A bare-host upstream is a root, and its
+`MirrorSet` (`sources/mirror.py`) holds that root and the adapters registered
+for its sources. There is nothing to persist (the root is rebuilt from config
+on every start, and the catalog drops its rows at open) and no file to
+re-find. Rows are written from the upstream's rows in one batch
+(`MetadataDatabase.sync_mirrored_rows`): array_id prefixes swapped, the url
+rewritten, `metadata_json` passed through as the upstream wrote it. A row the
+upstream did not change is left as it is. A source configured on its own
+(`grpc://host:port/<id>`) is an ordinary claim, and reads its metadata from
+the upstream when it registers.
 
 **Cache staleness is versioned, not open.** The upstream's `indexed_at`
 becomes this mirror's `content_version`, folded into every chunk_id's proxy

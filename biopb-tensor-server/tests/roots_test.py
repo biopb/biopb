@@ -193,16 +193,6 @@ class TestCatalogIdentity:
             != _root(RootKind.MONITORED, "/data").root_id
         )
 
-    def test_the_upstream_of_a_mirrored_claim_is_found_by_endpoint_and_alias(self):
-        a = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="a")
-        b = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="b")
-        roots = Roots([a, b])
-
-        assert roots.upstream_of("grpc://lab:8815/img", "a") is a
-        assert roots.upstream_of("grpc://lab:8815/img", "b") is b
-        assert roots.upstream_of("grpc://lab:8815/img", None) is None
-        assert roots.upstream_of("grpc://other:8815/img", "a") is None
-
     def test_only_the_configured_kinds_are_persisted(self):
         roots = Roots(
             [

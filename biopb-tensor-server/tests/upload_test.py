@@ -776,6 +776,31 @@ class TestAddTensor:
                 )
             )
 
+    @pytest.mark.parametrize("field", ["@fields/result", "img/@labels/nuclei"])
+    def test_a_mirrored_source_takes_no_upload(self, tmp_path, field):
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        server = self._server(tmp_path)
+        server.register_source(
+            "lab__img",
+            RemoteTensorAdapter(
+                "lab__img",
+                "grpc://localhost:1",
+                "img",  # never dialed
+            ),
+        )
+        scheme = "zarr" if "@labels" in field else "cache"
+        with pytest.raises(flight.FlightServerError, match="mirror of another server"):
+            server.uploads.add_tensor(
+                TensorDescriptor(
+                    array_id=f"{scheme}://lab__img/{field}",
+                    shape=[10, 10],
+                    dtype="uint8",
+                    chunk_shape=[5, 5],
+                    dim_labels=["y", "x"],
+                )
+            )
+
     @pytest.mark.parametrize(
         "array_id", ["cache:test", "bare", "cache://", "cache://source-only", "//x/y"]
     )

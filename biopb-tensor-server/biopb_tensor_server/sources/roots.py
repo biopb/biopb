@@ -316,17 +316,6 @@ class Roots:
         """The roots whose sources the catalog table holds."""
         return [r for r in self._snap.roots if r.persisted]
 
-    def upstream_of(self, primary_path: str, alias: Optional[str]) -> Optional[Root]:
-        """The upstream a mirrored source comes from: the one whose endpoint is the
-        claim's ``<endpoint>/<upstream id>`` and whose alias namespaced its id."""
-        for root in self.of_kind(RootKind.UPSTREAM):
-            parts = urlsplit(root.url)
-            if root.alias == alias and str(primary_path).startswith(
-                f"{parts.scheme}://{parts.netloc}/"
-            ):
-                return root
-        return None
-
     def check_overlap(
         self,
         path: Path,
