@@ -522,7 +522,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         self._client = None  # lazy TensorFlightClient to the upstream
 
-        # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
+        # Bulk-seeded catalog surface (biopb/biopb#266). When a MirrorSet fetches
         # the whole upstream catalog in one query, it seeds the tensors so
         # registration (sync_source_added -> list_tensors) needs no per-source
         # upstream RPC. None = not seeded (fall back to a live per-source

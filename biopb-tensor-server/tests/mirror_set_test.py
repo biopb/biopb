@@ -202,7 +202,12 @@ def _mirrors(db=None, server=None, is_claimed=lambda source_id: False):
         SourceConfig(url="grpc://lab:8815", alias="lab"), RootKind.UPSTREAM
     )
     server = server or _Server()
-    return MirrorSet(root, server, db, is_claimed), server
+    ensure_root = (
+        (lambda r: db.ensure_root(r.root_id, r.root_url))
+        if db is not None
+        else (lambda r: None)
+    )
+    return MirrorSet(root, server, db, is_claimed, ensure_root), server
 
 
 class TestMirrorSet:

@@ -38,16 +38,18 @@ class MirrorSet:
         server: Any,
         metadata_db: Optional[MetadataDatabase],
         is_claimed: Callable[[str], bool],
+        ensure_root: Callable[[Root], None],
     ):
         """*is_claimed* says whether a source id belongs to a claim, which a mirror
-        must not displace."""
+        must not displace. *ensure_root* has the catalog know the root before a row
+        sits under it."""
         self.root = root
         self._server = server
         self._metadata_db = metadata_db
         self._is_claimed = is_claimed
+        self._ensure_root = ensure_root
         self._endpoint = _split_grpc_url(root.url)[0]
         self._adapters: Dict[str, RemoteTensorAdapter] = {}
-        self._rooted = False
 
     def relist(self, credentials_config: Optional[Any]) -> bool:
         """Bring the mirrors to what the upstream lists now.
@@ -145,7 +147,7 @@ class MirrorSet:
                 self._server.register_source(source_id, adapter)
                 registered.append(source_id)
             if self._metadata_db is not None and entries:
-                self._ensure_root()
+                self._ensure_root(self.root)
                 self._metadata_db.sync_mirrored_rows(
                     self.root.root_id, "tensor-server", entries
                 )
@@ -185,12 +187,6 @@ class MirrorSet:
             bool(row.get("is_resolved", True)),
             adapter.local_tensor_rows(row.get("tensors")),
         )
-
-    def _ensure_root(self) -> None:
-        """Have the catalog know the root before a row sits under it."""
-        if not self._rooted:
-            self._metadata_db.ensure_root(self.root.root_id, self.root.root_url)
-            self._rooted = True
 
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the

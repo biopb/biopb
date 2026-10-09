@@ -1265,7 +1265,11 @@ class Reconciler:
         if mirrors is None:
             _warn_experimental_source("tensor-server")
             mirrors = self._mirrors[root] = MirrorSet(
-                root, self._server, self._metadata_db, self.has_claim
+                root,
+                self._server,
+                self._metadata_db,
+                self.has_claim,
+                self._ensure_root,
             )
         return mirrors.relist(self._credentials_config)
 
