@@ -372,6 +372,16 @@ class SourceAdapter(ABC):
         ``sources.tensors``. It returns lightweight entries without expensive
         operations like scene switching or chunk-layout computation.
 
+        **The listing is static for the life of the adapter.** Once the adapter
+        is built, every call answers the same ``array_id`` / ``dim_labels`` /
+        ``shape`` / ``dtype`` set; a source whose tensors change is a *new*
+        adapter, registered in place of this one (a refresh, a rebuild after
+        eviction). Callers rely on it: ``Attachments`` snapshots this listing
+        when the registry registers the adapter and judges the label sets
+        against that snapshot until the next registration, so an adapter that
+        discovers tensors lazily, or whose shape changes under it, would leave
+        sets bound to a stale image.
+
         Returns:
             List of :class:`TensorEntry`, each a :func:`catalog_entry` projection:
 
