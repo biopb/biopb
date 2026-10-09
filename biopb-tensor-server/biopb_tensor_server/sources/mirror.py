@@ -81,7 +81,8 @@ class MirrorSet:
             stale = sorted(
                 source_id
                 for source_id, adapter in self._adapters.items()
-                if not adapter.is_current(versions[desired[source_id]].indexed_at)
+                if source_id in desired
+                and not adapter.is_current(versions[desired[source_id]].indexed_at)
             )
             wanted = [desired[source_id] for source_id in new + stale]
             sizes = {up: versions[up].size for up in wanted}
@@ -191,6 +192,7 @@ class MirrorSet:
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the
         catalog. One whose unregistering fails stays, and is tried again."""
+        gone = []
         for source_id in source_ids:
             try:
                 self._server.unregister_source(source_id)
@@ -198,11 +200,14 @@ class MirrorSet:
                 logger.exception("Failed to unregister mirrored source %s", source_id)
                 continue
             del self._adapters[source_id]
-            if self._metadata_db is None:
-                continue
-            try:
-                self._metadata_db.sync_source_removed(source_id)
-            except Exception:
-                logger.exception(
-                    "Failed to remove source %s from metadata DB", source_id
-                )
+            gone.append(source_id)
+        if self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.sync_mirrored_removed(gone)
+        except Exception:
+            logger.exception(
+                "Failed to remove %d mirrored sources of %s from metadata DB",
+                len(gone),
+                self._endpoint,
+            )

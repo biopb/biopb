@@ -1637,6 +1637,31 @@ class MetadataDatabase:
                 conn.execute("ROLLBACK")
                 raise
 
+    def sync_mirrored_removed(self, source_ids: Sequence[str]) -> None:
+        """Drop the rows of mirrored sources in one transaction.
+
+        :meth:`sync_source_removed` for a batch, and only the row: a mirror's
+        registration imports no ROIs (:meth:`sync_mirrored_rows` writes none), so
+        there are no reserved sets of its own to delete.
+        """
+        if not source_ids:
+            return
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                for i in range(0, len(source_ids), self._PENDING_CHUNK):
+                    chunk = list(source_ids[i : i + self._PENDING_CHUNK])
+                    conn.execute(
+                        "DELETE FROM source_catalog WHERE source_id IN "
+                        f"({', '.join('?' * len(chunk))})",
+                        chunk,
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
     def bind_registry(self, registry: Any) -> None:
         """List tensors through *registry*, which holds the ones attached to a source,
         and keep each row's listing in step with them."""
