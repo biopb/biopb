@@ -2916,12 +2916,11 @@ class _CatalogRowAdapter:
     """Minimal adapter to seed a controllable upstream catalog row
     (is_resolved / tensors / metadata)."""
 
-    def __init__(self, source_id, tensors, resolved=None, metadata=None):
+    def __init__(self, source_id, tensors, metadata=None):
         self.source_id = source_id
         self._source_url = f"/data/{source_id}"
         self._source_type = "zarr"
         self._tensors = tensors
-        self._resolved = bool(tensors) if resolved is None else resolved
         self._metadata = metadata or {}
 
     @property
@@ -2943,7 +2942,7 @@ class _CatalogRowAdapter:
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        return RegistrationRecord(self._metadata, is_resolved=self._resolved)
+        return RegistrationRecord(self._metadata)
 
 
 def test_seed_catalog_detects_change():
@@ -3019,14 +3018,13 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
     from biopb_tensor_server import TensorFlightServer
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
-    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     up_db = MetadataDatabase()
     upstream = TensorFlightServer("localhost:0", metadata_db=up_db)
-    up_db.sync_source_added(
-        "cloud", _CatalogRowAdapter("cloud", tensors=[], resolved=False)
-    )
+    # An upstream source that has not resolved: a row with no adapter behind it.
+    up_db.sync_pending_source(SourceClaim("zarr", "s3://bucket/cloud.zarr", "cloud"))
     _serve(upstream)
     try:
         local_db = MetadataDatabase()

@@ -78,7 +78,6 @@ from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
-from biopb_tensor_server.core.registration import RegistrationRecord
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -1462,7 +1461,6 @@ class MetadataDatabase:
         source_id: str,
         adapter: SourceAdapter,
         record: Optional[CatalogRecord] = None,
-        registration: Optional[RegistrationRecord] = None,
     ) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
@@ -1487,9 +1485,6 @@ class MetadataDatabase:
                 registers a source with a claim. The row keeps them, with the
                 adapter's ``catalog_payload`` when it is resolved and has one;
                 without one the row's claim, if it has one, is left as it was.
-            registration: What the row holds besides its tensors, from a caller
-                that already has it. Without one the adapter builds it
-                (:meth:`SourceAdapter.registration_record`).
         """
         conn = self._get_connection()
 
@@ -1500,7 +1495,6 @@ class MetadataDatabase:
         source_url = adapter.catalog_url
         source_type = adapter.source_type
         catalog = self._catalog_tensors(source_id, adapter)
-        is_resolved = registration is None or registration.is_resolved
 
         # Full per-tensor structural info (biopb/biopb#224): one struct per
         # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
@@ -1510,17 +1504,12 @@ class MetadataDatabase:
         tensors = self._tensor_rows(catalog)
 
         # Every source with a claim is persisted; the payload only lets a
-        # restart skip the parse, so an adapter without one (or a cloud row, or
-        # one that is not resolved) stores NULL and is rebuilt from its claim.
+        # restart skip the parse, so an adapter without one (or a cloud row)
+        # stores NULL and is rebuilt from its claim.
         # Before the record, which is the adapter's cue to drop what it parked
         # for it: the payload reads the same intermediates.
         payload = None
-        if (
-            record is not None
-            and record.claim is not None
-            and is_resolved
-            and not record.cloud
-        ):
+        if record is not None and record.claim is not None and not record.cloud:
             payload = adapter.catalog_payload()
 
         # The file's metadata and ROIs (#951), built together by the adapter:
@@ -1530,12 +1519,11 @@ class MetadataDatabase:
         # format meant by it. A server that does not serve the annotation actions
         # does not parse a file's ROIs either: the rows would be unreadable
         # through every surface, so the work and the storage buy nothing.
-        if registration is None:
-            registration = adapter.registration_record(
-                [(t.array_id, list(t.dim_labels)) for t in catalog],
-                import_rois=self._annotations_enabled,
-                max_rois_per_tensor=self._max_rois_per_tensor,
-            )
+        registration = adapter.registration_record(
+            [(t.array_id, list(t.dim_labels)) for t in catalog],
+            import_rois=self._annotations_enabled,
+            max_rois_per_tensor=self._max_rois_per_tensor,
+        )
         if registration.report:
             logger.info("ome rois for %s: %s", source_id, registration.report.summary())
         indexed_at = datetime.now()
@@ -1553,8 +1541,8 @@ class MetadataDatabase:
             source_type,
             indexed_at,
             metadata_json,
-            registration.is_resolved,
-            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
+            True,  # a source with an adapter is resolved; ``sync_pending_source`` writes the rest
+            None,  # ... and sets the reason
             tensors,
             None,
         ]
