@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -65,17 +66,16 @@ def _store_filesystem_path(store) -> str:
     repr rather than a path, in the other -- and the second derivation is gone.
 
     A ``LocalStore`` carries ``root`` and no ``path``; an ``FsspecStore`` carries
-    ``path``. ``str(store)`` is a ``file://`` URL for the former.
+    ``path``. Either beats parsing ``str(store)``, a ``file://`` URL that loses
+    the drive letter on Windows.
     """
+    for attr in ("path", "root"):
+        value = getattr(store, attr, None)
+        if value is not None:
+            return str(value)
     store_str = str(store)
     if store_str.startswith("file://"):
-        return str(urlparse(store_str).path)
-    path = getattr(store, "path", None)
-    if path is not None:
-        return str(path)
-    root = getattr(store, "root", None)
-    if root is not None:
-        return str(root)
+        return url2pathname(urlparse(store_str).path)
     return store_str
 
 

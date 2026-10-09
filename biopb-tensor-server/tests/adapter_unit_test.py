@@ -2303,7 +2303,7 @@ class TestOmeZarrStorePathResolution:
             def __repr__(self):
                 return self._repr
 
-        # file:// URL wins over everything (checked first, as __init__ did).
+        # A store with no path or root falls back to parsing its file:// URL.
         assert _store_filesystem_path(_Store("file:///data/p.zarr")) == "/data/p.zarr"
         # FsspecStore exposes .path
         assert _store_filesystem_path(_Store("<FsspecStore>", path="/d/a")) == "/d/a"
