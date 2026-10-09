@@ -216,7 +216,20 @@ export default function DashboardPage() {
 
   const registerRemote = () => {
     const url = prompt("URL of the algorithm server (grpc://host:port or grpcs://host:port)");
-    if (url?.trim()) algoEdit("/api/algorithms/register", { url: url.trim() });
+    if (!url?.trim()) return;
+    // The server's own default (host and port, made filename-safe), offered for
+    // editing. Cancelling this second dialog cancels the registration; blank
+    // leaves the choice to the server.
+    let host = url.trim();
+    try {
+      host = new URL(url.trim().replace(/^grpcs?:/i, "http:")).host || host;
+    } catch {
+      // not a URL; the server refuses it with its own message
+    }
+    const suggested = host.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    const name = prompt("Name for this server", suggested || "server");
+    if (name === null) return;
+    algoEdit("/api/algorithms/register", { url: url.trim(), name: name.trim() || undefined });
   };
   // Stable identity: FileBrowser reloads (and resets to its start folder) when
   // this changes, so an inline function would undo every navigation.
