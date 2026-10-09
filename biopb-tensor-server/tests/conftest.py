@@ -99,6 +99,16 @@ def _private_write_dir(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _private_state_dir(monkeypatch, tmp_path_factory):
+    """Keep the state tree out of the real ``~/.local/state``.
+
+    The CLI's server setup writes the ticket-seal key there, so a test that sets
+    one up would otherwise leave a key in the developer's own state tree.
+    """
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path_factory.mktemp("state-home")))
+
+
+@pytest.fixture(autouse=True)
 def _close_pooled_handles():
     """Close the files the handle pools hold open after each test.
 

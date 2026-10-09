@@ -129,8 +129,10 @@ ticket changed. A valid seal opens `do_get` and `chunk_locate` for its chunks in
 place of a bearer token, so a reference can leave the machine without the
 connection's token (`auth_token` empty). It never opens planning or an action. The
 tensor's ROI sets get the same treatment (`roi_ticket`), with the content version
-in the MAC so a reused name inherits nothing. The key lives in the state tree
-(`ticket-seal.key`); deleting it revokes every seal outstanding. A mirror wraps
+in the MAC so a reused name inherits nothing. Seals last `server.seal_ttl`
+seconds (a day by default, 0 never expires; on the admin page like any other
+server key). The key lives in the state tree (`ticket-seal.key`); deleting it
+revokes every seal outstanding. A mirror wraps
 its upstream's identity once and keeps the upstream's indices, and seals what it
 serves with its own key.
 

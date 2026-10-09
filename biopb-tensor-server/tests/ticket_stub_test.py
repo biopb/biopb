@@ -307,6 +307,52 @@ class TestKeyFile:
         assert "could not persist" in caplog.text
 
 
+class TestSealTtlConfig:
+    def test_it_defaults_to_the_sealers_own(self):
+        from biopb_tensor_server.core.config import parse_config
+        from biopb_tensor_server.core.ticket_seal import DEFAULT_SEAL_TTL
+
+        assert parse_config({}).seal_ttl == DEFAULT_SEAL_TTL
+
+    def test_it_is_read_from_the_server_section(self):
+        from biopb_tensor_server.core.config import parse_config
+
+        assert parse_config({"server": {"seal_ttl": 90}}).seal_ttl == 90.0
+        assert parse_config({"server": {"seal_ttl": 0}}).seal_ttl == 0.0
+
+    def test_the_server_applies_it(self):
+        server = catalog_server("localhost:0", seal_ttl=600)
+        try:
+            grant = server._sealer.grant_chunks(b"\xfdid", (0,), (1,))
+            assert 590 < grant.expires_at - time.time() <= 600
+        finally:
+            server.shutdown()
+
+    def test_zero_never_expires(self):
+        server = catalog_server("localhost:0", seal_ttl=0)
+        try:
+            assert server._sealer.grant_chunks(b"\xfdid", (0,), (1,)).expires_at == 0
+        finally:
+            server.shutdown()
+
+    def test_the_cli_hands_the_configured_value_to_the_server(self, tmp_path):
+        from biopb_tensor_server import cli
+        from biopb_tensor_server.core.config import parse_config
+
+        cfg = parse_config(
+            {
+                "server": {"seal_ttl": 600, "writable": False},
+                "cache": {"file_cache_dir": str(tmp_path / "cache")},
+            }
+        )
+        server, _, _ = cli._setup_flight_server(cfg, port=0)
+        try:
+            grant = server._sealer.grant_chunks(b"\xfdid", (0,), (1,))
+            assert 590 < grant.expires_at - time.time() <= 600
+        finally:
+            server.shutdown()
+
+
 # --------------------------------------------------------------- the live server
 
 

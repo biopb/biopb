@@ -116,6 +116,8 @@ def _default_of(section, field):
             "checkpoint_threshold_mb",
         ),
         ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
+        # A negative lifetime is not "never": 0 is.
+        ({"server": {"seal_ttl": -1}}, "server", "seal_ttl"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
 )

@@ -783,6 +783,7 @@ def _setup_flight_server(
         scratch_ttl=server_config.scratch_ttl,
         external_location=external_location,
         seal_key=load_seal_key(),
+        seal_ttl=server_config.seal_ttl,
     )
 
     # Publish TLS fingerprint for any local clients.
