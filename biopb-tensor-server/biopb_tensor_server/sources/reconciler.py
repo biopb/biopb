@@ -569,16 +569,18 @@ class Reconciler:
             self._mark_registration_failed(claim.source_id, errors)
 
     def ensure_registered(self, source_id: str) -> bool:
-        """Register a pending source now. Returns whether it is registered.
+        """Make sure a claimed source has an adapter. Returns whether it has.
 
         Safe from any thread and single-flight per source: the worker and a read
         that needs the source at the same moment share one registration. A
-        source that is not pending (never was, already registered, removed)
-        returns at once. A failed one is tried again: nothing queues it, so this
-        is a client's resolve asking.
+        pending source is registered; a source that is claimed and registered
+        but has no adapter in the registry is rebuilt from its row (see
+        :meth:`_rebuild`). One that is neither claimed nor pending (never was,
+        removed) returns ``True`` at once. A failed one is tried again: nothing
+        queues it, so this is a client's resolve asking.
         """
         if not self.is_pending(source_id):
-            return True
+            return self._rebuild(source_id)
         with self._registration_lock(source_id):
             with self._lock:
                 claim = self._state.claims.get(source_id)
@@ -620,6 +622,42 @@ class Reconciler:
             self._notify_source_committed(source_id)
         return True
 
+    def _rebuild(self, source_id: str) -> bool:
+        """Give a registered source back the adapter the registry no longer holds.
+
+        The adapter is rebuilt from the source's row, as a restart would, and
+        the source stays registered throughout: it is not pending, and it is
+        not announced to the precache as a new source. A failure marks the
+        source failed (pending again, with the error) and is a client's to retry.
+        """
+        if self._server.sources.get(source_id) is not None:
+            return True
+        with self._registration_lock(source_id):
+            with self._lock:
+                claim = self._state.claims.get(source_id)
+                signatures = self._source_signatures.get(source_id)
+            if claim is None or self._server.sources.get(source_id) is not None:
+                return True
+            catalog_url = self._catalog_url_for(claim)
+            errors: List[str] = []
+            if self._register_source_claim(
+                claim,
+                catalog_url=catalog_url,
+                replace=True,
+                error_sink=errors,
+                signatures=signatures,
+                hydrate=(
+                    self._metadata_db.read_hydration(source_id)
+                    if self._metadata_db is not None
+                    else None
+                ),
+            ):
+                return True
+            with self._lock:
+                self._pending[source_id] = catalog_url
+            self._mark_registration_failed(source_id, errors)
+            return False
+
     def materialize(self, source_id: str) -> None:
         """Register a pending source now, for a client that resolved it.
 
@@ -631,19 +669,22 @@ class Reconciler:
         self.check_registered(source_id)
 
     def check_registered(self, source_id: str) -> None:
-        """Raise why a read of a pending source cannot be served; never registers.
+        """Raise why a read of a source with no adapter cannot be served.
 
         ``SourceRegistrationError`` when its registration failed, an unresolved
         error while it waits -- either way the client resolves it. Returns for a
-        source that is not pending (unknown, registered, removed).
+        source that is unknown or has an adapter.
 
-        A restored source is the exception to "never registers": its row is
-        complete and lists as resolved, so a read hydrates it here, once (the
-        registration is single-flight), instead of asking a client to resolve it.
+        A registered source whose adapter is gone, and a restored one, are the
+        exceptions to "never registers": their rows are complete and list as
+        resolved, so a read rebuilds the adapter here, once (the registration
+        is single-flight), instead of asking a client to resolve it.
         """
         with self._lock:
             restored = source_id in self._restored
-        if restored and self.ensure_registered(source_id):
+        if (restored or not self.is_pending(source_id)) and self.ensure_registered(
+            source_id
+        ):
             return
         with self._lock:
             if source_id not in self._pending:
