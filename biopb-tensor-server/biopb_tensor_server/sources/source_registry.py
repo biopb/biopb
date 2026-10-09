@@ -167,7 +167,7 @@ class SourceRegistry:
         # Every route to a live adapter -- first registration, a refresh's swap,
         # the restore after a failed one, the rebuild after eviction -- ends
         # here, so this is where the attached tensors are judged against it.
-        self.attached_to(source_id).rebind(adapter)
+        self.attached_to(source_id).rebind()
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
@@ -295,7 +295,9 @@ class SourceRegistry:
         with self._lock:
             attachments = self._attachments.get(source_id)
             if attachments is None:
-                attachments = self._attachments[source_id] = Attachments(source_id)
+                attachments = self._attachments[source_id] = Attachments(
+                    source_id, lambda: self.get(source_id)
+                )
             return attachments
 
     def adopt(self, index: Dict[str, Dict[str, TensorAdapter]]) -> None:
@@ -440,8 +442,8 @@ class SourceRegistry:
         """Atomically swap the whole map (used by tests to inject fixtures)."""
         with self._lock:
             self._sources = {sid: _Slot(a, False) for sid, a in mapping.items()}
-        for sid, a in mapping.items():
-            self.attached_to(sid).rebind(a)
+        for sid in mapping:
+            self.attached_to(sid).rebind()
 
     def __contains__(self, source_id: str) -> bool:
         with self._lock:

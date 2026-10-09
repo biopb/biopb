@@ -50,6 +50,20 @@ class _Tensor:
         return ("level", tensor_id)
 
 
+def _bound(parent):
+    """An ``Attachments`` whose source's adapter is *parent* (None: not yet)."""
+    holder = SimpleNamespace(parent=parent)
+    att = Attachments(SRC, lambda: holder.parent)
+    att.holder = holder
+    return att
+
+
+def _rebind(att, parent):
+    """The registry registered *parent* in place of the adapter."""
+    att.holder.parent = parent
+    att.rebind()
+
+
 def _set(shape=(64, 64), **kw):
     return _Tensor(f"{SRC}/{SET}", shape, **kw)
 
@@ -60,39 +74,36 @@ def _field(**kw):
 
 class TestRebindJudgesTheSets:
     def test_a_set_that_fits_is_readable(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(SET, tensor := _set())
         assert att.error(SET) is None
         assert att.route(SET) is tensor
 
     def test_a_refresh_to_a_different_image_rejudges_it(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(SET, _set())
 
-        att.rebind(_Parent(shape=(32, 32)))
+        _rebind(att, _Parent(shape=(32, 32)))
 
         assert "does not span" in att.error(SET)
         with pytest.raises(AttachedTensorMismatch):
             att.route(SET)
         assert [f for f, _ in att.listed()] == [SET]  # listed, and refuses a read
 
-        att.rebind(_Parent())  # the file changed back
+        _rebind(att, _Parent())  # the file changed back
         assert att.error(SET) is None
         assert att.route(SET) is not None
 
     def test_a_set_with_no_image_binds_to_nothing(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach("Image:9/@labels/n", _Tensor(f"{SRC}/Image:9/@labels/n", (64, 64)))
         assert "binds to no tensor" in att.error("Image:9/@labels/n")
 
-    def test_nothing_is_judged_before_the_first_rebind(self):
-        att = Attachments(SRC)
+    def test_nothing_is_judged_before_there_is_a_parent(self):
+        att = _bound(None)
         att.attach(SET, _set(shape=(1, 1)))
         assert att.error(SET) is None
-        att.rebind(_Parent())
+        _rebind(att, _Parent())
         assert att.error(SET) is not None
 
     def test_registering_is_what_calls_it(self):
@@ -115,8 +126,7 @@ class TestRebindJudgesTheSets:
 
 class TestASetBoundToAnUploadedField:
     def test_detaching_the_field_invalidates_the_set_and_attaching_heals_it(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(FIELD, _field())
         att.attach(FIELD_SET, _Tensor(f"{SRC}/{FIELD_SET}", (64, 64)))
         assert att.error(FIELD_SET) is None
@@ -129,16 +139,14 @@ class TestASetBoundToAnUploadedField:
         assert att.error(FIELD_SET) is None
 
     def test_a_set_may_arrive_before_its_field(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(FIELD_SET, _Tensor(f"{SRC}/{FIELD_SET}", (64, 64)))
         assert att.error(FIELD_SET) is not None
         att.attach(FIELD, _field())
         assert att.error(FIELD_SET) is None
 
     def test_a_field_still_uploading_is_not_an_image_until_it_is_ready(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         filling = _field(readable=False)
         att.attach(FIELD, filling)
         att.attach(FIELD_SET, _Tensor(f"{SRC}/{FIELD_SET}", (64, 64)))
@@ -151,44 +159,49 @@ class TestASetBoundToAnUploadedField:
 
 class TestConformLabel:
     def test_a_request_with_no_axes_is_given_the_images(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         desc = SimpleNamespace(dim_labels=[], shape=[64, 64])
         assert att.conform_label(SET, desc) is None
         assert desc.dim_labels == ["y", "x"]
 
     def test_a_set_that_does_not_span_is_refused(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         desc = SimpleNamespace(dim_labels=["y", "x"], shape=[32, 64])
         assert "does not span" in att.conform_label(SET, desc)
 
     def test_a_field_that_names_no_set_is_refused(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         desc = SimpleNamespace(dim_labels=["y", "x"], shape=[64, 64])
         assert "does not name a label set" in att.conform_label("1", desc)
 
+    def test_a_level_is_not_a_set(self):
+        att = _bound(_Parent())
+        desc = SimpleNamespace(dim_labels=["y", "x"], shape=[64, 64])
+        assert "does not name a label set" in att.conform_label(f"{SET}/1", desc)
+
 
 class TestRouting:
+    def test_a_level_inherits_its_sets_verdict(self):
+        att = _bound(_Parent())
+        att.attach(SET, _set(shape=(32, 32)))
+        with pytest.raises(AttachedTensorMismatch):
+            att.route(f"{SET}/1")
+
     def test_a_level_rides_with_its_set_and_a_bare_field_is_the_formats(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(SET, _set())
         assert att.route(f"{SET}/1") == ("level", f"{SRC}/{SET}/1")
         assert att.route("0") is None
         assert att.route(None) is None
 
     def test_an_upload_in_flight_routes_but_is_not_listed(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(SET, tensor := _set(readable=False))
         assert att.route(SET) is tensor
         assert att.listed() == []
 
     def test_the_token_is_the_owning_tensors(self):
-        att = Attachments(SRC)
-        att.rebind(_Parent())
+        att = _bound(_Parent())
         att.attach(SET, _set(token="t"))
         assert att.capability_token(f"{SRC}/{SET}") == "t"
         assert att.capability_token(f"{SRC}/{SET}/1") == "t"

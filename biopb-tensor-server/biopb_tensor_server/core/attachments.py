@@ -14,11 +14,12 @@ status poll and a straggler's write both have to find their adapter.
 **A label set is checked where things change, not where it is read.** It must
 bind to an image of the source and span it
 (:func:`~biopb_tensor_server.core.labels.extent_mismatch`). The images are the
-parent's own, snapshotted when the registry registers an adapter
-(:meth:`rebind` -- the single chokepoint, so a refresh and a rebuild after
-eviction pass through it), and the source's published uploaded fields. The
-verdict is recomputed whenever either moves (:meth:`rebind`, :meth:`attach`,
-:meth:`detach`, :meth:`revalidate`) and kept, so a read is a lookup. A set that
+parent's own, snapshotted from the current adapter when there is a set to judge
+and dropped when the registry registers another one (:meth:`rebind` -- the
+single chokepoint, so a refresh and a rebuild after eviction pass through it),
+and the source's published uploaded fields. The verdict is recomputed whenever
+either moves (:meth:`rebind`, :meth:`attach`, :meth:`detach`,
+:meth:`revalidate`) and kept, so a read is a lookup. A set that
 fails stays listed, is logged, and raises :class:`AttachedTensorMismatch` when
 read, rather than being served misaligned or vanishing. The sets a source's own
 file carries are its own tensors and are not checked here: the file is the
@@ -29,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -60,13 +61,21 @@ logger = logging.getLogger(__name__)
 class Attachments:
     """One source's attached tensors, and the verdict on each label set."""
 
-    def __init__(self, source_id: str) -> None:
+    def __init__(
+        self,
+        source_id: str,
+        parent: Optional[Callable[[], Optional[SourceAdapter]]] = None,
+    ) -> None:
+        """*parent* answers with the source's adapter as registered now, or None;
+        it is asked only when a label set has to be judged, so a source with
+        none costs nothing."""
         self.source_id = source_id
+        self._parent = parent
         self._lock = threading.RLock()
         # The routable index: published, still filling, or a tombstone.
         self._tensors: Dict[str, TensorAdapter] = {}
         # The parent's image tensors by array_id, as of its last registration;
-        # None before the first, when there is nothing to judge a set against.
+        # None until loaded, when there is nothing to judge a set against.
         self._native: Optional[Dict[str, TensorEntry]] = None
         # Why a label set cannot be read, by field.
         self._invalid: Dict[str, str] = {}
@@ -106,20 +115,15 @@ class Attachments:
                 self._revalidate()
             return removed
 
-    def rebind(self, parent: SourceAdapter) -> None:
-        """*parent* is the source's adapter now: judge every label set against it.
+    def rebind(self) -> None:
+        """The source's adapter is another one now: judge every label set again.
 
-        Called by the registry on every registration of the source. Reads the
-        parent's tensors once, here, and never again.
+        Called by the registry on every registration of the source. The parent's
+        tensors are read once, when there is a set to judge, and not again until
+        the next call.
         """
-        entries = [
-            e
-            for e in parent.list_tensors()
-            if split_label_field(strip_source_prefix(self.source_id, e.array_id))
-            is None
-        ]
         with self._lock:
-            self._native = {e.array_id: e for e in entries}
+            self._native = None
             self._revalidate()
 
     def revalidate(self) -> None:
@@ -220,6 +224,7 @@ class Attachments:
     def _images(self) -> Dict[str, TensorEntry]:
         """What a set may bind to: the parent's images and the published
         uploaded fields, by array_id."""
+        self._load_native()
         images = dict(self._native or {})
         for field, tensor in self._tensors.items():
             if split_attached_field(field) is not None and is_published(tensor):
@@ -227,18 +232,35 @@ class Attachments:
                 images[entry.array_id] = entry
         return images
 
+    def _load_native(self) -> None:
+        """Snapshot the parent's images, unless they are held or it has none."""
+        if self._native is not None or self._parent is None:
+            return
+        parent = self._parent()
+        if parent is None:
+            return
+        self._native = {
+            e.array_id: e
+            for e in parent.list_tensors()
+            if split_label_field(strip_source_prefix(self.source_id, e.array_id))
+            is None
+        }
+
     def _image_of(
         self, field: str, images: Dict[str, TensorEntry]
     ) -> Optional[TensorEntry]:
         parsed = split_label_field(field)
-        if parsed is None or parsed.level is not None:
+        if parsed is None:
             return None
         return images.get(join_fields(self.source_id, parsed.image_field))
 
     def _binding_error(
         self, field: str, desc: TensorEntry, images: Dict[str, TensorEntry]
     ) -> Optional[str]:
-        if split_label_field(field) is None:
+        parsed = split_label_field(field)
+        if parsed is None or parsed.level is not None:
+            # A level is a view its set resolves (:meth:`route`), not a tensor
+            # of its own: it has no verdict, and inherits its set's.
             return f"{field!r} does not name a label set"
         image = self._image_of(field, images)
         if image is None:
@@ -251,10 +273,13 @@ class Attachments:
     def _revalidate(self) -> None:
         """Recompute the verdict on every label set. Caller holds the lock."""
         sets = {f: t for f, t in self._tensors.items() if split_label_field(f)}
-        if self._native is None or not sets:  # no parent yet, or nothing to judge
+        if not sets:
             self._invalid = {}
             return
         images = self._images()
+        if self._native is None:  # no parent yet: the next rebind judges them
+            self._invalid = {}
+            return
         invalid: Dict[str, str] = {}
         for field, tensor in sets.items():
             why = self._binding_error(field, tensor.get_tensor_descriptor(), images)
