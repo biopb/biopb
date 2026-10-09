@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -30,10 +29,8 @@ PARK_GRACE = 1.5
 #: Largest PNG the control accepts back.
 MAX_PNG_BYTES = 16 * 1024 * 1024
 
-_STEP = 0.5
-
-#: Seconds a tab that stopped polling stays on record.
-_FORGET = 60.0
+#: How often a parked poll checks that its page is still there.
+_STEP = 1.0
 
 
 class ViewerUnavailable(Exception):
@@ -45,12 +42,6 @@ class CaptureFailed(Exception):
 
 
 @dataclass
-class _Tab:
-    parked: Optional[asyncio.Future] = None
-    last_seen: float = 0.0
-
-
-@dataclass
 class Capture:
     png: bytes
     partial: bool = False
@@ -58,15 +49,17 @@ class Capture:
 
 
 class ViewerBroker:
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
-        self._clock = clock
-        self._tabs: dict[str, _Tab] = {}
+    def __init__(self) -> None:
+        # tab id -> its parked poll, oldest park first: the last entry is the
+        # tab that polled most recently.
+        self._parked: dict[str, asyncio.Future] = {}
         self._pending: dict[str, asyncio.Future] = {}
+        self._arrived = asyncio.Event()
         self._ids = itertools.count(1)
 
     def tab_count(self) -> int:
         """How many tabs have a poll parked."""
-        return sum(1 for t in self._tabs.values() if _is_parked(t))
+        return len(self._parked)
 
     async def next(
         self,
@@ -79,25 +72,18 @@ class ViewerBroker:
         *disconnected* is polled so a tab that went away frees its slot at once
         rather than at the end of the wait.
         """
-        now = self._clock()
-        # A page load mints a fresh id, so tabs that stopped polling are dropped
-        # rather than accumulated.
-        self._tabs = {
-            k: t
-            for k, t in self._tabs.items()
-            if _is_parked(t) or now - t.last_seen < _FORGET
-        }
-        tab = self._tabs.setdefault(tab_id, _Tab())
-        if _is_parked(tab):
+        old = self._parked.pop(tab_id, None)
+        if old is not None and not old.done():
             # One poll per tab: a reload racing its predecessor's poll wins.
-            tab.parked.set_result(None)
+            old.set_result(None)
         fut = asyncio.get_running_loop().create_future()
-        tab.parked = fut
-        tab.last_seen = self._clock()
-        deadline = self._clock() + timeout
+        self._parked[tab_id] = fut
+        self._arrived.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         try:
             while not fut.done():
-                left = deadline - self._clock()
+                left = deadline - loop.time()
                 if left <= 0:
                     break
                 try:
@@ -107,13 +93,12 @@ class ViewerBroker:
                         break
             return fut.result() if fut.done() else None
         finally:
-            if tab.parked is fut:
-                tab.parked = None
-            tab.last_seen = self._clock()
+            if self._parked.get(tab_id) is fut:
+                del self._parked[tab_id]
 
-    def _pick(self) -> Optional[_Tab]:
-        parked = [t for t in self._tabs.values() if _is_parked(t)]
-        return max(parked, key=lambda t: t.last_seen, default=None)
+    def _pick(self) -> Optional[asyncio.Future]:
+        live = [f for f in self._parked.values() if not f.done()]
+        return live[-1] if live else None
 
     async def capture(self, view: str, max_edge: int, timeout: float = 25.0) -> Capture:
         """Have a viewer page render *view* and return what it drew.
@@ -121,12 +106,16 @@ class ViewerBroker:
         *view* is the viewer's own query string; the page applies it exactly as
         it would a shared link.
         """
-        deadline = self._clock() + timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         tab = self._pick()
-        waited = 0.0
-        while tab is None and waited < PARK_GRACE:
-            await asyncio.sleep(0.05)
-            waited += 0.05
+        if tab is None:
+            # The instant between one poll ending and the next arriving.
+            self._arrived.clear()
+            try:
+                await asyncio.wait_for(self._arrived.wait(), PARK_GRACE)
+            except asyncio.TimeoutError:
+                pass
             tab = self._pick()
         if tab is None:
             raise ViewerUnavailable(
@@ -136,9 +125,9 @@ class ViewerBroker:
         req = f"c{next(self._ids)}"
         fut = asyncio.get_running_loop().create_future()
         self._pending[req] = fut
-        tab.parked.set_result({"req": req, "view": view, "max_edge": max_edge})
+        tab.set_result({"req": req, "view": view, "max_edge": max_edge})
         try:
-            return await asyncio.wait_for(fut, max(0.1, deadline - self._clock()))
+            return await asyncio.wait_for(fut, max(0.1, deadline - loop.time()))
         except asyncio.TimeoutError:
             raise CaptureFailed(
                 "the viewer page did not answer in time (a hidden or busy tab?)"
@@ -163,7 +152,3 @@ class ViewerBroker:
         else:
             fut.set_result(Capture(png, partial, notes or []))
         return True
-
-
-def _is_parked(tab: _Tab) -> bool:
-    return tab.parked is not None and not tab.parked.done()

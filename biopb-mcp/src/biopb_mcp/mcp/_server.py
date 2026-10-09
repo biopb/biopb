@@ -692,27 +692,18 @@ async def capture_view(view: str, max_edge: int = 1024) -> list:
     tab is open and visible -- then give the user the link instead.
 
     Args:
-        view: The viewer's state as a query string, as in its address bar, e.g.
+        view: The viewer's state as a query string, as in its address bar (a whole
+            address is accepted too), e.g.
             "id=<array_id>&z=3&c=1&tg=256,256&zm=-1&lb=<label array_id>".
             `id` is required. See read_doc("web-viewer") for the parameters.
         max_edge: Longest edge of the returned image in pixels.
 
     Returns a PNG image content block, plus a note when it may be incomplete.
     """
-    # The same query string a link carries; a whole address is accepted too.
-    query = view.split("?", 1)[1] if "?" in view else view
     try:
-        got = await asyncio.to_thread(
-            _control_client.capture_view, query.lstrip("?"), int(max_edge)
-        )
-    except _control_client.CaptureError as exc:
+        got = await asyncio.to_thread(_control_client.capture_view, view, int(max_edge))
+    except (_control_client.CaptureError, OSError) as exc:
         return [TextContent(type="text", text=f"No capture: {exc}.")]
-    except OSError as exc:
-        return [
-            TextContent(
-                type="text", text=f"No capture: the control did not answer ({exc})."
-            )
-        ]
     out = [ImageContent(type="image", mimeType="image/png", data=got["png"])]
     notes = list(got.get("notes") or [])
     if got.get("partial"):

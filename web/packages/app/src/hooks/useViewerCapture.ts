@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { withBase } from "../base";
 import { selectRoisPending, useAppStore } from "../store";
 import { SessionLocked, sessionFetch } from "../utils/sessionFetch";
@@ -135,5 +135,8 @@ export function useViewerCapture(): { capturing: boolean; cancel: () => void } {
     };
   }, []);
 
-  return { capturing, cancel: () => (cancelled.current = true) };
+  const cancel = useCallback(() => {
+    cancelled.current = true;
+  }, []);
+  return { capturing, cancel };
 }

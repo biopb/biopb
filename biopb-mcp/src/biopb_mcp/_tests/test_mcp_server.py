@@ -226,7 +226,7 @@ class TestTheReferenceDocs:
 
 
 class TestCaptureView:
-    def test_returns_the_page_png_and_strips_an_address_to_its_query(self, monkeypatch):
+    def test_returns_the_page_png_for_the_view_as_given(self, monkeypatch):
         seen = {}
 
         def fake(view, max_edge):
@@ -234,7 +234,7 @@ class TestCaptureView:
             return {"png": "UE5H", "partial": False, "notes": []}
 
         monkeypatch.setattr(_server._control_client, "capture_view", fake)
-        result = _tool(_server.capture_view, "http://h:8813/viewer?id=a&z=2", 256)
+        result = _tool(_server.capture_view, "id=a&z=2", 256)
         assert seen["args"] == ("id=a&z=2", 256)
         assert [c.type for c in result] == ["image"]
         assert result[0].data == "UE5H"
@@ -264,7 +264,7 @@ class TestCaptureView:
 
         monkeypatch.setattr(_server._control_client, "capture_view", down)
         result = _tool(_server.capture_view, "id=a")
-        assert "did not answer" in result[0].text
+        assert "No capture" in result[0].text and "refused" in result[0].text
 
 
 class TestTakeScreenshot:

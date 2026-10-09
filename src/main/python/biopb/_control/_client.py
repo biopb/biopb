@@ -20,19 +20,28 @@ def base_url() -> str:
     return control_base_url()
 
 
-def _request(method: str, path: str, params: dict, timeout: float) -> dict:
+def _request(
+    method: str, path: str, params: dict, timeout: float, body: Optional[dict] = None
+) -> dict:
     """The control's JSON answer to *method* ``path`` with *params* as its query
-    string; raises ``OSError`` when no control answers and
+    string and, if given, *body* as a JSON body; raises ``OSError`` when no control answers and
     ``urllib.error.HTTPError`` when it refuses."""
     token = _data_plane.resolve_data_plane_token()
     query = f"?{urlencode(params)}" if params else ""
     req = urllib.request.Request(
         f"{base_url()}{path}{query}",
-        data=b"" if method == "POST" else None,
+        data=json.dumps(body).encode()
+        if body is not None
+        else b""
+        if method == "POST"
+        else None,
         method=method,
         # The token also clears the control's CSRF gate on a POST. Without one
         # (a tokenless local control) the gate falls back to a loopback Host.
-        headers={"X-Biopb-Token": token} if token else {},
+        headers={
+            **({"X-Biopb-Token": token} if token else {}),
+            **({"Content-Type": "application/json"} if body is not None else {}),
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
@@ -94,23 +103,16 @@ def capture_view(view: str, max_edge: int = 1024, timeout: float = 30.0) -> dict
     :class:`CaptureError` with the control's reason when no visible page can
     answer, and :class:`OSError` when no control does.
     """
-    token = _data_plane.resolve_data_plane_token()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["X-Biopb-Token"] = token
-    req = urllib.request.Request(
-        f"{base_url()}/api/viewer/capture",
-        data=json.dumps(
-            {"view": view, "max_edge": max_edge, "timeout": timeout}
-        ).encode(),
-        method="POST",
-        headers=headers,
-    )
     try:
         # The control answers within *timeout*; the margin keeps its verdict from
         # arriving as a socket timeout.
-        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
-            return json.loads(resp.read().decode())
+        return _request(
+            "POST",
+            "/api/viewer/capture",
+            {},
+            timeout + 5,
+            {"view": view, "max_edge": max_edge, "timeout": timeout},
+        )
     except urllib.error.HTTPError as exc:
         try:
             reason = json.loads(exc.read().decode()).get("error")
