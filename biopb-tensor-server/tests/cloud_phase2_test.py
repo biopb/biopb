@@ -404,7 +404,7 @@ class _FakeMetadataDb:
     def confirm_root(self, root_id):
         pass
 
-    def sync_source_added(self, source_id, adapter, record=None, registration=None):
+    def sync_source_added(self, source_id, adapter, record=None):
         self.added.append((source_id, adapter))
 
     def sync_pending_source(

@@ -12,6 +12,7 @@ import json
 
 import duckdb
 import pytest
+from biopb_tensor_server.core.discovery import SourceClaim
 from biopb_tensor_server.core.registration import (
     RegistrationRecord,
     metadata_record,
@@ -31,14 +32,12 @@ class MockAdapter:
         source_type,
         shape,
         dtype,
-        is_resolved=True,
     ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
         self._shape = shape
         self._dtype = dtype
-        self._is_resolved = is_resolved
 
     @property
     def catalog_url(self):
@@ -66,8 +65,7 @@ class MockAdapter:
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
         return RegistrationRecord(
-            {"test_key": "test_value", "nested": {"a": 1, "b": 2}},
-            is_resolved=self._is_resolved,
+            {"test_key": "test_value", "nested": {"a": 1, "b": 2}}
         )
 
 
@@ -239,7 +237,6 @@ class MultiTensorAdapter:
         source_url,
         source_type,
         tensors,
-        is_resolved=True,
     ):
         self.source_id = source_id
         self._source_url = source_url
@@ -247,7 +244,6 @@ class MultiTensorAdapter:
         self._tensors = (
             tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
         )
-        self._is_resolved = is_resolved
 
     @property
     def catalog_url(self):
@@ -265,7 +261,7 @@ class MultiTensorAdapter:
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        return RegistrationRecord({}, is_resolved=self._is_resolved)
+        return RegistrationRecord({})
 
 
 class TestPerTensorCatalog:
@@ -381,12 +377,7 @@ class TestPerTensorCatalog:
         """An unresolved (no-tensor) source stores an empty list, so per-tensor
         predicates exclude it while `WHERE NOT is_resolved` still finds it."""
         db = MetadataDatabase()
-        db.sync_source_added(
-            "unresolved",
-            MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
-            ),
-        )
+        db.sync_pending_source(SourceClaim("zarr", "s3://b/x.zarr", "unresolved"))
         conn = db._get_connection()
         tensors, resolved = conn.execute(
             "SELECT tensors, is_resolved FROM sources WHERE source_id='unresolved'"
@@ -405,12 +396,7 @@ class TestPerTensorCatalog:
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
         )
-        db.sync_source_added(
-            "unresolved",
-            MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
-            ),
-        )
+        db.sync_pending_source(SourceClaim("zarr", "s3://b/x.zarr", "unresolved"))
 
         # UNNEST -> one row per tensor, through the validator + Arrow path.
         rows = db.query(
@@ -513,16 +499,7 @@ class TestSourceRowProjection:
 
     def test_unresolved_source_has_no_tensors(self):
         db = MetadataDatabase()
-        db.sync_source_added(
-            "u",
-            MultiTensorAdapter(
-                "u",
-                "s3://b/x.zarr",
-                "zarr",
-                [],
-                is_resolved=False,
-            ),
-        )
+        db.sync_pending_source(SourceClaim("zarr", "s3://b/x.zarr", "u"))
         sources = _sources(db)
         assert len(sources[0]["tensors"]) == 0
         # Empty tensors is not what makes it unresolved -- the flag is
@@ -899,28 +876,6 @@ class TestNoResidencyColumn:
     (biopb/biopb#1035).
     """
 
-    class _UnresolvedAdapter:
-        """A cloud / synced-folder source catalogued by URL only: no tensors,
-        and not resident until resolved."""
-
-        def __init__(self, source_id, source_url):
-            self.source_id = source_id
-            self._source_url = source_url
-
-        source_type = "unresolved"
-
-        @property
-        def catalog_url(self):
-            return self._source_url
-
-        def list_tensors(self):
-            return []  # nothing to say about shape or dtype yet
-
-        def registration_record(
-            self, tensors, *, import_rois=True, max_rois_per_tensor=None
-        ) -> RegistrationRecord:
-            return RegistrationRecord({}, is_resolved=False)
-
     def test_the_column_is_gone(self):
         import duckdb
 
@@ -932,11 +887,9 @@ class TestNoResidencyColumn:
         with pytest.raises(duckdb.BinderException):
             db._get_connection().execute("SELECT data_resident FROM sources")
 
-    def test_an_unresolved_adapter_registers_as_unresolved(self):
+    def test_a_claimed_source_not_yet_registered_is_unresolved(self):
         db = MetadataDatabase()
-        db.sync_source_added(
-            "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
-        )
+        db.sync_pending_source(SourceClaim("zarr", "https://x/y.zarr", "cloud-1"))
         (resolved,) = (
             db._get_connection()
             .execute("SELECT is_resolved FROM sources WHERE source_id='cloud-1'")
@@ -952,9 +905,7 @@ class TestNoResidencyColumn:
             "local-1",
             MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
         )
-        db.sync_source_added(
-            "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
-        )
+        db.sync_pending_source(SourceClaim("zarr", "https://x/y.zarr", "cloud-1"))
         conn = db._get_connection()
 
         by_dtype = conn.execute(
@@ -993,10 +944,7 @@ class TestIsResolvedColumn:
             "local-1",
             MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
         )
-        db.sync_source_added(
-            "cloud-1",
-            TestNoResidencyColumn._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
-        )
+        db.sync_pending_source(SourceClaim("zarr", "https://x/y.zarr", "cloud-1"))
         conn = db._get_connection()
 
         unresolved = conn.execute(
