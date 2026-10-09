@@ -15,11 +15,12 @@ from pathlib import Path
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor._session import _parse_flight_endpoints
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import TensorTicket
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
-from biopb_tensor_server.core.chunk import content_version_of
+from biopb_tensor_server.core.chunk import content_version_of, expand_identity
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
@@ -540,10 +541,18 @@ class TestContentVersion:
     """
 
     def _chunk_ids(self, client, array_id):
+        """The chunk_ids the plan stands for: its stub, completed by each index."""
         info = flight.FlightInfo.deserialize(
             client.get_tensor(array_id, output="pb").flight_info
         )
-        return set(_parse_flight_endpoints(info)[0])
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        identity = TensorTicket.FromString(desc.ticket_stub).chunk_ref.stub.identity
+        return {
+            expand_identity(
+                identity, TensorTicket.FromString(ep.ticket.ticket).chunk_ref.index
+            )
+            for ep in info.endpoints
+        }
 
     def _minted(self, client, array_id):
         """The content_version the read plan's chunk_ids carry."""

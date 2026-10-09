@@ -18,7 +18,7 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
@@ -93,11 +93,13 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
+    ChunkRef,
     PutCommand,
     RoiDelete,
     RoiPut,
     RoiRead,
     TensorTicket,
+    TicketStub,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,6 +133,9 @@ class _ClientState:
     # if the server didn't advertise one (an old server, a loopback
     # deployment, or the check was bypassed).
     advertised_location: Optional[str] = None
+    # The server's ``health`` body, read with ``protocol``. Empty until the
+    # check has run, and for a connection handed in directly.
+    server_health: Dict[str, Any] = field(default_factory=dict)
     # The ``sources`` table's column names, from its flight's schema, read on
     # first need (see ``CatalogClient._catalog_columns``). Empty when the server
     # would not say, which a caller reads as "ask for the base columns only".
@@ -151,7 +156,10 @@ class _ClientState:
         if not self.protocol_checked:
             try:
                 self.advertised_location = _check_flight_protocol(
-                    self.raw_client, self.call_options, self.location
+                    self.raw_client,
+                    self.call_options,
+                    self.location,
+                    health_out=self.server_health,
                 )
             except flight.FlightUnavailableError as exc:
                 raise _explain_handshake_failure(
@@ -166,6 +174,18 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
+
+    @property
+    def ticket_stubs(self) -> bool:
+        """Does the server issue a plan as one sealed stub plus an index per
+        chunk (``health.ticket_stubs``, biopb/biopb#1112)?
+
+        Reads ``health`` first if nothing has. A server that does not say, or a
+        connection handed in directly, is taken not to: its plans stay one full
+        ticket per chunk.
+        """
+        _ = self.client
+        return bool(self.server_health.get("ticket_stubs"))
 
     def trust_for(self, location: str) -> TlsTrust:
         """The trust a consumer dialing *location* is handed.
@@ -264,20 +284,42 @@ def _request_crop_slices(
 
 def _parse_flight_endpoints(
     info: "flight.FlightInfo",
-) -> Tuple[List[bytes], List[ChunkBounds]]:
-    """Decode a FlightInfo's endpoints into parallel ``(chunk_ids, bounds)`` lists.
+) -> Tuple[List[bytes], List[ChunkBounds], Optional[bytes]]:
+    """Decode a FlightInfo's endpoints into parallel ``(chunk_ids, bounds)``
+    lists, and the grant they were issued under.
 
-    chunk_id is an opaque server-minted token (echoed back to do_get); a chunk's
+    A chunk_id is the opaque token a chunk is cached and fetched by; a chunk's
     bounds ride on the endpoint's app_metadata, so the client never decodes the
     chunk_id byte format. Shared by every GetFlightInfo read planner.
+
+    A plan issued as a stub (``descriptor.ticket_stub``, biopb/biopb#1112) has
+    endpoints that carry only a grid index. The chunk's key is then the stub's
+    stable identity joined to that index, and the stub's grant -- which changes
+    with every plan -- is returned apart, to be joined at fetch time. Without a
+    stub the grant is None and the chunk_ids are the server's own.
     """
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    stub: Optional[TicketStub] = None
+    if descriptor.ticket_stub:
+        stub = TensorTicket.FromString(descriptor.ticket_stub).chunk_ref.stub
+    key_prefix = grant = None
+    if stub is not None:
+        key_prefix = TensorTicket(
+            chunk_ref=ChunkRef(stub=TicketStub(identity=stub.identity))
+        ).SerializeToString()
+        grant = TensorTicket(
+            chunk_ref=ChunkRef(stub=TicketStub(grant=stub.grant))
+        ).SerializeToString()
+
     chunks: List[bytes] = []
     chunk_bounds_list: List[ChunkBounds] = []
     for endpoint in info.endpoints:
-        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-        chunks.append(ticket.chunk_id)
+        if key_prefix is None:
+            chunks.append(TensorTicket.FromString(endpoint.ticket.ticket).chunk_id)
+        else:
+            chunks.append(key_prefix + endpoint.ticket.ticket)
         chunk_bounds_list.append(ChunkBounds.FromString(endpoint.app_metadata))
-    return chunks, chunk_bounds_list
+    return chunks, chunk_bounds_list, grant
 
 
 def _refetch_flight_info(
@@ -369,7 +411,7 @@ def _dask_from_flight_info(
     """
     _check_wire_protocol(info.schema)
     descriptor = TensorDescriptor.FromString(info.descriptor.command)
-    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    chunk_ids, bounds_list, grant = _parse_flight_endpoints(info)
     shape = tuple(descriptor.shape)
     chunk_map, grid_shape = _chunk_map_from_endpoints(chunk_ids, bounds_list, shape)
     dask_arr = _build_dask_array_from_chunk_map(
@@ -381,6 +423,7 @@ def _dask_from_flight_info(
         token,
         cache_bytes,
         tls_trust,
+        grant,
     )
     crop = _crop_slices(
         descriptor,
@@ -406,7 +449,7 @@ def _array_from_flight_info(
     """
     _check_wire_protocol(info.schema)
     descriptor = TensorDescriptor.FromString(info.descriptor.command)
-    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    chunk_ids, bounds_list, grant = _parse_flight_endpoints(info)
     shape = tuple(descriptor.shape)
     start, stop = tuple(bounds_list[0].start), tuple(bounds_list[0].stop)
     if len(chunk_ids) != 1 or any(start) or stop != shape:
@@ -414,7 +457,7 @@ def _array_from_flight_info(
             info, location, token, cache_bytes, tls_trust
         ).compute()
     arr = _fetch_chunk_distributed(
-        location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust
+        location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust, grant
     )
     crop = _crop_slices(descriptor, _requested_slice(info), len(shape))
     if crop is None:
@@ -451,7 +494,10 @@ _TRANSIENT_FLIGHT_ERRORS = (
 
 
 def _check_flight_protocol(
-    client: flight.FlightClient, call_options: flight.FlightCallOptions, location: str
+    client: flight.FlightClient,
+    call_options: flight.FlightCallOptions,
+    location: str,
+    health_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Refuse a server whose Flight protocol shape is not this SDK's.
 
@@ -459,6 +505,9 @@ def _check_flight_protocol(
     the key predates it and speaks v1 (sentinel-routed descriptors,
     prefix-sniffed tickets), which this SDK no longer does. An unreachable
     server is not this check's concern: its error propagates as it always did.
+
+    The ``health`` body is copied into *health_out* when one is given, for the
+    capabilities a caller reads off it (``ticket_stubs``).
 
     Returns the server's advertised ``external_location`` (biopb/biopb#1158),
     or None if it published none, could not be reached, or isn't a biopb
@@ -481,6 +530,8 @@ def _check_flight_protocol(
         health = {}
     if not isinstance(health, Mapping):
         health = {}
+    if health_out is not None:
+        health_out.update(health)
     try:
         server_ver = int(health.get("protocol", 1))
     except (ValueError, TypeError):
@@ -647,6 +698,7 @@ def _read_option(
     pyramid: bool = False,
     upload_status: bool = False,
     is_resident: bool = False,
+    ticket_stub: bool = False,
 ) -> TensorReadOption:
     """A ``TensorReadOption`` whose field mask names the parts asked for.
 
@@ -668,6 +720,7 @@ def _read_option(
             ("pyramid", pyramid),
             ("upload_status", upload_status),
             ("is_resident", is_resident),
+            ("ticket_stub", ticket_stub),
         )
         if wanted
     )
@@ -1233,11 +1286,28 @@ class CatalogClient:
 
     # ---- ROI annotations ----
 
-    def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
+    def list_rois(
+        self,
+        array_id: str,
+        set_name: str = "",
+        *,
+        roi_ticket: Optional[bytes] = None,
+    ) -> "RoiListResult":
         """Backs TensorFlightClient.list_rois; see that method."""
-        ticket = TensorTicket(roi_read=RoiRead(array_id=array_id, set_name=set_name))
+        if roi_ticket:
+            # The sealed ticket a plan carried, with the one set merged on: a
+            # serialized RoiRead{set_name} joined to it is one RoiRead.
+            ticket_bytes = roi_ticket + (
+                TensorTicket(roi_read=RoiRead(set_name=set_name)).SerializeToString()
+                if set_name
+                else b""
+            )
+        else:
+            ticket_bytes = TensorTicket(
+                roi_read=RoiRead(array_id=array_id, set_name=set_name)
+            ).SerializeToString()
         reader = self._state.client.do_get(
-            flight.Ticket(ticket.SerializeToString()), options=self._state.call_options
+            flight.Ticket(ticket_bytes), options=self._state.call_options
         )
         table = reader.read_all()
         metadata = table.schema.metadata or {}
@@ -1369,7 +1439,7 @@ class ChunkFetcher:
 
         # Build TensorReadOption with flattened fields. `endpoints` is explicit:
         # this is the read path, and the plan is what it came for.
-        read_opt = _read_option(endpoints=True)
+        read_opt = _read_option(endpoints=True, ticket_stub=self._state.ticket_stubs)
         if slice_hint_proto is not None:
             read_opt.slice_hint.CopyFrom(slice_hint_proto)
         if scale_hint is not None:
@@ -1419,9 +1489,16 @@ class ChunkFetcher:
             else self._state.location
         )
         if output == "pb":
+            # A plan the server sealed names what it reads and needs no
+            # credential to read it, so the reference leaves without the
+            # connection's own token (biopb/biopb#1112). Anything unsealed
+            # still carries it: the reader has nothing else to read with.
+            sealed = bool(info.endpoints) and bool(
+                TensorDescriptor.FromString(info.descriptor.command).ticket_stub
+            )
             return SerializedTensor(
                 location=location,
-                auth_token=self._state.token or "",
+                auth_token="" if sealed else (self._state.token or ""),
                 flight_info=info.serialize(),
                 tls_anchor=self._state.tls_anchor if is_tls_location(location) else b"",
             )

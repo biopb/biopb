@@ -18,17 +18,87 @@ message TensorTicket {
     CatalogQuery catalog_query = 2;
     // One tensor's annotation set from the `roi` flight (private data).
     RoiRead roi_read = 3;
+    // One pixel chunk of the `data` flight, named by a plan-wide stub plus the
+    // chunk's grid index instead of by a chunk_id of its own. See ChunkRef.
+    ChunkRef chunk_ref = 4;
   }
+}
+
+// One pixel chunk, as `stub + index`.
+//
+// A GetFlightInfo that is asked for `ticket_stub` returns the stub once, on
+// the descriptor, and each endpoint's ticket carries only the `index`. The
+// ticket DoGet takes is the two joined: serialized protobuf messages merge
+// when concatenated, so `stub_bytes + endpoint_ticket_bytes` is one ChunkRef
+// carrying both, and a client needs no codec to build it.
+//
+// The server expands `(stub.identity, index)` into the chunk_id it always
+// served, so the cache, the staleness check and the upload path see the same
+// bytes they did before; nothing below the ticket changed.
+message ChunkRef {
+  TicketStub stub = 1;
+  // The chunk's absolute position on the tensor's chunk grid, one entry per
+  // axis. Absolute rather than relative to the plan's window, so one chunk
+  // reads the same bytes whichever plan reached it.
+  repeated uint32 index = 2;
+}
+
+// What every chunk of one plan shares, split by how long it stays true.
+//
+// The two halves are separate fields so they can be told apart without being
+// understood: a cache keys on `identity` and ignores `grant`, whose expiry and
+// seal change every time the plan is made.
+message TicketStub {
+  // Which tensor, version, scale, method and grid. Opaque, server-minted, and
+  // stable: the same tensor, read the same way, mints the same bytes. A client
+  // echoes it back and a proxy wraps it, and neither reads it.
+  bytes identity = 1;
+  // The authority to read this plan's chunks, in place of a bearer token.
+  ChunkGrant grant = 2;
+}
+
+// A seal over a TicketStub's identity, the window of chunks the plan covers,
+// and an expiry. Whoever holds it may read exactly those chunks until it
+// expires, with no other credential.
+message ChunkGrant {
+  // The plan's window on the chunk grid, [window_start, window_stop) per axis.
+  // A chunk_ref whose index falls outside it is refused.
+  repeated uint32 window_start = 1;
+  repeated uint32 window_stop = 2;
+  // Unix seconds after which the seal is refused; 0 never expires.
+  uint64 expires_at = 3;
+  // A MAC the server computes over the identity, window and expiry, keyed by a
+  // secret that persists across restarts. Rotating the key revokes every seal
+  // outstanding.
+  bytes seal = 4;
 }
 
 // A tensor's annotations, as rows of the ROI row schema (biopb.image). The
 // stream's schema metadata carries `truncated` and the tensor's `sets` (JSON).
+//
+// A GetFlightInfo asked for `ticket_stub` returns, on the descriptor, the
+// ticket that reads every set of the tensor with `grant` filled in. A holder
+// that wants one set merges `RoiRead{set_name}` onto it the same way.
 message RoiRead {
   // Unversioned array_id of the annotated tensor.
   string array_id = 1;
   // Restrict to one layer, and the only way to read a reserved ("@") set.
   // Empty -> the tensor's client-owned sets.
   string set_name = 2;
+  // The authority to read this tensor's annotations, in place of a bearer
+  // token. Absent on a ticket a bearer-authenticated caller makes itself.
+  RoiGrant grant = 3;
+}
+
+// A seal over a tensor's id, its content version, and an expiry. The version
+// is in it so a tensor name that is reused cannot inherit the grant of the
+// tensor that had it before.
+message RoiGrant {
+  // The tensor's content version when the seal was made.
+  bytes content_version = 1;
+  // Unix seconds after which the seal is refused; 0 never expires.
+  uint64 expires_at = 2;
+  bytes seal = 3;
 }
 
 // Encoded into FlightEndpoint.app_metadata bytes

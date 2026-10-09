@@ -53,6 +53,7 @@ from biopb_tensor_server.core.chunk import (
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
+    encode_grid_identity,
     is_scaled_chunk,
     mint_chunk_id,
     normalized_scale_hint,
@@ -244,6 +245,13 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
+    #: What every endpoint shares, when the plan is one regular grid of one
+    #: tensor: the identity ``expand_identity`` completes with each endpoint's
+    #: ``index``. None for a plan that is not (it can only be issued as full
+    #: tickets).
+    identity: Optional[bytes] = None
+    #: The plan's window on that grid, ``(start, stop)`` per axis, stop exclusive.
+    window: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
 
 
 def require_resolved(desc: TensorDescriptor) -> None:
@@ -1437,6 +1445,12 @@ def _get_read_plan(
         for ax in range(ndim)
     )
 
+    # The plan on the tensor's own chunk grid: realized_start is a multiple of
+    # the virtual chunk size, so the first chunk's absolute index is exact.
+    grid_origin = tuple(
+        realized_start[ax] // virtual_chunk_size[ax] for ax in range(ndim)
+    )
+
     # Iterate over chunk grid
     for chunk_idx in np.ndindex(*n_chunks_per_axis):
         virtual_start = tuple(
@@ -1480,7 +1494,11 @@ def _get_read_plan(
         )
 
         logical_endpoints.append(
-            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+            ChunkEndpoint(
+                chunk_id=chunk_id,
+                bounds=logical_bounds,
+                index=tuple(grid_origin[ax] + chunk_idx[ax] for ax in range(ndim)),
+            )
         )
 
     # Build descriptor
@@ -1506,4 +1524,16 @@ def _get_read_plan(
     return TensorReadPlan(
         descriptor=logical_desc,
         chunk_endpoints=logical_endpoints,
+        identity=encode_grid_identity(
+            base_desc.array_id,
+            virtual_chunk_size,
+            base_shape,
+            scale_hint,
+            reduction_method,
+            content_version,
+        ),
+        window=(
+            grid_origin,
+            tuple(grid_origin[ax] + n_chunks_per_axis[ax] for ax in range(ndim)),
+        ),
     )

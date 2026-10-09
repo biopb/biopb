@@ -478,7 +478,7 @@ class TestMultifieldServerClient:
                 f"grpc://localhost:{server.port}",
                 None,
             )
-            chunk_ids, bounds = _parse_flight_endpoints(info)
+            chunk_ids, bounds, _grant = _parse_flight_endpoints(info)
 
             assert len(chunk_ids) > 0
             assert len(chunk_ids) == len(bounds)

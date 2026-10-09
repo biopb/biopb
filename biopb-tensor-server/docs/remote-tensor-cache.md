@@ -102,6 +102,14 @@ code of its own.
   result under the envelope's own key. Forwarding the *scaled* inner means the
   upstream does any downsampling, so only the small result crosses the
   network.
+- **Stub plans.** When the caller asks for `ticket_stub` and the upstream offers
+  it (`health.ticket_stubs`), the proxy wraps the upstream's stub identity once,
+  in the same route/epoch/content_version frame, and keeps the upstream's
+  indices. A chunk is then keyed by that envelope plus the index and forwarded
+  upstream as `identity + index` under the proxy's own credentials, so the
+  upstream's grant is dropped and the proxy seals what it serves with its own
+  key. Native-level (`precompute`) reads are planned the old way, since their
+  chunks route by a level's `array_id` that a stub hides.
 - **Writes are not forwarded.** The proxy is read-only: `add_tensor` and other
   write verbs are refused on a mirrored source, exactly as on the wire.
 

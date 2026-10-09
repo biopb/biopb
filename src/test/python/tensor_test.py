@@ -559,7 +559,9 @@ class TestExportLocation:
         client = _offline_client(raw_client=Mock())
         client._state.advertised_location = "grpc://real-host:8815"
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
         return client
 
@@ -677,7 +679,9 @@ class TestExportedTrust:
     def test_pb_carries_the_anchor_for_a_tls_location_only(self):
         client = self._tls_client()
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
         pb = client._fetcher.get_tensor("test-tensor", output="pb")
         assert pb.tls_anchor == self.LEAF
@@ -730,7 +734,9 @@ class TestGetTensorOutputSwitch:
     def test_get_tensor_output_pb(self):
         client = _offline_client(raw_client=Mock())
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
 
         pb = client.get_tensor("test-tensor", output="pb")
@@ -742,7 +748,9 @@ class TestGetTensorOutputSwitch:
     def test_get_tensor_pb_forwards_export_location(self):
         client = _offline_client(raw_client=Mock())
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
 
         pb = client.get_tensor(
