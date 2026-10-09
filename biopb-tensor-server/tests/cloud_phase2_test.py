@@ -428,10 +428,10 @@ class _FakeServer:
         # registry; `registered` is this fake's own record of the same calls.
         self.sources = self.registered
 
-    def register_source(self, source_id, adapter):
+    def register_source(self, source_id, adapter, evictable=False):
         self.registered[source_id] = adapter
 
-    def swap_source(self, source_id, adapter):
+    def swap_source(self, source_id, adapter, evictable=False):
         displaced = self.registered.get(source_id)
         self.registered[source_id] = adapter
         return adapter, displaced
@@ -684,6 +684,8 @@ class TestPrecacheSkipsUnresolved:
         class _Registry:
             def get(self, sid):
                 return None
+
+            resolve = get
 
         class _Srv:
             sources = _Registry()

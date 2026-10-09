@@ -307,10 +307,14 @@ class Reconciler:
         if adapter is not None:
             return adapter.catalog_url
         with self._lock:
-            if source_id not in self._pending:
-                return None
             claim = self._state.claims.get(source_id)
-            url = self._pending[source_id]
+            if source_id not in self._pending:
+                # Registered, its adapter let go of: derived as it was built.
+                if claim is None or source_id not in self._server.sources:
+                    return None
+                url = self._catalog_url_for(claim)
+            else:
+                url = self._pending[source_id]
         if url:
             return url
         return to_catalog_url(str(claim.primary_path)) if claim is not None else None
@@ -1218,7 +1222,12 @@ class Reconciler:
         live = self._server.sources.get(source_id)
         if live is not None:
             return getattr(live, "_catalog_url", None)
-        return self._pending.get(source_id)
+        if source_id in self._pending:
+            return self._pending[source_id]
+        claim = self._state.claims.get(source_id)
+        if claim is not None and source_id in self._server.sources:
+            return self._catalog_url_for(claim)  # registered, adapter let go of
+        return None
 
     def _replace_claim_locked(
         self,
@@ -1626,10 +1635,16 @@ class Reconciler:
         registered = False
         displaced: Optional[Any] = None
         try:
+            # What can be rebuilt from its row may be let go when idle: a local
+            # file source with a claim. A cloud recall, a proxy and a drop-in
+            # upload are held for as long as they are registered.
+            evictable = not recall and self._deferrable(claim)
             if replace:
-                adapter, displaced = self._server.swap_source(claim.source_id, adapter)
+                adapter, displaced = self._server.swap_source(
+                    claim.source_id, adapter, evictable
+                )
             else:
-                self._server.register_source(claim.source_id, adapter)
+                self._server.register_source(claim.source_id, adapter, evictable)
             registered = True
 
             # Raises on failure -> the except below rolls back register_source,

@@ -109,6 +109,7 @@ class SourceManager:
         prune_unseen_days: int = 0,
         registration_workers: int = 0,
         walk_threads: int = 1,
+        adapter_idle_seconds: float = 0.0,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -116,6 +117,10 @@ class SourceManager:
         self._server = server
         self._registry = registry
         self._metadata_db = metadata_db
+        # How long a source's adapter is kept after its last read; 0 keeps it for
+        # as long as the source is registered. A rebuild costs a row read and a
+        # payload rebuild, and the first read reopens the file.
+        self._adapter_idle_seconds = adapter_idle_seconds
 
         # Every root, and what is true of each (alias, cloud, kind). Under a cloud
         # root (config ``cloud=true``) dehydrated entries are admitted and
@@ -518,12 +523,25 @@ class SourceManager:
     def _event_loop(self) -> None:
         """Run a rescan every ``rescan_interval`` seconds until stopped.
 
+        With an adapter idle time set, the loop also wakes to let go of idle
+        adapters between rescans.
+
         The next tick is scheduled from the moment the previous one *finished*,
         so a rescan that outruns the interval does not immediately queue another.
         A failed rescan is logged and the cadence continues; the next pass sees
         the same tree and retries.
         """
-        while not self._stop.wait(max(0.0, self._next_rescan_at - time.monotonic())):
+        idle = self._adapter_idle_seconds
+        while True:
+            wait = max(0.0, self._next_rescan_at - time.monotonic())
+            if idle > 0:
+                wait = min(wait, max(1.0, idle / 4))
+            if self._stop.wait(wait):
+                break
+            if idle > 0:
+                self._server.sources.release_idle(idle)
+            if time.monotonic() < self._next_rescan_at:
+                continue
             try:
                 self._handle_rescan()
             except Exception:
@@ -1375,6 +1393,7 @@ def create_source_manager(
     rescan_interval: float = 120.0,
     registration_workers: int = 0,
     walk_threads: int = 1,
+    adapter_idle_seconds: float = 0.0,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1408,6 +1427,9 @@ def create_source_manager(
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
         rescan_interval: Seconds between rescans (floored at 0.1s).
+        adapter_idle_seconds: Seconds a registered source's adapter is kept after
+            its last read, for a source that can be rebuilt from its row; 0 keeps
+            every adapter.
         registration_workers: Threads that register, in the background, the
             sources the first scan claims. 0 registers each as it is claimed.
 
@@ -1462,6 +1484,7 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         prune_unseen_days=prune_unseen_days,
         registration_workers=registration_workers,
+        adapter_idle_seconds=adapter_idle_seconds,
         walk_threads=walk_threads,
     )
 

@@ -1675,7 +1675,7 @@ class MetadataDatabase:
         row is how a source is *browsable*, and it must not be able to fail the
         change that made a tensor *readable*. A source with no adapter or no row
         has nothing to re-list."""
-        adapter = self._registry.get(source_id)
+        adapter = self._registry.resolve(source_id)
         if adapter is None:
             return
         try:
