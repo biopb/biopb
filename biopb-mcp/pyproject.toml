@@ -18,13 +18,14 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-# Upper bound mirrors biopb / biopb-tensor-server (both >=3.12,<3.13): biopb-mcp
-# depends on biopb[tensor], so without it a 3.13 install fails with a confusing
-# transitive resolution error instead of a clean requires-python message. Also
-# matches the classifiers above (3.12 only).
-requires-python = ">=3.12,<3.13"
+# Bounds mirror biopb-tensor-server and biopb-control: biopb-mcp depends on
+# biopb[tensor], so a mismatch fails with a confusing transitive resolution
+# error instead of a clean requires-python message.
+requires-python = ">=3.12,<3.15"
 dependencies = [
     # mcp <2: 2.x deleted `mcp.server.fastmcp`, which `mcp/_server.py` is built
     # on, and imports cryptography at module scope, which our pyjwt override
@@ -80,15 +81,14 @@ dependencies = [
 # the version: dev/CI (`uv sync ... --extra napari`), the published wheel, and
 # the installer all resolve the identical napari, so the graph-walk
 # thread-safety test certifies the same object graph that actually ships (see
-# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari -- its
-# default Qt binding is version-dependent, so the exact pin freezes that too
-# (>=0.7 was also needed to stay off the 0.6.x line, which pins vispy<0.16 and
-# can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
-# version as a `versions.json` release attribute that install.sh reads to pin
-# `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
+# _jobs.wrap_viewer_for_threads). The `pyqt6` extra, not `all`, brings the Qt
+# binding: `all` pulls napari's optional-base (plugin manager and more), which
+# nothing here uses, and the extra carries napari's pyqt6-qt6 exclusions. The
+# release pipeline surfaces this version as a `versions.json` release attribute
+# that install.sh reads to pin `napari[pyqt6]==` at deploy time (release.yaml +
+# install/install.sh). Bump here.
 napari = [
-    "napari[all]==0.7.0",
-    "pyqt6",
+    "napari[pyqt6]==0.9.2",
     "qtpy",
     # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
     "biopb-napari-widget >= 0.1.1rc5",

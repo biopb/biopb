@@ -91,7 +91,7 @@ Two independent workflows fire on the same tag, from the tagged commit:
    `SHA256SUMS` + `install.sh`/`install.ps1` + the Windows GUI installer — to the
    **GitHub release `release-v<R>`**. **This is the installer's source of truth**
    (it `file://`-installs the wheels; from PyPI it takes the `biopb` SDK and
-   `napari[all]`, both pinned by `versions.json`, and `biopb-napari-widget`,
+   `napari[pyqt6]`, both pinned by `versions.json`, and `biopb-napari-widget`,
    which biopb-mcp's `[napari]` extra brings). The SDK is not a release asset; `release.yaml`
    builds it only to check it against PyPI. It builds **no Docker**.
 2. **`tensor-server-ci`**'s `publish` job builds the `biopb-tensor-server` image

@@ -1373,10 +1373,10 @@ function Invoke-BiopbInstall {
     # The download is ~30 MB and cached, and uv and the wheels already need the
     # network.
     #
-    # 3.12 is the ceiling: the biopb packages declare requires-python
-    # ">=3.12,<3.13", and the CZI reader (pylibczirw / aicspylibczi) has no cp313
-    # wheel, so 3.13 would build it from source (cmake + libCZI + MSVC) on a fresh
-    # Windows box. $pythonSpec is what `uv tool install --python` gets below;
+    # 3.12 is the interpreter the installer is tested with: the biopb packages
+    # run on 3.12-3.14, but the CZI reader (aicspylibczi) has no cp314 wheel, so
+    # 3.14 would build it from source (cmake + libCZI + MSVC) on a fresh Windows
+    # box. $pythonSpec is what `uv tool install --python` gets below;
     # pinning it keeps uv from discovering a system Python of its own.
     #
     # install.sh deliberately still prefers a system python3 in range: a POSIX box
@@ -1472,7 +1472,7 @@ function Invoke-BiopbInstall {
     if (-not $versions.biopb -or -not $versions.napari -or -not $versions.release) {
         throw "Release $($release.tag_name) has an incomplete versions.json."
     }
-    $napariReq   = "napari[all]==$($versions.napari)"
+    $napariReq   = "napari[pyqt6]==$($versions.napari)"
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
     $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1

@@ -1336,12 +1336,12 @@ install_biopb() {
     # biopb-mcp (always installed) requires Python >= 3.12.
     MIN_MINOR=12
 
-    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
-    # requires-python ">=3.12,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
-    # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
-    # libCZI), which fails on a fresh machine without a C++ toolchain. If the
-    # system Python is newer we fall back to a uv-managed 3.12 below.
+    # Upper bound: the packages run on 3.12-3.14, but this is the interpreter the
+    # installer is tested with, and the default `czi` extra pulls the CZI reader
+    # (aicspylibczi), which ships no cp314 wheel yet — on 3.14 pip would build it
+    # from source (cmake + libCZI), which fails on a fresh machine without a C++
+    # toolchain. If the system Python is newer we fall back to a uv-managed 3.12
+    # below.
     MAX_MINOR=12
 
     # PYTHON_SPEC is the interpreter we hand to `uv tool install` below via --python.
@@ -1436,7 +1436,7 @@ install_biopb() {
         fi
         exit 1
     fi
-    # The release's versions.json pins napari (and so the napari[all] Qt
+    # The release's versions.json pins napari (and so the napari[pyqt6] Qt
     # binding) and the `biopb` SDK, installed from PyPI, to the versions the
     # release was built and tested with, and carries the deployment `release`
     # version, recorded post-install as the auto-updater's baseline (issue #87).
@@ -1462,7 +1462,7 @@ install_biopb() {
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
     fi
-    napari_req="napari[all]==$napari_pin"
+    napari_req="napari[pyqt6]==$napari_pin"
     local mcp_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
