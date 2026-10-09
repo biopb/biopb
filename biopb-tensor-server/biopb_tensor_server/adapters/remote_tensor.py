@@ -16,7 +16,7 @@ OPAQUE: a served chunk_id is a **proxy envelope** (``chunk.encode_proxy_envelope
 wrapping the upstream chunk_id byte-for-byte, plus a local route and the upstream's
 content_version. A later ``do_get`` peels the envelope and forwards the inner
 VERBATIM -- no decode, no rewrite of the upstream id (biopb/biopb#178 W1). The
-upstream array_id is read once at flight-info time only to build the local route.
+local route is the tensor the plan is for.
 
 This module is the adapter and its data path, constructible directly (and via
 ``create_from_config`` for the single-source
@@ -77,18 +77,25 @@ from biopb_tensor_server.core.adapter_base import (
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
-    array_id_from_chunk_id,
     cache_key_for_chunk_id,
     current_epoch,
     encode_chunk_id,
     encode_proxy_envelope,
+    encode_proxy_identity,
+    envelope_inner_is_ticket,
+    expand_identity,
     is_proxy_envelope,
     peel_proxy_envelope,
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
 from biopb_tensor_server.core.labels import split_label_field
-from biopb_tensor_server.core.read_mask import LOCAL_ONLY, PYRAMID, read_mask
+from biopb_tensor_server.core.read_mask import (
+    LOCAL_ONLY,
+    PYRAMID,
+    TICKET_STUB,
+    read_mask,
+)
 from biopb_tensor_server.core.registration import (
     RegistrationRecord,
     metadata_record,
@@ -596,6 +603,11 @@ class RemoteTensorAdapter(TensorAdapter):
         out.CopyFrom(desc)
         out.array_id = self._to_local_array_id(desc.array_id)
         out.metadata_json = ""
+        # The upstream's tickets are its own to seal. This server issues its own
+        # over the plan it serves (biopb/biopb#1112), and an upstream's stub
+        # would name a tensor and a key this server does not hold.
+        out.ClearField("ticket_stub")
+        out.ClearField("roi_ticket")
         return out
 
     def _mark_unreachable(self, exc: Exception) -> None:
@@ -982,27 +994,30 @@ class RemoteTensorAdapter(TensorAdapter):
         info = self._upstream_flight_info(read_opt)
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
-            endpoints = []
             content_version = self.content_version  # loop-invariant
+            if up_desc.ticket_stub and info.endpoints:
+                return self._forward_stub_plan(info, up_desc, content_version)
+            # The local route is the tensor this plan is for. It only has to reach
+            # an adapter of this source: that adapter forwards the envelope's
+            # inner to the upstream verbatim, and the upstream routes by the ids
+            # inside it -- a native level's own adapter included. So the proxy
+            # never reads an upstream chunk_id; wrapping it in the envelope
+            # (route, epoch, content_version, then the bytes untouched) is the
+            # whole of it. The upstream's content_version rides the envelope, so
+            # the proxy cache namespaces by upstream content.
+            route = self._to_local_array_id(up_desc.array_id)
+            endpoints = []
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
-                bounds = ChunkBounds.FromString(ep.app_metadata)
-                # Wrap the upstream chunk_id in a proxy envelope: it is carried
-                # VERBATIM (never rewritten) and forwarded byte-for-byte on do_get,
-                # so bounds/scale/version bytes are untouched and the proxy stays
-                # blind to the upstream codec. We read the chunk's OWN upstream
-                # array_id (not self.array_id -- a sibling-field chunk keeps its own)
-                # only to build the LOCAL route, so the server dispatches a later
-                # do_get back to the right local tensor view. The upstream's
-                # content_version rides the envelope, so the proxy cache
-                # namespaces by upstream content.
-                upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
-                    ticket.chunk_id,
-                    self._to_local_array_id(upstream_aid),
-                    content_version,
+                    ticket.chunk_id, route, content_version
                 )
-                endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
+                endpoints.append(
+                    ChunkEndpoint(
+                        chunk_id=local_chunk_id,
+                        bounds=ChunkBounds.FromString(ep.app_metadata),
+                    )
+                )
             return TensorReadPlan(
                 descriptor=self._localize_forwarded_descriptor(up_desc),
                 chunk_endpoints=endpoints,
@@ -1012,6 +1027,39 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"upstream flight-info response for {self.array_id} could not be "
                 f"localized: {exc!r}"
             ) from exc
+
+    def _forward_stub_plan(
+        self, info, up_desc: TensorDescriptor, content_version: Optional[bytes]
+    ) -> TensorReadPlan:
+        """Localize an upstream plan that came as a stub plus indices.
+
+        The stub's identity is wrapped once, verbatim, in this proxy's own frame
+        -- route, epoch, content_version -- and the endpoints keep the upstream's
+        indices. So the proxy reads no upstream ticket per chunk and never learns
+        what the identity says; the local server seals what it serves, over the
+        upstream's window. The upstream's grant is dropped: it authorizes reading
+        the upstream, and this proxy does that with its own credentials.
+        """
+        stub = TensorTicket.FromString(up_desc.ticket_stub).chunk_ref.stub
+        identity = encode_proxy_identity(
+            stub.identity, self._to_local_array_id(up_desc.array_id), content_version
+        )
+        endpoints = []
+        for ep in info.endpoints:
+            index = tuple(TensorTicket.FromString(ep.ticket.ticket).chunk_ref.index)
+            endpoints.append(
+                ChunkEndpoint(
+                    chunk_id=expand_identity(identity, index),
+                    bounds=ChunkBounds.FromString(ep.app_metadata),
+                    index=index,
+                )
+            )
+        return TensorReadPlan(
+            descriptor=self._localize_forwarded_descriptor(up_desc),
+            chunk_endpoints=endpoints,
+            identity=identity,
+            window=(tuple(stub.grant.window_start), tuple(stub.grant.window_stop)),
+        )
 
     def has_native_pyramid(self) -> bool:
         """Whether the upstream serves this tensor from stored pyramid levels.
@@ -1045,6 +1093,16 @@ class RemoteTensorAdapter(TensorAdapter):
         self._native_pyramid_memo = (key, native)
         return native
 
+    def _upstream_issues_stubs(self, read_opt: TensorReadOption) -> bool:
+        """Should this request ask the upstream for a stub plan?
+
+        Only when the caller asked for one and the upstream offers it. Every
+        other case is planned as before, one ticket per chunk.
+        """
+        if TICKET_STUB not in read_mask(read_opt):
+            return False
+        return bool(self.client._state.ticket_stubs)
+
     def _upstream_flight_info(self, read_opt: TensorReadOption):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
 
@@ -1063,6 +1121,8 @@ class RemoteTensorAdapter(TensorAdapter):
         # Forward the mask minus what this server answers itself -- LOCAL_ONLY
         # is the single definition of which paths those are (read_mask.py).
         forwarded = read_mask(read_opt) - LOCAL_ONLY
+        if not self._upstream_issues_stubs(read_opt):
+            forwarded = forwarded - {TICKET_STUB}
         up_read_opt.fields.paths.extend(sorted(forwarded))
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
@@ -1151,7 +1211,10 @@ class RemoteTensorAdapter(TensorAdapter):
         def compute_fn():
             # Forward the upstream chunk_id VERBATIM (the opaque inner); the upstream
             # does any downsampling and only the result crosses the network.
-            batch = self._upstream_record_batch(inner)
+            if envelope_inner_is_ticket(chunk_id):
+                batch = self._upstream_do_get(inner)
+            else:
+                batch = self._upstream_record_batch(inner)
             return batch, batch.nbytes
 
         if should_cache:
@@ -1167,9 +1230,18 @@ class RemoteTensorAdapter(TensorAdapter):
 
     def _upstream_record_batch(self, upstream_chunk_id: bytes) -> pa.RecordBatch:
         """do_get one chunk from the upstream, as a single unified RecordBatch."""
-        ticket = TensorTicket(chunk_id=upstream_chunk_id)
+        return self._upstream_do_get(
+            TensorTicket(chunk_id=upstream_chunk_id).SerializeToString()
+        )
+
+    def _upstream_do_get(self, ticket_bytes: bytes) -> pa.RecordBatch:
+        """do_get *ticket_bytes* from the upstream, as one unified RecordBatch.
+
+        The ticket is whatever names the chunk: a chunk_id arm, or an identity
+        and index the upstream completes itself.
+        """
         reader = self.client._client.do_get(
-            flight.Ticket(ticket.SerializeToString()),
+            flight.Ticket(ticket_bytes),
             options=self.client._call_options,
         )
         table = reader.read_all()

@@ -90,6 +90,12 @@ message TensorDescriptor {
   // Per-dimension integer downsampling factors for virtual/scaled reads.
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   // These do not change tensor identity, only how a specific read request is planned.
+  //
+  // A GetFlightInfo *response* leaves this and `reduction_method` unset from
+  // Flight protocol v3 on: the request is recorded whole in
+  // `FlightInfo.app_metadata` (a TensorReadOption), and the descriptor carries
+  // what the server decided -- the realized `slice_hint`, the logical `shape`
+  // and `chunk_shape`. A v2 server echoed them here.
   repeated int64 scale_hint = 7;
 
   // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",
@@ -214,6 +220,24 @@ message TensorDescriptor {
   // forms an opaque chunk key, which must also change when chunking or
   // normalization changes, is internal to the server and not visible here.
   optional bytes content_version = 14;
+
+  // A serving field, filled only when the request's field mask names
+  // "ticket_stub". The plan's stub: a serialized TensorTicket whose
+  // `chunk_ref.stub` carries what every chunk of the plan shares, and whose
+  // endpoints then carry only their `chunk_ref.index`. A client reads a chunk
+  // by sending `ticket_stub + endpoint.ticket` -- the two concatenated, which
+  // protobuf merges into one ChunkRef.
+  //
+  // The stub's grant is a read credential for exactly the chunks the plan
+  // names, so a reference can leave the machine without the connection's own
+  // token. Empty means the server issued full tickets and the endpoints stand
+  // alone.
+  bytes ticket_stub = 18;
+
+  // A serving field, filled with `ticket_stub`. A serialized TensorTicket whose
+  // `roi_read` names this tensor with a grant: send it as the ticket for every
+  // set, or merge a `RoiRead{set_name}` onto it for one.
+  bytes roi_ticket = 19;
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -336,6 +360,10 @@ message TensorReadOption {
   //                     The one cheap path: an in-memory record read.
   //   "is_resident"   - whether the bytes are local right now. A bounded stat
   //                     walk of the source (biopb/biopb#1035).
+  //   "ticket_stub"   - issue the plan as one sealed stub plus an index per
+  //                     endpoint (see ChunkRef) instead of a full ticket per
+  //                     endpoint, and fill `roi_ticket`. Refused by a server
+  //                     whose `health` does not report `ticket_stubs`.
   //
   // Opt-in throughout, and that is the point of replacing the three `with_*`
   // bools this supersedes: they defaulted the *most* expensive part, the read

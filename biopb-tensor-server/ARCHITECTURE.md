@@ -101,7 +101,7 @@ id or a byte-prefix sniff -- and the arm names the flight:
 | Flight | Data | GetFlightInfo | DoGet ticket | DoPut command |
 |---|---|---|---|---|
 | `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
-| `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted) | `PutCommand.chunk` (writable servers) |
+| `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted), or `chunk_ref` (a plan's stub + a grid index) | `PutCommand.chunk` (writable servers) |
 | `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.tensor._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
 
 `ListFlights` advertises the catalog only: one flight per table by path, with
@@ -117,6 +117,33 @@ capability token when it carries one, else the server-wide token. A grant sits
 on one tensor, never on the source it hangs off -- one source is shared by
 uploads with different producers. A private tensor may still be catalogued --
 the token gates reading, not knowing.
+
+**Sealed plans** (`ticket_stub` in the field mask). A plan is issued as one
+*stub* on the descriptor plus an index per endpoint, rather than a ticket per
+chunk. The stub splits into an `identity` (tensor, version, scale, method, grid:
+stable, and what a cache keys on) and a `grant`: a MAC over the identity, the
+plan's window of chunks and an expiry. A client reads a chunk by concatenating
+the stub and the endpoint's ticket, which protobuf merges; the server expands
+`(identity, index)` back into the chunk_id it always minted, so nothing below the
+ticket changed. A valid seal opens `do_get` and `chunk_locate` for its chunks in
+place of a bearer token, so a reference can leave the machine without the
+connection's token (`auth_token` empty). It never opens planning or an action. The
+tensor's ROI sets get the same treatment (`roi_ticket`), with the content version
+in the MAC so a reused name inherits nothing. Seals last `server.seal_ttl`
+seconds (a day by default, 0 never expires; on the admin page like any other
+server key). The key lives in the state tree (`ticket-seal.key`); deleting it
+revokes every seal outstanding. A mirror wraps
+its upstream's identity once and keeps the upstream's indices, and seals what it
+serves with its own key.
+
+**What a plan records of its request.** From Flight protocol v3 a plan's
+`FlightInfo.app_metadata` is the whole `TensorReadOption` it answers, and its
+descriptor carries only what the server decided (realized `slice_hint`, logical
+`shape`/`chunk_shape`), not an echo of the scale and method. A consumer crops
+back to the request, or replays it to plan a handle that has no endpoints, from
+there. Which protocol wrote a plan is stamped on its schema (`flight_protocol`),
+so a plan handed between processes is self-describing. The SDK reads v2 and v3
+servers; a v2 SDK refuses a v3 server by its health check and has to upgrade.
 
 `health` is outside both tiers and answers anyone, the way an HTTP server
 answers `/healthz`: it is the liveness probe, so a caller that cannot yet

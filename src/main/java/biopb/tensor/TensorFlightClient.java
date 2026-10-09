@@ -863,14 +863,24 @@ public class TensorFlightClient implements AutoCloseable {
      * @return the annotations, a {@code truncated} flag, and the tensor's sets
      */
     public RoiListResult listRois(String arrayId, String setName) throws IOException {
-        TensorTicket ticket = TensorTicket.newBuilder()
-                .setRoiRead(RoiRead.newBuilder()
-                        .setArrayId(arrayId)
-                        .setSetName(setName == null ? "" : setName)
-                        .build())
-                .build();
+        return listRois(arrayId, setName, null);
+    }
+
+    /**
+     * Fetch one layer of a tensor's ROI annotations through a sealed ticket.
+     *
+     * @param arrayId unversioned array_id of the tensor
+     * @param setName restrict to one layer; empty means the client-owned sets
+     * @param roiTicket the sealed ticket a reference carried
+     *        ({@link #roiTicketOf}), to read through a connection that holds no
+     *        token of its own; null reads with this connection's own
+     * @return the annotations, a {@code truncated} flag, and the tensor's sets
+     */
+    public RoiListResult listRois(String arrayId, String setName, byte[] roiTicket)
+            throws IOException {
         RoiListResult.Builder result = RoiListResult.newBuilder();
-        try (FlightStream stream = session.getStream(new Ticket(ticket.toByteArray()))) {
+        try (FlightStream stream = session.getStream(
+                new Ticket(roiReadTicket(arrayId, setName, roiTicket)))) {
             // `truncated` and the tensor's `sets` ride the stream's schema
             // metadata, so they are read before the first batch.
             Map<String, String> metadata = stream.getSchema().getCustomMetadata();
@@ -1210,7 +1220,7 @@ public class TensorFlightClient implements AutoCloseable {
         // descriptor.shape may be larger than the requested extent.
         if (sliceHint != null && context.descriptor.hasSliceHint()) {
             rai = RegionCrop.cropToRequest(rai, sliceHint, context.descriptor.getSliceHint(),
-                    context.descriptor.getScaleHintList());
+                    PlanRequest.of(context.info).getScaleHintList());
         }
 
         // Preserve source compatibility while externalizing only the v2 handle.
@@ -1288,7 +1298,11 @@ public class TensorFlightClient implements AutoCloseable {
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
                 .setLocation(exportLocation == null ? location.getUri().toString() : exportLocation)
                 .setFlightInfo(ByteString.copyFrom(info.serialize()));
-        if (token != null && !token.isEmpty()) {
+        // A plan the server sealed names what it reads and needs no credential
+        // to read it, so the reference leaves without this connection's token
+        // (biopb/biopb#1112). Anything unsealed still carries it: the reader has
+        // nothing else to read with.
+        if (token != null && !token.isEmpty() && !isSealed(info)) {
             builder.setAuthToken(token);
         }
         // The anchor the plan was read under, so the consumer trusts the same
@@ -1298,6 +1312,46 @@ public class TensorFlightClient implements AutoCloseable {
             builder.setTlsAnchor(ByteString.copyFrom(anchor));
         }
         return builder.build();
+    }
+
+    /** Did the server seal this plan: endpoints that are indices under a stub? */
+    static boolean isSealed(FlightInfo info) {
+        return !info.getEndpoints().isEmpty()
+                && !TensorChunkCodec.descriptorOf(info).getTicketStub().isEmpty();
+    }
+
+    /**
+     * The sealed ticket for reading a SerializedTensor's annotations, or null if
+     * its sender issued none. The server seals it into the plan it answers, so a
+     * reference that carries no token can still read its tensor's ROI sets: pass
+     * it to {@link #listRois(String, String, byte[])}.
+     */
+    public static byte[] roiTicketOf(SerializedTensor pb) {
+        ByteString ticket = descriptorOf(pb).getRoiTicket();
+        return ticket.isEmpty() ? null : ticket.toByteArray();
+    }
+
+    /**
+     * The ticket for one read of the {@code roi} flight. A sealed {@code roiTicket}
+     * reads every set; naming one merges a {@code RoiRead{set_name}} onto it, the
+     * way protobuf merges concatenated messages.
+     */
+    static byte[] roiReadTicket(String arrayId, String setName, byte[] roiTicket) {
+        String set = setName == null ? "" : setName;
+        if (roiTicket == null || roiTicket.length == 0) {
+            return TensorTicket.newBuilder()
+                    .setRoiRead(RoiRead.newBuilder().setArrayId(arrayId).setSetName(set).build())
+                    .build()
+                    .toByteArray();
+        }
+        if (set.isEmpty()) {
+            return roiTicket;
+        }
+        byte[] named = TensorTicket.newBuilder()
+                .setRoiRead(RoiRead.newBuilder().setSetName(set).build())
+                .build()
+                .toByteArray();
+        return ByteString.copyFrom(roiTicket).concat(ByteString.copyFrom(named)).toByteArray();
     }
 
     /** The plan a SerializedTensor carries: its serialized Arrow FlightInfo. */
@@ -1778,9 +1832,14 @@ public class TensorFlightClient implements AutoCloseable {
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
+        // Ask for the sealed stub when the server issues one, so the plan carries
+        // an index per chunk instead of a ticket per chunk and can leave the
+        // machine without this connection's token (biopb/biopb#1112).
         TensorReadOption.Builder read = TensorReadOption.newBuilder()
                 .setArrayId(arrayId)
-                .setFields(readMask("endpoints"));
+                .setFields(session.ticketStubs()
+                        ? readMask("endpoints", "ticket_stub")
+                        : readMask("endpoints"));
         if (sliceHint != null) {
             read.setSliceHint(sliceHint);
         }

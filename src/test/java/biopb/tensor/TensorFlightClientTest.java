@@ -444,6 +444,54 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testAsksForTheSealedStubOnlyOfAServerThatOffersIt() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setProtocolVersion(3);
+            server.setTicketStubs(true);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getTensor("test-tensor");
+                Assert.assertEquals(Arrays.asList("endpoints", "ticket_stub"), server.getLastFields());
+            }
+        }
+        // A server that does not say gets the plan it always did; asking it for
+        // the path would be refused as an unknown mask path.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setProtocolVersion(3);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getTensor("test-tensor");
+                Assert.assertEquals(Arrays.asList("endpoints"), server.getLastFields());
+            }
+        }
+    }
+
+    @Test
+    public void testAcceptsEverySupportedFlightShape() throws Exception {
+        // A new client reads a v2 server's plans as well as a v3 server's.
+        for (int version : new int[] {2, 3}) {
+            try (TestFlightServer server = new TestFlightServer()) {
+                server.setProtocolVersion(version);
+                try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                    client.getTensor("test-tensor");
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testRefusesANewerServerNamingTheClientToUpgrade() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setProtocolVersion(4);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> client.getTensor("test-tensor"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("server speaks v4"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("Upgrade the client"));
+            }
+        }
+    }
+
+    @Test
     public void testAcceptsAMatchingFlightShapeAndProbesOnlyOnce() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
@@ -1016,6 +1064,11 @@ public class TensorFlightClientTest {
             producer.protocolVersion = version;
         }
 
+        /** The server says, on health, that it issues plans as sealed stubs. */
+        void setTicketStubs(boolean offered) {
+            producer.ticketStubs = offered;
+        }
+
         void setChunkWireProtocol(String version) {
             producer.chunkWireProtocol = version;
         }
@@ -1080,6 +1133,8 @@ public class TensorFlightClientTest {
         final List<String> catalogQueries = new java.util.concurrent.CopyOnWriteArrayList<>();
         // The Flight protocol shape this fake claims to speak.
         volatile int protocolVersion = 2;
+        // Whether `health` reports `ticket_stubs`.
+        volatile boolean ticketStubs = false;
         // What `health` says clients outside the server's network should dial.
         volatile String externalLocation = null;
         final AtomicInteger healthRequests = new AtomicInteger();
@@ -1354,8 +1409,9 @@ public class TensorFlightClientTest {
                 String external = externalLocation == null
                         ? ""
                         : ",\"external_location\":\"" + externalLocation + "\"";
+                String stubs = ticketStubs ? ",\"ticket_stubs\":true" : "";
                 listener.onNext(new Result(("{\"status\":\"SERVING\",\"protocol\":"
-                        + protocolVersion + external + "}").getBytes(StandardCharsets.UTF_8)));
+                        + protocolVersion + stubs + external + "}").getBytes(StandardCharsets.UTF_8)));
                 listener.onCompleted();
                 return;
             }

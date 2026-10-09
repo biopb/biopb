@@ -44,6 +44,7 @@ from biopb_tensor_server.core.config import (
 )
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.retention import active_decode_rates
+from biopb_tensor_server.core.ticket_seal import load_seal_key
 from biopb_tensor_server.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -781,6 +782,8 @@ def _setup_flight_server(
         upload_ttl=server_config.upload_ttl,
         scratch_ttl=server_config.scratch_ttl,
         external_location=external_location,
+        seal_key=load_seal_key(),
+        seal_ttl=server_config.seal_ttl,
     )
 
     # Publish TLS fingerprint for any local clients.

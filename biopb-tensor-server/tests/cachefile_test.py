@@ -93,10 +93,14 @@ def _first_chunk(client, array_id: str):
     """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
     from biopb.tensor._session import _parse_flight_endpoints
 
+    # The leaf is driven with a bare chunk_id, so plan without stubs; a stub plan
+    # has its own tests (ticket_stub_test).
+    _ = client._state.client  # run the health check, so the override sticks
+    client._state.server_health["ticket_stubs"] = False
     info = flight.FlightInfo.deserialize(
         client.get_tensor(array_id, output="pb").flight_info
     )
-    chunk_ids, bounds = _parse_flight_endpoints(info)
+    chunk_ids, bounds, _grant = _parse_flight_endpoints(info)
     b = bounds[0]
     return chunk_ids[0], tuple(b.start), tuple(b.stop)
 
@@ -1329,7 +1333,12 @@ class TestCachefileIntegration:
         """A real (chunk_id, start, stop) triple for source "z"'s first chunk."""
         from biopb.tensor._session import _parse_flight_endpoints
 
-        chunk_ids, bounds = _parse_flight_endpoints(client._fetcher._plan_read("z"))
+        # The leaf is driven with a bare chunk_id, so plan without stubs.
+        _ = client._state.client  # run the health check, so the override sticks
+        client._state.server_health["ticket_stubs"] = False
+        chunk_ids, bounds, _grant = _parse_flight_endpoints(
+            client._fetcher._plan_read("z")
+        )
         return chunk_ids[0], tuple(bounds[0].start), tuple(bounds[0].stop)
 
     def test_fetched_block_is_read_only_fast_path(self):

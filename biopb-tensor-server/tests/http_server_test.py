@@ -1375,6 +1375,33 @@ class TestAdminConfigRoutes:
         assert body["config"]["server"]["port"] == 8815
         assert "properties" in body["schema"]
 
+    def test_the_seal_ttl_is_on_the_admin_form_and_saves(self, admin_client):
+        """The form is the published schema, so a new server key reaches it with
+        its help text and its bound, and a save round-trips."""
+        tc, config_path = admin_client
+        schema = tc.get("/api/config").json()["schema"]
+        prop = schema["properties"]["server"]["properties"]["seal_ttl"]
+        assert prop["minimum"] == 0
+        assert "sealed read ticket" in prop["description"]
+
+        ok = tc.put(
+            "/api/config",
+            json={"server": {"seal_ttl": 7200}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert tc.get("/api/config").json()["config"]["server"]["seal_ttl"] == 7200
+
+        before = config_path.read_text()
+        bad = tc.put(
+            "/api/config",
+            json={"server": {"seal_ttl": -1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert bad.status_code == 422
+        assert any(e["path"] == ["server", "seal_ttl"] for e in bad.json()["errors"])
+        assert config_path.read_text() == before
+
     def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
         tc, config_path = admin_client
         before = config_path.read_text()

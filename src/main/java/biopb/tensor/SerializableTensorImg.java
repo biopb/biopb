@@ -141,41 +141,34 @@ class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         }
 
         RandomAccessibleInterval<T> image = new Imglib2TensorFactory(session, cacheBytes).create(plan);
-        SliceHint requested = requestedSlice(plan);
+        TensorReadOption request = PlanRequest.of(plan);
         TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
-        if (requested != null && descriptor.hasSliceHint()) {
-            image = RegionCrop.cropToRequest(image, requested, descriptor.getSliceHint(),
-                    descriptor.getScaleHintList());
+        if (request.hasSliceHint() && descriptor.hasSliceHint()) {
+            image = RegionCrop.cropToRequest(image, request.getSliceHint(), descriptor.getSliceHint(),
+                    request.getScaleHintList());
         }
         return image;
     }
 
     private FlightInfo refreshEndpointlessPlan(FlightInfo plan) {
         TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
+        // Replay the request the handle recorded, for its endpoints; a handle
+        // that recorded none is rebuilt from the descriptor's realized slice.
+        TensorReadOption recorded = PlanRequest.of(plan);
         TensorReadOption.Builder read = TensorReadOption.newBuilder()
                 .setArrayId(descriptor.getArrayId())
                 .setFields(FieldMask.newBuilder().addPaths("endpoints").build());
-        if (descriptor.hasSliceHint()) {
+        if (recorded.hasSliceHint()) {
+            read.setSliceHint(recorded.getSliceHint());
+        } else if (descriptor.hasSliceHint()) {
             read.setSliceHint(descriptor.getSliceHint());
         }
-        read.addAllScaleHint(descriptor.getScaleHintList());
-        if (!descriptor.getReductionMethod().isEmpty()) {
-            read.setReductionMethod(descriptor.getReductionMethod());
+        read.addAllScaleHint(recorded.getScaleHintList());
+        if (!recorded.getReductionMethod().isEmpty()) {
+            read.setReductionMethod(recorded.getReductionMethod());
         }
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
         return session.getInfo(FlightDescriptor.command(request.toByteArray()));
-    }
-
-    private static SliceHint requestedSlice(FlightInfo plan) {
-        byte[] metadata = plan.getAppMetadata();
-        if (metadata == null || metadata.length == 0) {
-            return null;
-        }
-        try {
-            return SliceHint.parseFrom(metadata);
-        } catch (InvalidProtocolBufferException error) {
-            throw new IllegalArgumentException("FlightInfo.app_metadata is not a SliceHint", error);
-        }
     }
 
     /**

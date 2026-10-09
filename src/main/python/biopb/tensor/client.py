@@ -47,8 +47,8 @@ from biopb.tensor._session import (
     _ClientState,
     _dask_from_flight_info,
     _explain_handshake_failure,
+    _plan_request,
     _refetch_flight_info,
-    _requested_slice,
     split_array_id as split_array_id,
 )
 from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
@@ -505,7 +505,13 @@ class TensorFlightClient:
 
     # ---- ROI annotations ----
 
-    def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
+    def list_rois(
+        self,
+        array_id: str,
+        set_name: str = "",
+        *,
+        roi_ticket: Optional[bytes] = None,
+    ) -> RoiListResult:
         """Fetch a tensor's ROI annotations.
 
         There is no plane or bbox filter: a client hit-tests and re-renders
@@ -516,6 +522,9 @@ class TensorFlightClient:
             array_id: Unversioned array_id of the tensor.
             set_name: Restrict to one layer, and the only way to read a
                 reserved (``@``) set. Empty means the client-owned sets.
+            roi_ticket: The sealed ticket a reference carried
+                (:meth:`roi_ticket_from_pb`), to read through a connection that
+                holds no token of its own.
 
         Returns:
             ``RoiListResult`` with ``rois``, a ``truncated`` flag, and ``sets``
@@ -525,7 +534,7 @@ class TensorFlightClient:
         Raises:
             flight.FlightUnavailableError: annotations disabled, or no metadata DB.
         """
-        return self._catalog.list_rois(array_id, set_name)
+        return self._catalog.list_rois(array_id, set_name, roi_ticket=roi_ticket)
 
     def put_rois(
         self,
@@ -696,6 +705,17 @@ class TensorFlightClient:
         return TensorDescriptor.FromString(info.descriptor.command)
 
     @staticmethod
+    def roi_ticket_from_pb(pb: SerializedTensor) -> Optional[bytes]:
+        """The sealed ticket for reading a SerializedTensor's annotations, or
+        None if its sender issued none.
+
+        The server seals it into the plan it answers, so a reference that
+        carries no token can still read its tensor's ROI sets: pass it to
+        :meth:`list_rois` as ``roi_ticket``.
+        """
+        return TensorFlightClient.descriptor_from_pb(pb).roi_ticket or None
+
+    @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
         cache_bytes: Optional[int] = None,
@@ -727,7 +747,7 @@ class TensorFlightClient:
         token = pb.auth_token or None
         location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        requested = _requested_slice(info)
+        request = _plan_request(info)
         # The sender's anchor, applied to the name dialed here; a sender that
         # predates the field sends none, and this falls back to TOFU.
         trust = (
@@ -742,6 +762,7 @@ class TensorFlightClient:
                 location,
                 token,
                 trust,
+                request,
             )
         return _dask_from_flight_info(
             info,
@@ -749,7 +770,7 @@ class TensorFlightClient:
             token,
             cache_bytes,
             trust,
-            requested,
+            request,
         )
 
     # ====================

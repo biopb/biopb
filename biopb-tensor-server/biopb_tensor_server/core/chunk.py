@@ -219,6 +219,11 @@ _ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
 # Envelope layout, the byte after the sentinel.
 _ENV_FORMAT_CONTENT = 1  # (route, cv, inner)
 _ENV_FORMAT_EPOCH = 2  # (route, epoch, cv, inner)
+# Same layout as _ENV_FORMAT_EPOCH, but the inner is a serialized TensorTicket
+# naming a chunk by `stub + index` (see ``expand_identity``) rather than an
+# upstream chunk_id. It always carries the epoch, even a zero one, so the
+# format byte alone says how to forward the inner.
+_ENV_FORMAT_TICKET = 3
 
 
 def is_proxy_envelope(chunk_id: bytes) -> bool:
@@ -238,14 +243,33 @@ def encode_proxy_envelope(
     in what they mean here has to re-key here. The inner is stored and later
     forwarded byte-for-byte -- the proxy never interprets it.
     """
-    route_bytes = route.encode("utf-8")
-    cv = content_version or b""
     epoch = current_epoch()
     fmt = _ENV_FORMAT_CONTENT if epoch == 0 else _ENV_FORMAT_EPOCH
+    return _frame_envelope(fmt, inner_chunk_id, route, epoch, content_version)
+
+
+def _frame_envelope(
+    fmt: int,
+    inner: bytes,
+    route: str,
+    epoch: int,
+    content_version: Optional[bytes],
+) -> bytes:
+    route_bytes = route.encode("utf-8")
+    cv = content_version or b""
     head = struct.pack(">BBI", _ENV_SENTINEL, fmt, len(route_bytes)) + route_bytes
-    if epoch != 0:
+    if fmt != _ENV_FORMAT_CONTENT:
         head += struct.pack(">I", epoch)
-    return head + struct.pack(">I", len(cv)) + cv + inner_chunk_id
+    return head + struct.pack(">I", len(cv)) + cv + inner
+
+
+def envelope_inner_is_ticket(chunk_id: bytes) -> bool:
+    """True if a proxy envelope's inner is a serialized ticket, not a chunk_id.
+
+    Decides how a proxy forwards the peeled inner upstream: as the ticket
+    itself, or wrapped as a ``chunk_id`` arm.
+    """
+    return is_proxy_envelope(chunk_id) and chunk_id[1] == _ENV_FORMAT_TICKET
 
 
 def peel_proxy_envelope(
@@ -259,7 +283,7 @@ def peel_proxy_envelope(
     route_len = struct.unpack(">I", chunk_id[2:6])[0]
     offset = 6 + route_len
     route = chunk_id[6:offset].decode("utf-8")
-    if chunk_id[1] == _ENV_FORMAT_EPOCH:
+    if chunk_id[1] in (_ENV_FORMAT_EPOCH, _ENV_FORMAT_TICKET):
         epoch = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
         offset += 4
     else:
@@ -448,6 +472,216 @@ def mint_chunk_id(
     return wrap_content_version(inner, content_version)
 
 
+# =============================================================================
+# Plan identity (biopb/biopb#1112)
+# -----------------------------------------------------------------------------
+# A plan whose chunks share everything but their position is issued as ONE
+# identity plus an index per chunk, instead of a minted chunk_id per chunk. The
+# identity is the chunk_id minus the bounds: a template that ``expand_identity``
+# completes, byte for byte, into the chunk_id ``mint_chunk_id`` would have
+# minted for that chunk. So the cache key, the staleness gate and the upload
+# path see the ids they always did.
+#
+# The identity names the tensor and how it is read -- never the request that
+# reached it. The index is absolute on the tensor's own chunk grid, so two plans
+# with different windows mint the same bytes for the same chunk, and a cache
+# keyed on identity + index does not fragment by slice.
+#
+# Two kinds, told apart by the first byte (disjoint from the 0x00 / 0xFF / 0xFE
+# chunk_id discriminators, though an identity is never a chunk_id):
+#   0xFD  a grid: ``[kind][u32 hdr_len][hdr][u32 aid_len][aid][u16 ndim]
+#         [ndim*i64 chunk][ndim*i64 shape][u8 scaled][scaled: ndim*i64 scale, u8 method]``
+#         where ``hdr`` is the version header ``mint_chunk_id`` would prepend.
+#   0xFC  a proxy's: the route, epoch and content_version of
+#         ``encode_proxy_envelope``, then the UPSTREAM's identity verbatim. A
+#         proxy never reads the upstream's identity, so it cannot complete it;
+#         it expands to an envelope whose inner is the upstream ticket instead.
+# =============================================================================
+
+_ID_GRID = 0xFD
+_ID_PROXY = 0xFC
+
+
+def encode_grid_identity(
+    array_id: str,
+    chunk_size: Sequence[int],
+    shape: Sequence[int],
+    scale_hint: Optional[Sequence[int]] = None,
+    reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
+    content_version: Optional[bytes] = None,
+) -> bytes:
+    """The identity of a regular grid of chunks of *array_id*.
+
+    *chunk_size* is the SOURCE extent one chunk reads (the virtual chunk size),
+    *shape* the source tensor's, so a chunk's bounds are ``index * chunk_size``
+    clipped to the tensor -- exactly how the planner cuts them. The version
+    header is fixed here, at planning time, as ``mint_chunk_id`` fixes it.
+    """
+    ndim = len(chunk_size)
+    if len(shape) != ndim:
+        raise ValueError("chunk_size and shape must have the same rank")
+    header = (
+        b""
+        if content_version is None and current_epoch() == 0
+        else _version_header(content_version, current_epoch())
+    )
+    aid = array_id.encode("utf-8")
+    parts = [
+        struct.pack(">BI", _ID_GRID, len(header)),
+        header,
+        struct.pack(">I", len(aid)),
+        aid,
+        struct.pack(">H", ndim),
+        struct.pack(f">{ndim}q", *map(int, chunk_size)),
+        struct.pack(f">{ndim}q", *map(int, shape)),
+    ]
+    if scale_hint is None:
+        parts.append(b"\x00")
+    else:
+        normalized = normalize_reduction_method(reduction_method)
+        try:
+            method = _SCALED_METHOD_BYTE[normalized]
+        except KeyError:
+            raise ValueError(
+                f"No chunk_id code for reduction_method {normalized!r}"
+            ) from None
+        parts += [b"\x01", struct.pack(f">{ndim}q", *map(int, scale_hint)), method]
+    return b"".join(parts)
+
+
+def encode_proxy_identity(
+    upstream_identity: bytes,
+    route: str,
+    content_version: Optional[bytes],
+) -> bytes:
+    """Wrap an upstream's plan identity, verbatim, for a proxy to serve.
+
+    The counterpart of :func:`encode_proxy_envelope` for a plan: the same route,
+    epoch and content_version frame, around an identity this proxy cannot read.
+    """
+    route_bytes = route.encode("utf-8")
+    cv = content_version or b""
+    return (
+        struct.pack(">BI", _ID_PROXY, len(route_bytes))
+        + route_bytes
+        + struct.pack(">II", current_epoch(), len(cv))
+        + cv
+        + upstream_identity
+    )
+
+
+def expand_identity(identity: bytes, index: Sequence[int]) -> bytes:
+    """Complete *identity* with the chunk at *index* into a chunk_id.
+
+    Raises ``ValueError`` for an identity this server did not mint, an index of
+    the wrong rank, or one off the tensor's grid.
+    """
+    if not identity:
+        raise ValueError("empty ticket identity")
+    kind = identity[0]
+    if kind == _ID_GRID:
+        return _expand_grid_identity(identity, index)
+    if kind == _ID_PROXY:
+        return _expand_proxy_identity(identity, index)
+    raise ValueError("ticket identity is not one this server minted")
+
+
+def _expand_grid_identity(identity: bytes, index: Sequence[int]) -> bytes:
+    try:
+        (hdr_len,) = struct.unpack_from(">I", identity, 1)
+        offset = 5
+        header = identity[offset : offset + hdr_len]
+        offset += hdr_len
+        (aid_len,) = struct.unpack_from(">I", identity, offset)
+        offset += 4
+        array_id = identity[offset : offset + aid_len].decode("utf-8")
+        offset += aid_len
+        (ndim,) = struct.unpack_from(">H", identity, offset)
+        offset += 2
+        chunk_size = struct.unpack_from(f">{ndim}q", identity, offset)
+        offset += 8 * ndim
+        shape = struct.unpack_from(f">{ndim}q", identity, offset)
+        offset += 8 * ndim
+        scaled = identity[offset]
+        offset += 1
+        scale_hint: Optional[Tuple[int, ...]] = None
+        method = b""
+        if scaled:
+            scale_hint = struct.unpack_from(f">{ndim}q", identity, offset)
+            offset += 8 * ndim
+            method = identity[offset : offset + 1]
+    except (struct.error, IndexError, UnicodeDecodeError) as exc:
+        raise ValueError("ticket identity is malformed") from exc
+
+    if len(index) != ndim:
+        raise ValueError(f"chunk index has rank {len(index)}, the tensor has {ndim}")
+    start = []
+    stop = []
+    for ax in range(ndim):
+        lo = int(index[ax]) * chunk_size[ax]
+        if not 0 <= lo < shape[ax]:
+            raise ValueError(f"chunk index {tuple(index)} is off the tensor's grid")
+        start.append(lo)
+        stop.append(min(lo + chunk_size[ax], shape[ax]))
+    bounds = ChunkBounds(start=start, stop=stop)
+    inner = encode_chunk_id(array_id, bounds)
+    if scale_hint is not None:
+        inner += struct.pack(f">{ndim}q", *scale_hint) + method
+    return header + inner
+
+
+def _expand_proxy_identity(identity: bytes, index: Sequence[int]) -> bytes:
+    # Imported here: ticket_pb2 is the SDK's, and this module is imported
+    # before a proxy exists.
+    from biopb.tensor.ticket_pb2 import ChunkRef, TensorTicket, TicketStub
+
+    try:
+        (route_len,) = struct.unpack_from(">I", identity, 1)
+        offset = 5
+        route = identity[offset : offset + route_len].decode("utf-8")
+        offset += route_len
+        epoch, cv_len = struct.unpack_from(">II", identity, offset)
+        offset += 8
+        cv = identity[offset : offset + cv_len]
+        offset += cv_len
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise ValueError("ticket identity is malformed") from exc
+    ticket = TensorTicket(
+        chunk_ref=ChunkRef(
+            stub=TicketStub(identity=identity[offset:]), index=list(index)
+        )
+    )
+    return _frame_envelope(
+        _ENV_FORMAT_TICKET,
+        ticket.SerializeToString(deterministic=True),
+        route,
+        epoch,
+        cv,
+    )
+
+
+def identity_array_id(identity: bytes) -> str:
+    """The array_id a stub identity routes to, without completing it.
+
+    For a grid, its own; for a proxy's, the route. Cheap enough to gate on
+    before any index is looked at.
+    """
+    if not identity:
+        raise ValueError("empty ticket identity")
+    try:
+        if identity[0] == _ID_GRID:
+            (hdr_len,) = struct.unpack_from(">I", identity, 1)
+            offset = 5 + hdr_len
+            (aid_len,) = struct.unpack_from(">I", identity, offset)
+            return identity[offset + 4 : offset + 4 + aid_len].decode("utf-8")
+        if identity[0] == _ID_PROXY:
+            (route_len,) = struct.unpack_from(">I", identity, 1)
+            return identity[5 : 5 + route_len].decode("utf-8")
+    except (struct.error, UnicodeDecodeError) as exc:
+        raise ValueError("ticket identity is malformed") from exc
+    raise ValueError("ticket identity is not one this server minted")
+
+
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
     """``(ndim, bounds_end)`` for an INNER (legacy, version-stripped) chunk_id.
 
@@ -578,6 +812,9 @@ class ChunkEndpoint:
 
     chunk_id: bytes
     bounds: ChunkBounds
+    #: The chunk's absolute position on the tensor's chunk grid, or empty for a
+    #: plan that cannot be issued as an identity plus an index.
+    index: Tuple[int, ...] = ()
 
 
 # =============================================================================

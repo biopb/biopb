@@ -254,6 +254,7 @@ _CONSTRAINTS = {
         "handle_reaper_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
         "scratch_ttl": _Range(min=0),
+        "seal_ttl": _Range(min=0),
     },
 }
 
@@ -929,6 +930,19 @@ class ServerConfig:
             "discards them."
         },
     )
+    seal_ttl: float = field(
+        default=86400.0,
+        metadata={
+            "help": "Seconds a sealed read ticket stays valid. A reference sent "
+            "off the machine reads its tensor with these instead of this "
+            "server's token, so this is how long such a reference works: set it "
+            "to cover your longest job, or the longest a session keeps a lazy "
+            "array open. The server's own token reads without a seal and is not "
+            "affected. 0 never expires. Takes effect at the next start; "
+            "deleting ticket-seal.key from the state directory revokes every "
+            "ticket outstanding."
+        },
+    )
     stability_window: float = field(
         default=30.0,
         metadata={
@@ -1391,6 +1405,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
+    _carry(server_kwargs, "seal_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(server_kwargs, "registration_workers", server_data, cast=int)
     _carry(server_kwargs, "walk_threads", server_data, cast=int)

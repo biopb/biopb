@@ -64,6 +64,7 @@ class TestReadMaskReader:
             "pyramid",
             "upload_status",
             "is_resident",
+            "ticket_stub",
         } == READ_MASK_PATHS
 
 

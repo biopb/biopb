@@ -29,7 +29,10 @@ message SerializedTensor {
   // Flight server location URI (e.g., "grpc://localhost:8815")
   string location = 3;
 
-  // Per-source capability token or the server token; empty if none.
+  // Per-tensor capability token or the server token; empty if none. Empty too
+  // when the server sealed the plan in `flight_info` (its descriptor carries a
+  // `ticket_stub`): the plan's own tickets then read exactly its chunks until
+  // they expire, and the connection's token stays with the sender.
   string auth_token = 4;
 
   // Serialized arrow.flight.protocol.FlightInfo; see above.

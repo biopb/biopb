@@ -66,9 +66,12 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
+    ChunkRef,
     PutCommand,
+    RoiRead,
     SetUploadStatus,
     TensorTicket,
+    TicketStub,
 )
 from google.protobuf.message import DecodeError, Message
 
@@ -89,6 +92,8 @@ from biopb_tensor_server.core.adapter_base import (
 )
 from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
+    expand_identity,
+    identity_array_id,
     is_proxy_envelope,
     is_scaled_chunk,
     routing_array_id,
@@ -106,10 +111,12 @@ from biopb_tensor_server.core.errors import (
 from biopb_tensor_server.core.read_mask import (
     IS_RESIDENT,
     METADATA_JSON,
+    TICKET_STUB,
     UPLOAD_STATUS,
     read_mask,
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
+from biopb_tensor_server.core.ticket_seal import DEFAULT_SEAL_TTL, TicketSealer
 from biopb_tensor_server.serving.activity import ActivityTracker
 from biopb_tensor_server.serving.metadata_db import (
     MetadataDatabase,
@@ -420,6 +427,8 @@ class TensorFlightServer(flight.FlightServerBase):
         upload_ttl: float = DEFAULT_UPLOAD_TTL,
         scratch_ttl: float = DEFAULT_SCRATCH_TTL,
         external_location: Optional[str] = None,
+        seal_key: Optional[bytes] = None,
+        seal_ttl: Optional[float] = DEFAULT_SEAL_TTL,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -467,6 +476,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 ``TensorFlightClient``). Pass neither for a plaintext ``grpc://``
                 server; passing exactly one is an error.
             tls_private_key: PEM-encoded private key matching ``tls_cert_chain``.
+            seal_key: The secret that seals the tickets this server issues
+                (biopb/biopb#1112). Keep it across restarts, or the lazy arrays
+                clients hold stop reading; replacing it revokes every seal
+                outstanding. ``None`` makes one for this process, so its seals
+                die with it -- right for a test or an embedded server.
+            seal_ttl: Seconds a seal lasts; 0 or ``None`` never expires.
             **kwargs: Additional arguments passed to FlightServerBase
         """
         # TLS is all-or-nothing: a cert without its key (or vice versa) can't
@@ -506,6 +521,10 @@ class TensorFlightServer(flight.FlightServerBase):
         # what a private source without a capability token of its own falls
         # back to. None disables it (local mode).
         self._server_token: Optional[str] = token or None
+
+        # Seals the read tickets it issues, so a reference can name what it
+        # reads and carry no token (biopb/biopb#1112).
+        self._sealer = TicketSealer(seal_key, seal_ttl)
 
         # The address advertised on ``health`` for a client that isn't the one
         # that dialed us (biopb/biopb#1158). None means advertise nothing.
@@ -790,9 +809,19 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
 
     def _authorize_read(
-        self, context: flight.ServerCallContext, array_id: str, action: str
+        self,
+        context: flight.ServerCallContext,
+        array_id: str,
+        action: str,
+        sealed: bool = False,
     ) -> None:
-        """Full access, or a narrow grant covering this read of this tensor.
+        """Full access, a valid seal, or a narrow grant covering this read of
+        this tensor.
+
+        *sealed* says the ticket being read carries a seal this server made and
+        that covers it (biopb/biopb#1112); the caller checked, since only it
+        holds the ticket. A seal names its own chunks, so it needs neither the
+        bearer token nor the tensor's grant.
 
         The server-wide token is checked first and grants everything, so a
         capability *adds* access rather than replacing it -- do not reorder
@@ -811,7 +840,7 @@ class TensorFlightServer(flight.FlightServerBase):
         be catalogued. Reading it is.
         """
         provided = self._presented_token(context)
-        if self._has_full_access(provided):
+        if self._has_full_access(provided) or sealed:
             return
         granted = self._grants(provided, action, array_id)
         if granted:
@@ -1151,6 +1180,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 # The Flight protocol shape this server speaks; the SDK checks
                 # it before its first call. A server without the key is v1.
                 "protocol": FLIGHT_PROTOCOL_VERSION,
+                # Whether GetFlightInfo serves the ``ticket_stub`` mask path:
+                # one sealed stub per plan in place of a ticket per chunk. A
+                # server without the key does not, and refuses the path.
+                "ticket_stubs": True,
                 "source_count": len(self.sources) + self._unregistered(),
                 # Whether this server offers a catalog at all. A constant True
                 # since #225 ("every server has a catalog now"), which is the
@@ -1221,17 +1254,13 @@ class TensorFlightServer(flight.FlightServerBase):
             yield reply.SerializeToString()
         elif action.type == "chunk_locate":
             ticket = self._parse_ticket(flight.Ticket(action.body.to_pybytes()))
-            if ticket.WhichOneof("payload") != "chunk_id":
+            if ticket.WhichOneof("payload") not in ("chunk_id", "chunk_ref"):
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
-            # The ticket first, then the gate it names: routing_array_id reads
-            # the route token without decoding the chunk, the same way do_get
-            # does for this ticket. Computed once and passed on, so the
-            # adapter lookup below does not re-derive it from the chunk_id.
-            array_id = routing_array_id(ticket.chunk_id)
-            self._authorize_read(context, array_id, READ_PIXELS)
-            yield self._handle_chunk_locate(ticket.chunk_id, array_id=array_id).encode(
-                "utf-8"
-            )
+            # The ticket first, then the gate it names, exactly as do_get does
+            # for this ticket. The array_id is computed once and passed on, so
+            # the adapter lookup below does not re-derive it from the chunk_id.
+            chunk_id, array_id = self._open_chunk_ticket(context, ticket)
+            yield self._handle_chunk_locate(chunk_id, array_id=array_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)
             from dataclasses import asdict
@@ -1671,13 +1700,26 @@ class TensorFlightServer(flight.FlightServerBase):
             except Exception:  # noqa: BLE001 -- a balky adapter is not the request
                 logger.debug("is_resident failed for %s", source_id, exc_info=True)
 
+        # A client that asked for ``ticket_stub`` gets the plan's shared part
+        # once, on the descriptor, and an index per endpoint. A plan that is not
+        # one regular grid has no shared part and is issued whole, which the
+        # empty ``ticket_stub`` tells the client.
+        stubbed = False
+        if TICKET_STUB in mask:
+            stubbed = self._issue_ticket_stub(context, read_plan, tensor_adapter)
+
         # Convert to FlightEndpoints. Each endpoint carries the server-minted
-        # chunk_id as an opaque ticket and the chunk's bounds as app_metadata;
-        # the client echoes the ticket back to do_get and never decodes the
-        # chunk_id byte format (a strictly server-side concern).
+        # chunk_id (or, for a stubbed plan, its grid index) as an opaque ticket
+        # and the chunk's bounds as app_metadata; the client echoes the ticket
+        # back to do_get and never decodes the chunk_id byte format (a strictly
+        # server-side concern).
         endpoints = []
         for ce in read_plan.chunk_endpoints:
-            ticket = TensorTicket(chunk_id=ce.chunk_id)
+            ticket = (
+                TensorTicket(chunk_ref=ChunkRef(index=ce.index))
+                if stubbed
+                else TensorTicket(chunk_id=ce.chunk_id)
+            )
             endpoint = flight.FlightEndpoint(
                 ticket=flight.Ticket(ticket.SerializeToString()),
                 locations=[],
@@ -1686,11 +1728,11 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints.append(endpoint)
 
         logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
-        # The requested slice, verbatim, so the plan says what it was asked for
-        # as well as what it realized: the descriptor's slice_hint is snapped
-        # outward to chunk-aligned bounds, and a consumer -- this connection or
-        # one handed the FlightInfo as a SerializedTensor -- crops back to the
-        # request from here rather than remembering it separately.
+        # The plan records the request it answers, verbatim, beside the realized
+        # slice on its descriptor; the descriptor does not echo the scale and
+        # method back.
+        read_plan.descriptor.ClearField("scale_hint")
+        read_plan.descriptor.ClearField("reduction_method")
         return flight.FlightInfo(
             schema=schema,
             descriptor=flight.FlightDescriptor.for_command(
@@ -1699,12 +1741,106 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints=endpoints,
             total_records=-1,
             total_bytes=-1,
-            app_metadata=(
-                read_opt.slice_hint.SerializeToString()
-                if read_opt.HasField("slice_hint")
-                else b""
-            ),
+            app_metadata=read_opt.SerializeToString(),
         )
+
+    def _may_read(
+        self, context: flight.ServerCallContext, array_id: str, action: str
+    ) -> bool:
+        """Would :meth:`_authorize_read` pass? For deciding what to issue, where
+        a refusal is an omission and not an error."""
+        try:
+            self._authorize_read(context, array_id, action)
+        except flight.FlightUnauthenticatedError:
+            return False
+        return True
+
+    def _issue_ticket_stub(
+        self,
+        context: flight.ServerCallContext,
+        read_plan,
+        tensor_adapter: TensorAdapter,
+    ) -> bool:
+        """Seal the plan's shared part onto its descriptor, and the tensor's ROI
+        ticket beside it (biopb/biopb#1112).
+
+        Returns whether the plan's endpoints are to be issued as indices. The
+        caller was authorized to read these pixels before it was planned, and
+        that is what a seal is issued on -- a holder of one cannot plan.
+
+        The ROI ticket goes to a caller that may also read the annotations, and
+        only where there is a store to read them from.
+        """
+        desc = read_plan.descriptor
+        if (
+            self._annotations_enabled
+            and self._metadata_db is not None
+            and self._may_read(context, desc.array_id, READ_ANNOTATIONS)
+        ):
+            desc.roi_ticket = TensorTicket(
+                roi_read=RoiRead(
+                    array_id=desc.array_id,
+                    grant=self._sealer.grant_rois(
+                        desc.array_id, tensor_adapter.content_version
+                    ),
+                )
+            ).SerializeToString()
+
+        if (
+            read_plan.identity is None
+            or read_plan.window is None
+            or not read_plan.chunk_endpoints
+        ):
+            return False
+        start, stop = read_plan.window
+        desc.ticket_stub = TensorTicket(
+            chunk_ref=ChunkRef(
+                stub=TicketStub(
+                    identity=read_plan.identity,
+                    grant=self._sealer.grant_chunks(read_plan.identity, start, stop),
+                )
+            )
+        ).SerializeToString()
+        return True
+
+    def _open_chunk_ticket(
+        self, context: flight.ServerCallContext, ticket: TensorTicket
+    ) -> Tuple[bytes, str]:
+        """The chunk_id a pixel ticket names, and the array_id it routes to,
+        after authorizing the read.
+
+        A ``chunk_id`` ticket is the id itself. A ``chunk_ref`` is completed
+        into the id the planner would have minted, so everything past this
+        point -- adapter lookup, the cache, the staleness gate -- sees the ids
+        it always did. A seal on the ref opens the read in place of a bearer
+        token, for the chunks in its window and no others.
+        """
+        arm = ticket.WhichOneof("payload")
+        if arm == "chunk_id":
+            array_id = routing_array_id(ticket.chunk_id)
+            self._authorize_read(context, array_id, READ_PIXELS)
+            return ticket.chunk_id, array_id
+
+        ref = ticket.chunk_ref
+        try:
+            chunk_id = expand_identity(ref.stub.identity, ref.index)
+            array_id = identity_array_id(ref.stub.identity)
+        except ValueError as exc:
+            raise flight.FlightServerError(f"chunk_ref ticket refused: {exc}") from exc
+        # The MAC is only worth computing for a caller the token does not
+        # already admit.
+        sealed = not self._has_full_access(
+            self._presented_token(context)
+        ) and self._sealer.covers(ref.stub.identity, ref.stub.grant, ref.index)
+        try:
+            self._authorize_read(context, array_id, READ_PIXELS, sealed=sealed)
+        except flight.FlightUnauthenticatedError:
+            if ref.stub.grant.seal and not sealed:
+                raise flight.FlightUnauthenticatedError(
+                    "Ticket seal is invalid, expired, or does not cover this chunk"
+                ) from None
+            raise
+        return chunk_id, array_id
 
     def do_get(
         self, context: flight.ServerCallContext, ticket: flight.Ticket
@@ -1728,21 +1864,17 @@ class TensorFlightServer(flight.FlightServerBase):
         # Heavy chunk-read path: track it as in-flight so the background
         # precache worker stays idle while real reads are happening.
         with self.activity.serving_request():
-            logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
+            chunk_id, array_id = self._open_chunk_ticket(context, tensor_ticket)
+            logger.debug(f"do_get: chunk_id={chunk_id[:16]}...")
 
-            array_id = routing_array_id(tensor_ticket.chunk_id)
-            self._authorize_read(context, array_id, READ_PIXELS)
-
-            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id, array_id)
+            adapter = self._get_adapter_for_chunk(chunk_id, array_id)
 
             # Get cache manager singleton (if initialized)
             cache_manager = CacheManager.get_instance()
 
             # Read the chunk, using the configured cache backend when applicable.
             try:
-                record_batch = adapter.resolve_chunk_data(
-                    tensor_ticket.chunk_id, cache_manager
-                )
+                record_batch = adapter.resolve_chunk_data(chunk_id, cache_manager)
             except TensorResolutionError as e:
                 # A stale chunk_id (biopb/biopb#178) is the client's held ticket
                 # outliving a re-registration, not a server bug -- surface it as
@@ -1770,6 +1902,26 @@ class TensorFlightServer(flight.FlightServerBase):
                 reader, options=WIRE_WRITE_OPTIONS if compressed else None
             )
 
+    def _roi_sealed(self, req: RoiRead) -> bool:
+        """Does the grant on this read cover this tensor as it is now?
+
+        Looks the tensor up to compare versions: a seal made for a tensor that
+        has since been replaced under the same id is not its seal. A tensor that
+        cannot be found has no version to compare, and an unversioned one is
+        told apart from another only by its absence of one.
+        """
+        if not req.HasField("grant"):
+            return False
+        source_id, tensor_id = split_array_id(req.array_id)
+        try:
+            adapter = self._get_adapter_for_tensor(
+                source_id, self._field_within_source(source_id, tensor_id)
+            )
+        except Exception:  # noqa: BLE001 -- no tensor, no version: not sealed
+            return False
+        version = getattr(adapter, "content_version", None)
+        return self._sealer.covers_rois(req.array_id, req.grant, version)
+
     def _roi_read_stream(
         self, context: flight.ServerCallContext, req
     ) -> flight.FlightDataStream:
@@ -1778,7 +1930,12 @@ class TensorFlightServer(flight.FlightServerBase):
         db = self._require_annotations()
         try:
             _require_array_id(req.array_id)
-            self._authorize_read(context, req.array_id, READ_ANNOTATIONS)
+            self._authorize_read(
+                context,
+                req.array_id,
+                READ_ANNOTATIONS,
+                sealed=self._roi_sealed(req),
+            )
             rois, truncated = db.list_rois(req.array_id, req.set_name)
             sets = [
                 {"set_name": name, "count": count, "reserved": is_reserved_set(name)}

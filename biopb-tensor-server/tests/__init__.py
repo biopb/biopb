@@ -1,5 +1,8 @@
 """Tests for biopb-tensor-server."""
 
+import threading
+import time
+
 
 def source_ids(client):
     """The ``source_id`` set of every source the server's catalog holds."""
@@ -91,3 +94,23 @@ def make_manager(
     for source in monitored_upstreams:
         roots.add(Root.from_config(source, RootKind.UPSTREAM))
     return SourceManager(roots=roots, **kwargs)
+
+
+def serve(server):
+    """Run *server* on a daemon thread and give it a moment to bind."""
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(1)
+
+
+def grid_source(tmp_path, name="img", shape=(64, 64), chunks=(16, 16)):
+    """``(data, adapter)``: a uint8 zarr of ``arange`` values, served as a tensor
+    whose chunk grid is ``shape // chunks``."""
+    import numpy as np
+    import zarr
+    from biopb_tensor_server import ZarrAdapter
+
+    data = np.arange(shape[0] * shape[1], dtype=np.uint8).reshape(shape)
+    path = str(tmp_path / f"{name}.zarr")
+    arr = zarr.open_array(path, mode="w", shape=shape, chunks=chunks, dtype="uint8")
+    arr[:] = data
+    return data, ZarrAdapter(zarr.open_array(path, mode="r"), name, ["y", "x"])
