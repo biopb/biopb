@@ -2,6 +2,8 @@
 rebuilds it from the source's row."""
 
 import gc
+import sys
+import time
 
 import pytest
 from biopb_tensor_server.sources.source_registry import SourceRegistry
@@ -21,6 +23,15 @@ class _Slotted:
 
     def close(self):
         pass
+
+
+def _descriptors():
+    """Open descriptors of this process, where /proc says (None elsewhere)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    import os
+
+    return len(os.listdir("/proc/self/fd"))
 
 
 def _release(registry, idle=0.0):
@@ -156,7 +167,8 @@ class TestRebuildAfterRelease:
     def test_a_rescan_tick_lets_idle_adapters_go(self, tmp_path):
         run, sid, first = self._run(tmp_path)
         del first
-        run.manager._adapter_idle_seconds = 1e-6
+        run.manager._adapter_idle_seconds = 0.01
+        time.sleep(0.1)  # the monotonic clock is coarse on Windows
 
         run.manager._release_idle_adapters()
         gc.collect()
@@ -179,8 +191,6 @@ class TestFormatsAreCollected:
 
     @pytest.mark.parametrize("name", ["plain.tif", "scene.ome.tif"])
     def test_a_tiff_family_source_after_a_read(self, tmp_path, name):
-        import os
-
         import numpy as np
         import tifffile
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -211,12 +221,13 @@ class TestFormatsAreCollected:
 
         run = rt._Run(tmp_path)
         run.restore()
-        before = len(os.listdir("/proc/self/fd"))
+        before = _descriptors()
         first = read(sid, run)
         assert run.server.sources.release_idle(0.0, now=1e12) == 1
         gc.collect()
 
         assert run.server.sources.get(sid) is None
-        assert len(os.listdir("/proc/self/fd")) <= before + 2  # the pooled handle
+        if before is not None:
+            assert _descriptors() <= before + 2  # the pooled handle
         assert np.array_equal(read(sid, run), first)
         run.stop()
