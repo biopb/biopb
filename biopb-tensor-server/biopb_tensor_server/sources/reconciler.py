@@ -672,12 +672,10 @@ class Reconciler:
     def materialize(self, source_id: str) -> None:
         """Register a pending source now, for a client that resolved it.
 
-        Returns once the source is registered, or is not pending (unknown,
-        removed). Raises ``SourceRegistrationError`` when its registration failed.
+        Returns once the source has an adapter, or is unknown. Raises why it
+        cannot be had: see :meth:`ensure_adapter`.
         """
-        if self._materialize_mirror(source_id) or self.ensure_registered(source_id):
-            return
-        self.check_registered(source_id)
+        self.ensure_adapter(source_id, consent=True)
 
     def _materialize_mirror(self, source_id: str) -> bool:
         """Give a mirrored source its adapter. Returns whether *source_id* is one
@@ -693,24 +691,33 @@ class Reconciler:
         return any(m.owns(source_id) for m in list(self._mirrors.values()))
 
     def check_registered(self, source_id: str) -> None:
-        """Raise why a read of a source with no adapter cannot be served.
+        """Give a read of a source with no adapter its adapter, or raise why not.
 
-        ``SourceRegistrationError`` when its registration failed, an unresolved
-        error while it waits -- either way the client resolves it. Returns for a
-        source that is unknown or has an adapter.
+        :meth:`ensure_adapter` without a client's consent.
+        """
+        self.ensure_adapter(source_id, consent=False)
 
-        A registered source whose adapter is gone, and a restored one, are the
-        exceptions to "never registers": their rows are complete and list as
-        resolved, so a read rebuilds the adapter here, once (the registration
-        is single-flight), instead of asking a client to resolve it.
+    def ensure_adapter(self, source_id: str, *, consent: bool) -> None:
+        """Make sure *source_id* has an adapter, or raise why it cannot.
+
+        *consent* is whether a client asked for this source by resolving it. A
+        mirror is built from its row. A source that is registered but lost its
+        adapter, and a restored one, have complete rows that list as resolved,
+        so they are built either way. Any other pending source -- a cloud
+        recall, one never resolved, a failed one retried -- is registered only
+        with consent. Returns for an unknown source, so ``get`` stays ``None``.
+
+        Without an adapter at the end, raises ``SourceRegistrationError`` when
+        its registration failed, an unresolved error while it waits. The
+        registration is attempted at most once.
         """
         if self._materialize_mirror(source_id):
             return
         with self._lock:
             restored = source_id in self._restored
-        if (restored or not self.is_pending(source_id)) and self.ensure_registered(
-            source_id
-        ):
+        if (
+            consent or restored or not self.is_pending(source_id)
+        ) and self.ensure_registered(source_id):
             return
         with self._lock:
             if source_id not in self._pending:
