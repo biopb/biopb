@@ -235,7 +235,11 @@ class SourceManager:
         self._deferred: Dict[str, float] = {}
         set_pending_check = getattr(server.sources, "set_pending_check", None)
         if set_pending_check is not None:
-            set_pending_check(self._reconciler.check_registered)
+            set_pending_check(
+                lambda source_id: self._reconciler.ensure_adapter(
+                    source_id, consent=False
+                )
+            )
 
     def resolve_source(self, source_id: str, on_target: Callable[[str], None]) -> bool:
         """Register a source that has no adapter yet, for the ``resolve`` action.
@@ -244,7 +248,7 @@ class SourceManager:
         of the pool; a source that is registered already is left alone. Calls
         ``on_target`` with the path about to be opened. Returns False for an
         unknown source, and raises why a source cannot be opened (retriable or
-        not): see ``Reconciler.materialize``.
+        not): see ``Reconciler.ensure_adapter``.
         """
         adapter = self._server.sources.get(source_id)
         path = (
@@ -257,7 +261,7 @@ class SourceManager:
         if path is None:
             return False
         on_target(path or source_id)
-        self._reconciler.materialize(source_id)
+        self._reconciler.ensure_adapter(source_id, consent=True)
         return True
 
     @property

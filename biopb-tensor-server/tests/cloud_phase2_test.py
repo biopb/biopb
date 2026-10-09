@@ -616,10 +616,10 @@ class TestCloudRegistrationEndToEnd:
         assert reconciler.unregistered_count() == 1
         assert reconciler.pending_count() == 0  # waits for a client, not the pool
         with pytest.raises(SourceUnresolvedError, match="download"):
-            reconciler.check_registered("cloud1")
+            reconciler.ensure_adapter("cloud1", consent=False)
 
         # An explicit resolve builds the real adapter and writes the concrete row.
-        reconciler.materialize("cloud1")
+        reconciler.ensure_adapter("cloud1", consent=True)
         adapter = server.registered["cloud1"]
         assert [list(t.shape) for t in adapter.list_tensors()] == [[32, 48]]
         assert [sid for sid, _ in server._metadata_db.added] == ["cloud1"]
@@ -640,7 +640,7 @@ class TestCloudRegistrationEndToEnd:
         reconciler = mgr._reconciler
         claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
         reconciler._commit_add_claim(claim)
-        reconciler.materialize("cloud1")
+        reconciler.ensure_adapter("cloud1", consent=True)
         assert "cloud1" in server.registered
 
         # The bytes behind it changed: nothing is reopened, the adapter is
@@ -1503,7 +1503,7 @@ class TestResolveErrorSurfacing:
 
         monkeypatch.setattr(reconciler._registry, "get_claims_for_path", _boom)
         with pytest.raises(SourceResolveRetriableError):
-            reconciler.materialize("s1")
+            reconciler.ensure_adapter("s1", consent=True)
         assert server.registered == {}
         assert "s1" in reconciler._recall  # still waiting for a retry
 
@@ -1527,7 +1527,7 @@ class TestResolveErrorSurfacing:
 
         monkeypatch.setattr(ZarrAdapter, "create_from_config", classmethod(_boom))
         with pytest.raises(SourceResolveRetriableError):
-            reconciler.materialize("s1")
+            reconciler.ensure_adapter("s1", consent=True)
         assert "s1" in reconciler._recall
 
     def test_permanent_failure_is_plain_unresolved(self):
@@ -1541,7 +1541,7 @@ class TestResolveErrorSurfacing:
 
         server, reconciler = self._recall("/nonexistent/path.zarr", "zarr")
         with pytest.raises(SourceUnresolvedError) as exc_info:
-            reconciler.materialize("s1")
+            reconciler.ensure_adapter("s1", consent=True)
         assert not isinstance(exc_info.value, SourceResolveRetriableError)
         assert "s1" not in reconciler._pending_failed
 

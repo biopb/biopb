@@ -217,7 +217,7 @@ class Reconciler:
         # ``_pending``, disjoint from ``_pending_failed``.
         self._recall: Set[str] = set()
         # The pending sources a restore found resolved: their rows are complete
-        # and list at once, and a read registers them (``check_registered``)
+        # and list at once, and a read registers them (``ensure_adapter``)
         # rather than raising "resolve it", which a client would never ask for.
         # A subset of ``_pending``, disjoint from the other two.
         self._restored: Set[str] = set()
@@ -669,14 +669,6 @@ class Reconciler:
             self._mark_registration_failed(source_id, errors)
             return False
 
-    def materialize(self, source_id: str) -> None:
-        """Register a pending source now, for a client that resolved it.
-
-        Returns once the source has an adapter, or is unknown. Raises why it
-        cannot be had: see :meth:`ensure_adapter`.
-        """
-        self.ensure_adapter(source_id, consent=True)
-
     def _materialize_mirror(self, source_id: str) -> bool:
         """Give a mirrored source its adapter. Returns whether *source_id* is one
         (``SourceUnresolvedError`` when the upstream has not resolved it)."""
@@ -690,12 +682,9 @@ class Reconciler:
         """Whether *source_id* is a source mirrored from an upstream."""
         return any(m.owns(source_id) for m in list(self._mirrors.values()))
 
-    def check_registered(self, source_id: str) -> None:
-        """Give a read of a source with no adapter its adapter, or raise why not.
-
-        :meth:`ensure_adapter` without a client's consent.
-        """
-        self.ensure_adapter(source_id, consent=False)
+    def _is_restored(self, source_id: str) -> bool:
+        with self._lock:
+            return source_id in self._restored
 
     def ensure_adapter(self, source_id: str, *, consent: bool) -> None:
         """Make sure *source_id* has an adapter, or raise why it cannot.
@@ -713,10 +702,8 @@ class Reconciler:
         """
         if self._materialize_mirror(source_id):
             return
-        with self._lock:
-            restored = source_id in self._restored
         if (
-            consent or restored or not self.is_pending(source_id)
+            consent or not self.is_pending(source_id) or self._is_restored(source_id)
         ) and self.ensure_registered(source_id):
             return
         with self._lock:
