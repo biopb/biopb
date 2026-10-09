@@ -1436,7 +1436,7 @@ install_biopb() {
         fi
         exit 1
     fi
-    # The release's versions.json pins napari (and so the napari[pyqt6] Qt
+    # The release's versions.json pins napari (and so the napari[all] Qt
     # binding) and the `biopb` SDK, installed from PyPI, to the versions the
     # release was built and tested with, and carries the deployment `release`
     # version, recorded post-install as the auto-updater's baseline (issue #87).
@@ -1462,7 +1462,7 @@ install_biopb() {
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
     fi
-    napari_req="napari[pyqt6]==$napari_pin"
+    napari_req="napari[all]==$napari_pin"
     local mcp_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')

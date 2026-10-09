@@ -14,7 +14,7 @@ console one-liner share **one install brain**.
 `install.ps1` is **not a file-copy install** — it is a multi-minute network
 *orchestration*: install `uv`, provision a uv-managed Python, download the wheel set
 (biopb + tensor-server + mcp + control) from the latest `release-v*`, pull
-`napari[pyqt6]` from PyPI, unpack the webapp,
+`napari[all]` from PyPI, unpack the webapp,
 write `biopb.json`, start the tensor server, and wire MCP clients. It is
 idempotent and already handles the interactive choices.
 

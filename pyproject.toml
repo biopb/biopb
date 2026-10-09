@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb"
 dynamic = ["version"]
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.10,<3.15"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
 readme = "README.md"
@@ -18,6 +18,7 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -59,7 +60,7 @@ dependencies = [
     "pyarrow >= 14.0.0",
     "dask[array] >= 2024.0.0",
     "cachey >= 0.1.0",
-    "zarr >= 3.0.8",
+    "zarr >= 2.0.0",
   ]
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the
   # release publishes to biopb.org/docs/api/python/ — see docs-api/ and

@@ -293,12 +293,12 @@ jobs:
           # Read it from the PRISTINE committed blob, not the working tree: the
           # earlier `uv build --package biopb-mcp` step invokes setuptools, which
           # normalizes (rewrites) biopb-mcp/pyproject.toml in place and drops the
-          # `"napari[pyqt6]==…"` line, so a working-tree grep finds
+          # `"napari[all]==…"` line, so a working-tree grep finds
           # nothing and `set -e` aborts the step silently. `git show HEAD:` is
           # immune to that mutation. (Tag push & dry-run both checkout a commit, so
           # HEAD resolves to it.)
-          nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[pyqt6\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
-          [ -n "$nver" ] || { echo "ERROR: no napari[pyqt6]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
+          nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
+          [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
           # The SDK the installer takes from PyPI: the nearest v* tag. The next
           # step checks it is the SDK this commit builds.

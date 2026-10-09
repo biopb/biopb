@@ -66,13 +66,25 @@ def installer_requirements(target: str) -> list[str]:
         f"./biopb-tensor-server[{','.join(extras)}]",
         "./biopb-mcp[napari]",
         "./biopb-control",
-        "napari[pyqt6]",
+        "napari[all]",
     ]
 
 
 _INSTALL_SH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "install.sh"
 )
+
+_MAX_MINOR = re.compile(r"^\s*MAX_MINOR=(\d+)\s*$", re.M)
+
+
+def installer_python_version(install_sh: str = _INSTALL_SH) -> str:
+    """The interpreter install.sh installs on (``3.12``): its MAX_MINOR."""
+    with open(install_sh, encoding="utf-8") as fh:
+        match = _MAX_MINOR.search(fh.read())
+    if match is None:
+        raise SystemExit(f"no MAX_MINOR= in {install_sh}")
+    return f"3.{match.group(1)}"
+
 
 # The single `printf ... > "$WHEELS_DIR/overrides.txt"` install.sh writes its
 # --overrides file with.
@@ -249,7 +261,11 @@ def missing_wheel(name: str, version: str, compatible, python_version: str) -> b
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", required=True, choices=sorted(TARGETS))
-    ap.add_argument("--python-version", default="3.12")
+    ap.add_argument(
+        "--python-version",
+        default=installer_python_version(),
+        help="default: the interpreter install.sh installs on (its MAX_MINOR)",
+    )
     args = ap.parse_args()
 
     compatible = TARGETS[args.target]

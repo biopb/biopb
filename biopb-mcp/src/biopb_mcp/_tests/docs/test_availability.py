@@ -65,7 +65,7 @@ from .conftest import (
 )
 
 # What a user installs, resolved from this checkout rather than from PyPI: the
-# published biopb-mcp yields napari 0.8.0 where the source pins napari[pyqt6]
+# published biopb-mcp yields napari 0.8.0 where the source pins napari[all]
 # 0.9.2, so PyPI would answer for the last release instead of this branch. The
 # SDK comes from the checkout too, as the installer ships it paired with mcp.
 REPO = Path(__file__).resolve().parents[5]

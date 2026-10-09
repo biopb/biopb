@@ -1472,7 +1472,7 @@ function Invoke-BiopbInstall {
     if (-not $versions.biopb -or -not $versions.napari -or -not $versions.release) {
         throw "Release $($release.tag_name) has an incomplete versions.json."
     }
-    $napariReq   = "napari[pyqt6]==$($versions.napari)"
+    $napariReq   = "napari[all]==$($versions.napari)"
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
     $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1
