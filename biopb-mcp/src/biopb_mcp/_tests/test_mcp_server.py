@@ -225,6 +225,48 @@ class TestTheReferenceDocs:
 # -----------------------------------------------------------------------
 
 
+class TestCaptureView:
+    def test_returns_the_page_png_and_strips_an_address_to_its_query(self, monkeypatch):
+        seen = {}
+
+        def fake(view, max_edge):
+            seen["args"] = (view, max_edge)
+            return {"png": "UE5H", "partial": False, "notes": []}
+
+        monkeypatch.setattr(_server._control_client, "capture_view", fake)
+        result = _tool(_server.capture_view, "http://h:8813/viewer?id=a&z=2", 256)
+        assert seen["args"] == ("id=a&z=2", 256)
+        assert [c.type for c in result] == ["image"]
+        assert result[0].data == "UE5H"
+
+    def test_a_partial_capture_says_so(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "capture_view",
+            lambda *a: {"png": "x", "partial": True, "notes": ["timed out"]},
+        )
+        result = _tool(_server.capture_view, "id=a")
+        assert result[1].type == "text"
+        assert "incomplete" in result[1].text and "timed out" in result[1].text
+
+    def test_a_refusal_is_text_with_the_controls_reason(self, monkeypatch):
+        def refuse(*a):
+            raise _server._control_client.CaptureError("no visible viewer page")
+
+        monkeypatch.setattr(_server._control_client, "capture_view", refuse)
+        result = _tool(_server.capture_view, "id=a")
+        assert [c.type for c in result] == ["text"]
+        assert "no visible viewer page" in result[0].text
+
+    def test_no_control_is_text_not_a_crash(self, monkeypatch):
+        def down(*a):
+            raise ConnectionRefusedError("refused")
+
+        monkeypatch.setattr(_server._control_client, "capture_view", down)
+        result = _tool(_server.capture_view, "id=a")
+        assert "did not answer" in result[0].text
+
+
 class TestTakeScreenshot:
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
@@ -1657,6 +1699,7 @@ class TestToolReturnShape:
         ("read_doc", {"id": "index"}, True),
         ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
+        ("capture_view", {"view": "id=a"}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("verify_workflow", {"document": "```python\n1\n```"}, True),
         ("poll_job", {"job_id": "job-1"}, True),
@@ -1674,6 +1717,13 @@ class TestToolReturnShape:
         # None so a stray MagicMock host from another test cannot reach a code
         # path that formats one.
         monkeypatch.setattr(_app, "_kernel_host", None)
+
+        # capture_view reaches the control, not the kernel: keep it off the
+        # developer's real one.
+        def no_page(*args):
+            raise _server._control_client.CaptureError("no visible viewer page")
+
+        monkeypatch.setattr(_server._control_client, "capture_view", no_page)
 
     def test_every_tool_is_covered(self):
         """A new tool must land in the table above, with its shape chosen."""

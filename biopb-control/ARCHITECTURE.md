@@ -70,7 +70,7 @@ namespace, which would collide at the root. So the control serves
 | Path | Target | Hop |
 |---|---|---|
 | `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
-| `/api/*` | control's own API (status, sessions, data-plane verbs, session launch) | in-process |
+| `/api/*` | control's own API (status, sessions, data-plane verbs, session launch, viewer capture) | in-process |
 | `/health` | bare liveness | in-process |
 | `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
@@ -85,6 +85,13 @@ control *verbs about* the plane live under `/api/data_plane/*`, so proxy and ver
 never mix. Observe uses SSE, so its proxy is a streaming passthrough; explicit
 prefix mounts — no root catch-all — keep the static `/`-fallback from swallowing
 the session and data-plane prefixes.
+
+**Viewer capture.** A session with no napari window cannot see its own results, so
+`POST /api/viewer/capture` hands a request to an open viewer page and returns the PNG
+it draws. The page long-polls `/api/viewer/next` only while its tab is visible (a
+hidden tab does not repaint), so a parked poll is both the heartbeat and the only way
+to be given work; the answer comes back on `/api/viewer/answer/<req>`. With no
+visible page the request fails at once. The broker is `_viewer_broker.py`.
 
 Because the data plane is the control's child, clients ask the control to *ensure*
 it rather than starting one themselves.

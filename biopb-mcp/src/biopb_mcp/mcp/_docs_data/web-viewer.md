@@ -18,9 +18,8 @@ both:
 
 - **The user**, by clicking it. This is what a visual check is *for*; opening
   the page yourself shows them nothing.
-- **You**, if your host gives you browser automation. biopb ships no tool that
-  drives the page, but most agents have one, and on a session with no napari
-  window this is how you look at a result rather than only compute it.
+- **You**, through `capture_view`, which has the user's open tab draw a view for
+  you; or through your host's browser automation, if it has any.
 
 ## Building the link
 
@@ -113,22 +112,27 @@ control requires one (`--remote`), the user unlocks the page themselves; append
 `&token=…` only if they gave you a token for this purpose. Do not go looking for
 one.
 
-## Opening it yourself
+## Seeing it yourself
 
-Where you have browser automation, this page is the replacement for
-`take_screenshot` on a session with no napari window — `take_screenshot`
-captures the napari canvas and cannot see a browser.
+`capture_view(view)` is the replacement for `take_screenshot` on a session with
+no napari window. It has the user's open viewer tab draw `view` — the query
+string from [Parameters](#parameters), `id` required — and returns the PNG. Like
+napari, it changes the viewer: the view stays applied, so the user sees what you
+set. Overlays (`lb`, `rs`) must already be on the server (above); the page
+refetches them for the capture.
 
-Three things to get right:
+- **It needs a tab.** The user must have the web viewer (`/viewer`) open and
+  visible in a browser. Otherwise it fails with "no visible viewer page": give
+  the user the link and ask them to open it. A hidden tab cannot render.
+- **A note means partial.** If tiles or an overlay were still loading when the
+  page gave up waiting, the image comes back with a note saying so; capture again
+  rather than reporting it.
+- **Your own browser tool is the alternative**, where the host gives you one and
+  the link is reachable from where it runs (the link is loopback). Wait for the
+  tiles before capturing, or you get an empty canvas.
 
-- **Give it time.** The page fetches tiles after it loads, so a capture taken
-  the moment navigation finishes is of an empty canvas. Wait for the image, and
-  re-capture rather than reporting the blank one.
-- **Reachability is yours, not the user's.** The link is a loopback URL. Your
-  browser tool can only open it if it runs on this machine; from elsewhere it
-  will not resolve, which is a fact about where you run and not about the data.
-- **Looking is not showing.** Your capture is yours. The user still needs the
-  link, and a visual check is not satisfied by a screenshot they never saw.
+Looking is not showing: the user still needs the link for any visual check they
+are meant to make.
 
 ## What it will not do
 

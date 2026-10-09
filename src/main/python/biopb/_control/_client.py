@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.request
 from typing import Optional
 from urllib.parse import urlencode
@@ -80,3 +81,39 @@ def ensure_data_plane(timeout: float = 60.0) -> Optional[dict]:
     if not url:
         logger.warning("control answered ensure without a data-plane url")
     return _answer(url)
+
+
+class CaptureError(Exception):
+    """The control could not have a viewer page draw the view; the message says why."""
+
+
+def capture_view(view: str, max_edge: int = 1024, timeout: float = 30.0) -> dict:
+    """Have an open viewer page draw *view*: ``{"png", "partial", "notes"}``.
+
+    *view* is the viewer's query string. ``png`` is base64. Raises
+    :class:`CaptureError` with the control's reason when no visible page can
+    answer, and :class:`OSError` when no control does.
+    """
+    token = _data_plane.resolve_data_plane_token()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-Biopb-Token"] = token
+    req = urllib.request.Request(
+        f"{base_url()}/api/viewer/capture",
+        data=json.dumps(
+            {"view": view, "max_edge": max_edge, "timeout": timeout}
+        ).encode(),
+        method="POST",
+        headers=headers,
+    )
+    try:
+        # The control answers within *timeout*; the margin keeps its verdict from
+        # arriving as a socket timeout.
+        with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        try:
+            reason = json.loads(exc.read().decode()).get("error")
+        except Exception:  # noqa: BLE001 - the status alone will do
+            reason = None
+        raise CaptureError(reason or f"the control answered HTTP {exc.code}") from exc
