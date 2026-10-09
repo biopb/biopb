@@ -23,6 +23,8 @@ from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     TensorEntry,
+    catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.normalize import is_canonical, log_reordering, unwrapped
@@ -162,6 +164,10 @@ class SourceRegistry:
         _log_reordering(source_id, adapter)
         with self._lock:
             self._sources[source_id] = _Slot(adapter, evictable)
+        # Every route to a live adapter -- first registration, a refresh's swap,
+        # the restore after a failed one, the rebuild after eviction -- ends
+        # here, so this is where the attached tensors are judged against it.
+        self.attached_to(source_id).rebind(adapter)
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
@@ -300,27 +306,29 @@ class SourceRegistry:
         until it is.
         """
         for source_id, tensors in index.items():
-            self.attached_to(source_id).tensors.update(tensors)
+            attachments = self.attached_to(source_id)
+            for field, tensor in tensors.items():
+                attachments.attach(field, tensor)
 
     def attachments(self, source_id: str) -> Dict[str, TensorAdapter]:
         """The tensors attached to *source_id*, whatever state: a copy."""
         with self._lock:
             found = self._attachments.get(source_id)
-            return dict(found.tensors) if found is not None else {}
+            return found.items() if found is not None else {}
 
     def attached(self, source_id: str, field: str) -> Optional[TensorAdapter]:
         """The tensor attached at *field* of *source_id*, whatever its state."""
         with self._lock:
             found = self._attachments.get(source_id)
-            return found.tensors.get(field) if found is not None else None
+            return found.get(field) if found is not None else None
 
     def attachment_snapshot(self) -> List[Tuple[str, Dict[str, TensorAdapter]]]:
         """Every source's attachments, for a sweep that walks them all."""
         with self._lock:
             return [
-                (sid, dict(a.tensors))
+                (sid, items)
                 for sid, a in self._attachments.items()
-                if a.tensors
+                if (items := a.items())
             ]
 
     def attach(self, source_id: str, field: str, tensor: TensorAdapter) -> None:
@@ -336,8 +344,8 @@ class SourceRegistry:
         return removed
 
     def attachment_changed(self, source_id: str) -> None:
-        """Rebuild the source's checked views: an attached tensor's state moved."""
-        self.attached_to(source_id).changed()
+        """An attached tensor's state moved: judge the label sets again."""
+        self.attached_to(source_id).revalidate()
         self._notify(source_id)
 
     def _notify(self, source_id: str) -> None:
@@ -350,13 +358,27 @@ class SourceRegistry:
         self, source_id: str, adapter: Optional[SourceAdapter] = None
     ) -> List[TensorEntry]:
         """A source's tensors as the catalog stores them: the format's own, then
-        its attached fields and label sets (:meth:`Attachments.catalog_tensors`).
+        its published attached fields and label sets.
+
+        The one path into the DuckDB ``sources.tensors`` column. Entries are
+        :class:`TensorEntry` records, which have no field for a serving fact
+        (biopb/biopb#812); a bound tensor's descriptor is projected onto one.
+
+        The attached tensors are listed **after** the format's own: a source's
+        first tensor is the one every listing reads as its picture -- the
+        browser groups on it, and SQL reaches for ``tensors[1]`` -- and neither
+        a label set (biopb/biopb#1059) nor an uploaded field may ever be that.
+        A scratch source has no tensors of its own, so its whole listing is
+        fields, the same path a discovered source's uploaded fields take.
 
         *adapter* is the one being described when it is not the registered one
         yet; attachments are the id's either way.
         """
         adapter = adapter if adapter is not None else self.get(source_id)
-        return self.attached_to(source_id).catalog_tensors(adapter)
+        tensors = list(adapter.list_tensors()) if adapter is not None else []
+        for _, tensor in self.attached_to(source_id).listed():
+            tensors.append(catalog_entry(tensor.get_tensor_descriptor()))
+        return tensors
 
     def resolve_tensor(
         self, source_id: str, tensor_id: Optional[str]
@@ -366,7 +388,14 @@ class SourceRegistry:
         adapter = self.get_registered(source_id)
         if adapter is None:
             return None
-        return self.attached_to(source_id).resolve_tensor(adapter, tensor_id)
+        # An id under a marked segment that names nothing attached here is handed
+        # to the format anyway rather than refused: a proxy's upstream may serve
+        # it, and a format that cannot raises its own ``TensorNotFound``.
+        field = strip_source_prefix(source_id, tensor_id)
+        attached = self.attached_to(source_id).route(field)
+        if attached is not None:
+            return attached
+        return adapter.get_tensor_adapter(tensor_id)
 
     def tensor_capability_token(
         self, source_id: str, array_id: Optional[str]
@@ -397,7 +426,7 @@ class SourceRegistry:
         with self._lock:
             adapters = self.values()
             attached = [
-                t for a in self._attachments.values() for t in a.tensors.values()
+                t for a in self._attachments.values() for t in a.items().values()
             ]
         for tensor in attached:
             try:
@@ -411,6 +440,8 @@ class SourceRegistry:
         """Atomically swap the whole map (used by tests to inject fixtures)."""
         with self._lock:
             self._sources = {sid: _Slot(a, False) for sid, a in mapping.items()}
+        for sid, a in mapping.items():
+            self.attached_to(sid).rebind(a)
 
     def __contains__(self, source_id: str) -> bool:
         with self._lock:

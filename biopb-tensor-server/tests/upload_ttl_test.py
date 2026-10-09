@@ -224,9 +224,8 @@ class TestALabelSetIsAnUploadedTensorToo:
 
         assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
         assert "lifetime" in client.get_upload_status(desc.array_id)["reason"]
-        assert desc.array_id not in writable_server.sources.attached_to(
-            source
-        ).label_sets(writable_server.sources.get(source))
+        listed = writable_server.sources.attached_to(source).listed()
+        assert desc.array_id not in [t.array_id for _, t in listed]
 
     def test_the_deadline_is_recorded_in_the_sidecar(
         self, client, source, writable_server, tmp_path

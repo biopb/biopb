@@ -105,7 +105,7 @@ def create_field_upload(
     # Folded, because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
     # NFD. Only against what is attached here: the marked segment is what keeps
     # the name off the parent's own tensors, so those cannot collide.
-    taken = folded_match(field, attached.tensors)
+    taken = folded_match(field, attached.items())
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A field is taken for as "

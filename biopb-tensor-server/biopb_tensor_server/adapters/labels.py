@@ -32,8 +32,8 @@ group's ``labels/`` (called from ``OmeZarrAdapter._read_embedded_sets``),
 :func:`create_label_upload` for a set arriving over the wire.
 The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
-for every origin where the sets meet (``Attachments.label_binding_error``,
-from the upload's create and from ``Attachments.label_sets``).
+for every origin where the sets meet (``Attachments.conform_label`` from
+the upload's create, and ``Attachments.rebind`` for the rest).
 """
 
 from __future__ import annotations
@@ -71,7 +71,6 @@ from biopb_tensor_server.core.labels import (
     LABELS_SEGMENT,
     RESERVED_PREFIX,
     join_fields,
-    label_extent,
     label_field,
     split_label_field,
 )
@@ -372,8 +371,8 @@ def create_label_upload(
     Raises ``ValueError`` for a request the kind cannot serve -- an
     unresolved parent, a reserved name, a dtype that is not an unsigned
     integer, a name already taken on this parent, or a shape that does not
-    span the image (``Attachments.label_binding_error``, the same rule the
-    listing re-checks). Nothing touches disk until every one of them has
+    span the image (``Attachments.conform_label``, the same rule the
+    registry re-checks on every registration). Nothing touches disk until every one of them has
     passed, so a refused request leaves no store behind.
     """
     import zarr
@@ -409,9 +408,7 @@ def create_label_upload(
     native = [
         strip_source_prefix(parent.source_id, e.array_id) for e in parent.list_tensors()
     ]
-    taken = folded_match(
-        field, (*native, *attached.label_sets(parent), *attached.tensors)
-    )
+    taken = folded_match(field, (*native, *attached.items()))
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "
@@ -419,17 +416,9 @@ def create_label_upload(
             f"case or accent form are one name on Windows and macOS; delete it "
             f"first, or upload under another name."
         )
-    images = attached.normalized_tensors(parent)
-    if not desc.dim_labels:
-        # The extent rule leaves exactly one legal set of axes for this image,
-        # so a request that named none is filled in rather than refused. In
-        # place, so the descriptor ``add_tensor`` echoes back carries them:
-        # everything downstream (the sidecar's NGFF, the chunk grid, the
-        # client's own later calls) is built from that descriptor.
-        image = attached.label_image_descriptor(parent, field, images=images)
-        if image is not None:
-            desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
-    why = attached.label_binding_error(parent, field, desc, images=images)
+    # Fills in the axes when the request named none, then holds the set to the
+    # same rule the listing applies.
+    why = attached.conform_label(field, desc)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")
 

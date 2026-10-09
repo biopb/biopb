@@ -360,7 +360,7 @@ class UploadManager:
 
         The set is attached to its source, which routes its own writes and its
         status polls; it is not *listed* until it reaches READY
-        (``Attachments.label_sets``). No catalog write at create: the row the
+        (``Attachments.listed``). No catalog write at create: the row the
         source already has still describes what a reader may see.
 
         It takes a deadline the same way a field does: a set is an uploaded
