@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.adapters.remote_tensor import UpstreamVersion
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
 from biopb_tensor_server.sources import mirror as mirror_module
 from biopb_tensor_server.sources.mirror import MirrorSet
 from biopb_tensor_server.sources.roots import Root, RootKind
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 ROOT_ID = "up1"
 
@@ -136,23 +138,18 @@ def _fields(changed):
 # ----------------------------------------------------------------- MirrorSet
 
 
-class _Registry(dict):
-    pass
-
-
 class _Server:
     def __init__(self):
-        self.sources = _Registry()
+        self.sources = SourceRegistry()
         self.fail_register = False
 
     def register_source(self, source_id, adapter):
         if self.fail_register:
             raise RuntimeError("no room")
-        self.sources[source_id] = adapter
-        return adapter
+        return self.sources.register(source_id, adapter)
 
     def unregister_source(self, source_id):
-        self.sources.pop(source_id)
+        self.sources.unregister(source_id)
 
 
 class _Upstream:
@@ -202,6 +199,8 @@ def _mirrors(db=None, server=None, is_claimed=lambda source_id: False):
         SourceConfig(url="grpc://lab:8815", alias="lab"), RootKind.UPSTREAM
     )
     server = server or _Server()
+    if db is not None:
+        db.bind_registry(server.sources)
     return MirrorSet(root, server, db, is_claimed), server
 
 
@@ -253,7 +252,7 @@ class TestMirrorSet:
         db = MetadataDatabase()
         mirrors, server = _mirrors(db)
         mirrors.relist(None)
-        adapter = server.sources["lab__a"]
+        adapter = server.sources.get("lab__a")
         upstream.fetched.clear()
 
         upstream.put("a", indexed_at=2, metadata_json='{"v": 2}')
@@ -261,7 +260,7 @@ class TestMirrorSet:
         assert mirrors.relist(None) is False  # the set did not change
         assert upstream.fetched == ["a"]
         assert db.get_metadata_json("lab__a") == {"v": 2}
-        assert server.sources["lab__a"] is adapter
+        assert server.sources.get("lab__a") is adapter
         assert adapter.is_current(2)
 
     def test_an_unversioned_upstream_is_read_every_time_but_not_rewritten(
@@ -302,7 +301,7 @@ class TestMirrorSet:
 
         monkeypatch.setattr(db, "sync_mirrored_rows", broken)
         assert mirrors.relist(None) is False
-        assert server.sources == {}
+        assert len(server.sources) == 0
 
         monkeypatch.delattr(db, "sync_mirrored_rows")
         assert mirrors.relist(None) is True
@@ -337,3 +336,46 @@ class TestMirrorSet:
         assert db.query("SELECT source_url FROM sources").to_pylist() == [
             {"source_url": "grpc://lab/a"}
         ]
+
+    def test_what_an_upload_attached_stays_listed_across_a_relist(self, upstream):
+        class _Field:
+            """A published field, as the upload path attaches it."""
+
+            def get_tensor_descriptor(self):
+                return TensorDescriptor(
+                    array_id="lab__a/@fields/result",
+                    dim_labels=["y", "x"],
+                    shape=[4, 4],
+                    dtype="uint8",
+                )
+
+        upstream.put("a", indexed_at=1)
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        server.sources.attach("lab__a", "@fields/result", _Field())
+
+        upstream.put("a", indexed_at=2)
+        mirrors.relist(None)
+
+        assert [t["array_id"] for t in _row(db, "lab__a")["tensors"]] == [
+            "lab__a",
+            "lab__a/@fields/result",
+        ]
+
+    def test_a_source_whose_write_failed_is_read_again(self, upstream, monkeypatch):
+        upstream.put("a", indexed_at=1, metadata_json='{"v": 1}')
+        db = MetadataDatabase()
+        mirrors, _ = _mirrors(db)
+        mirrors.relist(None)
+        upstream.put("a", indexed_at=2, metadata_json='{"v": 2}')
+
+        def broken(*args):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(db, "sync_mirrored_rows", broken)
+        mirrors.relist(None)
+        monkeypatch.delattr(db, "sync_mirrored_rows")
+        mirrors.relist(None)
+
+        assert db.get_metadata_json("lab__a") == {"v": 2}

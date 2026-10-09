@@ -1649,6 +1649,12 @@ class MetadataDatabase:
                 conn.execute("ROLLBACK")
                 raise
 
+    def tensor_rows(self, source_id: str, adapter: Any) -> List[Dict[str, Any]]:
+        """The ``tensors`` column of *source_id* served by *adapter*: its own
+        tensors, then the fields and label sets attached to the id, resolved
+        through the registry as a registration resolves them."""
+        return self._tensor_rows(self._catalog_tensors(source_id, adapter))
+
     def bind_registry(self, registry: Any) -> None:
         """List tensors through *registry*, which holds the ones attached to a source."""
         self._registry = registry
