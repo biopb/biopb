@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -230,6 +231,55 @@ def deregister(name: str, directory: Optional[Path] = None) -> None:
         raise KeyError(name)
     for p in paths:
         p.unlink()
+
+
+# Cap on one listing, so a directory of tens of thousands of files cannot make a
+# giant payload; the chooser notes the truncation and the user navigates in.
+_BROWSE_MAX_ENTRIES = 2000
+
+
+def browse(path: Optional[str] = None) -> dict:
+    """One directory of this machine, for choosing a server file to register.
+
+    Folders and ``.py`` files only: nothing else can be registered. *path* blank
+    starts at the home directory; a file resolves to its folder so the chooser
+    can navigate from it. Answers ``{path, parent, entries: [{name, is_dir}],
+    truncated}``, the shape of the tensor server's file chooser.
+
+    Raises ValueError for an unusable path, NotADirectoryError when there is no
+    folder to list, PermissionError for an unreadable one.
+    """
+    try:
+        base = (Path(path).expanduser() if path else Path.home()).resolve()
+        directory = base if base.is_dir() else base.parent
+        listable = directory.is_dir()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"cannot access {path}: {exc}") from exc
+    if not listable:
+        raise NotADirectoryError(str(base))
+
+    entries: list[dict] = []
+    truncated = False
+    with os.scandir(directory) as it:
+        for de in it:
+            try:
+                is_dir = de.is_dir(follow_symlinks=True)
+            except OSError:
+                is_dir = False  # broken link or a race: a file, which .py filters
+            if not is_dir and not de.name.endswith(".py"):
+                continue
+            if len(entries) >= _BROWSE_MAX_ENTRIES:
+                truncated = True
+                break
+            entries.append({"name": de.name, "is_dir": is_dir})
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    parent = directory.parent
+    return {
+        "path": str(directory),
+        "parent": None if parent == directory else str(parent),
+        "entries": entries,
+        "truncated": truncated,
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -221,6 +221,7 @@ the control, as `failed` and the log tail.
 | `POST /api/algorithms/{ensure,stop,restart}` | one entry by name |
 | `GET /api/algorithms/logs?name=&lines=` | a script entry's log tail |
 | `POST /api/algorithms/register` | add an entry: `{url}` for a server someone else runs, `{path}` for a server file here (symlinked into the registry; refused unless the control is loopback-bound, since it runs code). `GET` reports `can_add_script` |
+| `GET /api/algorithms/browse?path=` | list a folder here (folders and `.py` files only; blank starts at home) for choosing the `{path}` above; same loopback-bound gate |
 | `POST /api/algorithms/deregister?name=` | remove an entry; a script entry's server is stopped, its file left alone |
 
 The routes sit behind the control's token like the rest of `/api`. A verb

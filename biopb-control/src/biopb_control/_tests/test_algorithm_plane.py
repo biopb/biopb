@@ -426,6 +426,50 @@ def test_deregister_removes_the_entry_not_the_server_file(tmp_path, registry):
         _registry.deregister("seg", directory=registry)
 
 
+def test_browse_lists_folders_and_py_files_only(tmp_path):
+    (tmp_path / "b_dir").mkdir()
+    (tmp_path / "A_dir").mkdir()
+    (tmp_path / "z.py").write_text("")
+    (tmp_path / "a.py").write_text("")
+    (tmp_path / "notes.txt").write_text("")
+    got = _registry.browse(str(tmp_path))
+    assert got["path"] == str(tmp_path.resolve())
+    assert got["parent"] == str(tmp_path.resolve().parent)
+    assert not got["truncated"]
+    # Folders first, then files, each by name without regard to case.
+    assert [(e["name"], e["is_dir"]) for e in got["entries"]] == [
+        ("A_dir", True),
+        ("b_dir", True),
+        ("a.py", False),
+        ("z.py", False),
+    ]
+
+
+def test_browse_a_file_lists_its_folder(tmp_path):
+    f = tmp_path / "seg.py"
+    f.write_text("")
+    assert _registry.browse(str(f))["path"] == str(tmp_path.resolve())
+
+
+def test_browse_with_no_path_starts_at_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert _registry.browse()["path"] == str(tmp_path.resolve())
+
+
+def test_browse_caps_a_big_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(_registry, "_BROWSE_MAX_ENTRIES", 2)
+    for i in range(4):
+        (tmp_path / f"s{i}.py").write_text("")
+    got = _registry.browse(str(tmp_path))
+    assert len(got["entries"]) == 2 and got["truncated"]
+
+
+def test_browse_a_missing_path_is_not_a_directory(tmp_path):
+    with pytest.raises(NotADirectoryError):
+        _registry.browse(str(tmp_path / "nope" / "deeper" / "x.py"))
+
+
 def test_deregister_stops_a_running_script(plane, registry):
     (registry / "seg.py").write_text(_server())
     assert plane.ensure("seg", wait=60.0)["state"] == "up"
@@ -474,3 +518,31 @@ def test_register_and_deregister_over_http(control, tmp_path, registry):
     assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 200
     assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 404
     assert {r["name"] for r in client.algorithms()} == {"seg"}
+
+
+def test_browse_over_http(control, tmp_path):
+    import json
+    import urllib.error
+    import urllib.request
+
+    from biopb._control import _client
+
+    here = tmp_path / "pick"  # tmp_path also holds the fixtures' own folders
+    here.mkdir()
+    (here / "seg.py").write_text("")
+    (here / "skip.txt").write_text("")
+
+    def get(query):
+        try:
+            with urllib.request.urlopen(
+                _client.control_base_url() + "/api/algorithms/browse" + query,
+                timeout=10,
+            ) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    status, body = get("?path=" + str(here))
+    assert status == 200
+    assert [e["name"] for e in body["entries"]] == ["seg.py"]
+    assert get("?path=" + str(tmp_path / "nope" / "x.py"))[0] == 404

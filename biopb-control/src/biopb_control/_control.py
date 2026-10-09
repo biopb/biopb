@@ -25,7 +25,9 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
 - ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
 - ``POST /api/algorithms/register`` (``{url}`` or ``{path}``), ``POST
-  /api/algorithms/deregister`` (``?name=``) -> add or remove a registry entry.
+  /api/algorithms/deregister`` (``?name=``) -> add or remove a registry entry;
+  ``GET /api/algorithms/browse`` (``?path=``) lists the folders and ``.py``
+  files to choose from (loopback-bound only).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
 - ``POST /api/sessions/new``      -> launch a session on this machine; its
@@ -129,6 +131,7 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import _registry
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
@@ -1480,6 +1483,24 @@ def build_app(
             return JSONResponse({"error": str(exc)}, status_code=500)
         return JSONResponse({"name": added})
 
+    def algorithms_browse(request: Request) -> JSONResponse:
+        # A listing of this machine's folders and .py files, for choosing the
+        # file to add. Gated like registering one: it is the same filesystem.
+        if not loopback_bound:
+            return JSONResponse(
+                {"error": "browsing needs a loopback-bound control"}, status_code=403
+            )
+        try:
+            return JSONResponse(_registry.browse(request.query_params.get("path")))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except NotADirectoryError:
+            return JSONResponse({"error": "not a directory"}, status_code=404)
+        except PermissionError:
+            return JSONResponse({"error": "permission denied"}, status_code=403)
+        except OSError as exc:
+            return JSONResponse({"error": f"cannot list: {exc}"}, status_code=400)
+
     def algorithms_deregister(request: Request) -> JSONResponse:
         # Remove an entry by ?name=; a script entry's server is stopped by the
         # registry sync. Never touches the server file itself.
@@ -1814,6 +1835,7 @@ def build_app(
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
         Route("/api/algorithms/register", algorithms_register, methods=["POST"]),
+        Route("/api/algorithms/browse", algorithms_browse, methods=["GET"]),
         Route("/api/algorithms/deregister", algorithms_deregister, methods=["POST"]),
         Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
         Route("/api/algorithms/stop", algorithms_stop, methods=["POST"]),

@@ -23,6 +23,8 @@ interface FileBrowserProps {
   initialPath?: string;
   onPick: (path: string) => void;
   onClose: () => void;
+  /** Only a file can be chosen: no "Use this folder", and a title that says so. */
+  filesOnly?: boolean;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -30,7 +32,13 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`;
 }
 
-export function FileBrowser({ browse, initialPath, onPick, onClose }: FileBrowserProps) {
+export function FileBrowser({
+  browse,
+  initialPath,
+  onPick,
+  onClose,
+  filesOnly,
+}: FileBrowserProps) {
   const [data, setData] = useState<BrowseResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +66,7 @@ export function FileBrowser({ browse, initialPath, onPick, onClose }: FileBrowse
 
   return (
     <Modal
-      title="Choose a file or folder"
+      title={filesOnly ? "Choose a file" : "Choose a file or folder"}
       onClose={onClose}
       className="wide"
       labelId="file-browser-title"
@@ -119,14 +127,16 @@ export function FileBrowser({ browse, initialPath, onPick, onClose }: FileBrowse
           <button type="button" className="icon-btn" onClick={onClose}>
             Cancel
           </button>
-          <button
-            type="button"
-            className="submit-btn"
-            disabled={!dir}
-            onClick={() => onPick(dir)}
-          >
-            Use this folder
-          </button>
+          {!filesOnly && (
+            <button
+              type="button"
+              className="submit-btn"
+              disabled={!dir}
+              onClick={() => onPick(dir)}
+            >
+              Use this folder
+            </button>
+          )}
         </div>
       </div>
     </Modal>

@@ -3,6 +3,8 @@ import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 import { catalogIsFilling } from "../utils/catalogHealth";
 import { sessionFetch } from "../utils/sessionFetch";
+import type { BrowseResponse } from "@biopb/tensor-flight-client";
+import { FileBrowser } from "../components/admin/FileBrowser";
 import {
   authRequired,
   captureUrlToken,
@@ -90,6 +92,8 @@ export default function DashboardPage() {
   // Adding a local script runs code, so the control offers it only when
   // loopback-bound; default off until the first listing says otherwise.
   const [canAddScript, setCanAddScript] = useState(false);
+  // The server-file chooser behind "Add local", while it is open.
+  const [browsing, setBrowsing] = useState(false);
   const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
@@ -214,10 +218,16 @@ export default function DashboardPage() {
     const url = prompt("URL of the algorithm server (grpc://host:port or grpcs://host:port)");
     if (url?.trim()) algoEdit("/api/algorithms/register", { url: url.trim() });
   };
-  const addLocal = () => {
-    const path = prompt("Path of a server .py file on the control's machine");
-    if (path?.trim()) algoEdit("/api/algorithms/register", { path: path.trim() });
-  };
+  // Stable identity: FileBrowser reloads (and resets to its start folder) when
+  // this changes, so an inline function would undo every navigation.
+  const browseAlgoFiles = useCallback(async (path?: string): Promise<BrowseResponse> => {
+    const q = path ? "?path=" + encodeURIComponent(path) : "";
+    const r = await sessionFetch(withBase("/api/algorithms/browse" + q));
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body?.error ?? "HTTP " + r.status);
+    return body as BrowseResponse;
+  }, []);
+  const addLocal = () => setBrowsing(true);
   const deregister = (s: AlgoRec) => {
     const running = s.kind === "script" && ["up", "starting", "installing"].includes(s.state);
     const msg =
@@ -673,6 +683,17 @@ export default function DashboardPage() {
           ) : null}
         </div>
       </main>
+      {browsing && (
+        <FileBrowser
+          browse={browseAlgoFiles}
+          filesOnly
+          onPick={(path) => {
+            setBrowsing(false);
+            algoEdit("/api/algorithms/register", { path });
+          }}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
       <style>{DASH_CSS}</style>
     </div>
   );
