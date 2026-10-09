@@ -1650,8 +1650,28 @@ class MetadataDatabase:
                 raise
 
     def bind_registry(self, registry: Any) -> None:
-        """List tensors through *registry*, which holds the ones attached to a source."""
+        """List tensors through *registry*, which holds the ones attached to a source,
+        and keep each row's listing in step with them."""
         self._registry = registry
+        registry.set_attachment_listener(self._attachments_changed)
+
+    def _attachments_changed(self, source_id: str) -> None:
+        """Re-list a source whose attached tensors changed (:meth:`relist_tensors`).
+
+        Best-effort for the reason every catalog write on the upload path is: the
+        row is how a source is *browsable*, and it must not be able to fail the
+        change that made a tensor *readable*. A source with no adapter or no row
+        has nothing to re-list."""
+        adapter = self._registry.get(source_id)
+        if adapter is None:
+            return
+        try:
+            self.relist_tensors(source_id, adapter)
+        except Exception as e:
+            logger.warning(
+                f"Failed to re-list {source_id} in the catalog "
+                f"(readable by id, not listed): {e}"
+            )
 
     def _catalog_tensors(self, source_id: str, adapter: Any) -> List[Any]:
         """The tensors a row lists: the registry's view when bound, else the
@@ -1676,13 +1696,14 @@ class MetadataDatabase:
     def relist_tensors(self, source_id: str, adapter: SourceAdapter) -> bool:
         """Make a row list the tensors *adapter* serves now, and only that.
 
-        For a source rebuilt from its row, whose row was written before the
-        uploaded fields and label sets on disk were attached (or before some of
-        them went): the row says what was true at its last write. Writes the
-        ``tensors`` column and nothing else when it differs -- the metadata the row
-        holds is not re-read -- and reports whether it did. The order is not
-        compared: a row lists fields in the order they were uploaded and the attach
-        scan finds them by name, and neither is a change.
+        For a source whose attached fields and label sets are not what its row
+        lists: one rebuilt from its row, written before those on disk were attached
+        (or before some of them went), or one whose attachments just changed
+        (:meth:`_attachments_changed`). Writes the ``tensors`` column and nothing
+        else when it differs -- the metadata the row holds is not re-read -- and
+        reports whether it did. A source with no row is left without one. The order
+        is not compared: a row lists fields in the order they were uploaded and the
+        attach scan finds them by name, and neither is a change.
         """
         tensors = self._tensor_rows(self._catalog_tensors(source_id, adapter))
         conn = self._get_connection()

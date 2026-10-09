@@ -269,7 +269,7 @@ class UploadManager:
         if parent is None:
             self._drop_catalog_row(adapter, array_id)
         else:
-            self._unlist(parent, field)
+            self._unlist(parent.source_id, field)
         self._forget_rois(array_id)
         return status
 
@@ -314,7 +314,7 @@ class UploadManager:
                 f"set_upload_status: could not publish {array_id} on disk: {e}"
             ) from e
         if parent is not None and not was_readable and progress.is_readable:
-            self._publish(parent, field, adapter)
+            self._registry.attachment_changed(parent.source_id)
         return status
 
     def _delete_adopted_tensor(self, array_id: str) -> Dict[str, Any]:
@@ -338,45 +338,22 @@ class UploadManager:
         if adapter is None:
             return unknown_upload_status(array_id)
         adapter.delete_store()
-        self._sync_parent_row(parent)
         self._forget_rois(array_id)
         logger.info(f"Deleted tensor {array_id}")
         return unknown_upload_status(array_id)
 
     # -- listing ---------------------------------------------------------------
 
-    def _sync_parent_row(self, parent: Any) -> None:
-        """Re-publish a parent's catalog row after its sets changed.
-
-        ``sync_source_added`` is an upsert and ``catalog_tensors`` reads the
-        sets off the adapter, so re-registering the parent is the whole of it
-        (the ROI re-import it triggers is idempotent).
-        """
-        self._sync_row(parent.source_id, parent)
-
-    def _publish(self, parent: Any, field: Optional[str], adapter: Any) -> None:
-        """List a tensor that has just become readable, under its source.
-
-        Every kind was attached at ``add_tensor`` -- that is what routes its own
-        writes -- and becomes *listed* by becoming readable, which its own
-        upload record answers. So what is owed is the stale views and the row.
-        """
-        self._registry.attachment_changed(parent.source_id)
-        self._sync_parent_row(parent)
-
-    def _unlist(self, parent: Any, field: Optional[str]) -> None:
+    def _unlist(self, source_id: str, field: Optional[str]) -> None:
         """Take a tensor out of its source's listing, if it was in it.
 
         Nothing is detached: a tensor leaves the listing by ceasing to be
         readable, and stays reachable as the tombstone a straggler polls until
         the reclaim sweep drops it.
         """
-        if parent is None or field is None:
+        if field is None or self._registry.attached(source_id, field) is None:
             return
-        if self._registry.attached(parent.source_id, field) is None:
-            return
-        self._registry.attachment_changed(parent.source_id)
-        self._sync_parent_row(parent)
+        self._registry.attachment_changed(source_id)
 
     def _add_label_set(
         self, parent: Any, field: str, req_desc: TensorDescriptor
@@ -751,27 +728,20 @@ class UploadManager:
         fields_dir = source_fields_dir(fields_root(self._write_dir), SCRATCH_SOURCE_ID)
         adapter = ScratchSource(max_ttl, fields_dir=fields_dir)
         registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
-        self._sync_row(SCRATCH_SOURCE_ID, registered)
+        # Best-effort, as every catalog write on this path is: the row is how a
+        # source is *browsable*, and it must not be able to fail the registration
+        # that made it *readable*. A leaked row is the worst case, and the boot
+        # sweep is what collects those.
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_added(SCRATCH_SOURCE_ID, registered)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to sync {SCRATCH_SOURCE_ID} to the catalog "
+                    f"(readable by id, not listed): {e}"
+                )
         logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
         return SCRATCH_SOURCE_ID
-
-    def _sync_row(self, source_id: str, adapter: Any) -> None:
-        """Put *source_id* in the catalog; the one best-effort catalog write.
-
-        Best-effort for the reason every catalog write on this path is: the
-        row is how a source is *browsable*, and it must not be able to fail the
-        registration that made it *readable*. A leaked row is the worst case,
-        and the boot sweep is what collects those.
-        """
-        if self._metadata_db is None:
-            return
-        try:
-            self._metadata_db.sync_source_added(source_id, adapter)
-        except Exception as e:
-            logger.warning(
-                f"Failed to sync {source_id} to the catalog "
-                f"(readable by id, not listed): {e}"
-            )
 
     def write_chunk(
         self,
@@ -914,7 +884,7 @@ class UploadManager:
         for field, tensor in tensors.items():
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             if expired_now:
-                self._unlist(self._registry.get(source_id), field)
+                self._unlist(source_id, field)
                 self._forget_rois(tensor.array_id)
                 expired += 1
             if stale:
