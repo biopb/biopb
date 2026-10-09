@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.error
 import urllib.request
 from typing import Optional
 from urllib.parse import urlencode
@@ -19,19 +20,28 @@ def base_url() -> str:
     return control_base_url()
 
 
-def _request(method: str, path: str, params: dict, timeout: float) -> dict:
+def _request(
+    method: str, path: str, params: dict, timeout: float, body: Optional[dict] = None
+) -> dict:
     """The control's JSON answer to *method* ``path`` with *params* as its query
-    string; raises ``OSError`` when no control answers and
+    string and, if given, *body* as a JSON body; raises ``OSError`` when no control answers and
     ``urllib.error.HTTPError`` when it refuses."""
     token = _data_plane.resolve_data_plane_token()
     query = f"?{urlencode(params)}" if params else ""
     req = urllib.request.Request(
         f"{base_url()}{path}{query}",
-        data=b"" if method == "POST" else None,
+        data=json.dumps(body).encode()
+        if body is not None
+        else b""
+        if method == "POST"
+        else None,
         method=method,
         # The token also clears the control's CSRF gate on a POST. Without one
         # (a tokenless local control) the gate falls back to a loopback Host.
-        headers={"X-Biopb-Token": token} if token else {},
+        headers={
+            **({"X-Biopb-Token": token} if token else {}),
+            **({"Content-Type": "application/json"} if body is not None else {}),
+        },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
@@ -80,3 +90,37 @@ def ensure_data_plane(timeout: float = 60.0) -> Optional[dict]:
     if not url:
         logger.warning("control answered ensure without a data-plane url")
     return _answer(url)
+
+
+class CaptureError(Exception):
+    """The control could not have a viewer page draw the view; the message says why."""
+
+
+def capture_view(view: str, max_edge: int = 1024, timeout: float = 30.0) -> dict:
+    """Have an open viewer page draw *view*: ``{"png", "partial", "notes"}``.
+
+    *view* is the viewer's query string. ``png`` is base64. Raises
+    :class:`CaptureError` with the control's reason when no visible page can
+    answer, and :class:`OSError` when no control does.
+    """
+    try:
+        # The control answers within *timeout*; the margin keeps its verdict from
+        # arriving as a socket timeout.
+        got = _request(
+            "POST",
+            "/api/viewer/capture",
+            {},
+            timeout + 5,
+            {"view": view, "max_edge": max_edge, "timeout": timeout},
+        )
+        if not isinstance(got, dict) or not got.get("png"):
+            raise CaptureError("the control answered without an image")
+        return got
+    except ValueError as exc:  # a body that is not JSON
+        raise CaptureError("the control did not answer in JSON") from exc
+    except urllib.error.HTTPError as exc:
+        try:
+            reason = json.loads(exc.read().decode()).get("error")
+        except Exception:  # noqa: BLE001 - the status alone will do
+            reason = None
+        raise CaptureError(reason or f"the control answered HTTP {exc.code}") from exc

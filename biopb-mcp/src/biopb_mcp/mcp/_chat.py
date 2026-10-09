@@ -71,7 +71,7 @@ _MAX_TOOL_ROUNDS = 12
 #: Tools whose only useful result is a picture. Withdrawn when images cannot
 #: reach the model: it would spend a round on a screenshot and be handed a
 #: parenthetical.
-_IMAGE_TOOLS = frozenset({"take_screenshot"})
+_IMAGE_TOOLS = frozenset({"take_screenshot", "capture_view"})
 
 #: What stands in for an image the provider will not be sent, in the projection.
 _NO_VISION_NOTE = " -- not sent: this model does not accept images."

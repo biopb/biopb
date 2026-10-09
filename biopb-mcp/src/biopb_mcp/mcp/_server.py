@@ -32,6 +32,7 @@ import threading
 import time
 from typing import Annotated
 
+from biopb._control import _client as _control_client
 from mcp.types import ImageContent, TextContent
 from pydantic import AnyUrl, Field
 
@@ -49,8 +50,8 @@ logger = logging.getLogger(__name__)
 
 #: What a session without a viewer loses, and the route that replaces it.
 _NO_VIEWER_HINT = (
-    "there is no `viewer` and no take_screenshot, so show results through the "
-    'web viewer (read_doc("web-viewer"))'
+    "there is no `viewer` and no take_screenshot, so see results with "
+    'capture_view and show them through the web viewer (read_doc("web-viewer"))'
 )
 
 _SCREENSHOT_SNIPPET = (
@@ -678,6 +679,42 @@ async def take_screenshot(canvas_only: bool = True) -> list:
         detail = res.get("error_text") or res.get("stdout") or res.get("status")
         return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
     return [ImageContent(type="image", mimeType="image/png", data=data)]
+
+
+@mcp.tool()
+async def capture_view(view: str, max_edge: int = 1024) -> list:
+    """See the web viewer: have the user's open viewer page draw a view and return it as a PNG.
+
+    Works in any session, napari window or not. The page is the browser tab
+    the user has open on the web viewer; it applies `view`, loads the image and
+    any annotation or label overlay, and sends back what it drew. The view stays
+    applied there, so the user sees what you set. Fails plainly when no viewer
+    tab is open and visible -- then give the user the link instead, built with
+    user_base_url() (read_doc("web-viewer")): behind a proxy or --url-prefix it
+    is not a bare /viewer.
+
+    Args:
+        view: The viewer's state as a query string, as in its address bar (a whole
+            address is accepted too), e.g.
+            "id=<array_id>&z=3&c=1&tg=256,256&zm=-1&lb=<label array_id>".
+            `id` is required. See read_doc("web-viewer") for the parameters.
+        max_edge: Longest edge of the returned image in pixels.
+
+    Returns a PNG image content block, plus a note when it may be incomplete.
+    """
+    try:
+        got = await asyncio.to_thread(_control_client.capture_view, view, int(max_edge))
+    except (_control_client.CaptureError, OSError) as exc:
+        return [TextContent(type="text", text=f"No capture: {exc}.")]
+    out = [ImageContent(type="image", mimeType="image/png", data=got["png"])]
+    notes = list(got.get("notes") or [])
+    if got.get("partial"):
+        notes.insert(
+            0, "the image may be incomplete: tiles or overlays were still loading"
+        )
+    if notes:
+        out.append(TextContent(type="text", text="; ".join(notes)))
+    return out
 
 
 #: ``intent``'s guidance, on the parameter rather than only in the prose above

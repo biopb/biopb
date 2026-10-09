@@ -89,6 +89,7 @@ front.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -128,6 +129,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
+from ._viewer_broker import (
+    MAX_PNG_BYTES,
+    CaptureFailed,
+    ViewerBroker,
+    ViewerUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +233,9 @@ def _session_proxy_roots(
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
 # (GET/HEAD/OPTIONS) don't.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: What a viewer page's answer must open with.
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
 # exempted (biopb/biopb#424 item 2) because biopb._control._launch had no way
@@ -1339,6 +1349,61 @@ def build_app(
     def agent_unregister(request: Request) -> JSONResponse:
         return _agent_action(request, _agents.unregister)
 
+    viewer = ViewerBroker()
+
+    async def viewer_next(request: Request) -> Response:
+        # A viewer page's long poll for a capture request: 200 with the request,
+        # 204 when none came within the window.
+        job = await viewer.next(
+            request.query_params.get("client", ""), disconnected=request.is_disconnected
+        )
+        return JSONResponse(job) if job else Response(status_code=204)
+
+    async def viewer_answer(request: Request) -> JSONResponse:
+        # The page's answer: a PNG body, or ?error= with none.
+        query = request.query_params
+        body = await request.body()
+        if len(body) > MAX_PNG_BYTES:
+            return JSONResponse({"error": "image too large"}, status_code=413)
+        error = query.get("error")
+        if not error and not body.startswith(_PNG_SIGNATURE):
+            error = "the viewer page sent no image"
+        ok = viewer.resolve(
+            request.path_params["req"],
+            body,
+            partial=query.get("partial") == "1",
+            notes=query.getlist("note"),
+            error=error,
+        )
+        return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
+
+    async def viewer_capture(request: Request) -> JSONResponse:
+        # A session's request for a picture: blocks until a page answers.
+        try:
+            payload = await request.json()
+            view = str(payload["view"])
+            max_edge = int(payload.get("max_edge", 1024))
+            timeout = float(payload.get("timeout", 25))
+        except (ValueError, KeyError, TypeError, OverflowError):
+            return JSONResponse({"error": "view is required"}, status_code=400)
+        # Not NaN-safe by comparison alone: a NaN fails both bounds and lands on
+        # the default.
+        max_edge = max_edge if 16 <= max_edge <= 4096 else 1024
+        timeout = timeout if 0 < timeout <= 60 else 25.0
+        try:
+            got = await viewer.capture(view, max_edge, timeout)
+        except ViewerUnavailable as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except CaptureFailed as exc:
+            return JSONResponse({"error": str(exc)}, status_code=504)
+        return JSONResponse(
+            {
+                "png": base64.b64encode(got.png).decode("ascii"),
+                "partial": got.partial,
+                "notes": got.notes,
+            }
+        )
+
     def api_algorithms(_request: Request) -> JSONResponse:
         # Every registry entry with its state and cached ops: a script entry as
         # the algorithm plane supervises it, a url entry probed live (so this
@@ -1692,6 +1757,9 @@ def build_app(
         Route("/api/agents", api_agents, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
+        Route("/api/viewer/next", viewer_next, methods=["GET"]),
+        Route("/api/viewer/answer/{req}", viewer_answer, methods=["POST"]),
+        Route("/api/viewer/capture", viewer_capture, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
         Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
