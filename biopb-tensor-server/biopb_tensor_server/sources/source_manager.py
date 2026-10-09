@@ -523,30 +523,27 @@ class SourceManager:
     def _event_loop(self) -> None:
         """Run a rescan every ``rescan_interval`` seconds until stopped.
 
-        With an adapter idle time set, the loop also wakes to let go of idle
-        adapters between rescans.
-
         The next tick is scheduled from the moment the previous one *finished*,
         so a rescan that outruns the interval does not immediately queue another.
         A failed rescan is logged and the cadence continues; the next pass sees
         the same tree and retries.
         """
-        idle = self._adapter_idle_seconds
-        while True:
-            wait = max(0.0, self._next_rescan_at - time.monotonic())
-            if idle > 0:
-                wait = min(wait, max(1.0, idle / 4))
-            if self._stop.wait(wait):
-                break
-            if idle > 0:
-                self._server.sources.release_idle(idle)
-            if time.monotonic() < self._next_rescan_at:
-                continue
+        while not self._stop.wait(max(0.0, self._next_rescan_at - time.monotonic())):
             try:
                 self._handle_rescan()
             except Exception:
                 logger.exception("Rescan failed")
+            self._release_idle_adapters()
             self._next_rescan_at = time.monotonic() + self._rescan_interval
+
+    def _release_idle_adapters(self) -> None:
+        """Let go of the adapters nothing has read for ``adapter_idle_seconds``.
+
+        Once per tick, so an adapter is kept for that long rounded up to the next
+        one; a failed rescan does not skip it.
+        """
+        if self._adapter_idle_seconds > 0:
+            self._server.sources.release_idle(self._adapter_idle_seconds)
 
     def _handle_rescan(self) -> None:
         """Run one tick: the one-shot directories, the monitored walk, then the

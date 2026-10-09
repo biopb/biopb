@@ -153,26 +153,24 @@ class TestRebuildAfterRelease:
         assert sid not in run.server.sources
         run.stop()
 
-    def test_the_event_loop_lets_idle_adapters_go(self, tmp_path):
+    def test_a_rescan_tick_lets_idle_adapters_go(self, tmp_path):
         run, sid, first = self._run(tmp_path)
         del first
-        run.manager._adapter_idle_seconds = 0.001
-        run.manager._rescan_interval = 3600.0
-        run.manager._next_rescan_at = __import__("time").monotonic() + 3600.0
-        run.manager.start()
-        try:
-            import time
+        run.manager._adapter_idle_seconds = 1e-6
 
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                gc.collect()
-                if run.server.sources.get(sid) is None:
-                    break
-                time.sleep(0.05)
-            assert run.server.sources.get(sid) is None
-        finally:
-            run.manager.stop()
-            run.stop()
+        run.manager._release_idle_adapters()
+        gc.collect()
+
+        assert run.server.sources.get(sid) is None
+        run.stop()
+
+    def test_an_idle_time_of_zero_keeps_every_adapter(self, tmp_path):
+        run, sid, first = self._run(tmp_path)
+
+        run.manager._release_idle_adapters()
+
+        assert run.server.sources.get(sid) is first
+        run.stop()
 
 
 class TestFormatsAreCollected:
