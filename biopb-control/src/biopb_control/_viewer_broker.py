@@ -128,7 +128,8 @@ class ViewerBroker:
         if tab is None:
             raise ViewerUnavailable(
                 "no visible viewer page is connected: ask the user to open the "
-                "web viewer (/viewer) in a browser tab and keep it visible"
+                "web viewer in a browser tab and keep it visible (build the link "
+                'with user_base_url(), not a bare /viewer: see read_doc("web-viewer"))'
             )
         req = f"c{next(self._ids)}"
         fut = asyncio.get_running_loop().create_future()

@@ -123,7 +123,8 @@ refetches them for the capture.
 
 - **It needs a tab.** The user must have the web viewer (`/viewer`) open and
   visible in a browser. Otherwise it fails with "no visible viewer page": give
-  the user the link and ask them to open it. A hidden tab cannot render.
+  the user the link (from `user_base_url()`, see above) and ask them to open it.
+  A hidden tab cannot render.
 - **A note means partial.** If tiles or an overlay were still loading when the
   page gave up waiting, the image comes back with a note saying so; capture again
   rather than reporting it.

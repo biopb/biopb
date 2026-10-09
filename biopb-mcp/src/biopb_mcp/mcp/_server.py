@@ -689,7 +689,9 @@ async def capture_view(view: str, max_edge: int = 1024) -> list:
     the user has open on the web viewer; it applies `view`, loads the image and
     any annotation or label overlay, and sends back what it drew. The view stays
     applied there, so the user sees what you set. Fails plainly when no viewer
-    tab is open and visible -- then give the user the link instead.
+    tab is open and visible -- then give the user the link instead, built with
+    user_base_url() (read_doc("web-viewer")): behind a proxy or --url-prefix it
+    is not a bare /viewer.
 
     Args:
         view: The viewer's state as a query string, as in its address bar (a whole
