@@ -509,7 +509,7 @@ class TestFailure:
         )[1]
         for _ in range(2):
             with pytest.raises(SourceRegistrationError):
-                reconciler.check_registered(sid)  # what a read does
+                reconciler.ensure_adapter(sid, consent=False)  # what a read does
             manager._handle_rescan()
         assert attempts == []
         assert _rows(server)[sid]["unresolved_reason"] == "failed"
