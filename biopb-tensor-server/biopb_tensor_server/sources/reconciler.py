@@ -309,12 +309,8 @@ class Reconciler:
         with self._lock:
             claim = self._state.claims.get(source_id)
             if source_id not in self._pending:
-                # Registered, its adapter let go of: derived as it was built.
-                if claim is None or source_id not in self._server.sources:
-                    return None
-                url = self._catalog_url_for(claim)
-            else:
-                url = self._pending[source_id]
+                return self._let_go_catalog_url(source_id)
+            url = self._pending[source_id]
         if url:
             return url
         return to_catalog_url(str(claim.primary_path)) if claim is not None else None
@@ -328,6 +324,13 @@ class Reconciler:
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
+
+    def _evictable(self, claim: SourceClaim) -> bool:
+        """Whether *claim*'s adapter may be let go when idle: a local file source,
+        which its row rebuilds. A proxy is held for as long as it is registered, and
+        an upload has no claim. A cloud source waiting for a recall is pending, not
+        registered, and is never rebuilt here."""
+        return self._deferrable(claim)
 
     def _deferrable(self, claim: SourceClaim) -> bool:
         """Whether registering *claim* is the slow, local, file-opening kind.
@@ -1224,10 +1227,16 @@ class Reconciler:
             return getattr(live, "_catalog_url", None)
         if source_id in self._pending:
             return self._pending[source_id]
+        return self._let_go_catalog_url(source_id)
+
+    def _let_go_catalog_url(self, source_id: str) -> Optional[str]:
+        """The catalog url of a registered source whose adapter was let go: derived
+        again from its claim, as it was when the adapter was built. None for a
+        source that is not registered."""
         claim = self._state.claims.get(source_id)
-        if claim is not None and source_id in self._server.sources:
-            return self._catalog_url_for(claim)  # registered, adapter let go of
-        return None
+        if claim is None or source_id not in self._server.sources:
+            return None
+        return self._catalog_url_for(claim)
 
     def _replace_claim_locked(
         self,
@@ -1273,7 +1282,7 @@ class Reconciler:
                     recall=True,
                     record=self._catalog_record(claim, signatures=signatures),
                 )
-            if self._server.sources.get(source_id) is not None:
+            if source_id in self._server.sources:
                 self._server.unregister_source(source_id)
         except Exception:
             logger.exception("could not refresh cloud source %s", source_id)
@@ -1401,10 +1410,14 @@ class Reconciler:
         if not self._roots.is_cloud(claim.primary_path):
             return True
         adapter = self._server.sources.get(source_id)
-        if adapter is None:
+        if adapter is not None:
+            url = adapter.source_url
+        elif source_id in self._server.sources:  # its adapter was let go
+            url = str(claim.primary_path)
+        else:
             return False
         try:
-            return source_is_resident(adapter.source_url)
+            return source_is_resident(url)
         except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
             return False
 
@@ -1635,11 +1648,7 @@ class Reconciler:
         registered = False
         displaced: Optional[Any] = None
         try:
-            # What can be rebuilt from its row may be let go when idle: a local
-            # file source with a claim. A proxy and an upload are held for as
-            # long as they are registered. A cloud source waiting for a recall is
-            # pending, not registered, and is never rebuilt here.
-            evictable = self._deferrable(claim)
+            evictable = self._evictable(claim)
             if replace:
                 adapter, displaced = self._server.swap_source(
                     claim.source_id, adapter, evictable

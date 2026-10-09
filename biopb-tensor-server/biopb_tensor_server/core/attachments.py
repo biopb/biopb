@@ -17,7 +17,6 @@ status poll and a straggler's write both have to find their adapter.
 from __future__ import annotations
 
 import logging
-import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import (
@@ -39,6 +38,7 @@ from biopb_tensor_server.core.labels import (
     join_fields,
     split_label_field,
 )
+from biopb_tensor_server.core.weak import weak_or_none
 
 __all__ = ["Attachments"]
 
@@ -47,11 +47,8 @@ logger = logging.getLogger(__name__)
 
 def _weak(obj: Any) -> Callable[[], Any]:
     """A call that returns *obj* while it lives; *obj* itself when it cannot be
-    weakly referenced (a test double)."""
-    try:
-        return weakref.ref(obj)
-    except TypeError:
-        return lambda: obj
+    weakly referenced."""
+    return weak_or_none(obj) or (lambda: obj)
 
 
 class Attachments:

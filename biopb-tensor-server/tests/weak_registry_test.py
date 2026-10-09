@@ -63,11 +63,11 @@ class TestRegistry:
     def test_get_does_not_count_as_a_read(self):
         registry = SourceRegistry()
         registry.register("a", _Adapter(), evictable=True)
-        registry._last_access["a"] = 0.0
+        registry._sources["a"].last_access = 0.0
 
         registry.get("a")
 
-        assert registry._last_access["a"] == 0.0
+        assert registry._sources["a"].last_access == 0.0
 
     def test_only_an_evictable_source_is_released(self):
         registry = SourceRegistry()
@@ -93,7 +93,6 @@ class TestRegistry:
         registry.unregister("a")
 
         assert "a" not in registry and len(registry) == 0
-        assert registry._idle == {} and registry._evictable == set()
 
     def test_reregistering_pins_an_evicted_source_again(self):
         registry = SourceRegistry()
