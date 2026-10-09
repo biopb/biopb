@@ -120,11 +120,9 @@ class _Server:
         return _is_remote(self.kind, self._url)
 
     @property
-    def where(self) -> str:
-        """``local``, or ``remote`` with the host, for what the agent reads."""
-        if not self.remote:
-            return "local"
-        return f"remote, {urlparse(self._url).hostname or self._url}"
+    def url(self) -> Optional[str]:
+        """Where the server is dialled; None for a script entry not yet started."""
+        return self._url
 
     def stub(self):
         """The stub and call metadata, starting a script entry if needed."""
@@ -244,7 +242,7 @@ class _OpCall:
         """The events that carry outputs, reading until the stream ends."""
         if self.server.remote:
             self._check_no_credential(arguments)
-            print(f"{self.name}: calling {self.server.where}", flush=True)
+            print(f"{self.name}: calling {self.server.url}", flush=True)
         for attempt in (1, 2):
             stub, metadata = self.server.stub()
             try:
@@ -374,7 +372,8 @@ def _build_op(call: _OpCall) -> Callable:
     doc = [
         info.get("description") or f"The {call.name} op.",
         "",
-        f"Server: {call.server.name} ({call.server.kind} entry, {call.server.where})",
+        f"Server: {call.server.name} ({call.server.kind} entry, "
+        f"{call.server.url or 'started on first call'})",
         f"Tensor arguments (axes the op sees): {tensors}",
     ]
     if info.get("labels"):
@@ -411,7 +410,7 @@ def _build_op(call: _OpCall) -> Callable:
     op.__name__ = _sanitize_name(call.name)
     op.op_name = call.name
     op.server = call.server.name
-    op.remote = call.server.remote
+    op.url = call.server.url
     op.labels = list(info.get("labels") or [])
     op.description = info.get("description", "")
     op.kwargs_text = info.get("kwargs") or ""
@@ -578,8 +577,8 @@ class Ops:
         lines = []
         for r in rows:
             names = ", ".join(o["name"] for o in r["ops"]) or "-"
-            where = "remote" if _is_remote(r["kind"], r.get("url")) else "local"
-            line = f"{r['name']} ({r['kind']}, {where}): {r['state']}; ops: {names}"
+            at = f", {r['url']}" if r.get("url") else ""
+            line = f"{r['name']} ({r['kind']}{at}): {r['state']}; ops: {names}"
             if any((r["name"], o["name"]) not in bound for o in r["ops"]):
                 line += " (not bound in this kernel: call ops.refresh())"
             lines.append(line)
