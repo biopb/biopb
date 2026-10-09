@@ -380,7 +380,16 @@ class SourceAdapter(ABC):
         when the registry registers the adapter and judges the label sets
         against that snapshot until the next registration, so an adapter that
         discovers tensors lazily, or whose shape changes under it, would leave
-        sets bound to a stale image.
+        sets bound to a stale image. Computing it lazily is fine so long as
+        every call answers the same.
+
+        **The one exception is a mirror** (``RemoteTensorAdapter``): its catalog
+        is re-seeded in place when the upstream re-registers
+        (``seed_catalog``), and until it is seeded it asks the upstream on each
+        call. That is safe only because a mirror carries no attached tensors --
+        ``add_tensor`` refuses it -- so nothing is judged against its listing.
+        A new adapter whose listing can move must either be registered anew
+        when it does, or never hold attachments.
 
         Returns:
             List of :class:`TensorEntry`, each a :func:`catalog_entry` projection:
