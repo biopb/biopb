@@ -2830,9 +2830,10 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
 
             _relist(manager)
 
-            assert set(proxy.sources) == {"lab__img", "lab__img2"}
+            assert set(proxy.sources) == set()  # catalogued, no adapter built
+            assert manager.unregistered_sources() == 2
             for sid in ("lab__img", "lab__img2"):
-                adapter = proxy.sources.get(sid)
+                adapter = proxy.sources.get_registered(sid)  # a read builds it
                 assert adapter._descriptors_cache is not None  # seeded, not live
                 assert adapter._client is None  # no per-source upstream dial
                 # source_url mirrors the upstream path under the endpoint root, so
@@ -2841,6 +2842,10 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 assert adapter._source_url.startswith("grpc://lab/")
                 assert adapter._source_url.endswith(".zarr")
 
+            # Built, they are counted as registered, so the total did not move.
+            assert manager.unregistered_sources() == 0
+            assert len(proxy.sources) + manager.unregistered_sources() == 2
+
             # local catalog populated from the bulk seed
             rows = (
                 local_db._get_connection()
@@ -2848,6 +2853,68 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 .fetchall()
             )
             assert [r[0] for r in rows] == ["lab__img", "lab__img2"]
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_an_idle_mirror_is_let_go_and_built_again_at_the_same_version(
+    simple_zarr_array,
+):
+    """A mirror is evictable like a claimed source: let go when idle, and the next
+    read builds it again from its catalog row, at the version it was synced."""
+    import gc
+
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream, _, _ = _db_upstream(zarr_path, ["img"])
+    _serve(upstream)
+    try:
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = make_manager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            _relist(manager)
+            first = proxy.sources.get_registered("lab__img")
+            version, url = first.content_version, first.catalog_url
+            tensors = [t.array_id for t in first.list_tensors()]
+            del first
+
+            assert proxy.sources.release_idle(0.0, now=1e12) == 1
+            gc.collect()
+            assert proxy.sources.get("lab__img") is None
+            assert "lab__img" in proxy.sources
+            # Let go, it is still an entry of the registry: counted once.
+            assert manager.unregistered_sources() == 0
+            assert len(proxy.sources) + manager.unregistered_sources() == 1
+
+            # Resolving a mirror that has no adapter builds it too.
+            assert manager.resolve_source("lab__img", lambda path: None) is True
+            assert proxy.sources.get("lab__img") is not None
+            assert proxy.sources.release_idle(0.0, now=1e12) == 1
+            gc.collect()
+
+            again = proxy.sources.get_registered("lab__img")
+
+            assert again.content_version == version and again.catalog_url == url
+            assert [t.array_id for t in again.list_tensors()] == tensors
         finally:
             proxy.shutdown()
     finally:
@@ -2887,7 +2954,8 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
                 ],
             )
             _relist(manager)
-            assert set(proxy.sources) == {"lab__img", "lab__img2"}
+            for sid in ("lab__img", "lab__img2"):
+                assert proxy.sources.get_registered(sid) is not None
 
             def _fails(client):
                 raise RuntimeError("query timed out")
@@ -2903,6 +2971,7 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
             _relist(manager)
 
             assert set(proxy.sources) == {"lab__img", "lab__img2"}  # nothing removed
+            assert local_db.query("SELECT 1 FROM sources").num_rows == 2
         finally:
             proxy.shutdown()
     finally:
@@ -3058,6 +3127,15 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             assert resolved is False  # unresolved mirror, not advertised readable
             assert tensors == []
 
+            # A read is refused as unresolved: the row says so, and the read does
+            # not change it by giving the source an adapter.
+            from biopb_tensor_server.core.errors import SourceUnresolvedError
+
+            with pytest.raises(SourceUnresolvedError):
+                proxy.sources.get_registered("lab__cloud")
+            assert proxy.sources.get("lab__cloud") is None
+            assert _row() == (False, [])
+
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(
                 "cloud",
@@ -3147,7 +3225,8 @@ def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch
 
             _relist(manager)
 
-            assert set(proxy.sources) == {f"lab__{sid}" for sid in ids}
+            rows = local_db.query("SELECT source_id FROM sources").to_pylist()
+            assert {r["source_id"] for r in rows} == {f"lab__{sid}" for sid in ids}
             assert len(_full_row_queries()) == 3  # 5 ids, 2 per batch
 
             queries.clear()
@@ -3275,7 +3354,7 @@ class TestAliasAndSchemeSurviveRegistration:
             )
             _relist(manager)
 
-            url = proxy.sources.get("lab__img")._source_url
+            url = proxy.sources.get_registered("lab__img")._source_url
             # seeded from the upstream catalog row: the alias is the authority and
             # the upstream's own filepath is the path (not localhost:<port>).
             assert url.startswith("grpc://lab/")

@@ -1973,6 +1973,25 @@ class MetadataDatabase:
             logger.warning("unreadable payload for source %s", source_id)
             return None
 
+    def read_mirrored(
+        self, source_id: str
+    ) -> Optional[Tuple[str, List[Dict[str, Any]], bool]]:
+        """``(source_url, tensors, is_resolved)`` of a catalogued source, or None:
+        what a mirror's adapter is rebuilt from, in the local ids the row was
+        written with. ``is_resolved`` is the row's, as the upstream last said."""
+        row = (
+            self._get_cursor()
+            .execute(
+                "SELECT source_url, tensors, is_resolved FROM sources "
+                "WHERE source_id = ?",
+                [source_id],
+            )
+            .fetchone()
+        )
+        if row is None:
+            return None
+        return row[0] or "", list(row[1] or []), bool(row[2])
+
     def drop_catalog_rows(self, source_ids: Sequence[str]) -> None:
         """Delete persisted rows a restore did not keep, with the reserved ROI rows
         each one's registration derived (see :meth:`sync_source_removed`)."""

@@ -3,25 +3,36 @@
 A bare-host ``tensor-server`` entry is a root (:attr:`RootKind.UPSTREAM`) that is
 re-listed rather than walked. What it mirrors is not a set of claims: there is no
 file to stat, parse or re-find, and nothing to persist, since the root is rebuilt
-from config on every start. A :class:`MirrorSet` holds the root and the adapters
-registered for its sources, and keeps both and the catalog in step with the
+from config on every start. A :class:`MirrorSet` holds the root and the version
+each of its sources was last synced at, and keeps the catalog in step with the
 upstream's own catalog.
+
+A re-list writes catalog rows and builds no adapter. A source's adapter is built
+by :meth:`MirrorSet.materialize` on the first read, from the row the catalog holds,
+and is then let go of when idle like any other.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from biopb_tensor_server.adapters.remote_tensor import (
     RemoteTensorAdapter,
     _split_grpc_url,
     close_upstream_client,
+    content_version_for,
+    display_parts,
     fetch_upstream_rows,
     list_upstream_versions,
+    localize_tensor_rows,
+    mirror_display_url,
     open_upstream_client,
     resolve_upstream_credentials,
+    warn_noncanonical_tensors,
 )
+from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
 from biopb_tensor_server.sources.resolve import namespaced_source_id
 from biopb_tensor_server.sources.roots import Root
@@ -30,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class MirrorSet:
-    """The mirrors of one upstream: its root, and a source id -> adapter map."""
+    """The mirrors of one upstream: its root, and the version of each source."""
 
     def __init__(
         self,
@@ -49,7 +60,73 @@ class MirrorSet:
         self._is_claimed = is_claimed
         self._ensure_root = ensure_root
         self._endpoint = _split_grpc_url(root.url)[0]
-        self._adapters: Dict[str, RemoteTensorAdapter] = {}
+        self._scheme, self._authority = display_parts(self._endpoint, root.alias)
+        # source id -> (upstream id, the upstream's ``indexed_at`` it was synced at):
+        # all a mirror needs besides its catalog row to be rebuilt.
+        self._versions: Dict[str, Tuple[str, object]] = {}
+        # The rows themselves, for a set with no catalog to read them back from.
+        self._held: Dict[str, Tuple[str, List[dict], bool]] = {}
+        self._credentials: Any = None
+        self._build_lock = threading.Lock()
+
+    def owns(self, source_id: str) -> bool:
+        """Whether *source_id* is one of this upstream's mirrors."""
+        return source_id in self._versions
+
+    def unbuilt(self) -> int:
+        """How many mirrors the registry has no entry for. One it has let go of is
+        still an entry, and counted there."""
+        return sum(
+            1
+            for source_id in list(self._versions)
+            if source_id not in self._server.sources
+        )
+
+    def _built(self, source_id: str) -> Optional[Any]:
+        return self._server.sources.get(source_id)
+
+    def materialize(self, source_id: str) -> bool:
+        """Give a mirror its adapter, from the row the catalog holds. Returns whether
+        the source has one: False for an id this set does not mirror.
+
+        Whether the source is resolved is the row's to say, and the adapter does not
+        change it: a row the upstream has not resolved gets no adapter, and the read
+        is refused as unresolved.
+
+        Single-flight, and the adapter is registered evictable, so an idle one is
+        let go of and built again by the next read.
+        """
+        if source_id not in self._versions:
+            return False
+        with self._build_lock:
+            entry = self._versions.get(source_id)
+            if entry is None:
+                return False
+            if self._built(source_id) is not None:
+                return True
+            if self._metadata_db is not None:
+                row = self._metadata_db.read_mirrored(source_id)
+            else:
+                row = self._held.get(source_id)
+            if row is None:
+                return False
+            url, tensors, resolved = row
+            if not resolved:
+                raise SourceUnresolvedError(
+                    f"source {source_id!r} is not resolved on its upstream "
+                    f"{self._endpoint}"
+                )
+            upstream_id, indexed_at = entry
+            adapter = RemoteTensorAdapter(
+                source_id,
+                self._endpoint,
+                upstream_id,
+                credentials=self._credentials,
+                alias=self.root.alias,
+            )
+            adapter.restore_catalog(tensors, url, indexed_at)
+            self._server.register_source(source_id, adapter, evictable=True)
+        return True
 
     def relist(self, credentials_config: Optional[Any]) -> bool:
         """Bring the mirrors to what the upstream lists now.
@@ -68,28 +145,29 @@ class MirrorSet:
         """
         alias = self.root.alias
         credentials = resolve_upstream_credentials(self.root.source, credentials_config)
+        self._credentials = credentials
         client = open_upstream_client(self._endpoint, credentials)
         added = 0
         try:
             versions = list_upstream_versions(client)
             desired = {namespaced_source_id(alias, up): up for up in versions}
 
-            removed = sorted(self._adapters.keys() - desired.keys())
+            removed = sorted(self._versions.keys() - desired.keys())
             self._remove(removed)
 
-            new = sorted(desired.keys() - self._adapters.keys())
+            new = sorted(desired.keys() - self._versions.keys())
             stale = sorted(
                 source_id
-                for source_id, adapter in self._adapters.items()
+                for source_id, (_, held) in self._versions.items()
                 if source_id in desired
-                and not adapter.is_current(versions[desired[source_id]].indexed_at)
+                and not self._is_current(held, versions[desired[source_id]].indexed_at)
             )
             wanted = [desired[source_id] for source_id in new + stale]
             sizes = {up: versions[up].size for up in wanted}
             # One bounded batch of full rows at a time, so the first sync of a large
             # catalog never holds it whole.
             for rows in fetch_upstream_rows(client, wanted, sizes):
-                added += self._apply(rows, credentials)
+                added += self._apply(rows)
         finally:
             close_upstream_client(client)
 
@@ -102,26 +180,32 @@ class MirrorSet:
             )
         return bool(added or removed)
 
-    def _apply(self, rows: Sequence[dict], credentials: Any) -> int:
-        """Register the new sources among *rows*, write all their catalog rows
-        and re-seed the known ones. Returns how many sources were added.
+    @staticmethod
+    def _is_current(held: object, indexed_at: object) -> bool:
+        """Whether a source synced at *held* is as the upstream lists it now. An
+        unversioned upstream is never current, so it is re-read."""
+        version = content_version_for(indexed_at)
+        return version is not None and version == content_version_for(held)
 
-        A failure leaves the catalog and the registry agreeing: the new adapters
-        come back out and nothing is re-seeded, so the next tick finds the same
-        sources new or stale and tries again.
+    def _apply(self, rows: Sequence[dict]) -> int:
+        """Write the catalog rows of *rows* and record their versions. Returns how
+        many sources were added.
+
+        A source the upstream re-registered loses its adapter, and the next read
+        builds it from the new row. A failure leaves nothing recorded and nothing
+        released, so the next tick finds the same sources new or stale and tries
+        again.
         """
         alias = self.root.alias
-        fresh: Dict[str, RemoteTensorAdapter] = {}
-        known: List[Tuple[RemoteTensorAdapter, dict]] = []
+        versions: Dict[str, Tuple[str, object]] = {}
         entries: List[MirroredRow] = []
+        held: Dict[str, Tuple[str, List[dict], bool]] = {}
+        added = 0
         for row in rows:
             upstream_id = row["source_id"]
             source_id = namespaced_source_id(alias, upstream_id)
-            adapter = self._adapters.get(source_id)
-            if adapter is None:
-                if self._server.sources.get(source_id) is not None or (
-                    self._is_claimed(source_id)
-                ):
+            if source_id not in self._versions:
+                if source_id in self._server.sources or self._is_claimed(source_id):
                     logger.warning(
                         "Not mirroring %s from %s: its id is already a source of "
                         "this server. Give the upstream an alias to namespace it.",
@@ -129,85 +213,85 @@ class MirrorSet:
                         self._endpoint,
                     )
                     continue
-                adapter = RemoteTensorAdapter(
-                    source_id,
-                    self._endpoint,
-                    upstream_id,
-                    credentials=credentials,
-                    alias=alias,
+                added += 1
+            entry = self._entry(source_id, upstream_id, row)
+            entries.append(entry)
+            previous = self._versions.get(source_id)
+            if previous is None or previous[1] != row.get("indexed_at"):
+                warn_noncanonical_tensors(source_id, entry.tensors)
+            versions[source_id] = (upstream_id, row.get("indexed_at"))
+            if self._metadata_db is None:
+                held[source_id] = (
+                    self._url(upstream_id, row),
+                    entry.tensors,
+                    entry.is_resolved,
                 )
-                self._seed(adapter, row)
-                fresh[source_id] = adapter
-            else:
-                known.append((adapter, row))
-            entries.append(self._entry(adapter, row))
 
-        registered: List[str] = []
-        try:
-            for source_id, adapter in fresh.items():
-                self._server.register_source(source_id, adapter)
-                registered.append(source_id)
-            if self._metadata_db is not None and entries:
+        if self._metadata_db is not None and entries:
+            try:
                 self._ensure_root(self.root)
                 self._metadata_db.sync_mirrored_rows(
                     self.root.root_id, "tensor-server", entries
                 )
-        except Exception:
-            logger.exception(
-                "Failed to register mirrored sources of %s; they are retried",
-                self._endpoint,
-            )
-            for source_id in registered:
-                self._server.unregister_source(source_id)
-            return 0
+            except Exception:
+                logger.exception(
+                    "Failed to catalogue the mirrored sources of %s; they are retried",
+                    self._endpoint,
+                )
+                return 0
 
-        self._adapters.update(fresh)
-        for adapter, row in known:
-            self._seed(adapter, row)
-        return len(fresh)
+        # Under the build lock, so a build from the row as it was cannot register
+        # after this and leave a stale adapter.
+        with self._build_lock:
+            self._versions.update(versions)
+            self._held.update(held)
+            for source_id in versions:
+                self._release(source_id)
+        return added
 
-    @staticmethod
-    def _seed(adapter: RemoteTensorAdapter, row: dict) -> None:
-        adapter.seed_catalog(
-            row.get("tensors"), row.get("source_url"), row.get("indexed_at")
+    def _url(self, upstream_id: str, row: dict) -> str:
+        return mirror_display_url(
+            self._scheme, self._authority, upstream_id, row.get("source_url")
         )
 
-    def _entry(self, adapter: RemoteTensorAdapter, row: dict) -> MirroredRow:
+    def _entry(self, source_id: str, upstream_id: str, row: dict) -> MirroredRow:
         """The catalog row of a mirror: the upstream's, with its ids made local.
 
-        Placed beneath the root by the url the adapter shows: the upstream's own
+        Placed beneath the root by the url the mirror shows: the upstream's own
         path where it has one, else its id.
         """
-        url = adapter.display_url(row.get("source_url"))
+        url = self._url(upstream_id, row)
         prefix = self.root.root_url + "/"
         return MirroredRow(
-            adapter.source_id,
+            source_id,
             url[len(prefix) :] if url.startswith(prefix) else row["source_id"],
             row.get("metadata_json") or None,
             # An upstream predating the column has only resolved sources.
             bool(row.get("is_resolved", True)),
-            adapter.local_tensor_rows(row.get("tensors")),
+            localize_tensor_rows(row.get("tensors"), upstream_id, source_id),
         )
+
+    def _release(self, source_id: str) -> None:
+        """Take a mirror's adapter out of the registry, if it has one. Caller holds
+        the build lock."""
+        if source_id in self._server.sources:
+            self._server.unregister_source(source_id)
 
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the
-        catalog. One whose unregistering fails stays, and is tried again."""
-        gone = []
-        for source_id in source_ids:
-            try:
-                self._server.unregister_source(source_id)
-            except Exception:
-                logger.exception("Failed to unregister mirrored source %s", source_id)
-                continue
-            del self._adapters[source_id]
-            gone.append(source_id)
+        catalog in one transaction."""
+        with self._build_lock:
+            for source_id in source_ids:
+                self._release(source_id)
+                del self._versions[source_id]
+                self._held.pop(source_id, None)
         if self._metadata_db is None:
             return
         try:
-            self._metadata_db.sync_mirrored_removed(gone)
+            self._metadata_db.sync_mirrored_removed(source_ids)
         except Exception:
             logger.exception(
                 "Failed to remove %d mirrored sources of %s from metadata DB",
-                len(gone),
+                len(source_ids),
                 self._endpoint,
             )

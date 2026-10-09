@@ -252,6 +252,8 @@ class SourceManager:
             if adapter is not None
             else self._reconciler.claim_primary_path(source_id)
         )
+        if path is None and self._reconciler.is_mirror(source_id):
+            path = source_id  # a mirror has no adapter until it is read
         if path is None:
             return False
         on_target(path or source_id)

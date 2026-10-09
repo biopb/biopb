@@ -452,6 +452,71 @@ def fetch_upstream_rows(
         )
 
 
+def display_parts(upstream_location: str, alias: Optional[str]) -> Tuple[str, str]:
+    """The scheme and authority a mirror is shown under: whatever the upstream was
+    configured with (grpc://, grpcs://, grpc+tls://; hardcoding grpc:// advertised a
+    TLS upstream as plaintext, biopb/biopb#788), and the alias or else host:port."""
+    parts = urlsplit(upstream_location)
+    return parts.scheme or "grpc", alias or (parts.netloc or upstream_location)
+
+
+def mirror_display_url(
+    scheme: str,
+    authority: str,
+    upstream_source_id: str,
+    upstream_source_url: Optional[str],
+) -> str:
+    """The catalog ``source_url`` of a mirror, so a browser can tree it by path.
+
+    Embeds the upstream source's REAL location under the (aliased) endpoint --
+    ``<scheme>://<authority>/<remote-path>`` -- so a client nests mirrored sources
+    by their upstream filepath beneath an endpoint root, instead of collapsing
+    every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297). The
+    upstream url is a normalized catalog url (e.g. ``file:///labs/x/img.tif`` or
+    ``s3://bucket/key``); keep its authority + path, drop the scheme. Falls back to
+    the endpoint + upstream source_id when no usable path is available.
+    """
+    if upstream_source_url:
+        parts = urlsplit(upstream_source_url)
+        remote = (parts.netloc + parts.path).strip("/")
+        if remote:
+            return f"{scheme}://{authority}/{remote}"
+    return f"{scheme}://{authority}:{upstream_source_id}"
+
+
+def warn_noncanonical_tensors(source_id: str, tensor_rows: List[dict]) -> None:
+    """Log the tensors of a mirror that an upstream serves in a non-canonical axis
+    order, which reads of will refuse (biopb/biopb#596). Said when the mirror is
+    synced, not only when someone opens the tensor, so a reads-refused mirror is
+    discoverable from the log of the re-list that mirrored it."""
+    for t in tensor_rows:
+        why = noncanonical_order(t["dim_labels"], t["shape"])
+        if why is not None:
+            logger.warning(
+                "mirrored source %s: upstream tensor %s %s -- reads of it "
+                "will be refused until that upstream is upgraded",
+                source_id,
+                t["array_id"],
+                why,
+            )
+
+
+def localize_tensor_rows(
+    upstream_tensors: Optional[List[dict]], upstream_source_id: str, source_id: str
+) -> List[dict]:
+    """An upstream row's ``tensors`` as the mirror lists them: the same structure
+    with the source_id prefix of each ``array_id`` swapped."""
+    return [
+        {
+            "array_id": source_id + t["array_id"][len(upstream_source_id) :],
+            "dim_labels": list(t.get("dim_labels") or []),
+            "shape": [int(n) for n in t.get("shape") or []],
+            "dtype": t.get("dtype") or "",
+        }
+        for t in upstream_tensors or []
+    ]
+
+
 class RemoteTensorAdapter(TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
@@ -503,15 +568,9 @@ class RemoteTensorAdapter(TensorAdapter):
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
         self._alias = alias
-        _parts = urlsplit(upstream_location)
-        # Display scheme: whatever the upstream was configured with (grpc://,
-        # grpcs://, grpc+tls://). Hardcoding grpc:// advertised a TLS upstream as
-        # plaintext (biopb/biopb#788).
-        self._scheme = _parts.scheme or "grpc"
-        # Display authority for the catalog source_url: the alias, or the
-        # host:port when there is none. (self._upstream_location keeps the real
-        # endpoint for dialing.)
-        self._authority = alias or (_parts.netloc or upstream_location)
+        # Display scheme and authority for the catalog source_url.
+        # (self._upstream_location keeps the real endpoint for dialing.)
+        self._scheme, self._authority = display_parts(upstream_location, alias)
         # Display-friendly catalog source_url. Until the upstream's real path is
         # seeded (seed_catalog, biopb/biopb#297), fall back to the endpoint + the
         # upstream source_id -- grpc://lab:experiment1 (aliased) or
@@ -656,44 +715,34 @@ class RemoteTensorAdapter(TensorAdapter):
         )
 
     def display_url(self, upstream_source_url: Optional[str]) -> str:
-        """Build the catalog ``source_url`` so a browser can tree a mirror by path.
-
-        Embeds the upstream source's REAL location under the (aliased) endpoint --
-        ``<scheme>://<authority>/<remote-path>``, keeping the upstream's own
-        grpc/grpcs scheme -- so a client nests mirrored sources
-        by their upstream filepath beneath an endpoint root, instead of collapsing
-        every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297).
-        The upstream url is a normalized catalog url (e.g.
-        ``file:///labs/x/img.tif`` or ``s3://bucket/key``); keep its authority +
-        path, drop the scheme. Falls back to the endpoint + upstream source_id when
-        no usable path is available (empty/opaque upstream url).
-        """
-        if upstream_source_url:
-            parts = urlsplit(upstream_source_url)
-            remote = (parts.netloc + parts.path).strip("/")
-            if remote:
-                return f"{self._scheme}://{self._authority}/{remote}"
-        return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
-
-    def is_current(self, indexed_at: object) -> bool:
-        """Whether this mirror was last seeded from an upstream row stamped
-        ``indexed_at``. An unversioned upstream is never current, so it is
-        re-read on every re-list."""
-        version = content_version_for(indexed_at)
-        return version is not None and version == self._content_version
+        """:func:`mirror_display_url` for this mirror."""
+        return mirror_display_url(
+            self._scheme, self._authority, self._upstream_source_id, upstream_source_url
+        )
 
     def local_tensor_rows(self, upstream_tensors: Optional[List[dict]]) -> List[dict]:
-        """An upstream row's ``tensors`` as this mirror lists them: the same
-        structure with the source_id prefix of each ``array_id`` swapped."""
-        return [
-            {
-                "array_id": self._to_local_array_id(t["array_id"]),
-                "dim_labels": list(t.get("dim_labels") or []),
-                "shape": [int(n) for n in t.get("shape") or []],
-                "dtype": t.get("dtype") or "",
-            }
-            for t in upstream_tensors or []
+        """:func:`localize_tensor_rows` for this mirror."""
+        return localize_tensor_rows(
+            upstream_tensors, self._upstream_source_id, self.source_id
+        )
+
+    def restore_catalog(
+        self, local_tensors: List[dict], source_url: str, indexed_at: object
+    ) -> None:
+        """Seed the catalog surface from what this mirror's own catalog row holds:
+        its tensors already local, its url already the display url, and the
+        upstream's ``indexed_at`` it was synced at."""
+        self._content_version = content_version_for(indexed_at)
+        self._descriptors_cache = [
+            TensorDescriptor(
+                array_id=t["array_id"],
+                dim_labels=t["dim_labels"],
+                shape=t["shape"],
+                dtype=t["dtype"],
+            )
+            for t in local_tensors
         ]
+        self._source_url = source_url
 
     def seed_catalog(
         self,
@@ -733,6 +782,7 @@ class RemoteTensorAdapter(TensorAdapter):
         # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
         # envelope carries an empty cv, exactly as before this plumbing.
         self._content_version = content_version_for(indexed_at)
+        rows = self.local_tensor_rows(upstream_tensors)
         descs = [
             TensorDescriptor(
                 array_id=t["array_id"],
@@ -740,7 +790,7 @@ class RemoteTensorAdapter(TensorAdapter):
                 shape=t["shape"],
                 dtype=t["dtype"],
             )
-            for t in self.local_tensor_rows(upstream_tensors)
+            for t in rows
         ]
         # Mirror the upstream's real path into the display url (biopb/biopb#297).
         new_url = self.display_url(source_url)
@@ -748,20 +798,7 @@ class RemoteTensorAdapter(TensorAdapter):
         self._descriptors_cache = descs
         self._source_url = new_url
         if changed:
-            # Say it at seed time, not only when someone opens the tensor: a
-            # reads-refused mirror should be discoverable from the log of the
-            # reconcile that mirrored it (biopb/biopb#596). Gated on `changed` so
-            # a steady re-list does not repeat it every tick.
-            for desc in descs:
-                why = noncanonical_order(desc.dim_labels, desc.shape)
-                if why is not None:
-                    logger.warning(
-                        "mirrored source %s: upstream tensor %s %s -- reads of it "
-                        "will be refused until that upstream is upgraded",
-                        self.source_id,
-                        desc.array_id,
-                        why,
-                    )
+            warn_noncanonical_tensors(self.source_id, rows)
         return changed
 
     def registration_record(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from biopb_tensor_server.adapters.remote_tensor import UpstreamVersion
 from biopb_tensor_server.core.config import SourceConfig
+from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
 from biopb_tensor_server.sources import mirror as mirror_module
 from biopb_tensor_server.sources.mirror import MirrorSet
@@ -254,7 +255,9 @@ def _mirrors(db=None, server=None, is_claimed=lambda source_id: False):
 
 
 class TestMirrorSet:
-    def test_the_first_relist_registers_and_catalogues_every_source(self, upstream):
+    def test_the_first_relist_catalogues_every_source_and_builds_no_adapter(
+        self, upstream
+    ):
         upstream.put("a", metadata_json='{"ome": 1}')
         upstream.put("b", resolved=False)
         db = MetadataDatabase()
@@ -262,13 +265,136 @@ class TestMirrorSet:
 
         assert mirrors.relist(None) is True
 
-        assert sorted(server.sources) == ["lab__a", "lab__b"]
+        assert server.sources == {}
+        assert mirrors.owns("lab__a") and mirrors.owns("lab__b")
+        assert mirrors.unbuilt() == 2
         rows = db.query("SELECT source_id, source_url FROM sources").to_pylist()
         assert {r["source_id"]: r["source_url"] for r in rows} == {
             "lab__a": "grpc://lab/data/a.tif",
             "lab__b": "grpc://lab/data/b.tif",
         }
         assert db.get_metadata_json("lab__a") == {"ome": 1}
+
+    def test_a_mirror_is_built_from_its_row_on_demand(self, upstream):
+        upstream.put("a", indexed_at=7)
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+
+        assert mirrors.materialize("lab__a") is True
+
+        adapter = server.sources["lab__a"]
+        assert adapter.catalog_url == "grpc://lab/data/a.tif"
+        assert [t.array_id for t in adapter.list_tensors()] == ["lab__a"]
+        assert adapter.content_version == b"iat:7"
+        assert mirrors.unbuilt() == 0
+        assert mirrors.materialize("lab__a") is True
+        assert server.sources["lab__a"] is adapter  # not built twice
+
+    def test_a_row_the_upstream_has_not_resolved_gets_no_adapter(self, upstream):
+        upstream.put("a", resolved=False)
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        assert _row(db, "lab__a")["is_resolved"] is False
+
+        with pytest.raises(SourceUnresolvedError):
+            mirrors.materialize("lab__a")
+
+        assert server.sources == {}
+        assert _row(db, "lab__a")["is_resolved"] is False  # the row's to say
+
+    def test_a_re_sync_during_a_build_leaves_the_adapter_at_the_new_version(
+        self, upstream
+    ):
+        import threading
+        import time
+
+        upstream.put("a", indexed_at=1, metadata_json='{"v": 1}')
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        real = db.read_mirrored
+        resync = threading.Thread(target=lambda: mirrors.relist(None))
+
+        def stale_read(source_id):
+            row = real(source_id)  # the row as it was before the re-sync
+            upstream.put("a", indexed_at=2, metadata_json='{"v": 2}')
+            resync.start()
+            time.sleep(0.3)  # the re-sync has written its row and waits for the build
+            return row
+
+        db.read_mirrored = stale_read
+
+        mirrors.materialize("lab__a")
+        resync.join(timeout=10)
+
+        assert not resync.is_alive()
+        # The adapter built from the old row was released by the re-sync; the next
+        # read builds it from the new one.
+        assert "lab__a" not in server.sources
+        db.read_mirrored = real
+        mirrors.materialize("lab__a")
+        assert server.sources["lab__a"].content_version == b"iat:2"
+
+    def test_a_removal_during_a_build_leaves_no_adapter_behind(self, upstream):
+        import threading
+        import time
+
+        upstream.put("a")
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        real = db.read_mirrored
+        removal = threading.Thread(target=lambda: mirrors._remove(["lab__a"]))
+
+        def read_then_remove(source_id):
+            row = real(source_id)
+            removal.start()
+            time.sleep(0.3)  # the removal waits for the build
+            return row
+
+        db.read_mirrored = read_then_remove
+
+        mirrors.materialize("lab__a")
+        removal.join(timeout=10)
+
+        assert not removal.is_alive()
+        assert server.sources == {} and not mirrors.owns("lab__a")
+
+    def test_a_source_synced_in_a_non_canonical_order_is_logged_once(
+        self, upstream, caplog
+    ):
+        upstream.put("a", indexed_at=1)
+        upstream.rows["a"]["tensors"][0]["dim_labels"] = ["x", "y", "z"]
+        upstream.rows["a"]["tensors"][0]["shape"] = [2, 3, 4]
+        mirrors, _ = _mirrors(MetadataDatabase())
+
+        with caplog.at_level("WARNING"):
+            mirrors.relist(None)
+            mirrors.relist(None)  # nothing re-read: nothing said again
+
+        assert caplog.text.count("reads of it will be refused") == 1
+        assert "lab__a" in caplog.text
+
+    def test_an_id_the_set_does_not_mirror_is_not_built(self, upstream):
+        mirrors, server = _mirrors(MetadataDatabase())
+
+        assert mirrors.materialize("nope") is False
+        assert server.sources == {}
+
+    def test_a_failed_build_leaves_the_mirror_unbuilt_and_is_retried(self, upstream):
+        upstream.put("a")
+        mirrors, server = _mirrors(MetadataDatabase())
+        mirrors.relist(None)
+        server.fail_register = True
+
+        with pytest.raises(RuntimeError):
+            mirrors.materialize("lab__a")
+        assert mirrors.unbuilt() == 1
+
+        server.fail_register = False
+        assert mirrors.materialize("lab__a") is True
 
     def test_a_relist_that_finds_nothing_new_fetches_nothing(self, upstream):
         upstream.put("a")
@@ -287,41 +413,31 @@ class TestMirrorSet:
         db = MetadataDatabase()
         mirrors, server = _mirrors(db)
         mirrors.relist(None)
+        mirrors.materialize("lab__b")
 
-        del upstream.rows["a"]
+        del upstream.rows["a"]  # never built: nothing to unregister
 
         assert mirrors.relist(None) is True
+        assert not mirrors.owns("lab__a")
         assert list(server.sources) == ["lab__b"]
         assert db.query("SELECT source_id FROM sources").to_pylist() == [
             {"source_id": "lab__b"}
         ]
 
-    def test_a_source_that_will_not_unregister_stays_and_is_tried_again(self, upstream):
+    def test_a_built_and_an_unbuilt_mirror_the_upstream_dropped_both_go(self, upstream):
         upstream.put("a")
         upstream.put("b")
         db = MetadataDatabase()
         mirrors, server = _mirrors(db)
         mirrors.relist(None)
-        del upstream.rows["a"]
-        del upstream.rows["b"]
-        real = server.unregister_source
+        mirrors.materialize("lab__a")
+        upstream.rows.clear()
 
-        def stuck(source_id):
-            if source_id == "lab__a":
-                raise RuntimeError("busy")
-            real(source_id)
-
-        server.unregister_source = stuck
-        mirrors.relist(None)
-
-        assert list(server.sources) == ["lab__a"]
-        assert db.query("SELECT source_id FROM sources").to_pylist() == [
-            {"source_id": "lab__a"}
-        ]
-
-        server.unregister_source = real
         assert mirrors.relist(None) is True
-        assert list(server.sources) == []
+
+        assert server.sources == {}
+        assert not mirrors.owns("lab__a") and not mirrors.owns("lab__b")
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
 
     def test_a_failed_catalog_delete_does_not_fail_the_relist(
         self, upstream, monkeypatch
@@ -345,6 +461,7 @@ class TestMirrorSet:
         db = MetadataDatabase()
         mirrors, server = _mirrors(db)
         mirrors.relist(None)
+        mirrors.materialize("lab__a")
         adapter = server.sources["lab__a"]
         upstream.fetched.clear()
 
@@ -353,8 +470,24 @@ class TestMirrorSet:
         assert mirrors.relist(None) is False  # the set did not change
         assert upstream.fetched == ["a"]
         assert db.get_metadata_json("lab__a") == {"v": 2}
-        assert server.sources["lab__a"] is adapter
-        assert adapter.is_current(2)
+        assert "lab__a" not in server.sources  # released: the next read rebuilds
+        mirrors.materialize("lab__a")
+        rebuilt = server.sources["lab__a"]
+        assert rebuilt is not adapter
+        assert rebuilt.content_version == b"iat:2"
+
+    def test_a_mirror_never_built_is_built_at_the_version_it_was_last_synced(
+        self, upstream
+    ):
+        upstream.put("a", indexed_at=1)
+        mirrors, server = _mirrors(MetadataDatabase())
+        mirrors.relist(None)
+        upstream.put("a", indexed_at=2)
+        mirrors.relist(None)
+
+        mirrors.materialize("lab__a")
+
+        assert server.sources["lab__a"].content_version == b"iat:2"
 
     def test_an_unversioned_upstream_is_read_every_time_but_not_rewritten(
         self, upstream
@@ -379,10 +512,10 @@ class TestMirrorSet:
         with caplog.at_level("WARNING"):
             mirrors.relist(None)
 
-        assert list(server.sources) == ["lab__b"]
+        assert mirrors.owns("lab__b") and not mirrors.owns("lab__a")
         assert "Not mirroring a" in caplog.text
 
-    def test_a_failed_catalog_write_leaves_nothing_registered_and_retries(
+    def test_a_failed_catalog_write_leaves_nothing_recorded_and_retries(
         self, upstream, monkeypatch
     ):
         upstream.put("a")
@@ -394,26 +527,18 @@ class TestMirrorSet:
 
         monkeypatch.setattr(db, "sync_mirrored_rows", broken)
         assert mirrors.relist(None) is False
-        assert server.sources == {}
+        assert not mirrors.owns("lab__a")
 
         monkeypatch.delattr(db, "sync_mirrored_rows")
         assert mirrors.relist(None) is True
-        assert list(server.sources) == ["lab__a"]
-
-    def test_a_failed_registration_writes_no_row(self, upstream):
-        upstream.put("a")
-        db = MetadataDatabase()
-        mirrors, server = _mirrors(db)
-        server.fail_register = True
-
-        assert mirrors.relist(None) is False
-        assert db.query("SELECT source_id FROM sources").num_rows == 0
+        assert mirrors.owns("lab__a")
 
     def test_without_a_catalog_the_sources_are_still_served(self, upstream):
         upstream.put("a")
         mirrors, server = _mirrors(None)
 
         assert mirrors.relist(None) is True
+        assert mirrors.materialize("lab__a") is True
         assert list(server.sources) == ["lab__a"]
 
     def test_a_mirror_whose_upstream_path_is_unknown_sits_beneath_its_id(

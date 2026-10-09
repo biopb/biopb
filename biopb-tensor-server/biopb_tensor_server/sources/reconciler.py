@@ -293,7 +293,8 @@ class Reconciler:
         """Sources in the catalog whose registration has not completed, failed
         ones included."""
         with self._lock:
-            return len(self._pending)
+            pending = len(self._pending)
+        return pending + sum(m.unbuilt() for m in list(self._mirrors.values()))
 
     def is_pending(self, source_id: str) -> bool:
         # A dict membership test is atomic, so this takes no lock: it is asked
@@ -674,9 +675,22 @@ class Reconciler:
         Returns once the source is registered, or is not pending (unknown,
         removed). Raises ``SourceRegistrationError`` when its registration failed.
         """
-        if self.ensure_registered(source_id):
+        if self._materialize_mirror(source_id) or self.ensure_registered(source_id):
             return
         self.check_registered(source_id)
+
+    def _materialize_mirror(self, source_id: str) -> bool:
+        """Give a mirrored source its adapter. Returns whether *source_id* is one
+        (``SourceUnresolvedError`` when the upstream has not resolved it)."""
+        for mirrors in list(self._mirrors.values()):
+            if mirrors.owns(source_id):
+                mirrors.materialize(source_id)
+                return True
+        return False
+
+    def is_mirror(self, source_id: str) -> bool:
+        """Whether *source_id* is a source mirrored from an upstream."""
+        return any(m.owns(source_id) for m in list(self._mirrors.values()))
 
     def check_registered(self, source_id: str) -> None:
         """Raise why a read of a source with no adapter cannot be served.
@@ -690,6 +704,8 @@ class Reconciler:
         resolved, so a read rebuilds the adapter here, once (the registration
         is single-flight), instead of asking a client to resolve it.
         """
+        if self._materialize_mirror(source_id):
+            return
         with self._lock:
             restored = source_id in self._restored
         if (restored or not self.is_pending(source_id)) and self.ensure_registered(
