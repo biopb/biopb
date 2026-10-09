@@ -95,10 +95,12 @@ class MirrorSet:
         Single-flight, and the adapter is registered evictable, so an idle one is
         let go of and built again by the next read.
         """
-        entry = self._versions.get(source_id)
-        if entry is None:
+        if source_id not in self._versions:
             return False
         with self._build_lock:
+            entry = self._versions.get(source_id)
+            if entry is None:
+                return False
             if self._built(source_id) is not None:
                 return True
             if self._metadata_db is not None:
@@ -234,16 +236,21 @@ class MirrorSet:
                 )
                 return 0
 
-        self._versions.update(versions)
-        self._held.update(held)
-        for source_id, row in by_source.items():
-            # A built adapter is re-seeded in place: the next read sees the new
-            # tensors and version without a rebuild.
-            adapter = self._built(source_id)
-            if adapter is not None:
-                adapter.seed_catalog(
-                    row.get("tensors"), row.get("source_url"), row.get("indexed_at")
-                )
+        # Under the build lock, so an adapter being built from the row as it was
+        # is re-seeded here, not left serving it.
+        with self._build_lock:
+            self._versions.update(versions)
+            self._held.update(held)
+            for source_id, row in by_source.items():
+                # A built adapter is re-seeded in place: the next read sees the new
+                # tensors and version without a rebuild.
+                adapter = self._built(source_id)
+                if adapter is not None:
+                    adapter.seed_catalog(
+                        row.get("tensors"),
+                        row.get("source_url"),
+                        row.get("indexed_at"),
+                    )
         return added
 
     def _url(self, upstream_id: str, row: dict) -> str:
@@ -271,6 +278,7 @@ class MirrorSet:
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the
         catalog. One whose unregistering fails stays, and is tried again."""
+        gone = []
         for source_id in source_ids:
             try:
                 if source_id in self._server.sources:
@@ -280,11 +288,14 @@ class MirrorSet:
                 continue
             del self._versions[source_id]
             self._held.pop(source_id, None)
-            if self._metadata_db is None:
-                continue
-            try:
-                self._metadata_db.sync_source_removed(source_id)
-            except Exception:
-                logger.exception(
-                    "Failed to remove source %s from metadata DB", source_id
-                )
+            gone.append(source_id)
+        if self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.sync_mirrored_removed(gone)
+        except Exception:
+            logger.exception(
+                "Failed to remove %d mirrored sources of %s from metadata DB",
+                len(gone),
+                self._endpoint,
+            )

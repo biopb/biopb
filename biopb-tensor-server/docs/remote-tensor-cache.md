@@ -180,8 +180,8 @@ continuing past any page the server flags `truncated`); the result is complete,
 so a re-list can safely remove sources that disappeared. Full rows (tensors, metadata, `is_resolved`) are then
 fetched by `fetch_upstream_rows`, in batches cut by that length (`FETCH_BYTES`;
 `metadata_json` is wildly uneven, so a count would not bound memory), for sources
-that are new or whose `indexed_at` differs from the one the mirror was synced at. A steady re-list of a six-figure catalog therefore moves a
-few MB, and a first sync never holds more than one batch. There is no
+that are new or whose `indexed_at` differs from the one the mirror was synced
+at. A steady re-list of a six-figure catalog therefore moves a few MB, and a first sync never holds more than one batch. There is no
 fallback: if the query fails the re-list raises, the mirrored catalog is left as
 it is, and the next tick retries. Enumerating ids and syncing each source over
 its own RPC would put two round trips per source on an upstream that is already
@@ -189,12 +189,11 @@ down, slow or refusing us.
 
 **A mirror is not a claim.** A bare-host upstream is a root, and its
 `MirrorSet` (`sources/mirror.py`) holds that root and the `indexed_at` each of
-its sources was synced at. A re-list writes catalog rows and builds no adapter:
-the first read of a mirror builds its `RemoteTensorAdapter` from its row
-(`MirrorSet.materialize`, reached through the registry's miss path), and the
-idle sweep lets it go again. There is nothing to persist (the root is rebuilt from config
-on every start, and the catalog drops its rows at open) and no file to
-re-find. Rows are written from the upstream's rows in one batch
+its sources was synced at. A re-list writes catalog rows and builds no adapter;
+a read builds it from the row (`MirrorSet.materialize`, through the registry's
+miss path) and the idle sweep lets it go again. There is nothing to persist (the
+root is rebuilt from config on every start, and the catalog drops its rows at
+open) and no file to re-find. Rows are written from the upstream's rows in one batch
 (`MetadataDatabase.sync_mirrored_rows`): array_id prefixes swapped, the url
 rewritten, `metadata_json` passed through as the upstream wrote it. A row the
 upstream did not change is left as it is. A source configured on its own

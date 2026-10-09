@@ -304,6 +304,34 @@ class TestMirrorSet:
         assert server.sources == {}
         assert _row(db, "lab__a")["is_resolved"] is False  # the row's to say
 
+    def test_a_re_sync_during_a_build_leaves_the_adapter_at_the_new_version(
+        self, upstream
+    ):
+        import threading
+        import time
+
+        upstream.put("a", indexed_at=1, metadata_json='{"v": 1}')
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        real = db.read_mirrored
+        resync = threading.Thread(target=lambda: mirrors.relist(None))
+
+        def stale_read(source_id):
+            row = real(source_id)  # the row as it was before the re-sync
+            upstream.put("a", indexed_at=2, metadata_json='{"v": 2}')
+            resync.start()
+            time.sleep(0.3)  # the re-sync has written its row and waits for the build
+            return row
+
+        db.read_mirrored = stale_read
+
+        mirrors.materialize("lab__a")
+        resync.join(timeout=10)
+
+        assert not resync.is_alive()
+        assert server.sources["lab__a"].is_current(2)
+
     def test_an_id_the_set_does_not_mirror_is_not_built(self, upstream):
         mirrors, server = _mirrors(MetadataDatabase())
 
