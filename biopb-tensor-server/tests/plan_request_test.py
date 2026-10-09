@@ -7,8 +7,6 @@ reads both; an older one refuses a v3 server by its protocol check.
 """
 
 import json
-import threading
-import time
 from unittest.mock import Mock
 
 import numpy as np
@@ -32,36 +30,15 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     TensorReadOption,
 )
-from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+from biopb_tensor_server import TensorFlightServer
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, grid_source, register_and_catalog, serve
 
 SHAPE = (64, 64)
 
 
 def _data():
     return np.arange(SHAPE[0] * SHAPE[1], dtype=np.uint8).reshape(SHAPE)
-
-
-def _adapter(tmp_path, name="img"):
-    import zarr
-
-    arr = zarr.open_array(
-        str(tmp_path / f"{name}.zarr"),
-        mode="w",
-        shape=SHAPE,
-        chunks=(16, 16),
-        dtype="uint8",
-    )
-    arr[:] = _data()
-    return ZarrAdapter(
-        zarr.open_array(str(tmp_path / f"{name}.zarr"), mode="r"), name, ["y", "x"]
-    )
-
-
-def _serve(server):
-    threading.Thread(target=server.serve, daemon=True).start()
-    time.sleep(1)
 
 
 def _plan(client, *args, **kwargs):
@@ -75,9 +52,9 @@ def _plan(client, *args, **kwargs):
 def served(tmp_path, transfer_target):
     transfer_target(256)  # one 16x16 uint8 block per chunk
     server = catalog_server("localhost:0")
-    register_and_catalog(server, "img", _adapter(tmp_path))
+    register_and_catalog(server, "img", grid_source(tmp_path)[1])
     server.mark_ready()
-    _serve(server)
+    serve(server)
     client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=0)
     yield server, client
     client.close()
@@ -325,9 +302,9 @@ def legacy(tmp_path, transfer_target):
 
     transfer_target(256)
     server = _V2Server("localhost:0", metadata_db=MetadataDatabase())
-    register_and_catalog(server, "img", _adapter(tmp_path))
+    register_and_catalog(server, "img", grid_source(tmp_path)[1])
     server.mark_ready()
-    _serve(server)
+    serve(server)
     client = TensorFlightClient(f"grpc://localhost:{server.port}", cache_bytes=0)
     yield server, client
     client.close()

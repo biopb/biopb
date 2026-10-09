@@ -6,7 +6,6 @@ token. These cover the codec that completes a stub into the chunk_id it replaces
 the seal, and the server and proxy that issue and redeem them.
 """
 
-import threading
 import time
 
 import numpy as np
@@ -26,7 +25,6 @@ from biopb.tensor.ticket_pb2 import (
     TensorTicket,
     TicketStub,
 )
-from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import _get_read_plan
 from biopb_tensor_server.core.chunk import (
     encode_proxy_identity,
@@ -41,7 +39,7 @@ from biopb_tensor_server.core.ticket_seal import (
     load_seal_key,
 )
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, grid_source, register_and_catalog, serve
 
 SERVER_TOKEN = "server-secret"
 SHAPE = (64, 64)
@@ -356,37 +354,15 @@ class TestSealTtlConfig:
 # --------------------------------------------------------------- the live server
 
 
-def _serve(server):
-    threading.Thread(target=server.serve, daemon=True).start()
-    time.sleep(1)
-
-
-def _zarr_source(tmp_path, name="img"):
-    import zarr
-
-    data = np.arange(SHAPE[0] * SHAPE[1], dtype=np.uint8).reshape(SHAPE)
-    arr = zarr.open_array(
-        str(tmp_path / f"{name}.zarr"),
-        mode="w",
-        shape=SHAPE,
-        chunks=(16, 16),
-        dtype="uint8",
-    )
-    arr[:] = data
-    return data, ZarrAdapter(
-        zarr.open_array(str(tmp_path / f"{name}.zarr"), mode="r"), name, ["y", "x"]
-    )
-
-
 @pytest.fixture
 def guarded(tmp_path, transfer_target):
     """A server that requires its token, serving a 4x4-chunk tensor."""
     transfer_target(256)  # one 16x16 uint8 block per chunk
-    data, adapter = _zarr_source(tmp_path)
+    data, adapter = grid_source(tmp_path)
     server = catalog_server("localhost:0", token=SERVER_TOKEN)
     register_and_catalog(server, "img", adapter)
     server.mark_ready()
-    _serve(server)
+    serve(server)
     client = TensorFlightClient(
         f"grpc://localhost:{server.port}", token=SERVER_TOKEN, cache_bytes=0
     )
@@ -492,7 +468,7 @@ class TestNativeLevels:
         server = catalog_server("localhost:0", token=SERVER_TOKEN)
         register_and_catalog(server, "ome", OmeZarrAdapter(root["0"], "ome"))
         server.mark_ready()
-        _serve(server)
+        serve(server)
         client = TensorFlightClient(
             f"grpc://localhost:{server.port}", token=SERVER_TOKEN, cache_bytes=0
         )
@@ -531,7 +507,7 @@ class TestNativeLevelsThroughAMirror:
         upstream = catalog_server("localhost:0")
         register_and_catalog(upstream, "ome", OmeZarrAdapter(root["0"], "ome"))
         upstream.mark_ready()
-        _serve(upstream)
+        serve(upstream)
         proxy = catalog_server("localhost:0")
         register_and_catalog(
             proxy,
@@ -543,7 +519,7 @@ class TestNativeLevelsThroughAMirror:
             ),
         )
         proxy.mark_ready()
-        _serve(proxy)
+        serve(proxy)
         client = TensorFlightClient(f"grpc://localhost:{proxy.port}", cache_bytes=0)
         yield upstream, client, np.asarray(root["1"][:])
         client.close()
@@ -800,11 +776,11 @@ class TestMirror:
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
         transfer_target(256)
-        data, adapter = _zarr_source(tmp_path)
+        data, adapter = grid_source(tmp_path)
         upstream = catalog_server("localhost:0", token="upstream-secret")
         register_and_catalog(upstream, "img", adapter)
         upstream.mark_ready()
-        _serve(upstream)
+        serve(upstream)
 
         proxy = catalog_server("localhost:0", token=SERVER_TOKEN)
         register_and_catalog(
@@ -818,7 +794,7 @@ class TestMirror:
             ),
         )
         proxy.mark_ready()
-        _serve(proxy)
+        serve(proxy)
         client = TensorFlightClient(
             f"grpc://localhost:{proxy.port}", token=SERVER_TOKEN, cache_bytes=0
         )

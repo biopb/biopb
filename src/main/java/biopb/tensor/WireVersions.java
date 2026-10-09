@@ -63,6 +63,16 @@ final class WireVersions {
     /** Schema-metadata key carrying the server's chunk encoding version. */
     static final String WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol";
 
+    /** The value stamped under {@code key} on the plan's schema metadata, or null. */
+    static String stamp(org.apache.arrow.flight.FlightInfo plan, String key) {
+        java.util.Optional<org.apache.arrow.vector.types.pojo.Schema> schema = plan.getSchemaOptional();
+        if (!schema.isPresent()) {
+            return null;
+        }
+        java.util.Map<String, String> metadata = schema.get().getCustomMetadata();
+        return metadata == null ? null : metadata.get(key);
+    }
+
     /**
      * A version stamp, or 1 when it is absent or unreadable.
      *

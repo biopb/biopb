@@ -323,6 +323,13 @@ def _parse_flight_endpoints(
     return chunks, chunk_bounds_list, grant
 
 
+def _is_sealed(info: "flight.FlightInfo") -> bool:
+    """Did the server seal this plan: endpoints that are indices under a stub?"""
+    return bool(info.endpoints) and bool(
+        TensorDescriptor.FromString(info.descriptor.command).ticket_stub
+    )
+
+
 def _refetch_flight_info(
     descriptor: TensorDescriptor,
     location: str,
@@ -1524,12 +1531,9 @@ class ChunkFetcher:
             # credential to read it, so the reference leaves without the
             # connection's own token (biopb/biopb#1112). Anything unsealed
             # still carries it: the reader has nothing else to read with.
-            sealed = bool(info.endpoints) and bool(
-                TensorDescriptor.FromString(info.descriptor.command).ticket_stub
-            )
             return SerializedTensor(
                 location=location,
-                auth_token="" if sealed else (self._state.token or ""),
+                auth_token="" if _is_sealed(info) else (self._state.token or ""),
                 flight_info=info.serialize(),
                 tls_anchor=self._state.tls_anchor if is_tls_location(location) else b"",
             )

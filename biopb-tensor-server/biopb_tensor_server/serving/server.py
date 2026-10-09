@@ -93,6 +93,7 @@ from biopb_tensor_server.core.adapter_base import (
 from biopb_tensor_server.core.chunk import (
     cache_key_for_chunk_id,
     expand_identity,
+    identity_array_id,
     is_proxy_envelope,
     is_scaled_chunk,
     routing_array_id,
@@ -1727,13 +1728,9 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints.append(endpoint)
 
         logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
-        # What the plan was asked for, verbatim, so it says that as well as what
-        # it realized: the descriptor's slice_hint is snapped outward to
-        # chunk-aligned bounds, and a consumer -- this connection or one handed
-        # the FlightInfo as a SerializedTensor -- crops back to the request, or
-        # replays it, from here rather than remembering it separately. The
-        # descriptor does not echo the scale and method back: they are in the
-        # request already.
+        # The plan records the request it answers, verbatim, beside the realized
+        # slice on its descriptor; the descriptor does not echo the scale and
+        # method back.
         read_plan.descriptor.ClearField("scale_hint")
         read_plan.descriptor.ClearField("reduction_method")
         return flight.FlightInfo(
@@ -1793,7 +1790,6 @@ class TensorFlightServer(flight.FlightServerBase):
             read_plan.identity is None
             or read_plan.window is None
             or not read_plan.chunk_endpoints
-            or any(not ce.index for ce in read_plan.chunk_endpoints)
         ):
             return False
         start, stop = read_plan.window
@@ -1828,10 +1824,14 @@ class TensorFlightServer(flight.FlightServerBase):
         ref = ticket.chunk_ref
         try:
             chunk_id = expand_identity(ref.stub.identity, ref.index)
-            array_id = routing_array_id(chunk_id)
+            array_id = identity_array_id(ref.stub.identity)
         except ValueError as exc:
             raise flight.FlightServerError(f"chunk_ref ticket refused: {exc}") from exc
-        sealed = self._sealer.covers(ref.stub.identity, ref.stub.grant, ref.index)
+        # The MAC is only worth computing for a caller the token does not
+        # already admit.
+        sealed = not self._has_full_access(
+            self._presented_token(context)
+        ) and self._sealer.covers(ref.stub.identity, ref.stub.grant, ref.index)
         try:
             self._authorize_read(context, array_id, READ_PIXELS, sealed=sealed)
         except flight.FlightUnauthenticatedError:

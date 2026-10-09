@@ -1327,7 +1327,7 @@ public class TensorFlightClient implements AutoCloseable {
      * it to {@link #listRois(String, String, byte[])}.
      */
     public static byte[] roiTicketOf(SerializedTensor pb) {
-        ByteString ticket = TensorChunkCodec.descriptorOf(flightInfoOf(pb)).getRoiTicket();
+        ByteString ticket = descriptorOf(pb).getRoiTicket();
         return ticket.isEmpty() ? null : ticket.toByteArray();
     }
 
@@ -1351,10 +1351,7 @@ public class TensorFlightClient implements AutoCloseable {
                 .setRoiRead(RoiRead.newBuilder().setSetName(set).build())
                 .build()
                 .toByteArray();
-        byte[] joined = new byte[roiTicket.length + named.length];
-        System.arraycopy(roiTicket, 0, joined, 0, roiTicket.length);
-        System.arraycopy(named, 0, joined, roiTicket.length, named.length);
-        return joined;
+        return ByteString.copyFrom(roiTicket).concat(ByteString.copyFrom(named)).toByteArray();
     }
 
     /** The plan a SerializedTensor carries: its serialized Arrow FlightInfo. */

@@ -713,8 +713,7 @@ class TensorFlightClient:
         carries no token can still read its tensor's ROI sets: pass it to
         :meth:`list_rois` as ``roi_ticket``.
         """
-        info = flight.FlightInfo.deserialize(pb.flight_info)
-        return TensorDescriptor.FromString(info.descriptor.command).roi_ticket or None
+        return TensorFlightClient.descriptor_from_pb(pb).roi_ticket or None
 
     @staticmethod
     def tensor_from_pb(

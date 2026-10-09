@@ -1,10 +1,6 @@
 package biopb.tensor;
 
-import java.util.Map;
-import java.util.Optional;
-
 import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 
@@ -51,16 +47,7 @@ final class PlanRequest {
 
     /** The Flight protocol stamped on the plan's schema; 2 when there is none. */
     private static int writtenUnder(FlightInfo plan) {
-        Optional<Schema> schema = plan.getSchemaOptional();
-        if (schema.isPresent()) {
-            Map<String, String> metadata = schema.get().getCustomMetadata();
-            if (metadata != null) {
-                String stamped = metadata.get(WireVersions.FLIGHT_PROTOCOL_METADATA_KEY);
-                if (stamped != null && !stamped.isEmpty()) {
-                    return WireVersions.stampedVersion(stamped);
-                }
-            }
-        }
-        return 2;
+        String stamped = WireVersions.stamp(plan, WireVersions.FLIGHT_PROTOCOL_METADATA_KEY);
+        return stamped == null || stamped.isEmpty() ? 2 : WireVersions.stampedVersion(stamped);
     }
 }

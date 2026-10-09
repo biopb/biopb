@@ -16,7 +16,7 @@ OPAQUE: a served chunk_id is a **proxy envelope** (``chunk.encode_proxy_envelope
 wrapping the upstream chunk_id byte-for-byte, plus a local route and the upstream's
 content_version. A later ``do_get`` peels the envelope and forwards the inner
 VERBATIM -- no decode, no rewrite of the upstream id (biopb/biopb#178 W1). The
-upstream array_id is read once at flight-info time only to build the local route.
+local route is the tensor the plan is for.
 
 This module is the adapter and its data path, constructible directly (and via
 ``create_from_config`` for the single-source
@@ -608,10 +608,6 @@ class RemoteTensorAdapter(TensorAdapter):
         # would name a tensor and a key this server does not hold.
         out.ClearField("ticket_stub")
         out.ClearField("roi_ticket")
-        # An older upstream still echoes the request here; this server's plan
-        # carries it in app_metadata instead.
-        out.ClearField("scale_hint")
-        out.ClearField("reduction_method")
         return out
 
     def _mark_unreachable(self, exc: Exception) -> None:
@@ -1105,10 +1101,7 @@ class RemoteTensorAdapter(TensorAdapter):
         """
         if TICKET_STUB not in read_mask(read_opt):
             return False
-        try:
-            return bool(self.client._state.ticket_stubs)
-        except Exception:  # noqa: BLE001 -- an upstream that will not say, will not stub
-            return False
+        return bool(self.client._state.ticket_stubs)
 
     def _upstream_flight_info(self, read_opt: TensorReadOption):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.

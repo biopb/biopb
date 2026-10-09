@@ -10,6 +10,8 @@ import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.vector.FieldVector;
 
+import com.google.protobuf.ByteString;
+
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.cache.img.ReadOnlyCachedCellImgFactory;
@@ -90,15 +92,8 @@ final class Imglib2TensorFactory {
      * from inside a cell load.
      */
     private static void checkWireProtocol(FlightInfo plan) {
-        String stamped = null;
-        java.util.Optional<org.apache.arrow.vector.types.pojo.Schema> schema = plan.getSchemaOptional();
-        if (schema.isPresent()) {
-            java.util.Map<String, String> metadata = schema.get().getCustomMetadata();
-            if (metadata != null) {
-                stamped = metadata.get(WireVersions.WIRE_PROTOCOL_METADATA_KEY);
-            }
-        }
-        int serverVersion = WireVersions.stampedVersion(stamped);
+        int serverVersion = WireVersions.stampedVersion(
+                WireVersions.stamp(plan, WireVersions.WIRE_PROTOCOL_METADATA_KEY));
         if (serverVersion != WireVersions.TENSOR_WIRE_PROTOCOL_VERSION) {
             throw new UnsupportedOperationException(WireVersions.mismatch(
                     "tensor wire protocol", serverVersion, WireVersions.TENSOR_WIRE_PROTOCOL_VERSION,
@@ -150,11 +145,9 @@ final class Imglib2TensorFactory {
         if (stub.length == 0) {
             return endpointTicket;
         }
-        byte[] index = endpointTicket.getBytes();
-        byte[] joined = new byte[stub.length + index.length];
-        System.arraycopy(stub, 0, joined, 0, stub.length);
-        System.arraycopy(index, 0, joined, stub.length, index.length);
-        return new Ticket(joined);
+        return new Ticket(ByteString.copyFrom(stub)
+                .concat(ByteString.copyFrom(endpointTicket.getBytes()))
+                .toByteArray());
     }
 
     @SuppressWarnings("unchecked")

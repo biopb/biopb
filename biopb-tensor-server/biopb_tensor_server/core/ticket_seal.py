@@ -57,6 +57,10 @@ def _uints(values: Sequence[int]) -> bytes:
     return struct.pack(f">{len(values)}I", *values)
 
 
+def _new_key() -> bytes:
+    return secrets.token_bytes(32)
+
+
 class TicketSealer:
     """Mints and checks the seals on one server's tickets."""
 
@@ -71,30 +75,32 @@ class TicketSealer:
         never expire."""
         if key is not None and len(key) < 16:
             raise ValueError("a seal key must be at least 16 bytes")
-        self._key = key if key is not None else secrets.token_bytes(32)
+        self._key = key if key is not None else _new_key()
         self._ttl = float(ttl) if ttl else 0.0
         self._clock = clock
 
-    @staticmethod
-    def new_key() -> bytes:
-        return secrets.token_bytes(32)
+    def _mac(self, domain: bytes, *parts: bytes) -> bytes:
+        body = _frame(domain, *parts)
+        return hmac.new(self._key, body, sha256).digest()[:_MAC_BYTES]
+
+    def _expiry(self) -> int:
+        return int(self._clock() + self._ttl) if self._ttl else 0
+
+    def _live(self, expires: int) -> bool:
+        return not expires or self._clock() < expires
 
     # -- chunks ---------------------------------------------------------------
 
     def _chunk_mac(
         self, identity: bytes, start: Sequence[int], stop: Sequence[int], expires: int
     ) -> bytes:
-        body = _frame(
+        return self._mac(
             _CHUNK_DOMAIN,
             identity,
             _uints(start),
             _uints(stop),
             struct.pack(">Q", expires),
         )
-        return hmac.new(self._key, body, sha256).digest()[:_MAC_BYTES]
-
-    def _expiry(self) -> int:
-        return int(self._clock() + self._ttl) if self._ttl else 0
 
     def grant_chunks(
         self, identity: bytes, start: Sequence[int], stop: Sequence[int]
@@ -120,22 +126,18 @@ class TicketSealer:
         if not (len(start) == len(stop) == len(index)):
             return False
         expected = self._chunk_mac(identity, start, stop, grant.expires_at)
-        if not hmac.compare_digest(expected, grant.seal):
-            return False
-        if grant.expires_at and self._clock() >= grant.expires_at:
+        if not hmac.compare_digest(expected, grant.seal) or not self._live(
+            grant.expires_at
+        ):
             return False
         return all(lo <= i < hi for lo, i, hi in zip(start, index, stop, strict=True))
 
     # -- annotations ----------------------------------------------------------
 
     def _roi_mac(self, array_id: str, version: bytes, expires: int) -> bytes:
-        body = _frame(
-            _ROI_DOMAIN,
-            array_id.encode("utf-8"),
-            version,
-            struct.pack(">Q", expires),
+        return self._mac(
+            _ROI_DOMAIN, array_id.encode("utf-8"), version, struct.pack(">Q", expires)
         )
-        return hmac.new(self._key, body, sha256).digest()[:_MAC_BYTES]
 
     def grant_rois(self, array_id: str, content_version: Optional[bytes]) -> RoiGrant:
         """The grant to read *array_id*'s annotations as of *content_version*."""
@@ -161,9 +163,9 @@ class TicketSealer:
         if not grant.seal:
             return False
         expected = self._roi_mac(array_id, grant.content_version, grant.expires_at)
-        if not hmac.compare_digest(expected, grant.seal):
-            return False
-        if grant.expires_at and self._clock() >= grant.expires_at:
+        if not hmac.compare_digest(expected, grant.seal) or not self._live(
+            grant.expires_at
+        ):
             return False
         return hmac.compare_digest(grant.content_version, current_version or b"")
 
@@ -190,7 +192,7 @@ def load_seal_key() -> bytes:
             key = b""
         if len(key) >= 16:
             return key
-    key = TicketSealer.new_key()
+    key = _new_key()
     try:
         write_credential(key.hex(), SEAL_KEY_FILE)
     except OSError as exc:
