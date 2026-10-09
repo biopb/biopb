@@ -122,7 +122,7 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 $script:BiopbPinnedRelease = ''
 
 # Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
-$script:InstallSchema = 2
+$script:InstallSchema = 3
 
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived

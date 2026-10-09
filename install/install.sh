@@ -55,7 +55,7 @@ BIOPB_PINNED_RELEASE=""
 # each release's versions.json as `install_schema`; a release declaring another,
 # or none, is refused with a pointer to the installer shipped alongside it. Bump
 # it when a change to the release makes an earlier installer wrong for it.
-INSTALL_SCHEMA=2
+INSTALL_SCHEMA=3
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
