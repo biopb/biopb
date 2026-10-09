@@ -1371,7 +1371,7 @@ install_biopb() {
                     PYTHON_VERSION=""
                 fi
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
-                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (the installer is tested with 3.$MAX_MINOR; the CZI reader has no 3.14 wheel yet)"
                 PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"

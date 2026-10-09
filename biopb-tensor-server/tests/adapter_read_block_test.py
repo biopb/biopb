@@ -8,6 +8,7 @@ Each class below is listed once, with the reason, and adding an adapter without
 touching this file fails.
 """
 
+import importlib.util
 import inspect
 
 import pytest
@@ -88,6 +89,8 @@ def test_every_adapter_is_classified():
 def test_the_lists_are_disjoint_and_real():
     assert not (set(QUANTIZED) & set(UNQUANTIZED))
     stale = (set(QUANTIZED) | set(UNQUANTIZED)) - set(_adapters()) - {"TensorAdapter"}
+    if importlib.util.find_spec("pylibCZIrw") is None:
+        stale -= {"CziAdapter"}  # registered only where the [czi] extra installs
     assert not stale, f"listed but no longer present: {sorted(stale)}"
 
 

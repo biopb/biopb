@@ -71,9 +71,10 @@ from .conftest import (
 REPO = Path(__file__).resolve().parents[5]
 WORKSPACE = REPO / "biopb-mcp"
 
-# What `install.sh` accepts (MIN_MINOR/MAX_MINOR), crossed with the three
-# platforms the catalog ships to.
-PYTHONS = ("3.12",)
+# The interpreters biopb-mcp's `requires-python` admits, crossed with the three
+# platforms the catalog ships to. Nine cells, not the CI matrix's: there is no
+# reason to leave macOS-3.14 unscreened when the answer costs a second.
+PYTHONS = ("3.12", "3.13", "3.14")
 PLATFORMS = ("linux", "macos", "windows")
 
 _WORKSPACE_DISTS = {"biopb", "biopb-mcp", "biopb-tensor-server", "biopb-control"}

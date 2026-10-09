@@ -131,7 +131,7 @@ jobs:
       - name: Run Python tests
         run: |
           if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
-            deselect=(--deselect "biopb-tensor-server/tests/adapter_read_block_test.py::test_the_lists_are_disjoint_and_real" -k "not czi")
+            deselect=(-k "not czi")
           fi
           pytest --timeout=300 --timeout-method=thread "${deselect[@]}" biopb-tensor-server/tests/
 
