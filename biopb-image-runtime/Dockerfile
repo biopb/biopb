@@ -11,7 +11,7 @@
 #   docker build -t biopb-image-base -f biopb-image-runtime/Dockerfile .
 #   docker compose -f biopb-image-runtime/docker-compose.yaml up
 
-FROM python:3.10-slim-bookworm
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 

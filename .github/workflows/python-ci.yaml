@@ -56,9 +56,9 @@ jobs:
       - name: Setup build environment
         run: |
           python -m pip install --upgrade pip setuptools
-          if [[ "${{ matrix.python-version }}" == "3.13" ]]; then
+          if [[ "${{ matrix.python-version }}" != "3.12" ]]; then
             # 3.14 is not tested yet (#1289).
-            # The `test` extra pulls biopb-mcp, which is still capped below 3.13;
+            # The `test` extra pulls biopb-mcp, which needs exactly Python 3.12;
             # install the rest of it by hand. The tests that need biopb-mcp skip.
             pip install -e ".[tensor,shim]" pytest pytest-timeout "opencv-python-headless==4.10.0.84"
           else
