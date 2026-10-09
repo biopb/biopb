@@ -701,7 +701,7 @@ def _legacy_upstream(tmp, arr, labels, name="u"):
     server = TensorFlightServer("localhost:0")
     adapter = _zarr_adapter(tmp, arr, labels, name)
     adapter.__class__ = type("_Legacy", (type(adapter),), {"_canonical_axes": False})
-    server.sources._sources[name] = adapter
+    server.sources.replace({name: adapter})
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(0.8)

@@ -130,11 +130,11 @@ class _FakeServer:
         self.scan_in_progress_history = []
         self.last_full_scan_at = None
 
-    def register_source(self, source_id, adapter):
+    def register_source(self, source_id, adapter, evictable=False):
         self.registered.append(source_id)
         self.sources[source_id] = adapter
 
-    def swap_source(self, source_id, adapter):
+    def swap_source(self, source_id, adapter, evictable=False):
         self.swapped.append(source_id)
         displaced = self.sources.get(source_id)
         self.sources[source_id] = adapter
@@ -153,7 +153,7 @@ class _FakeServer:
 
 
 class _FailingRegisterServer(_FakeServer):
-    def register_source(self, source_id, adapter):
+    def register_source(self, source_id, adapter, evictable=False):
         super().register_source(source_id, adapter)
         raise RuntimeError("register failed")
 
@@ -798,7 +798,7 @@ class TestMonitoredAlias:
         server = _FakeServer()
         adapters = {}
         register = server.register_source
-        server.register_source = lambda sid, adapter: (
+        server.register_source = lambda sid, adapter, evictable=False: (
             adapters.__setitem__(sid, adapter),
             register(sid, adapter),
         )[1]

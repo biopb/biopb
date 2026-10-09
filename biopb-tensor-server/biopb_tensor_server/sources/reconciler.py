@@ -307,9 +307,9 @@ class Reconciler:
         if adapter is not None:
             return adapter.catalog_url
         with self._lock:
-            if source_id not in self._pending:
-                return None
             claim = self._state.claims.get(source_id)
+            if source_id not in self._pending:
+                return self._let_go_catalog_url(source_id)
             url = self._pending[source_id]
         if url:
             return url
@@ -324,6 +324,13 @@ class Reconciler:
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
+
+    def _evictable(self, claim: SourceClaim) -> bool:
+        """Whether *claim*'s adapter may be let go when idle: a local file source,
+        which its row rebuilds. A proxy is held for as long as it is registered, and
+        an upload has no claim. A cloud source waiting for a recall is pending, not
+        registered, and is never rebuilt here."""
+        return self._deferrable(claim)
 
     def _deferrable(self, claim: SourceClaim) -> bool:
         """Whether registering *claim* is the slow, local, file-opening kind.
@@ -569,16 +576,18 @@ class Reconciler:
             self._mark_registration_failed(claim.source_id, errors)
 
     def ensure_registered(self, source_id: str) -> bool:
-        """Register a pending source now. Returns whether it is registered.
+        """Make sure a claimed source has an adapter. Returns whether it has.
 
         Safe from any thread and single-flight per source: the worker and a read
         that needs the source at the same moment share one registration. A
-        source that is not pending (never was, already registered, removed)
-        returns at once. A failed one is tried again: nothing queues it, so this
-        is a client's resolve asking.
+        pending source is registered; a source that is claimed and registered
+        but has no adapter in the registry is rebuilt from its row (see
+        :meth:`_rebuild`). One that is neither claimed nor pending (never was,
+        removed) returns ``True`` at once. A failed one is tried again: nothing
+        queues it, so this is a client's resolve asking.
         """
         if not self.is_pending(source_id):
-            return True
+            return self._rebuild(source_id)
         with self._registration_lock(source_id):
             with self._lock:
                 claim = self._state.claims.get(source_id)
@@ -620,6 +629,45 @@ class Reconciler:
             self._notify_source_committed(source_id)
         return True
 
+    def _rebuild(self, source_id: str) -> bool:
+        """Give a registered source back the adapter the registry no longer holds.
+
+        The adapter is rebuilt from the source's row, as a restart would, and
+        the source stays registered throughout: it is not pending, and it is
+        not announced to the precache as a new source. A failure marks the
+        source failed (pending again, with the error) and is a client's to retry.
+        """
+        if self._server.sources.get(source_id) is not None:
+            return True
+        with self._lock:
+            if source_id not in self._state.claims:
+                return True
+        with self._registration_lock(source_id):
+            with self._lock:
+                claim = self._state.claims.get(source_id)
+                signatures = self._source_signatures.get(source_id)
+            if claim is None or self._server.sources.get(source_id) is not None:
+                return True
+            catalog_url = self._catalog_url_for(claim)
+            errors: List[str] = []
+            if self._register_source_claim(
+                claim,
+                catalog_url=catalog_url,
+                replace=True,
+                error_sink=errors,
+                signatures=signatures,
+                hydrate=(
+                    self._metadata_db.read_hydration(source_id)
+                    if self._metadata_db is not None
+                    else None
+                ),
+            ):
+                return True
+            with self._lock:
+                self._pending[source_id] = catalog_url
+            self._mark_registration_failed(source_id, errors)
+            return False
+
     def materialize(self, source_id: str) -> None:
         """Register a pending source now, for a client that resolved it.
 
@@ -631,19 +679,22 @@ class Reconciler:
         self.check_registered(source_id)
 
     def check_registered(self, source_id: str) -> None:
-        """Raise why a read of a pending source cannot be served; never registers.
+        """Raise why a read of a source with no adapter cannot be served.
 
         ``SourceRegistrationError`` when its registration failed, an unresolved
         error while it waits -- either way the client resolves it. Returns for a
-        source that is not pending (unknown, registered, removed).
+        source that is unknown or has an adapter.
 
-        A restored source is the exception to "never registers": its row is
-        complete and lists as resolved, so a read hydrates it here, once (the
-        registration is single-flight), instead of asking a client to resolve it.
+        A registered source whose adapter is gone, and a restored one, are the
+        exceptions to "never registers": their rows are complete and list as
+        resolved, so a read rebuilds the adapter here, once (the registration
+        is single-flight), instead of asking a client to resolve it.
         """
         with self._lock:
             restored = source_id in self._restored
-        if restored and self.ensure_registered(source_id):
+        if (restored or not self.is_pending(source_id)) and self.ensure_registered(
+            source_id
+        ):
             return
         with self._lock:
             if source_id not in self._pending:
@@ -1174,7 +1225,18 @@ class Reconciler:
         live = self._server.sources.get(source_id)
         if live is not None:
             return getattr(live, "_catalog_url", None)
-        return self._pending.get(source_id)
+        if source_id in self._pending:
+            return self._pending[source_id]
+        return self._let_go_catalog_url(source_id)
+
+    def _let_go_catalog_url(self, source_id: str) -> Optional[str]:
+        """The catalog url of a registered source whose adapter was let go: derived
+        again from its claim, as it was when the adapter was built. None for a
+        source that is not registered."""
+        claim = self._state.claims.get(source_id)
+        if claim is None or source_id not in self._server.sources:
+            return None
+        return self._catalog_url_for(claim)
 
     def _replace_claim_locked(
         self,
@@ -1220,7 +1282,7 @@ class Reconciler:
                     recall=True,
                     record=self._catalog_record(claim, signatures=signatures),
                 )
-            if self._server.sources.get(source_id) is not None:
+            if source_id in self._server.sources:
                 self._server.unregister_source(source_id)
         except Exception:
             logger.exception("could not refresh cloud source %s", source_id)
@@ -1348,10 +1410,14 @@ class Reconciler:
         if not self._roots.is_cloud(claim.primary_path):
             return True
         adapter = self._server.sources.get(source_id)
-        if adapter is None:
+        if adapter is not None:
+            url = adapter.source_url
+        elif source_id in self._server.sources:  # its adapter was let go
+            url = str(claim.primary_path)
+        else:
             return False
         try:
-            return source_is_resident(adapter.source_url)
+            return source_is_resident(url)
         except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
             return False
 
@@ -1582,10 +1648,13 @@ class Reconciler:
         registered = False
         displaced: Optional[Any] = None
         try:
+            evictable = self._evictable(claim)
             if replace:
-                adapter, displaced = self._server.swap_source(claim.source_id, adapter)
+                adapter, displaced = self._server.swap_source(
+                    claim.source_id, adapter, evictable
+                )
             else:
-                self._server.register_source(claim.source_id, adapter)
+                self._server.register_source(claim.source_id, adapter, evictable)
             registered = True
 
             # Raises on failure -> the except below rolls back register_source,

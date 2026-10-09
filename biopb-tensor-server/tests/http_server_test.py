@@ -1402,6 +1402,34 @@ class TestAdminConfigRoutes:
         assert any(e["path"] == ["server", "seal_ttl"] for e in bad.json()["errors"])
         assert config_path.read_text() == before
 
+    def test_the_admin_page_sees_the_adapter_idle_setting(self, admin_client):
+        """The page renders what the schema lists, and a value it saves reaches
+        the file the server reads at start."""
+        import json
+
+        tc, config_path = admin_client
+        field = tc.get("/api/config").json()["schema"]["properties"]["server"][
+            "properties"
+        ]["adapter_idle_ttl"]
+        assert field["type"] == "number" and field["minimum"] == 0
+        assert "rebuilt from its catalog row" in field["description"]
+
+        r = tc.put(
+            "/api/config",
+            json={"server": {"adapter_idle_ttl": 300}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200
+        assert json.loads(config_path.read_text())["server"]["adapter_idle_ttl"] == 300
+        assert (
+            tc.put(
+                "/api/config",
+                json={"server": {"adapter_idle_ttl": -5}},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            ).status_code
+            == 422
+        )
+
     def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
         tc, config_path = admin_client
         before = config_path.read_text()

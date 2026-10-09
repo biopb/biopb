@@ -252,6 +252,7 @@ _CONSTRAINTS = {
         "registration_workers": _Range(min=0),
         "walk_threads": _Range(min=1),
         "handle_reaper_ttl": _Range(min=0),
+        "adapter_idle_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
         "scratch_ttl": _Range(min=0),
         "seal_ttl": _Range(min=0),
@@ -911,6 +912,19 @@ class ServerConfig:
             "unaffected."
         },
     )
+    adapter_idle_ttl: float = field(
+        default=0.0,
+        metadata={
+            "help": "Seconds a registered source's adapter is kept after its last "
+            "read before it is let go (0 keeps every adapter). A source that is "
+            "read again is rebuilt from its catalog row, and its first read "
+            "reopens the file, so this trades memory for first-read latency on "
+            "a catalog far larger than what is in use. Checked once per rescan "
+            "tick, so the effective time is rounded up to the next one. Only "
+            "sources that can be rebuilt from their row are let go: uploads and "
+            "mirrored sources are always kept."
+        },
+    )
     upload_ttl: float = field(
         default=3600.0,
         metadata={
@@ -1403,6 +1417,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
 
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
+    _carry(server_kwargs, "adapter_idle_ttl", server_data, cast=float)
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "seal_ttl", server_data, cast=float)

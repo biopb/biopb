@@ -449,6 +449,98 @@ def _confirmed(run):
     return dict(rows)
 
 
+class TestRebuildAfterLoss:
+    """A claimed, registered source whose adapter the registry no longer holds is
+    rebuilt from its row by the next read."""
+
+    def _lose(self, run, source_id):
+        run.server.sources.unregister(source_id)
+        assert run.server.sources.get(source_id) is None
+
+    def test_a_read_rebuilds_the_adapter_from_the_row(self, tmp_path):
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        sid = sorted(run.rows())[0]
+        first = run.server.sources.get_registered(sid)
+        self._lose(run, sid)
+
+        rebuilt = run.server.sources.get_registered(sid)
+
+        assert rebuilt is not None and rebuilt is not first
+        assert not run.reconciler.is_pending(sid)
+        assert run.rows()[sid]["is_resolved"]
+        run.stop()
+
+    def test_a_rebuild_does_not_parse_rewrite_the_row_or_warm(
+        self, tmp_path, monkeypatch
+    ):
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        sid = sorted(run.rows())[0]
+        run.server.sources.get_registered(sid)
+        self._lose(run, sid)
+        rewrites, warmed = [], []
+        monkeypatch.setattr(
+            run.db, "sync_source_added", lambda *a, **k: rewrites.append(a)
+        )
+        monkeypatch.setattr(run.reconciler, "_notify_source_committed", warmed.append)
+
+        run.server.sources.get_registered(sid)
+
+        assert rewrites == [] and warmed == []
+        run.stop()
+
+    def test_a_dropped_source_keeps_its_dnd_url(self, tmp_path):
+        run = _Run(tmp_path)
+        run.manager.complete_initial_scan()  # drops wait for the first scan
+        path = drt._make_zarr(tmp_path, "dropped.zarr")
+        for _ in run.manager.add_local_source(str(path)):
+            pass
+        (sid,) = run.rows()
+        url = run.server.sources.get(sid).catalog_url
+        assert url.startswith("dnd://")
+        self._lose(run, sid)
+
+        assert run.server.sources.get_registered(sid).catalog_url == url
+        run.stop()
+
+    def test_a_failed_rebuild_marks_the_source_failed_and_a_resolve_retries(
+        self, tmp_path, monkeypatch
+    ):
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        sid = sorted(run.rows())[0]
+        cls = type(run.server.sources.get_registered(sid))
+        self._lose(run, sid)
+        monkeypatch.setattr(
+            cls, "create_from_payload", classmethod(lambda *a, **k: None)
+        )
+        real = cls.create_from_config.__func__
+        monkeypatch.setattr(
+            cls,
+            "create_from_config",
+            classmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("gone"))),
+        )
+
+        with pytest.raises(SourceRegistrationError):
+            run.server.sources.get_registered(sid)
+        assert run.reconciler.is_pending(sid)
+
+        monkeypatch.setattr(cls, "create_from_config", classmethod(real))
+        assert run.manager.resolve_source(sid, lambda path: None)
+        assert run.server.sources.get(sid) is not None
+        assert not run.reconciler.is_pending(sid)
+        run.stop()
+
+    def test_an_unknown_source_is_still_unknown(self, tmp_path):
+        run = _Run(tmp_path)
+        assert run.server.sources.get_registered("nope") is None
+        run.stop()
+
+
 class TestConfirmation:
     def test_a_restored_row_is_confirmed_when_its_root_has_been_walked(self, tmp_path):
         ids = _first_run(tmp_path)

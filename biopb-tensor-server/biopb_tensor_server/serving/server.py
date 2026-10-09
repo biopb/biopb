@@ -706,7 +706,9 @@ class TensorFlightServer(flight.FlightServerBase):
             )
         return self._metadata_db
 
-    def register_source(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
+    def register_source(
+        self, source_id: str, adapter: SourceAdapter, evictable: bool = False
+    ) -> SourceAdapter:
         """Register a data source with the server (delegates to ``sources``).
 
         The registry only -- cataloguing is the caller's second step, see
@@ -714,10 +716,10 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Returns the adapter, as passed.
         """
-        return self.sources.register(source_id, adapter)
+        return self.sources.register(source_id, adapter, evictable)
 
     def swap_source(
-        self, source_id: str, adapter: SourceAdapter
+        self, source_id: str, adapter: SourceAdapter, evictable: bool = False
     ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
         """Replace a registered source's adapter in place (delegates to ``sources``).
 
@@ -726,7 +728,7 @@ class TensorFlightServer(flight.FlightServerBase):
         rebuilt against the current bytes. The displaced adapter is left open
         for the caller to close once in-flight reads have drained.
         """
-        return self.sources.swap(source_id, adapter)
+        return self.sources.swap(source_id, adapter, evictable)
 
     def unregister_source(self, source_id: str) -> None:
         """Unregister a data source (its upload state, if any, goes with it).

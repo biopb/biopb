@@ -109,6 +109,7 @@ class SourceManager:
         prune_unseen_days: int = 0,
         registration_workers: int = 0,
         walk_threads: int = 1,
+        adapter_idle_seconds: float = 0.0,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -116,6 +117,10 @@ class SourceManager:
         self._server = server
         self._registry = registry
         self._metadata_db = metadata_db
+        # How long a source's adapter is kept after its last read; 0 keeps it for
+        # as long as the source is registered. A rebuild costs a row read and a
+        # payload rebuild, and the first read reopens the file.
+        self._adapter_idle_seconds = adapter_idle_seconds
 
         # Every root, and what is true of each (alias, cloud, kind). Under a cloud
         # root (config ``cloud=true``) dehydrated entries are admitted and
@@ -528,7 +533,17 @@ class SourceManager:
                 self._handle_rescan()
             except Exception:
                 logger.exception("Rescan failed")
+            self._release_idle_adapters()
             self._next_rescan_at = time.monotonic() + self._rescan_interval
+
+    def _release_idle_adapters(self) -> None:
+        """Let go of the adapters nothing has read for ``adapter_idle_seconds``.
+
+        Once per tick, so an adapter is kept for that long rounded up to the next
+        one; a failed rescan does not skip it.
+        """
+        if self._adapter_idle_seconds > 0:
+            self._server.sources.release_idle(self._adapter_idle_seconds)
 
     def _handle_rescan(self) -> None:
         """Run one tick: the one-shot directories, the monitored walk, then the
@@ -1375,6 +1390,7 @@ def create_source_manager(
     rescan_interval: float = 120.0,
     registration_workers: int = 0,
     walk_threads: int = 1,
+    adapter_idle_seconds: float = 0.0,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1408,6 +1424,9 @@ def create_source_manager(
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
         rescan_interval: Seconds between rescans (floored at 0.1s).
+        adapter_idle_seconds: Seconds a registered source's adapter is kept after
+            its last read, for a source that can be rebuilt from its row; 0 keeps
+            every adapter.
         registration_workers: Threads that register, in the background, the
             sources the first scan claims. 0 registers each as it is claimed.
 
@@ -1462,6 +1481,7 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         prune_unseen_days=prune_unseen_days,
         registration_workers=registration_workers,
+        adapter_idle_seconds=adapter_idle_seconds,
         walk_threads=walk_threads,
     )
 

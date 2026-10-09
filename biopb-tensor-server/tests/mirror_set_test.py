@@ -188,7 +188,7 @@ class _Server:
         self.sources = _Registry()
         self.fail_register = False
 
-    def register_source(self, source_id, adapter):
+    def register_source(self, source_id, adapter, evictable=False):
         if self.fail_register:
             raise RuntimeError("no room")
         self.sources[source_id] = adapter

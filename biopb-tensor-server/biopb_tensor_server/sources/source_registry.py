@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -25,6 +26,7 @@ from biopb_tensor_server.core.adapter_base import (
 )
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.normalize import is_canonical, log_reordering, unwrapped
+from biopb_tensor_server.core.weak import weak_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +57,46 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
         logger.debug("error closing source adapter", exc_info=True)
 
 
+class _Slot:
+    """One registered source: its adapter, and whether it can be let go.
+
+    An evictable slot (``ref`` set) holds the adapter strongly while in use
+    and, once released, only through ``ref``: it lives as long as a reader.
+    """
+
+    __slots__ = ("strong", "ref", "last_access")
+
+    def __init__(self, adapter: SourceAdapter, evictable: bool) -> None:
+        self.strong: Optional[SourceAdapter] = adapter
+        self.ref: Optional[Callable[[], Any]] = (
+            weak_or_none(adapter) if evictable else None
+        )
+        self.last_access = time.monotonic()
+
+    @property
+    def adapter(self) -> Optional[SourceAdapter]:
+        if self.strong is not None or self.ref is None:
+            return self.strong
+        return self.ref()
+
+
 class SourceRegistry:
-    """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
+    """The server's live ``source_id -> SourceAdapter`` map, thread-safe.
+
+    A source registered ``evictable`` is one that can be rebuilt from its
+    catalog row (:meth:`Reconciler.ensure_registered`). The registry holds it
+    strongly while it is in use and :meth:`release_idle` demotes it to a weak
+    reference once it has been idle, so an adapter nobody is reading goes with
+    its last reader. The id stays registered throughout (``in``, ``len`` and
+    iteration count it); only :meth:`get` stops finding the adapter, and
+    :meth:`get_registered` asks the pending check to rebuild it.
+
+    Anything else -- uploads, scratch, a proxy -- is held strongly for as long
+    as it is registered.
+    """
 
     def __init__(self) -> None:
-        self._sources: Dict[str, SourceAdapter] = {}
+        self._sources: Dict[str, _Slot] = {}
         self._lock = threading.RLock()
         self._pending_check: Optional[Callable[[str], None]] = None
         # Tensors attached to a source -- uploaded fields, label sets -- keyed
@@ -84,7 +121,9 @@ class SourceRegistry:
         unresolved, or its registration failed) and returns for any other id."""
         self._pending_check = check
 
-    def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
+    def register(
+        self, source_id: str, adapter: SourceAdapter, evictable: bool = False
+    ) -> SourceAdapter:
         """Register a data source.
 
         Canonical axis order (biopb/biopb#596) is the adapter's own business
@@ -95,6 +134,8 @@ class SourceRegistry:
             source_id: Unique identifier for the data source. Must be non-empty
                 and slash-free (see Raises).
             adapter: Source adapter for the data source
+            evictable: Whether the source can be rebuilt once the registry has
+                let go of its adapter (see the class docstring).
 
         Returns:
             The adapter, as passed.
@@ -120,7 +161,7 @@ class SourceRegistry:
             )
         _log_reordering(source_id, adapter)
         with self._lock:
-            self._sources[source_id] = adapter
+            self._sources[source_id] = _Slot(adapter, evictable)
         logger.debug(f"Registered source: {source_id}")
         return adapter
 
@@ -138,13 +179,14 @@ class SourceRegistry:
         :meth:`swap` for why that is not what separates the two.
         """
         with self._lock:
-            adapter = self._sources.pop(source_id, None)
+            slot = self._sources.pop(source_id, None)
+        adapter = slot.adapter if slot is not None else None
         close_adapter(adapter)
         logger.debug(f"Unregistered source: {source_id}")
         return adapter
 
     def swap(
-        self, source_id: str, adapter: SourceAdapter
+        self, source_id: str, adapter: SourceAdapter, evictable: bool = False
     ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
         """Put *adapter* in place of ``source_id``'s current one, atomically.
 
@@ -172,31 +214,73 @@ class SourceRegistry:
         No caller of either method owes a drain.
         """
         with self._lock:
-            displaced = self._sources.get(source_id)
-            registered = self.register(source_id, adapter)
+            displaced = self.get(source_id)
+            registered = self.register(source_id, adapter, evictable)
         logger.debug(f"Swapped source adapter: {source_id}")
         return registered, displaced
 
     def get(self, source_id: str) -> Optional[SourceAdapter]:
-        """Thread-safe source lookup."""
+        """The source's adapter, or None when it has none: unknown, or evictable
+        and let go of. Does not count as use (see :meth:`get_registered`)."""
+        return self._lookup(source_id, touch=False)
+
+    def _lookup(self, source_id: str, touch: bool) -> Optional[SourceAdapter]:
+        """The adapter of *source_id*; with *touch*, a read of it: stamped, and
+        held strongly again if it had been let go."""
         with self._lock:
-            return self._sources.get(source_id)
+            slot = self._sources.get(source_id)
+            if slot is None:
+                return None
+            adapter = slot.adapter
+            if touch and adapter is not None and slot.ref is not None:
+                slot.last_access = time.monotonic()
+                slot.strong = adapter
+            return adapter
+
+    def release_idle(self, idle_seconds: float, now: Optional[float] = None) -> int:
+        """Let go of evictable adapters not read for *idle_seconds*.
+
+        A reader that already has the adapter keeps it alive and nothing else
+        does, so a read in flight needs no lease. Returns how many were released.
+        """
+        if now is None:
+            now = time.monotonic()
+        released = 0
+        with self._lock:
+            for slot in self._sources.values():
+                if (
+                    slot.ref is not None
+                    and slot.strong is not None
+                    and now - slot.last_access > idle_seconds
+                ):
+                    slot.strong = None
+                    released += 1
+        return released
 
     def get_registered(self, source_id: str) -> Optional[SourceAdapter]:
-        """:meth:`get`, raising when the source is claimed but not registered.
+        """:meth:`get` as a read, raising when the source is claimed but not registered.
 
         What a reader of the source's data or tensors uses: a pending source is
         not read until a client resolves it (the ``resolve`` action). Raises why it
         cannot be read -- unresolved while its registration is waiting, a
         registration error once it failed -- and returns None for an unknown
-        source. The internal callers that only ask whether it is registered, or
-        read its url, use :meth:`get`.
+        source. A source whose adapter was let go is rebuilt. The internal
+        callers that only ask whether it is registered, or read its url, use
+        :meth:`get`.
         """
-        adapter = self.get(source_id)
+        adapter = self._lookup(source_id, touch=True)
         if adapter is None and self._pending_check is not None:
             self._pending_check(source_id)
-            adapter = self.get(source_id)  # registered while we checked
+            adapter = self._lookup(source_id, touch=True)  # registered while we checked
         return adapter
+
+    def resolve(self, source_id: str) -> Optional[SourceAdapter]:
+        """:meth:`get_registered`, for a caller that wants the adapter or nothing:
+        None for a source that is unknown, unresolved or failed."""
+        try:
+            return self.get_registered(source_id)
+        except Exception:
+            return None
 
     # -- attachments ----------------------------------------------------------
 
@@ -294,9 +378,13 @@ class SourceRegistry:
         return found.capability_token(array_id) if found is not None else None
 
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:
-        """Return a stable snapshot of registered sources for iteration."""
+        """Return a stable snapshot of the sources that have an adapter now."""
         with self._lock:
-            return list(self._sources.items())
+            return [
+                (source_id, adapter)
+                for source_id, slot in self._sources.items()
+                if (adapter := slot.adapter) is not None
+            ]
 
     def close_all(self) -> None:
         """Release every registered adapter's resources (shutdown).
@@ -307,7 +395,7 @@ class SourceRegistry:
         (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
         """
         with self._lock:
-            adapters = list(self._sources.values())
+            adapters = self.values()
             attached = [
                 t for a in self._attachments.values() for t in a.tensors.values()
             ]
@@ -322,7 +410,7 @@ class SourceRegistry:
     def replace(self, mapping: Dict[str, SourceAdapter]) -> None:
         """Atomically swap the whole map (used by tests to inject fixtures)."""
         with self._lock:
-            self._sources = dict(mapping)
+            self._sources = {sid: _Slot(a, False) for sid, a in mapping.items()}
 
     def __contains__(self, source_id: str) -> bool:
         with self._lock:
@@ -330,15 +418,15 @@ class SourceRegistry:
 
     def __iter__(self) -> Iterator[str]:
         with self._lock:
-            return iter(list(self._sources.keys()))
+            return iter(list(self._sources))
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._sources)
 
     def values(self) -> List[SourceAdapter]:
-        with self._lock:
-            return list(self._sources.values())
+        """The adapters that exist now (an evicted source has none)."""
+        return [adapter for _, adapter in self.snapshot()]
 
 
 def _log_reordering(source_id: str, adapter: SourceAdapter) -> None:

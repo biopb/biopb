@@ -176,6 +176,16 @@ class TestTensorConfig:
             parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
         )
 
+    def test_adapter_idle_ttl_is_off_by_default_and_parsed(self):
+        assert parse_config({"server": {}}).adapter_idle_ttl == 0.0
+        config = parse_config({"server": {"adapter_idle_ttl": 300}, "sources": []})
+        assert config.adapter_idle_ttl == 300.0
+
+    def test_a_negative_adapter_idle_ttl_falls_back_to_off(self):
+        assert (
+            parse_config({"server": {"adapter_idle_ttl": -1}}).adapter_idle_ttl == 0.0
+        )
+
 
 class TestReductionMethodNormalization:
     """Tests for normalize_reduction_method and the deprecated linear alias."""

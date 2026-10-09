@@ -17,7 +17,7 @@ status poll and a straggler's write both have to find their adapter.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -38,10 +38,17 @@ from biopb_tensor_server.core.labels import (
     join_fields,
     split_label_field,
 )
+from biopb_tensor_server.core.weak import weak_or_none
 
 __all__ = ["Attachments"]
 
 logger = logging.getLogger(__name__)
+
+
+def _weak(obj: Any) -> Callable[[], Any]:
+    """A call that returns *obj* while it lives; *obj* itself when it cannot be
+    weakly referenced."""
+    return weak_or_none(obj) or (lambda: obj)
 
 
 class Attachments:
@@ -52,8 +59,9 @@ class Attachments:
         #: The routable index: published, still filling, or a tombstone.
         self.tensors: Dict[str, TensorAdapter] = {}
         # The published sets, for the parent they were built against; a rebuilt
-        # parent is a different object and misses.
-        self._view: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
+        # parent is a different object and misses. The parent is held weakly: a
+        # view must not keep an evicted adapter alive.
+        self._view: Optional[Tuple[Callable[[], Any], Dict[str, TensorAdapter]]] = None
         # Why a listed set cannot be read, by field; rebuilt with the view.
         self._mismatch: Dict[str, str] = {}
 
@@ -120,7 +128,7 @@ class Attachments:
         was discarded, is routable through ``tensors`` and joins this view when
         its upload reaches READY.
         """
-        if self._view is not None and self._view[0] is parent:
+        if self._view is not None and self._view[0]() is parent:
             return self._view[1]
         candidates = self._published_labels()
         images = self.normalized_tensors(parent) if candidates else {}
@@ -136,7 +144,7 @@ class Attachments:
                 logger.error(f"labels: {self.source_id}/{field} cannot be read: {why}")
                 self._mismatch[field] = why
             view[field] = tensor
-        self._view = (parent, view)
+        self._view = (_weak(parent), view)
         return view
 
     def normalized_tensors(self, parent: SourceAdapter) -> Dict[str, TensorEntry]:

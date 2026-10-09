@@ -215,13 +215,13 @@ class UploadManager:
 
     # -- lookup ----------------------------------------------------------------
 
-    def _locate(self, upload_id: str) -> Tuple[Any, Any, Optional[str]]:
-        """The adapter tracking upload *upload_id*, its source, and its field.
+    def _locate(self, upload_id: str) -> Tuple[Any, Optional[str], Optional[str]]:
+        """The adapter tracking upload *upload_id*, its source id, and its field.
 
         Every upload is a tensor of a source that already exists, so this is
         one lookup in two halves: the source from the registry, then the field
         from that source's attachment index, whatever kind of tensor it is.
-        Returns ``(adapter, parent, field)``, with *adapter* None when nothing
+        Returns ``(adapter, parent_id, field)``, with *adapter* None when nothing
         holds the id, which every caller already has to handle.
 
         A bare ``source_id`` answers ``(the source, None, None)``: it is a real
@@ -231,10 +231,9 @@ class UploadManager:
         source_id, _, field = upload_id.partition("/")
         if not field:
             return self._registry.get(upload_id), None, None
-        parent = self._registry.get(source_id)
-        if parent is None:
+        if source_id not in self._registry:
             return None, None, None
-        return self._registry.attached(source_id, field), parent, field
+        return self._registry.attached(source_id, field), source_id, field
 
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
@@ -262,14 +261,14 @@ class UploadManager:
         reads UNKNOWN rather than raising, so a retry after the tombstone is
         gone is not an error.
         """
-        adapter, parent, field = self._locate(array_id)
+        adapter, parent_id, field = self._locate(array_id)
         if upload_of(adapter) is None:
             return self._delete_adopted_tensor(array_id)
         status = adapter.discard(reason)
-        if parent is None:
+        if parent_id is None:
             self._drop_catalog_row(adapter, array_id)
         else:
-            self._unlist(parent.source_id, field)
+            self._unlist(parent_id, field)
         self._forget_rois(array_id)
         return status
 
@@ -294,7 +293,7 @@ class UploadManager:
         """
         if state is UploadStatus.DISCARDED:
             return self.discard(array_id, reason)
-        adapter, parent, field = self._locate(array_id)
+        adapter, parent_id, field = self._locate(array_id)
         progress = upload_of(adapter)
         if progress is None:
             raise flight.FlightServerError(
@@ -313,8 +312,8 @@ class UploadManager:
             raise flight.FlightServerError(
                 f"set_upload_status: could not publish {array_id} on disk: {e}"
             ) from e
-        if parent is not None and not was_readable and progress.is_readable:
-            self._registry.attachment_changed(parent.source_id)
+        if parent_id is not None and not was_readable and progress.is_readable:
+            self._registry.attachment_changed(parent_id)
         return status
 
     def _delete_adopted_tensor(self, array_id: str) -> Dict[str, Any]:
@@ -331,8 +330,7 @@ class UploadManager:
         else is a no-op, and answers UNKNOWN like the rest of :meth:`discard`.
         """
         source_id, _, field = array_id.partition("/")
-        parent = self._registry.get(source_id) if field else None
-        if parent is None:
+        if not field or source_id not in self._registry:
             return unknown_upload_status(array_id)
         adapter = self._registry.detach(source_id, field)
         if adapter is None:
