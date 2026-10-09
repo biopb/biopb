@@ -15,7 +15,7 @@ assumes a window.
 
 **Threading:** a cell runs on the Qt main thread, so it mutates the `viewer`
 directly. From a `run_async` task every mutation (layer properties,
-`viewer.dims`, `viewer.layers.remove()`, `viewer.camera`, the `add_*()` family)
+`viewer.dims`, `viewer.layers.remove()`, `viewer.scene.camera`, the `add_*()` family)
 is marshaled to the main thread for you, one round-trip each — so put bulk
 viewer work in a cell. Raw Qt (`viewer.window`) works only on the main thread:
 from a task it raises a clear error.

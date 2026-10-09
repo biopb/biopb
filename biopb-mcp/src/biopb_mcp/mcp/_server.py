@@ -1089,7 +1089,7 @@ async def inspect_object(object_path: str) -> str:
     """Inspect a live object in the napari kernel namespace.
 
     Returns the type, docstring, and public methods/attributes.
-    Example: inspect_object("viewer.layers") or inspect_object("viewer.camera")
+    Example: inspect_object("viewer.layers") or inspect_object("viewer.scene.camera")
     """
     host, err = _app._require_kernel_host()
     if err is not None:

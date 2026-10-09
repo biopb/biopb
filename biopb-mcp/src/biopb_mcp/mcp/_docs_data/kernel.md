@@ -35,7 +35,7 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
   the kernel cannot import goes behind one as a server file. See [[ops]] and
   [[algorithm-servers]].
 - The `viewer`, where there is one, is a napari window made **thread-safe** by marshaling known
-  mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
+  mutations (`viewer.dims`, `viewer.scene.camera`, layer properties, `viewer.layers.remove()`,
   the `add_*()` family, …) to the Qt main thread. A cell already runs there; the
   marshaling matters in a `run_async` task. Raw Qt (`viewer.window`) works only on the
   main thread: from a task it raises a clear error, so do it in a cell. See [[napari-viewer]]
