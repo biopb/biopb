@@ -129,6 +129,49 @@ class TestSyncMirroredRows:
         _db().sync_mirrored_rows(ROOT_ID, "tensor-server", [])
 
 
+class TestSyncMirroredRemoved:
+    def _ids(self, db):
+        return sorted(
+            r["source_id"]
+            for r in db.query("SELECT source_id FROM sources").to_pylist()
+        )
+
+    def test_it_drops_the_named_rows_and_no_others(self):
+        db = _db()
+        db.sync_mirrored_rows(
+            ROOT_ID,
+            "tensor-server",
+            [_mirrored("lab__a"), _mirrored("lab__b"), _mirrored("lab__c")],
+        )
+
+        db.sync_mirrored_removed(["lab__a", "lab__c"])
+
+        assert self._ids(db) == ["lab__b"]
+
+    def test_a_list_longer_than_a_statement_is_dropped_whole(self):
+        db = _db()
+        n = db._PENDING_CHUNK * 2 + 7
+        ids = [f"lab__s{i}" for i in range(n)]
+        db.sync_mirrored_rows(
+            ROOT_ID, "tensor-server", [_mirrored(i) for i in ids] + [_mirrored("keep")]
+        )
+
+        db.sync_mirrored_removed(ids)
+
+        assert self._ids(db) == ["keep"]
+
+    def test_an_id_with_no_row_is_not_an_error(self):
+        db = _db()
+        db.sync_mirrored_rows(ROOT_ID, "tensor-server", [_mirrored("lab__a")])
+
+        db.sync_mirrored_removed(["nobody", "lab__a"])
+
+        assert self._ids(db) == []
+
+    def test_nothing_to_drop_is_nothing(self):
+        _db().sync_mirrored_removed([])
+
+
 def _fields(changed):
     return {("is_resolved" if k == "resolved" else k): v for k, v in changed.items()}
 
@@ -252,6 +295,50 @@ class TestMirrorSet:
         assert db.query("SELECT source_id FROM sources").to_pylist() == [
             {"source_id": "lab__b"}
         ]
+
+    def test_a_source_that_will_not_unregister_stays_and_is_tried_again(self, upstream):
+        upstream.put("a")
+        upstream.put("b")
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        del upstream.rows["a"]
+        del upstream.rows["b"]
+        real = server.unregister_source
+
+        def stuck(source_id):
+            if source_id == "lab__a":
+                raise RuntimeError("busy")
+            real(source_id)
+
+        server.unregister_source = stuck
+        mirrors.relist(None)
+
+        assert list(server.sources) == ["lab__a"]
+        assert db.query("SELECT source_id FROM sources").to_pylist() == [
+            {"source_id": "lab__a"}
+        ]
+
+        server.unregister_source = real
+        assert mirrors.relist(None) is True
+        assert list(server.sources) == []
+
+    def test_a_failed_catalog_delete_does_not_fail_the_relist(
+        self, upstream, monkeypatch
+    ):
+        upstream.put("a")
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        del upstream.rows["a"]
+
+        def broken(*args):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(db, "sync_mirrored_removed", broken)
+
+        assert mirrors.relist(None) is True
+        assert list(server.sources) == []
 
     def test_a_source_the_upstream_re_registered_is_read_again(self, upstream):
         upstream.put("a", indexed_at=1, metadata_json='{"v": 1}')
