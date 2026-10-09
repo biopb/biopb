@@ -379,34 +379,20 @@ class TestMirrorSet:
             {"source_id": "lab__b"}
         ]
 
-    def test_a_source_that_will_not_unregister_stays_and_is_tried_again(self, upstream):
+    def test_a_built_and_an_unbuilt_mirror_the_upstream_dropped_both_go(self, upstream):
         upstream.put("a")
         upstream.put("b")
         db = MetadataDatabase()
         mirrors, server = _mirrors(db)
         mirrors.relist(None)
         mirrors.materialize("lab__a")
-        mirrors.materialize("lab__b")
-        del upstream.rows["a"]
-        del upstream.rows["b"]
-        real = server.unregister_source
+        upstream.rows.clear()
 
-        def stuck(source_id):
-            if source_id == "lab__a":
-                raise RuntimeError("busy")
-            real(source_id)
-
-        server.unregister_source = stuck
-        mirrors.relist(None)
-
-        assert list(server.sources) == ["lab__a"]
-        assert db.query("SELECT source_id FROM sources").to_pylist() == [
-            {"source_id": "lab__a"}
-        ]
-
-        server.unregister_source = real
         assert mirrors.relist(None) is True
-        assert list(server.sources) == []
+
+        assert server.sources == {}
+        assert not mirrors.owns("lab__a") and not mirrors.owns("lab__b")
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
 
     def test_a_failed_catalog_delete_does_not_fail_the_relist(
         self, upstream, monkeypatch

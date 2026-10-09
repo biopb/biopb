@@ -277,25 +277,19 @@ class MirrorSet:
 
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the
-        catalog. One whose unregistering fails stays, and is tried again."""
-        gone = []
+        catalog in one transaction."""
         for source_id in source_ids:
-            try:
-                if source_id in self._server.sources:
-                    self._server.unregister_source(source_id)
-            except Exception:
-                logger.exception("Failed to unregister mirrored source %s", source_id)
-                continue
+            if source_id in self._server.sources:
+                self._server.unregister_source(source_id)
             del self._versions[source_id]
             self._held.pop(source_id, None)
-            gone.append(source_id)
         if self._metadata_db is None:
             return
         try:
-            self._metadata_db.sync_mirrored_removed(gone)
+            self._metadata_db.sync_mirrored_removed(source_ids)
         except Exception:
             logger.exception(
                 "Failed to remove %d mirrored sources of %s from metadata DB",
-                len(gone),
+                len(source_ids),
                 self._endpoint,
             )
