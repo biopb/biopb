@@ -1641,13 +1641,14 @@ class MetadataDatabase:
     def relist_tensors(self, source_id: str, adapter: SourceAdapter) -> bool:
         """Make a row list the tensors *adapter* serves now, and only that.
 
-        For a source rebuilt from its row, whose row was written before the
-        uploaded fields and label sets on disk were attached (or before some of
-        them went): the row says what was true at its last write. Writes the
-        ``tensors`` column and nothing else when it differs -- the metadata the row
-        holds is not re-read -- and reports whether it did. The order is not
-        compared: a row lists fields in the order they were uploaded and the attach
-        scan finds them by name, and neither is a change.
+        For a source whose attached fields and label sets are not what its row
+        lists: one rebuilt from its row, written before those on disk were attached
+        (or before some of them went), or one whose attachments just changed
+        (:meth:`_attachments_changed`). Writes the ``tensors`` column and nothing
+        else when it differs -- the metadata the row holds is not re-read -- and
+        reports whether it did. A source with no row is left without one. The order
+        is not compared: a row lists fields in the order they were uploaded and the
+        attach scan finds them by name, and neither is a change.
         """
         tensors = self._tensor_rows(self._catalog_tensors(source_id, adapter))
         conn = self._get_connection()
