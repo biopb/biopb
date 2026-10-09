@@ -128,11 +128,33 @@ final class Imglib2TensorFactory {
     }
 
     private static List<ChunkRef> chunkRefs(FlightInfo plan) {
+        byte[] stub = descriptorOf(plan).getTicketStub().toByteArray();
         List<ChunkRef> chunks = new ArrayList<>(plan.getEndpoints().size());
         for (FlightEndpoint endpoint : plan.getEndpoints()) {
-            chunks.add(new ChunkRef(endpoint.getTicket(), parseChunkBounds(endpoint.getAppMetadata())));
+            chunks.add(new ChunkRef(
+                    ticketOf(stub, endpoint.getTicket()), parseChunkBounds(endpoint.getAppMetadata())));
         }
         return chunks;
+    }
+
+    /**
+     * The ticket that reads one endpoint.
+     *
+     * <p>A plan issued as a stub ({@code descriptor.ticket_stub},
+     * biopb/biopb#1112) has endpoints that carry only a grid index; the ticket
+     * is the stub and the endpoint's, concatenated, which protobuf merges into
+     * one {@code ChunkRef} carrying both -- no codec. Without a stub the
+     * endpoint's ticket is whole and is returned as the server minted it.
+     */
+    static Ticket ticketOf(byte[] stub, Ticket endpointTicket) {
+        if (stub.length == 0) {
+            return endpointTicket;
+        }
+        byte[] index = endpointTicket.getBytes();
+        byte[] joined = new byte[stub.length + index.length];
+        System.arraycopy(stub, 0, joined, 0, stub.length);
+        System.arraycopy(index, 0, joined, stub.length, index.length);
+        return new Ticket(joined);
     }
 
     @SuppressWarnings("unchecked")

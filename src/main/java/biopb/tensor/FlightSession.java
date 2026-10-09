@@ -52,6 +52,7 @@ public final class FlightSession implements AutoCloseable {
 
     /** The server's own {@code health.external_location}, once {@link #ensureProtocol} has read it. */
     private volatile String advertisedLocation;
+    private volatile boolean ticketStubs;
 
     public FlightSession(Location location, String token) {
         this(location, token, TlsTrust.NONE);
@@ -128,6 +129,9 @@ public final class FlightSession implements AutoCloseable {
             }
             throw TensorErrorMapper.map(error);
         }
+        // Whether the server issues a plan as one sealed stub plus an index per
+        // chunk (biopb/biopb#1112). A server that does not say does not.
+        ticketStubs = Boolean.TRUE.equals(health.orElse(Collections.emptyMap()).get("ticket_stubs"));
         Object external = health.orElse(Collections.emptyMap()).get("external_location");
         if (external instanceof String && !((String) external).isEmpty()) {
             advertisedLocation = (String) external;
@@ -145,6 +149,17 @@ public final class FlightSession implements AutoCloseable {
                     "The server at " + location + " routes requests in another shape."));
         }
         protocolChecked = true;
+    }
+
+    /**
+     * Does the server issue a plan as one sealed stub plus an index per chunk
+     * ({@code health.ticket_stubs})? Runs the one protocol check if no call has
+     * yet; a server that will not say, or whose {@code health} a capability
+     * token cannot reach, is taken not to.
+     */
+    boolean ticketStubs() {
+        ensureProtocol();
+        return ticketStubs;
     }
 
     /**
