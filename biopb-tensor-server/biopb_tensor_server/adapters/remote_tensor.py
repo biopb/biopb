@@ -77,7 +77,6 @@ from biopb_tensor_server.core.adapter_base import (
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
-    array_id_from_chunk_id,
     cache_key_for_chunk_id,
     current_epoch,
     encode_chunk_id,
@@ -1002,26 +1001,27 @@ class RemoteTensorAdapter(TensorAdapter):
             content_version = self.content_version  # loop-invariant
             if up_desc.ticket_stub and info.endpoints:
                 return self._forward_stub_plan(info, up_desc, content_version)
+            # The local route is the tensor this plan is for. It only has to reach
+            # an adapter of this source: that adapter forwards the envelope's
+            # inner to the upstream verbatim, and the upstream routes by the ids
+            # inside it -- a native level's own adapter included. So the proxy
+            # never reads an upstream chunk_id; wrapping it in the envelope
+            # (route, epoch, content_version, then the bytes untouched) is the
+            # whole of it. The upstream's content_version rides the envelope, so
+            # the proxy cache namespaces by upstream content.
+            route = self._to_local_array_id(up_desc.array_id)
             endpoints = []
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
-                bounds = ChunkBounds.FromString(ep.app_metadata)
-                # Wrap the upstream chunk_id in a proxy envelope: it is carried
-                # VERBATIM (never rewritten) and forwarded byte-for-byte on do_get,
-                # so bounds/scale/version bytes are untouched and the proxy stays
-                # blind to the upstream codec. We read the chunk's OWN upstream
-                # array_id (not self.array_id -- a sibling-field chunk keeps its own)
-                # only to build the LOCAL route, so the server dispatches a later
-                # do_get back to the right local tensor view. The upstream's
-                # content_version rides the envelope, so the proxy cache
-                # namespaces by upstream content.
-                upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
-                    ticket.chunk_id,
-                    self._to_local_array_id(upstream_aid),
-                    content_version,
+                    ticket.chunk_id, route, content_version
                 )
-                endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
+                endpoints.append(
+                    ChunkEndpoint(
+                        chunk_id=local_chunk_id,
+                        bounds=ChunkBounds.FromString(ep.app_metadata),
+                    )
+                )
             return TensorReadPlan(
                 descriptor=self._localize_forwarded_descriptor(up_desc),
                 chunk_endpoints=endpoints,
@@ -1100,14 +1100,10 @@ class RemoteTensorAdapter(TensorAdapter):
     def _upstream_issues_stubs(self, read_opt: TensorReadOption) -> bool:
         """Should this request ask the upstream for a stub plan?
 
-        Only when the caller asked for one, the upstream offers it, and the read
-        is not a native-level one: a precomputed chunk routes by its level's
-        array_id, which a stub's identity hides from a proxy that cannot read it.
-        Every other case is planned as before, one ticket per chunk.
+        Only when the caller asked for one and the upstream offers it. Every
+        other case is planned as before, one ticket per chunk.
         """
         if TICKET_STUB not in read_mask(read_opt):
-            return False
-        if read_opt.reduction_method == "precompute":
             return False
         try:
             return bool(self.client._state.ticket_stubs)

@@ -513,6 +513,71 @@ class TestNativeLevels:
             server.shutdown()
 
 
+class TestNativeLevelsThroughAMirror:
+    """A mirror routes a native level's chunks to its own adapter and forwards
+    them verbatim, so the level's own ``array_id`` need never be read."""
+
+    @pytest.fixture
+    def mirrored_ome(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import OmeZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+
+        zpath, _, _ = create_multiresolution_ome_zarr(
+            str(tmp_path), n_levels=3, base_shape=(256, 256), chunk_size=(64, 64)
+        )
+        root = zarr.open_group(zpath, mode="r")
+        upstream = catalog_server("localhost:0")
+        register_and_catalog(upstream, "ome", OmeZarrAdapter(root["0"], "ome"))
+        upstream.mark_ready()
+        _serve(upstream)
+        proxy = catalog_server("localhost:0")
+        register_and_catalog(
+            proxy,
+            "lab__ome",
+            RemoteTensorAdapter(
+                source_id="lab__ome",
+                upstream_location=f"grpc://localhost:{upstream.port}",
+                upstream_source_id="ome",
+            ),
+        )
+        proxy.mark_ready()
+        _serve(proxy)
+        client = TensorFlightClient(f"grpc://localhost:{proxy.port}", cache_bytes=0)
+        yield upstream, client, np.asarray(root["1"][:])
+        client.close()
+        proxy.shutdown()
+        upstream.shutdown()
+
+    def _read(self, client):
+        return client.get_tensor(
+            "lab__ome", scale_hint=(2, 2), reduction_method="precompute"
+        ).compute()
+
+    def test_by_stub(self, mirrored_ome):
+        _, client, level = mirrored_ome
+        assert client._state.ticket_stubs
+        np.testing.assert_array_equal(self._read(client), level)
+
+    def test_by_full_ticket(self, mirrored_ome):
+        _, client, level = mirrored_ome
+        assert client._state.client
+        client._state.server_health["ticket_stubs"] = False
+        np.testing.assert_array_equal(self._read(client), level)
+
+    def test_the_reference_is_sealed(self, mirrored_ome):
+        _, client, level = mirrored_ome
+        pb = client.get_tensor(
+            "lab__ome", scale_hint=(2, 2), reduction_method="precompute", output="pb"
+        )
+        _, _, stub = _stub_of(pb)
+        assert pb.auth_token == "" and stub.grant.seal
+        np.testing.assert_array_equal(
+            TensorFlightClient.tensor_from_pb(pb).compute(), level
+        )
+
+
 class TestRedeem:
     def _first(self, guarded):
         _, client, _ = guarded
@@ -813,26 +878,6 @@ class TestMirror:
         pb = client.get_tensor("lab__img", output="pb")
         TensorFlightClient.tensor_from_pb(pb).compute()
         assert arms and set(arms) == {"chunk_ref"}
-
-    def test_a_native_level_read_is_planned_as_before(self, mirrored):
-        """A precomputed chunk routes by its level's array_id, which a stub hides
-        from a proxy, so it is issued whole."""
-        _, _, client, _ = mirrored
-        from biopb.tensor._session import _read_option, _tensor_read_cmd
-
-        read_opt = _read_option(endpoints=True, ticket_stub=True)
-        read_opt.reduction_method = "precompute"
-        read_opt.scale_hint[:] = [1, 1]
-        cmd = _tensor_read_cmd("lab__img", read_opt)
-        try:
-            info = client._state.client.get_flight_info(
-                flight.FlightDescriptor.for_command(cmd.SerializeToString()),
-                options=client._state.call_options,
-            )
-        except flight.FlightError:
-            pytest.skip("no native level to plan against on a plain zarr")
-        desc = TensorDescriptor.FromString(info.descriptor.command)
-        assert not desc.ticket_stub
 
     def test_the_connection_still_reads_its_own_array(self, mirrored):
         _, _, client, data = mirrored
