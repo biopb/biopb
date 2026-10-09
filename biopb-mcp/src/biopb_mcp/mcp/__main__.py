@@ -202,6 +202,17 @@ def _decide_viewer(config, view=False):
     )
 
 
+def _withdraw_unusable_tools(mcp, viewer):
+    """Drop the tools a session with no napari viewer cannot use.
+
+    The mode is fixed for the process, so the list never changes under a client
+    (Codex does not follow ``tools/list_changed``). A tool that only refuses
+    costs the model a round; ``capture_view`` is how such a session sees.
+    """
+    if not viewer.has_window:
+        mcp.remove_tool("take_screenshot")
+
+
 def _setup_observe(config, mode=_session_mode.DIRECT, on_shutdown=None):
     """Wire up the web observe UI.
 
@@ -398,6 +409,7 @@ def _serve_http(config, port, view=False, start_kernel=False):
         )
     elif viewer.kind == "none":
         logger.info("This session has no napari viewer: %s.", viewer.reason)
+        _withdraw_unusable_tools(_app.mcp, viewer)
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]

@@ -173,6 +173,32 @@ class TestMainDispatch:
         assert calls == [True]
 
 
+class TestWithdrawUnusableTools:
+    class _Mcp:
+        def __init__(self):
+            self.removed = []
+
+        def remove_tool(self, name):
+            self.removed.append(name)
+
+    def test_a_session_without_a_viewer_loses_take_screenshot(self):
+        from biopb_mcp.mcp.__main__ import _withdraw_unusable_tools
+        from biopb_mcp.mcp._kernel_env import ViewerMode
+
+        mcp = self._Mcp()
+        _withdraw_unusable_tools(mcp, ViewerMode.none("no display"))
+        assert mcp.removed == ["take_screenshot"]
+
+    def test_a_session_with_a_window_keeps_every_tool(self):
+        from biopb_mcp.mcp.__main__ import _withdraw_unusable_tools
+        from biopb_mcp.mcp._kernel_env import ViewerMode
+
+        mcp = self._Mcp()
+        _withdraw_unusable_tools(mcp, ViewerMode.real())
+        _withdraw_unusable_tools(mcp, ViewerMode.virtual(":99"))
+        assert mcp.removed == []
+
+
 class TestHasDisplay:
     def test_linux_gates_on_display_env(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
