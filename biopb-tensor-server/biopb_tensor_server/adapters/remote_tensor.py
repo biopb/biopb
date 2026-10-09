@@ -484,6 +484,23 @@ def mirror_display_url(
     return f"{scheme}://{authority}:{upstream_source_id}"
 
 
+def warn_noncanonical_tensors(source_id: str, tensor_rows: List[dict]) -> None:
+    """Log the tensors of a mirror that an upstream serves in a non-canonical axis
+    order, which reads of will refuse (biopb/biopb#596). Said when the mirror is
+    synced, not only when someone opens the tensor, so a reads-refused mirror is
+    discoverable from the log of the re-list that mirrored it."""
+    for t in tensor_rows:
+        why = noncanonical_order(t["dim_labels"], t["shape"])
+        if why is not None:
+            logger.warning(
+                "mirrored source %s: upstream tensor %s %s -- reads of it "
+                "will be refused until that upstream is upgraded",
+                source_id,
+                t["array_id"],
+                why,
+            )
+
+
 def localize_tensor_rows(
     upstream_tensors: Optional[List[dict]], upstream_source_id: str, source_id: str
 ) -> List[dict]:
@@ -703,13 +720,6 @@ class RemoteTensorAdapter(TensorAdapter):
             self._scheme, self._authority, self._upstream_source_id, upstream_source_url
         )
 
-    def is_current(self, indexed_at: object) -> bool:
-        """Whether this mirror was last seeded from an upstream row stamped
-        ``indexed_at``. An unversioned upstream is never current, so it is
-        re-read on every re-list."""
-        version = content_version_for(indexed_at)
-        return version is not None and version == self._content_version
-
     def local_tensor_rows(self, upstream_tensors: Optional[List[dict]]) -> List[dict]:
         """:func:`localize_tensor_rows` for this mirror."""
         return localize_tensor_rows(
@@ -772,6 +782,7 @@ class RemoteTensorAdapter(TensorAdapter):
         # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
         # envelope carries an empty cv, exactly as before this plumbing.
         self._content_version = content_version_for(indexed_at)
+        rows = self.local_tensor_rows(upstream_tensors)
         descs = [
             TensorDescriptor(
                 array_id=t["array_id"],
@@ -779,7 +790,7 @@ class RemoteTensorAdapter(TensorAdapter):
                 shape=t["shape"],
                 dtype=t["dtype"],
             )
-            for t in self.local_tensor_rows(upstream_tensors)
+            for t in rows
         ]
         # Mirror the upstream's real path into the display url (biopb/biopb#297).
         new_url = self.display_url(source_url)
@@ -787,20 +798,7 @@ class RemoteTensorAdapter(TensorAdapter):
         self._descriptors_cache = descs
         self._source_url = new_url
         if changed:
-            # Say it at seed time, not only when someone opens the tensor: a
-            # reads-refused mirror should be discoverable from the log of the
-            # reconcile that mirrored it (biopb/biopb#596). Gated on `changed` so
-            # a steady re-list does not repeat it every tick.
-            for desc in descs:
-                why = noncanonical_order(desc.dim_labels, desc.shape)
-                if why is not None:
-                    logger.warning(
-                        "mirrored source %s: upstream tensor %s %s -- reads of it "
-                        "will be refused until that upstream is upgraded",
-                        self.source_id,
-                        desc.array_id,
-                        why,
-                    )
+            warn_noncanonical_tensors(self.source_id, rows)
         return changed
 
     def registration_record(

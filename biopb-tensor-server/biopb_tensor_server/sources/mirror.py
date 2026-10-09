@@ -30,6 +30,7 @@ from biopb_tensor_server.adapters.remote_tensor import (
     mirror_display_url,
     open_upstream_client,
     resolve_upstream_credentials,
+    warn_noncanonical_tensors,
 )
 from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, MirroredRow
@@ -190,12 +191,13 @@ class MirrorSet:
         """Write the catalog rows of *rows* and record their versions. Returns how
         many sources were added.
 
-        A failure leaves nothing recorded and nothing re-seeded, so the next tick
-        finds the same sources new or stale and tries again.
+        A source the upstream re-registered loses its adapter, and the next read
+        builds it from the new row. A failure leaves nothing recorded and nothing
+        released, so the next tick finds the same sources new or stale and tries
+        again.
         """
         alias = self.root.alias
         versions: Dict[str, Tuple[str, object]] = {}
-        by_source: Dict[str, dict] = {}
         entries: List[MirroredRow] = []
         held: Dict[str, Tuple[str, List[dict], bool]] = {}
         added = 0
@@ -214,8 +216,10 @@ class MirrorSet:
                 added += 1
             entry = self._entry(source_id, upstream_id, row)
             entries.append(entry)
+            previous = self._versions.get(source_id)
+            if previous is None or previous[1] != row.get("indexed_at"):
+                warn_noncanonical_tensors(source_id, entry.tensors)
             versions[source_id] = (upstream_id, row.get("indexed_at"))
-            by_source[source_id] = row
             if self._metadata_db is None:
                 held[source_id] = (
                     self._url(upstream_id, row),
@@ -236,21 +240,13 @@ class MirrorSet:
                 )
                 return 0
 
-        # Under the build lock, so an adapter being built from the row as it was
-        # is re-seeded here, not left serving it.
+        # Under the build lock, so a build from the row as it was cannot register
+        # after this and leave a stale adapter.
         with self._build_lock:
             self._versions.update(versions)
             self._held.update(held)
-            for source_id, row in by_source.items():
-                # A built adapter is re-seeded in place: the next read sees the new
-                # tensors and version without a rebuild.
-                adapter = self._built(source_id)
-                if adapter is not None:
-                    adapter.seed_catalog(
-                        row.get("tensors"),
-                        row.get("source_url"),
-                        row.get("indexed_at"),
-                    )
+            for source_id in versions:
+                self._release(source_id)
         return added
 
     def _url(self, upstream_id: str, row: dict) -> str:
@@ -275,14 +271,20 @@ class MirrorSet:
             localize_tensor_rows(row.get("tensors"), upstream_id, source_id),
         )
 
+    def _release(self, source_id: str) -> None:
+        """Take a mirror's adapter out of the registry, if it has one. Caller holds
+        the build lock."""
+        if source_id in self._server.sources:
+            self._server.unregister_source(source_id)
+
     def _remove(self, source_ids: Sequence[str]) -> None:
         """Drop sources the upstream no longer lists, from the registry and the
         catalog in one transaction."""
-        for source_id in source_ids:
-            if source_id in self._server.sources:
-                self._server.unregister_source(source_id)
-            del self._versions[source_id]
-            self._held.pop(source_id, None)
+        with self._build_lock:
+            for source_id in source_ids:
+                self._release(source_id)
+                del self._versions[source_id]
+                self._held.pop(source_id, None)
         if self._metadata_db is None:
             return
         try:

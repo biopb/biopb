@@ -286,7 +286,7 @@ class TestMirrorSet:
         adapter = server.sources["lab__a"]
         assert adapter.catalog_url == "grpc://lab/data/a.tif"
         assert [t.array_id for t in adapter.list_tensors()] == ["lab__a"]
-        assert adapter.is_current(7)
+        assert adapter.content_version == b"iat:7"
         assert mirrors.unbuilt() == 0
         assert mirrors.materialize("lab__a") is True
         assert server.sources["lab__a"] is adapter  # not built twice
@@ -330,7 +330,52 @@ class TestMirrorSet:
         resync.join(timeout=10)
 
         assert not resync.is_alive()
-        assert server.sources["lab__a"].is_current(2)
+        # The adapter built from the old row was released by the re-sync; the next
+        # read builds it from the new one.
+        assert "lab__a" not in server.sources
+        db.read_mirrored = real
+        mirrors.materialize("lab__a")
+        assert server.sources["lab__a"].content_version == b"iat:2"
+
+    def test_a_removal_during_a_build_leaves_no_adapter_behind(self, upstream):
+        import threading
+        import time
+
+        upstream.put("a")
+        db = MetadataDatabase()
+        mirrors, server = _mirrors(db)
+        mirrors.relist(None)
+        real = db.read_mirrored
+        removal = threading.Thread(target=lambda: mirrors._remove(["lab__a"]))
+
+        def read_then_remove(source_id):
+            row = real(source_id)
+            removal.start()
+            time.sleep(0.3)  # the removal waits for the build
+            return row
+
+        db.read_mirrored = read_then_remove
+
+        mirrors.materialize("lab__a")
+        removal.join(timeout=10)
+
+        assert not removal.is_alive()
+        assert server.sources == {} and not mirrors.owns("lab__a")
+
+    def test_a_source_synced_in_a_non_canonical_order_is_logged_once(
+        self, upstream, caplog
+    ):
+        upstream.put("a", indexed_at=1)
+        upstream.rows["a"]["tensors"][0]["dim_labels"] = ["x", "y", "z"]
+        upstream.rows["a"]["tensors"][0]["shape"] = [2, 3, 4]
+        mirrors, _ = _mirrors(MetadataDatabase())
+
+        with caplog.at_level("WARNING"):
+            mirrors.relist(None)
+            mirrors.relist(None)  # nothing re-read: nothing said again
+
+        assert caplog.text.count("reads of it will be refused") == 1
+        assert "lab__a" in caplog.text
 
     def test_an_id_the_set_does_not_mirror_is_not_built(self, upstream):
         mirrors, server = _mirrors(MetadataDatabase())
@@ -425,8 +470,11 @@ class TestMirrorSet:
         assert mirrors.relist(None) is False  # the set did not change
         assert upstream.fetched == ["a"]
         assert db.get_metadata_json("lab__a") == {"v": 2}
-        assert server.sources["lab__a"] is adapter
-        assert adapter.is_current(2)
+        assert "lab__a" not in server.sources  # released: the next read rebuilds
+        mirrors.materialize("lab__a")
+        rebuilt = server.sources["lab__a"]
+        assert rebuilt is not adapter
+        assert rebuilt.content_version == b"iat:2"
 
     def test_a_mirror_never_built_is_built_at_the_version_it_was_last_synced(
         self, upstream
@@ -439,7 +487,7 @@ class TestMirrorSet:
 
         mirrors.materialize("lab__a")
 
-        assert server.sources["lab__a"].is_current(2)
+        assert server.sources["lab__a"].content_version == b"iat:2"
 
     def test_an_unversioned_upstream_is_read_every_time_but_not_rewritten(
         self, upstream
