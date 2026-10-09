@@ -52,47 +52,6 @@ class TestRecordsOfSourcesThatAreNotWalked:
         db = manager._reconciler._metadata_db
         assert _roots(db)[root.root_id] == ("dnd://x", False)
 
-    def test_a_mirror_sits_under_its_upstream_by_the_url_its_adapter_shows(
-        self, tmp_path
-    ):
-        manager = _manager(tmp_path)
-        upstream = Root(RootKind.UPSTREAM, "grpc://lab:8815", alias="hpc")
-        manager._roots.add(upstream)
-        claim = SourceClaim(
-            "tensor-server",
-            "grpc://lab:8815/img1",
-            "hpc__img1",
-            extra_config={"alias": "hpc"},
-        )
-
-        pending = manager._reconciler._catalog_record(claim)
-        assert (pending.root_id, pending.rel) == (upstream.root_id, "img1")
-        assert pending.claim is None and not pending.signature
-
-        class _Seeded:
-            catalog_url = "grpc://hpc/labs/x/img.tif"
-
-        seeded = manager._reconciler._catalog_record(claim, adapter=_Seeded())
-        assert (seeded.root_id, seeded.rel) == (upstream.root_id, "labs/x/img.tif")
-
-    def test_a_mirror_whose_url_is_not_under_its_root_falls_back_to_its_upstream_id(
-        self, tmp_path
-    ):
-        manager = _manager(tmp_path)
-        manager._roots.add(Root(RootKind.UPSTREAM, "grpc://lab:8815", alias="hpc"))
-        claim = SourceClaim(
-            "tensor-server",
-            "grpc://lab:8815/img1",
-            "hpc__img1",
-            extra_config={"alias": "hpc"},
-        )
-
-        class _Unseeded:
-            catalog_url = "grpc://hpc:img1"
-
-        record = manager._reconciler._catalog_record(claim, adapter=_Unseeded())
-        assert record.rel == "img1"
-
 
 class TestTheViewAndTheOpen:
     def _drop_row(self, db):

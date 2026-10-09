@@ -74,12 +74,12 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_change_time,
     entry_is_quiet,
 )
+from biopb_tensor_server.sources.mirror import MirrorSet
 from biopb_tensor_server.sources.pending_rows import PendingRow, PendingRowWriter
 from biopb_tensor_server.sources.roots import Root, RootKind, Roots, path_under_root
 from biopb_tensor_server.sources.source_registry import close_adapter
 
 if TYPE_CHECKING:
-    from biopb_tensor_server.adapters.remote_tensor import MirrorSeed
     from biopb_tensor_server.core.config import (
         SourceConfig as _SourceConfig,  # noqa: F401
     )
@@ -171,6 +171,8 @@ class Reconciler:
         self._roots = roots
         # The roots that are not persisted the catalog has been told of.
         self._catalog_roots: Set[str] = set()
+        # The sources mirrored from each upstream root, which are not claims.
+        self._mirrors: Dict[Root, MirrorSet] = {}
         # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
         # Display root for a newly discovered claim (a monitored root's alias);
@@ -908,19 +910,15 @@ class Reconciler:
         self,
         claim: SourceClaim,
         signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
-        adapter: Optional[Any] = None,
     ) -> Optional[CatalogRecord]:
         """Where *claim*'s source sits in the catalog, and what it persists.
 
         A source under a root the server knows sits under it: a local source under a
         monitored or scan-once root (cloud roots included) with its claim and
-        signature, which a restart rebuilds it from; a drop, or a mirror of an
-        upstream, under that root without them, since nothing would rebuild it. Any
-        other has none, and the catalog files it under its built-in root. Whether the
-        adapter can also be rebuilt is its own ``catalog_payload``.
-
-        A mirror's path beneath its root is the url its adapter shows, once the
-        adapter has been seeded (*adapter*); before that, its upstream id.
+        signature, which a restart rebuilds it from; a drop under that root without
+        them, since nothing would rebuild it. Any other has none, and the catalog
+        files it under its built-in root. Whether the adapter can also be rebuilt
+        is its own ``catalog_payload``.
 
         The persisted signature drops ``st_dev`` (first element), which can
         renumber across boots and would make every row look changed.
@@ -933,18 +931,6 @@ class Reconciler:
         """
         from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
-        if claim.source_type == "tensor-server":
-            root = self._roots.upstream_of(
-                claim.primary_path, claim.extra_config.get("alias")
-            )
-            if root is None:
-                return None
-            upstream_id = str(claim.primary_path).rsplit("/", 1)[-1]
-            url = adapter.catalog_url if adapter is not None else None
-            prefix = root.root_url + "/"
-            rel = url[len(prefix) :] if url and url.startswith(prefix) else upstream_id
-            self._ensure_root(root)
-            return CatalogRecord(None, {}, root.root_id, rel)
         if claim.is_remote:
             return None
         root = self._roots.containing(Path(claim.primary_path))
@@ -1070,7 +1056,6 @@ class Reconciler:
     def _commit_add_claim(
         self,
         claim: SourceClaim,
-        catalog_seed: Optional[MirrorSeed] = None,
         catalog_url: Optional[str] = None,
         keep_failed: bool = False,
     ) -> bool:
@@ -1081,30 +1066,27 @@ class Reconciler:
         try again. A drop reports the failure to its caller instead, and leaves
         nothing behind.
 
-        ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
-        remote bulk-seed); ``None`` for local sources. ``catalog_url`` overrides the
-        descriptor's display ``source_url`` (drag-drop re-rooting, see
+        ``catalog_url`` overrides the descriptor's display ``source_url``
+        (drag-drop re-rooting, see
         ``_drop_catalog_url``); ``None`` falls back to the display root of the
         monitored directory the claim sits under, if that has one.
         """
         if catalog_url is None:
             catalog_url = self._catalog_url_for(claim)
-        if catalog_seed is None:
-            if self._claim_is_unresolved(claim):
-                return self._commit_pending_claim(claim, catalog_url, recall=True)
-            if self._defer_registration and self._deferrable(claim):
-                return self._commit_pending_claim(claim, catalog_url)
+        if self._claim_is_unresolved(claim):
+            return self._commit_pending_claim(claim, catalog_url, recall=True)
+        if self._defer_registration and self._deferrable(claim):
+            return self._commit_pending_claim(claim, catalog_url)
         # Before the parse, and the one the registration persists and state keeps.
         signatures = self._build_claim_signatures(claim)
         errors: List[str] = []
         if not self._register_source_claim(
             claim,
-            catalog_seed=catalog_seed,
             catalog_url=catalog_url,
             error_sink=errors,
             signatures=signatures,
         ):
-            if keep_failed and catalog_seed is None:
+            if keep_failed:
                 self._commit_failed_claim(claim, catalog_url, errors)
             return False
 
@@ -1274,142 +1256,18 @@ class Reconciler:
             self._clear_pending(source_id)
         return True
 
-    def _reconcile_one_upstream(self, upstream: SourceConfig) -> bool:
-        """Diff one upstream's live source list against the mirrored catalog.
+    def _reconcile_one_upstream(self, root: Root) -> bool:
+        """Re-list one upstream's sources: see :meth:`MirrorSet.relist`.
 
         Returns whether the mirrored set changed (a source was added or removed).
-
-        The diff is the same add/remove model as the filesystem reconcile, but the
-        "scan" is a remote catalog query and the unit is a source_id (not a
-        path signature): desired = the alias-namespaced ids the upstream lists now;
-        current = the tensor-server claims already mirrored from this endpoint.
         """
-        from biopb_tensor_server.adapters.remote_tensor import (
-            MirrorSeed,
-            _split_grpc_url,
-            close_upstream_client,
-            fetch_upstream_rows,
-            list_upstream_versions,
-            open_upstream_client,
-            resolve_upstream_credentials,
-        )
-        from biopb_tensor_server.sources.resolve import namespaced_source_id
-
-        endpoint, _ = _split_grpc_url(upstream.url)
-        alias = upstream.alias
-        # The catalog fetch dials the upstream directly (not through the adapter
-        # pool), so it needs the same per-upstream token AND trust anchor the
-        # mirrored adapters will use (biopb/biopb#604 item 4) -- otherwise a
-        # grpcs:// upstream with a configured CA would still be TOFU-pinned here.
-        credentials = resolve_upstream_credentials(upstream, self._credentials_config)
-
-        client = open_upstream_client(endpoint, credentials)
-        try:
-            # A narrow id + indexed_at pass decides everything that follows, so a
-            # steady re-list of a six-figure catalog moves two columns, not every
-            # source's metadata. Complete (the server-side DuckDB catalog is not
-            # row-capped), so what it no longer lists is gone.
-            versions = list_upstream_versions(client)
-            desired = {namespaced_source_id(alias, up): up for up in versions}
-
-            prefix = f"{endpoint}/"
-            alias_prefix = f"{alias}__" if alias else None
-            with self._lock:
-                current = {
-                    source_id
-                    for source_id, claim in self._state.claims.items()
-                    if claim.source_type == "tensor-server"
-                    and str(claim.primary_path).startswith(prefix)
-                    and (alias_prefix is None or source_id.startswith(alias_prefix))
-                }
-
-            added = desired.keys() - current
-            # A failed query raised above, leaving the mirrored catalog untouched.
-            removed = current - desired.keys()
-
-            for source_id in sorted(removed):
-                self._commit_remove_source(source_id)
-
-            # A mirrored source needs its row again only when the upstream
-            # re-registered it (indexed_at moved) -- notably unresolved -> resolved
-            # -- or when it was never seeded. An unversioned upstream has no
-            # indexed_at to compare, so it is re-read every time.
-            stale = {}
-            for source_id in current & desired.keys():
-                adapter = self._server.sources.get(source_id)
-                if adapter is None or not hasattr(adapter, "seed_catalog"):
-                    continue
-                if not adapter.is_current(versions[desired[source_id]].indexed_at):
-                    stale[source_id] = adapter
-
-            extra_config = {}
-            if upstream.credentials_profile:
-                extra_config["credentials_profile"] = upstream.credentials_profile
-            # The proxy's display authority; without it every mirrored source_url
-            # exposes the upstream host:port instead of the alias (biopb/biopb#788).
-            if alias:
-                extra_config["alias"] = alias
-
-            # One bounded batch of full rows at a time, so the first sync of a large
-            # catalog never holds it whole.
-            wanted = [desired[sid] for sid in sorted(added | stale.keys())]
-            sizes = {up: versions[up].size for up in wanted}
-            for rows in fetch_upstream_rows(client, wanted, sizes):
-                for row in rows:
-                    source_id = namespaced_source_id(alias, row["source_id"])
-                    seed = MirrorSeed.from_row(row)
-                    if source_id in added:
-                        self._commit_add_claim(
-                            SourceClaim(
-                                source_type="tensor-server",
-                                primary_path=f"{endpoint}/{row['source_id']}",
-                                source_id=source_id,
-                                extra_config=dict(extra_config),
-                            ),
-                            catalog_seed=seed,
-                        )
-                    elif source_id in stale:
-                        self._refresh_mirrored_source(source_id, stale[source_id], seed)
-        finally:
-            close_upstream_client(client)
-
-        if added or removed:
-            logger.info(
-                "Upstream %s re-list: +%d / -%d sources",
-                endpoint,
-                len(added),
-                len(removed),
+        mirrors = self._mirrors.get(root)
+        if mirrors is None:
+            _warn_experimental_source("tensor-server")
+            mirrors = self._mirrors[root] = MirrorSet(
+                root, self._server, self._metadata_db, self.has_claim
             )
-        # Whether the mirrored set moved -- drives the adaptive re-list cadence.
-        return bool(added or removed)
-
-    def _refresh_mirrored_source(
-        self, source_id: str, adapter: Any, seed: MirrorSeed
-    ) -> None:
-        """Re-seed an already-mirrored source and re-sync its catalog row if the
-        seed changed (so a steady re-list does not churn ``indexed_at``)."""
-        changed = seed.seed(adapter)
-        if self._metadata_db is None:
-            return
-        if changed or self._metadata_db.registration_differs(
-            source_id, seed.registration
-        ):
-            try:
-                claim = self._state.claims.get(source_id)
-                record = (
-                    self._catalog_record(claim, adapter=adapter)
-                    if claim is not None
-                    else None
-                )
-                self._metadata_db.sync_source_added(
-                    source_id, adapter, record, registration=seed.registration
-                )
-            except Exception:
-                logger.warning(
-                    "failed to refresh mirrored catalog row for %s",
-                    source_id,
-                    exc_info=True,
-                )
+        return mirrors.relist(self._credentials_config)
 
     def _claim_is_unresolved(self, claim: SourceClaim) -> bool:
         """Whether this claim must be registered as an unresolved cloud source.
@@ -1603,7 +1461,6 @@ class Reconciler:
     def _register_source_claim(
         self,
         claim: SourceClaim,
-        catalog_seed: Optional[MirrorSeed] = None,
         catalog_url: Optional[str] = None,
         replace: bool = False,
         error_sink: Optional[List[str]] = None,
@@ -1637,10 +1494,7 @@ class Reconciler:
         and its catalog row deleted for the length of the rebuild, and gone for
         good if the rebuild then failed.
 
-        ``catalog_seed`` (biopb/biopb#266) is an optional :class:`MirrorSeed` from a
-        bulk upstream ``query``; when the adapter supports it (the remote proxy), it is
-        applied before ``sync_source_added`` so registration needs no per-source
-        upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
+        ``catalog_url`` (drag-drop re-rooting) overrides the display
         ``source_url`` on the adapter *before* register/sync so both ListFlights
         and the metadata DB record the re-rooted url.
         """
@@ -1690,12 +1544,6 @@ class Reconciler:
                     adapter = adapter_cls.create_from_config(
                         source_config, self._credentials_config
                     )
-
-                # Bulk-seed the catalog surface so sync_source_added below needs
-                # no per-source upstream RPC (biopb/biopb#266). Guarded by the
-                # adapter opting in via seed_catalog (only the remote proxy does).
-                if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    catalog_seed.seed(adapter)
         except UpstreamConfigError as e:
             if error_sink is not None:
                 error_sink.append(str(e))
@@ -1727,10 +1575,6 @@ class Reconciler:
         # register/sync so ListFlights and the metadata-DB row both carry it.
         if catalog_url:
             adapter._catalog_url = catalog_url
-        if claim.source_type == "tensor-server":
-            # A mirror's place under its upstream is the url the seed gave its adapter.
-            record = self._catalog_record(claim, adapter=adapter)
-
         registered = False
         synced = False
         displaced: Optional[Any] = None
@@ -1755,15 +1599,8 @@ class Reconciler:
             # the tensors.
             if self._metadata_db is not None:
                 if not from_payload:
-                    # A mirror's row is the upstream's: its registration comes
-                    # with the seed, not from the adapter.
                     self._metadata_db.sync_source_added(
-                        claim.source_id,
-                        adapter,
-                        record,
-                        registration=catalog_seed.registration
-                        if catalog_seed
-                        else None,
+                        claim.source_id, adapter, record
                     )
                     synced = True
                 else:

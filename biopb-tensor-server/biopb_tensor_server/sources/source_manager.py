@@ -259,8 +259,8 @@ class SourceManager:
         return self._roots
 
     @property
-    def _monitored_upstreams(self) -> List[SourceConfig]:
-        return [r.source for r in self._roots.of_kind(RootKind.UPSTREAM)]
+    def _monitored_upstreams(self) -> List[Root]:
+        return self._roots.of_kind(RootKind.UPSTREAM)
 
     def start(self) -> None:
         """Start the rescan loop.
@@ -859,7 +859,7 @@ class SourceManager:
         mirrored within ~one tick. When there are no monitored *dirs* each pass
         is the whole reconcile, so a later one advances catalog freshness itself.
         """
-        due: List[SourceConfig] = []
+        due: List[Root] = []
         for upstream in self._monitored_upstreams:
             state = self._upstream_relist.setdefault(
                 upstream.url, {"period": 1, "countdown": 0}
@@ -963,7 +963,7 @@ class SourceManager:
             return
         logger.info("Upstream %s is reachable again; catalog re-listed.", url)
 
-    def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
+    def _reconcile_and_reschedule(self, upstream: Root) -> None:
         """Re-list one upstream and set its next-due period from the outcome."""
         state = self._upstream_relist[upstream.url]
         try:

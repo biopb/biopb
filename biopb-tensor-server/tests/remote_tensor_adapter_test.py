@@ -1087,18 +1087,38 @@ def _upstream_with_metadata(zarr_path):
     return upstream
 
 
-def test_a_mirror_holds_no_metadata_and_asks_nobody():
-    """A mirror's metadata is the upstream row's, written with the catalog row; the
-    adapter has none of its own and makes no per-source query for it."""
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_a_source_configured_alone_reads_its_metadata_from_the_upstream(
+    simple_zarr_array,
+):
+    """A ``grpc://host:port/<id>`` entry registers with no upstream row in hand,
+    so its record is read from the upstream's catalog."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream = _upstream_with_metadata(zarr_path)
+    try:
+        adapter = RemoteTensorAdapter(
+            source_id="img",
+            upstream_location=f"grpc://localhost:{upstream.port}",
+            upstream_source_id="img",
+        )
+        assert adapter.registration_record([], import_rois=False).metadata == {
+            "ome": {"channel": "DAPI"}
+        }
+    finally:
+        upstream.shutdown()
+
+
+def test_a_source_configured_alone_registers_with_no_metadata_when_the_upstream_is_down():
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
-        source_id="lab__img",
-        upstream_location="grpc://localhost:1",  # never dialed
+        source_id="img",
+        upstream_location="grpc://localhost:1",
         upstream_source_id="img",
     )
     assert adapter.registration_record([], import_rois=False).metadata == {}
-    assert adapter._client is None
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -1673,7 +1693,7 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.core.discovery import DiscoveryState
 
-        upstream = SourceConfig(url=url, alias="lab", credentials_profile="lab-store")
+        source = SourceConfig(url=url, alias="lab", credentials_profile="lab-store")
         proxy = TensorFlightServer("localhost:0")
         manager = make_manager(
             server=proxy,
@@ -1681,8 +1701,9 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
             discovery_state=DiscoveryState(),
             monitored_dirs=set(),
             credentials_config=credentials,
-            monitored_upstreams=[upstream],
+            monitored_upstreams=[source],
         )
+        (upstream,) = manager._monitored_upstreams
         # The cadence state the due-scheduler would have seeded for this tick.
         manager._upstream_relist[url] = {"period": 1, "countdown": 0}
         return manager, upstream, proxy
@@ -2488,7 +2509,7 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
     assert view._client is None
 
 
-def test_seed_catalog_empty_metadata_normalizes_to_dict():
+def test_seeding_an_unresolved_upstream_row_lists_no_tensors():
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
@@ -2498,7 +2519,6 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
     )
     adapter.seed_catalog([])  # unresolved upstream source: no tensors
     assert adapter.list_tensors() == []
-    assert adapter.registration_record([], import_rois=False).metadata == {}
     assert adapter._client is None
 
 
@@ -2926,16 +2946,11 @@ class _CatalogRowAdapter:
         return RegistrationRecord(self._metadata, is_resolved=self._resolved)
 
 
-def test_seed_catalog_carries_resolution_and_detects_change():
-    """An unresolved upstream source (is_resolved=false, empty tensors) mirrors as
-    unresolved; re-seeding reports change only when something differs, and an
-    in-place resolution flips the flag and the tensors together. The flag and the
-    metadata ride the seed's record, to the catalog write: the adapter holds
-    neither."""
-    from biopb_tensor_server.adapters.remote_tensor import (
-        MirrorSeed,
-        RemoteTensorAdapter,
-    )
+def test_seed_catalog_detects_change():
+    """An unresolved upstream source (empty tensors) mirrors with none; re-seeding
+    reports change only when something differs, and an in-place resolution changes
+    the tensors."""
+    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
     adapter = RemoteTensorAdapter(
         source_id="lab__cloud",
@@ -2943,36 +2958,22 @@ def test_seed_catalog_carries_resolution_and_detects_change():
         upstream_source_id="cloud",
     )
 
-    unresolved = MirrorSeed.from_row(
-        {"tensors": [], "is_resolved": False, "metadata_json": None}
-    )
-    assert unresolved.registration.is_resolved is False
-    assert unresolved.seed(adapter) is True
+    assert adapter.seed_catalog([]) is True
     assert adapter.list_tensors() == []
     assert adapter._client is None
 
-    # identical re-seed -> no change (so the caller skips a redundant re-sync)
-    assert unresolved.seed(adapter) is False
+    # identical re-seed -> no change
+    assert adapter.seed_catalog([]) is False
 
-    # in-place resolution upstream -> change detected, now resident with tensors
-    resolved = MirrorSeed.from_row(
+    resolved = [
         {
-            "tensors": [
-                {
-                    "array_id": "cloud",
-                    "dim_labels": ["y", "x"],
-                    "shape": [4, 4],
-                    "chunk_shape": [4, 4],
-                    "dtype": "uint8",
-                }
-            ],
-            "is_resolved": True,
-            "metadata_json": '{"ome": "m"}',
+            "array_id": "cloud",
+            "dim_labels": ["y", "x"],
+            "shape": [4, 4],
+            "dtype": "uint8",
         }
-    )
-    assert resolved.registration.is_resolved is True
-    assert resolved.registration.metadata == {"ome": "m"}
-    assert resolved.seed(adapter) is True
+    ]
+    assert adapter.seed_catalog(resolved) is True
     # Resolution upstream does not make anything local here.
     assert source_is_resident(adapter.source_url) is False
     assert [d.array_id for d in adapter.list_tensors()] == ["lab__cloud"]

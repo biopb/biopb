@@ -249,8 +249,3 @@ class TestRecord:
 
         assert record is not None and record.claim is None
         assert (record.root_id, record.rel) == (root.root_id, "sub/a.zarr")
-
-    def test_a_mirror_of_no_known_upstream_has_none(self, tmp_path):
-        manager = self._manager(tmp_path)
-        claim = SourceClaim("tensor-server", str(tmp_path / "a.zarr"), "x")
-        assert manager._reconciler._catalog_record(claim) is None
