@@ -1595,8 +1595,28 @@ class MetadataDatabase:
         )
 
     def bind_registry(self, registry: Any) -> None:
-        """List tensors through *registry*, which holds the ones attached to a source."""
+        """List tensors through *registry*, which holds the ones attached to a source,
+        and keep each row's listing in step with them."""
         self._registry = registry
+        registry.set_attachment_listener(self._attachments_changed)
+
+    def _attachments_changed(self, source_id: str) -> None:
+        """Re-list a source whose attached tensors changed (:meth:`relist_tensors`).
+
+        Best-effort for the reason every catalog write on the upload path is: the
+        row is how a source is *browsable*, and it must not be able to fail the
+        change that made a tensor *readable*. A source with no adapter or no row
+        has nothing to re-list."""
+        adapter = self._registry.get(source_id)
+        if adapter is None:
+            return
+        try:
+            self.relist_tensors(source_id, adapter)
+        except Exception as e:
+            logger.warning(
+                f"Failed to re-list {source_id} in the catalog "
+                f"(readable by id, not listed): {e}"
+            )
 
     def _catalog_tensors(self, source_id: str, adapter: Any) -> List[Any]:
         """The tensors a row lists: the registry's view when bound, else the

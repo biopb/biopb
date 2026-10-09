@@ -66,6 +66,17 @@ class SourceRegistry:
         # by source id, not by adapter: an adapter is rebuilt on a refresh, and
         # an upload in flight must keep routing across it.
         self._attachments: Dict[str, Attachments] = {}
+        self._attachment_listener: Optional[Callable[[str], None]] = None
+
+    def set_attachment_listener(
+        self, listener: Optional[Callable[[str], None]]
+    ) -> None:
+        """Tell *listener* the source id of every source whose attachments changed.
+
+        What follows from a change in what a source lists -- its catalog row --
+        is the listener's, so no caller has to remember it. Boot adoption
+        (:meth:`adopt`) is not a change and does not call it."""
+        self._attachment_listener = listener
 
     def set_pending_check(self, check: Optional[Callable[[str], None]]) -> None:
         """Wire what :meth:`get_registered` asks when a source is not registered:
@@ -231,14 +242,23 @@ class SourceRegistry:
     def attach(self, source_id: str, field: str, tensor: TensorAdapter) -> None:
         """Make *tensor* answer for *field* on *source_id*."""
         self.attached_to(source_id).attach(field, tensor)
+        self._notify(source_id)
 
     def detach(self, source_id: str, field: str) -> Optional[TensorAdapter]:
         """Stop answering for *field*; returns what was attached, or None."""
-        return self.attached_to(source_id).detach(field)
+        removed = self.attached_to(source_id).detach(field)
+        if removed is not None:
+            self._notify(source_id)
+        return removed
 
     def attachment_changed(self, source_id: str) -> None:
         """Rebuild the source's checked views: an attached tensor's state moved."""
         self.attached_to(source_id).changed()
+        self._notify(source_id)
+
+    def _notify(self, source_id: str) -> None:
+        if self._attachment_listener is not None:
+            self._attachment_listener(source_id)
 
     # -- reads through the attachments ---------------------------------------
 
