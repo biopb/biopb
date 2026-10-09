@@ -505,7 +505,8 @@ def test_status_logs_restart(monkeypatch):
     )
     ops = _ops(rows)
     assert (
-        ops.status() == "a (script): failed; ops: seg\n  error: exited before serving"
+        ops.status()
+        == "a (script, local): failed; ops: seg\n  error: exited before serving"
     )
     assert ops.logs("a") == "l1\nl2"
     assert ops.restart("a") == "a: up"
@@ -599,3 +600,50 @@ def test_make_channel_schemes():
         _make_channel("http://localhost:1")
     with pytest.raises(ValueError):
         _make_channel("grpc://")
+
+
+# --------------------------------------------------------------------------- #
+# Local or remote
+# --------------------------------------------------------------------------- #
+
+
+def _remote_ops(client, url="grpc://algo.example.org:443"):
+    return _ops(
+        [{"name": "far", "kind": "url", "url": url, "state": "up", "ops": OPS}], client
+    )
+
+
+def test_a_server_says_whether_it_is_local_or_remote(url_ops, client):
+    assert url_ops.double.remote is False
+    assert "url entry, local" in url_ops.double.__doc__
+    far = _remote_ops(client)
+    assert far.double.remote is True
+    assert "url entry, remote, algo.example.org" in far.double.__doc__
+    assert not _remote_ops(client, "grpc://[::1]:50051").double.remote
+
+
+def test_a_remote_server_is_never_handed_the_plane_token(client):
+    handle = _reference("src/@fields/x", PLANE).lazy
+    handle.auth_token = "plane-secret"
+    client.get_tensor = lambda *_a, **_k: (
+        handle if _k.get("output") == "pb" else (da.ones((2, 2), np.uint8, chunks=2))
+    )
+    far = _remote_ops(client)
+    call = far.lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    with pytest.raises(RuntimeError, match="remote algorithm server"):
+        call._check_no_credential({"image": proto.Arg(lazy=handle)})
+
+
+def test_a_remote_server_gets_inline_data_when_the_plane_advertises_nothing(client):
+    client.advertised_location = None
+    call = _remote_ops(client).lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    assert client.exports == []
+    client.advertised_location = "grpc://plane.example:8815"
+    assert (
+        call._tensor("image", "src/@fields/x", None, client).WhichOneof("kind")
+        == "lazy"
+    )

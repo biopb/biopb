@@ -20,6 +20,7 @@ without an event, and a Stop cancels it on the server.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import queue
@@ -28,6 +29,7 @@ import threading
 import time
 from collections.abc import Callable
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import biopb.image as proto
 import dask.array as da
@@ -80,6 +82,24 @@ def _sanitize_name(name: str) -> str:
 _same_plane = same_location
 
 
+def _is_remote(kind: str, url: Optional[str]) -> bool:
+    """Does a registry entry run off this machine? A script entry is always the
+    control's own child on loopback; a url entry is whatever it names."""
+    return kind == "url" and not _is_loopback(url)
+
+
+def _is_loopback(url: Optional[str]) -> bool:
+    """Is *url* served from this machine? An unparseable or unnamed host is not."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_loopback or address.is_unspecified
+    except ValueError:
+        return False
+
+
 class _Server:
     """One registry entry the kernel calls: where it is and as whom."""
 
@@ -93,6 +113,18 @@ class _Server:
         if self.kind == "url":
             self._url = row.get("url")
         self._stub = None
+
+    @property
+    def remote(self) -> bool:
+        """Does this server run off this machine?"""
+        return _is_remote(self.kind, self._url)
+
+    @property
+    def where(self) -> str:
+        """``local``, or ``remote`` with the host, for what the agent reads."""
+        if not self.remote:
+            return "local"
+        return f"remote, {urlparse(self._url).hostname or self._url}"
 
     def stub(self):
         """The stub and call metadata, starting a script entry if needed."""
@@ -151,13 +183,18 @@ class _OpCall:
                 )
             if self.mode == "EAGER":
                 return self._read_whole(name, value, client)
-            # The op server dials this handle from another host, so it carries
-            # the plane's advertised address, not the one this session dials.
-            return proto.Arg(
-                lazy=client.get_tensor(
-                    value, output="pb", export_location=client.advertised_location
-                )
-            )
+            # The op server dials this handle from elsewhere, so it carries the
+            # plane's advertised address, not the one this session dials. A
+            # server off this machine gets a reference only if the plane
+            # advertises one and the handle holds no bearer token (an unsealed
+            # handle carries the plane's); otherwise its input goes inline.
+            advertised = client.advertised_location
+            if self.server.remote and not advertised:
+                return self._read_whole(name, value, client)
+            handle = client.get_tensor(value, output="pb", export_location=advertised)
+            if self.server.remote and handle.auth_token:
+                return self._read_whole(name, value, client)
+            return proto.Arg(lazy=handle)
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)
@@ -205,6 +242,9 @@ class _OpCall:
 
     def stream(self, arguments: Dict[str, proto.Arg]) -> List[proto.Event]:
         """The events that carry outputs, reading until the stream ends."""
+        if self.server.remote:
+            self._check_no_credential(arguments)
+            print(f"{self.name}: calling {self.server.where}", flush=True)
         for attempt in (1, 2):
             stub, metadata = self.server.stub()
             try:
@@ -225,6 +265,16 @@ class _OpCall:
                     continue
                 raise
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _check_no_credential(arguments: Dict[str, proto.Arg]) -> None:
+        """Refuse to send a remote server anything that carries a bearer token."""
+        for name, arg in arguments.items():
+            if arg.HasField("lazy") and arg.lazy.auth_token:
+                raise RuntimeError(
+                    f"{name}: refusing to send the tensor server's token to a "
+                    "remote algorithm server"
+                )
 
     def _read(self, call) -> List[proto.Event]:
         events: queue.Queue = queue.Queue()
@@ -324,7 +374,7 @@ def _build_op(call: _OpCall) -> Callable:
     doc = [
         info.get("description") or f"The {call.name} op.",
         "",
-        f"Server: {call.server.name} ({call.server.kind} entry)",
+        f"Server: {call.server.name} ({call.server.kind} entry, {call.server.where})",
         f"Tensor arguments (axes the op sees): {tensors}",
     ]
     if info.get("labels"):
@@ -351,8 +401,8 @@ def _build_op(call: _OpCall) -> Callable:
         "Arguments go by name; one tensor argument may also go first.",
         "  A tensor is an np.ndarray (sent inline; axes by ndim: 2D=YX, 3D=YXC,",
         "  4D=ZYXC, 5D=TZYXC, or dim_labels='ZYX' / {name: axes}) or an array_id",
-        "  str (a lazy or blocks op's server reads it from the tensor server; an",
-        "  eager op gets it inline, read here).",
+        "  str (a lazy or blocks op's local server reads it from the tensor server;",
+        "  an eager op, or any remote server, gets it inline, read here).",
         "Tensor results are np.ndarray, or array_id str when an input was one or",
         "the server returned a reference. A tuple for several outputs; a list",
         "when a streaming op sent several events.",
@@ -361,6 +411,7 @@ def _build_op(call: _OpCall) -> Callable:
     op.__name__ = _sanitize_name(call.name)
     op.op_name = call.name
     op.server = call.server.name
+    op.remote = call.server.remote
     op.labels = list(info.get("labels") or [])
     op.description = info.get("description", "")
     op.kwargs_text = info.get("kwargs") or ""
@@ -527,7 +578,8 @@ class Ops:
         lines = []
         for r in rows:
             names = ", ".join(o["name"] for o in r["ops"]) or "-"
-            line = f"{r['name']} ({r['kind']}): {r['state']}; ops: {names}"
+            where = "remote" if _is_remote(r["kind"], r.get("url")) else "local"
+            line = f"{r['name']} ({r['kind']}, {where}): {r['state']}; ops: {names}"
             if any((r["name"], o["name"]) not in bound for o in r["ops"]):
                 line += " (not bound in this kernel: call ops.refresh())"
             lines.append(line)
