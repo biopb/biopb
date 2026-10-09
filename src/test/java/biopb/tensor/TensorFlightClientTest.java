@@ -444,6 +444,33 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testAcceptsEverySupportedFlightShape() throws Exception {
+        // A new client reads a v2 server's plans as well as a v3 server's.
+        for (int version : new int[] {2, 3}) {
+            try (TestFlightServer server = new TestFlightServer()) {
+                server.setProtocolVersion(version);
+                try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                    client.getTensor("test-tensor");
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testRefusesANewerServerNamingTheClientToUpgrade() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setProtocolVersion(4);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class,
+                        () -> client.getTensor("test-tensor"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("server speaks v4"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("Upgrade the client"));
+            }
+        }
+    }
+
+    @Test
     public void testAcceptsAMatchingFlightShapeAndProbesOnlyOnce() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {

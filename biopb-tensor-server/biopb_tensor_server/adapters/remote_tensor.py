@@ -609,6 +609,10 @@ class RemoteTensorAdapter(TensorAdapter):
         # would name a tensor and a key this server does not hold.
         out.ClearField("ticket_stub")
         out.ClearField("roi_ticket")
+        # An older upstream still echoes the request here; this server's plan
+        # carries it in app_metadata instead.
+        out.ClearField("scale_hint")
+        out.ClearField("reduction_method")
         return out
 
     def _mark_unreachable(self, exc: Exception) -> None:

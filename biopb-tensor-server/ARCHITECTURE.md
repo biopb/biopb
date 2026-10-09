@@ -134,6 +134,15 @@ in the MAC so a reused name inherits nothing. The key lives in the state tree
 its upstream's identity once and keeps the upstream's indices, and seals what it
 serves with its own key.
 
+**What a plan records of its request.** From Flight protocol v3 a plan's
+`FlightInfo.app_metadata` is the whole `TensorReadOption` it answers, and its
+descriptor carries only what the server decided (realized `slice_hint`, logical
+`shape`/`chunk_shape`), not an echo of the scale and method. A consumer crops
+back to the request, or replays it to plan a handle that has no endpoints, from
+there. Which protocol wrote a plan is stamped on its schema (`flight_protocol`),
+so a plan handed between processes is self-describing. The SDK reads v2 and v3
+servers; a v2 SDK refuses a v3 server by its health check and has to upgrade.
+
 `health` is outside both tiers and answers anyone, the way an HTTP server
 answers `/healthz`: it is the liveness probe, so a caller that cannot yet
 authenticate must still be able to ask. It reports status, protocol and

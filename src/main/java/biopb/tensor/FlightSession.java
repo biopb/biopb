@@ -139,9 +139,9 @@ public final class FlightSession implements AutoCloseable {
         // load, which is the error this gate exists to replace.
         Object protocol = health.orElse(Collections.emptyMap()).get("protocol");
         int serverVersion = protocol instanceof Number ? ((Number) protocol).intValue() : 1;
-        if (serverVersion != WireVersions.FLIGHT_PROTOCOL_VERSION) {
-            throw new UnsupportedOperationException(WireVersions.mismatch(
-                    "Flight protocol", serverVersion, WireVersions.FLIGHT_PROTOCOL_VERSION,
+        if (!WireVersions.supportsFlight(serverVersion)) {
+            throw new UnsupportedOperationException(WireVersions.flightMismatch(
+                    serverVersion,
                     "The server at " + location + " routes requests in another shape."));
         }
         protocolChecked = true;

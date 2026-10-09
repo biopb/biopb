@@ -487,11 +487,11 @@ class TestTensorFlightClientRoundTrip:
         )
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import SliceHint
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        # The requested slice rides the plan's app_metadata.
+        # The whole request rides the plan's app_metadata.
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        requested = SliceHint.FromString(info.app_metadata)
+        requested = TensorReadOption.FromString(info.app_metadata).slice_hint
         assert list(requested.start) == [0, 0]
         assert list(requested.stop) == [64, 64]
 
@@ -511,13 +511,17 @@ class TestTensorFlightClientRoundTrip:
         )
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 
-        # Verify scale_hint in the plan's descriptor
+        # The scale and method are in the request the plan records, and the
+        # descriptor does not echo them back.
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        assert list(
-            TensorDescriptor.FromString(info.descriptor.command).scale_hint
-        ) == [2, 2]
+        request = TensorReadOption.FromString(info.app_metadata)
+        assert list(request.scale_hint) == [2, 2]
+        assert request.reduction_method == "nearest"
+        descriptor = TensorDescriptor.FromString(info.descriptor.command)
+        assert not descriptor.scale_hint
+        assert not descriptor.reduction_method
 
         # Reconstruct and verify downscaled shape
         darr = TensorFlightClient.tensor_from_pb(pb)

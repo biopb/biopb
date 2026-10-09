@@ -702,7 +702,7 @@ class TestExportedTrust:
                 FlightInfo=SimpleNamespace(deserialize=lambda b: Mock(endpoints=[1]))
             ),
         )
-        monkeypatch.setattr(client_mod, "_requested_slice", lambda info: None)
+        monkeypatch.setattr(client_mod, "_plan_request", lambda info: None)
         monkeypatch.setattr(
             client_mod,
             "_dask_from_flight_info",

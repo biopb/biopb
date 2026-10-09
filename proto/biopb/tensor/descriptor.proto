@@ -90,6 +90,12 @@ message TensorDescriptor {
   // Per-dimension integer downsampling factors for virtual/scaled reads.
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   // These do not change tensor identity, only how a specific read request is planned.
+  //
+  // A GetFlightInfo *response* leaves this and `reduction_method` unset from
+  // Flight protocol v3 on: the request is recorded whole in
+  // `FlightInfo.app_metadata` (a TensorReadOption), and the descriptor carries
+  // what the server decided -- the realized `slice_hint`, the logical `shape`
+  // and `chunk_shape`. A v2 server echoed them here.
   repeated int64 scale_hint = 7;
 
   // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",

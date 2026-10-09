@@ -1210,7 +1210,7 @@ public class TensorFlightClient implements AutoCloseable {
         // descriptor.shape may be larger than the requested extent.
         if (sliceHint != null && context.descriptor.hasSliceHint()) {
             rai = RegionCrop.cropToRequest(rai, sliceHint, context.descriptor.getSliceHint(),
-                    context.descriptor.getScaleHintList());
+                    PlanRequest.of(context.info).getScaleHintList());
         }
 
         // Preserve source compatibility while externalizing only the v2 handle.

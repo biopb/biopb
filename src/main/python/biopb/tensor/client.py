@@ -47,8 +47,8 @@ from biopb.tensor._session import (
     _ClientState,
     _dask_from_flight_info,
     _explain_handshake_failure,
+    _plan_request,
     _refetch_flight_info,
-    _requested_slice,
     split_array_id as split_array_id,
 )
 from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
@@ -748,7 +748,7 @@ class TensorFlightClient:
         token = pb.auth_token or None
         location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        requested = _requested_slice(info)
+        request = _plan_request(info)
         # The sender's anchor, applied to the name dialed here; a sender that
         # predates the field sends none, and this falls back to TOFU.
         trust = (
@@ -763,6 +763,7 @@ class TensorFlightClient:
                 location,
                 token,
                 trust,
+                request,
             )
         return _dask_from_flight_info(
             info,
@@ -770,7 +771,7 @@ class TensorFlightClient:
             token,
             cache_bytes,
             trust,
-            requested,
+            request,
         )
 
     # ====================

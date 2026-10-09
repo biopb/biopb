@@ -1727,11 +1727,15 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints.append(endpoint)
 
         logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
-        # The requested slice, verbatim, so the plan says what it was asked for
-        # as well as what it realized: the descriptor's slice_hint is snapped
-        # outward to chunk-aligned bounds, and a consumer -- this connection or
-        # one handed the FlightInfo as a SerializedTensor -- crops back to the
-        # request from here rather than remembering it separately.
+        # What the plan was asked for, verbatim, so it says that as well as what
+        # it realized: the descriptor's slice_hint is snapped outward to
+        # chunk-aligned bounds, and a consumer -- this connection or one handed
+        # the FlightInfo as a SerializedTensor -- crops back to the request, or
+        # replays it, from here rather than remembering it separately. The
+        # descriptor does not echo the scale and method back: they are in the
+        # request already.
+        read_plan.descriptor.ClearField("scale_hint")
+        read_plan.descriptor.ClearField("reduction_method")
         return flight.FlightInfo(
             schema=schema,
             descriptor=flight.FlightDescriptor.for_command(
@@ -1740,11 +1744,7 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints=endpoints,
             total_records=-1,
             total_bytes=-1,
-            app_metadata=(
-                read_opt.slice_hint.SerializeToString()
-                if read_opt.HasField("slice_hint")
-                else b""
-            ),
+            app_metadata=read_opt.SerializeToString(),
         )
 
     def _may_read(

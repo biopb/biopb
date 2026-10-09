@@ -74,6 +74,7 @@ from biopb.tensor._tls import (
     is_tls_location,
     resolve_tls_trust,
 )
+from biopb.tensor._wire_version import FLIGHT_PROTOCOL_METADATA_KEY
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -327,13 +328,16 @@ def _refetch_flight_info(
     location: str,
     token: Optional[str],
     tls_trust: Optional[TlsTrust] = None,
+    request: Optional[TensorReadOption] = None,
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
     For a handle that carries no endpoints -- a source declared before its
     chunks existed, or one whose producer chose not to embed a plan. The
-    request is rebuilt from the descriptor's realized slice, scale and
-    reduction, so the answer is the same plan its producer would have got.
+    request is the one the handle recorded (*request*, see :func:`_plan_request`)
+    replayed for its endpoints; a handle that recorded none has it rebuilt from
+    the descriptor's realized slice, so the answer is the same plan its producer
+    would have got either way.
 
     Reuses the worker's pooled per-thread connection (with its tuned gRPC
     message-size options) rather than dialing a throwaway client; a later
@@ -345,12 +349,15 @@ def _refetch_flight_info(
     # `endpoints` is explicit: this call exists to get them, and nothing is
     # implied by the mask any more.
     read_opt = _read_option(endpoints=True)
-    if descriptor.HasField("slice_hint"):
+    if request is not None and (
+        request.HasField("slice_hint") or request.scale_hint or request.reduction_method
+    ):
+        if request.HasField("slice_hint"):
+            read_opt.slice_hint.CopyFrom(request.slice_hint)
+        read_opt.scale_hint[:] = list(request.scale_hint)
+        read_opt.reduction_method = request.reduction_method
+    elif descriptor.HasField("slice_hint"):
         read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
-    if descriptor.scale_hint:
-        read_opt.scale_hint[:] = list(descriptor.scale_hint)
-    if descriptor.reduction_method:
-        read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
     client = _get_thread_client(
@@ -363,33 +370,53 @@ def _refetch_flight_info(
     return info
 
 
-def _requested_slice(info: "flight.FlightInfo") -> Optional[SliceHint]:
-    """The slice a plan was asked for, off ``FlightInfo.app_metadata``.
+def _plan_request(info: "flight.FlightInfo") -> TensorReadOption:
+    """The request a plan answers, as a ``TensorReadOption``, whichever protocol
+    wrote it.
 
-    The server stamps the request's ``slice_hint`` there verbatim, beside the
-    chunk-aligned realized one in the descriptor. None for an unsliced read.
+    A v3 plan carries the whole request in ``FlightInfo.app_metadata``. A v2 plan
+    carried only the requested ``SliceHint`` there and echoed the scale and
+    method on its descriptor, so those are put back together here: everything
+    past this function reads one shape, and a v2 server costs one branch. Which
+    wrote the plan is stamped on its schema, not asked of a connection, because
+    a plan travels (``SerializedTensor``). A plan with no stamp is v2, and one
+    built by hand with nothing recorded comes back empty.
     """
+    metadata = info.schema.metadata or {}
+    stamped = metadata.get(FLIGHT_PROTOCOL_METADATA_KEY.encode())
     raw = info.app_metadata
-    return SliceHint.FromString(raw) if raw else None
+    if stamped and int(stamped) >= 3:
+        return TensorReadOption.FromString(raw) if raw else TensorReadOption()
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    request = TensorReadOption(array_id=descriptor.array_id)
+    if raw:
+        request.slice_hint.CopyFrom(SliceHint.FromString(raw))
+    request.scale_hint[:] = list(descriptor.scale_hint)
+    request.reduction_method = descriptor.reduction_method
+    return request
 
 
 def _crop_slices(
     descriptor: TensorDescriptor,
-    requested: Optional[SliceHint],
+    request: Optional[TensorReadOption],
     ndim: int,
 ) -> Optional[Tuple[slice, ...]]:
-    """The slices that crop a plan's realized region back to *requested*, or None
-    when nothing was requested or the plan carries no realized slice.
+    """The slices that crop a plan's realized region back to what *request* asked
+    for, or None when it asked for no slice or the plan carries no realized one.
 
     The one rule for both forms of a read (lazy and eager), so they cannot drift.
     """
-    if requested is None or not descriptor.HasField("slice_hint"):
+    if (
+        request is None
+        or not request.HasField("slice_hint")
+        or not descriptor.HasField("slice_hint")
+    ):
         return None
     return _request_crop_slices(
         ndim,
-        requested,
+        request.slice_hint,
         descriptor.slice_hint,
-        list(descriptor.scale_hint) if descriptor.scale_hint else None,
+        list(request.scale_hint) if request.scale_hint else None,
     )
 
 
@@ -399,15 +426,15 @@ def _dask_from_flight_info(
     token: Optional[str],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust],
-    requested: Optional[SliceHint] = None,
+    request: Optional[TensorReadOption] = None,
 ) -> da.Array:
     """The lazy array a planned read describes.
 
     The one reconstruction, whether the FlightInfo came from this connection's
     GetFlightInfo (``get_tensor``) or arrived serialized from another process
     (``tensor_from_pb``): decode the descriptor and endpoints, build the
-    chunk-fetching array, crop the realized region back to *requested* (the
-    plan's own ``app_metadata`` unless the caller kept an earlier one).
+    chunk-fetching array, crop the realized region back to *request* (the
+    plan's own unless the caller kept an earlier one).
     """
     _check_wire_protocol(info.schema)
     descriptor = TensorDescriptor.FromString(info.descriptor.command)
@@ -427,7 +454,7 @@ def _dask_from_flight_info(
     )
     crop = _crop_slices(
         descriptor,
-        _requested_slice(info) if requested is None else requested,
+        _plan_request(info) if request is None else request,
         len(shape),
     )
     return dask_arr if crop is None else dask_arr[crop]
@@ -459,7 +486,7 @@ def _array_from_flight_info(
     arr = _fetch_chunk_distributed(
         location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust, grant
     )
-    crop = _crop_slices(descriptor, _requested_slice(info), len(shape))
+    crop = _crop_slices(descriptor, _plan_request(info), len(shape))
     if crop is None:
         return arr
     cropped = arr[crop]
@@ -513,7 +540,10 @@ def _check_flight_protocol(
     or None if it published none, could not be reached, or isn't a biopb
     server at all -- the caller falls back to its own dial address either way.
     """
-    from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
+    from biopb.tensor._wire_version import (
+        FLIGHT_PROTOCOL_VERSION,
+        SUPPORTED_FLIGHT_PROTOCOLS,
+    )
 
     try:
         results = client.do_action(flight.Action("health", b""), options=call_options)
@@ -536,11 +566,12 @@ def _check_flight_protocol(
         server_ver = int(health.get("protocol", 1))
     except (ValueError, TypeError):
         server_ver = 1
-    if server_ver != FLIGHT_PROTOCOL_VERSION:
-        stale = "server" if server_ver < FLIGHT_PROTOCOL_VERSION else "client"
+    if server_ver not in SUPPORTED_FLIGHT_PROTOCOLS:
+        stale = "server" if server_ver < min(SUPPORTED_FLIGHT_PROTOCOLS) else "client"
         raise RuntimeError(
             f"Incompatible biopb Flight protocol: the server at {location} speaks "
-            f"v{server_ver}, this client speaks v{FLIGHT_PROTOCOL_VERSION}. "
+            f"v{server_ver}, this client speaks "
+            f"v{min(SUPPORTED_FLIGHT_PROTOCOLS)}-v{FLIGHT_PROTOCOL_VERSION}. "
             f"Upgrade the {stale} so both sides match."
         )
     advertised = health.get("external_location")
