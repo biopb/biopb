@@ -1636,9 +1636,10 @@ class Reconciler:
         displaced: Optional[Any] = None
         try:
             # What can be rebuilt from its row may be let go when idle: a local
-            # file source with a claim. A cloud recall, a proxy and a drop-in
-            # upload are held for as long as they are registered.
-            evictable = not recall and self._deferrable(claim)
+            # file source with a claim. A proxy and an upload are held for as
+            # long as they are registered. A cloud source waiting for a recall is
+            # pending, not registered, and is never rebuilt here.
+            evictable = self._deferrable(claim)
             if replace:
                 adapter, displaced = self._server.swap_source(
                     claim.source_id, adapter, evictable
