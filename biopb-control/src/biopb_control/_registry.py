@@ -159,6 +159,54 @@ def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
     return written
 
 
+def _new_name(name: str, directory: Path) -> str:
+    """*name* made safe for a file stem; ValueError when empty, reserved or taken."""
+    name = _UNSAFE_IN_A_NAME.sub("-", name).strip("-")
+    if not name or name.startswith("_"):
+        raise ValueError(
+            "name must be letters, digits, '-' or '_', not starting with '_'"
+        )
+    if any((directory / f"{name}{ext}").exists() for ext in (".py", ".json")):
+        raise ValueError(f"an entry named {name!r} already exists")
+    return name
+
+
+def register_url(
+    url: str, name: Optional[str] = None, directory: Optional[Path] = None
+) -> str:
+    """Add a url entry for a server someone else runs; answer its name.
+
+    Raises ValueError for a bad URL or a name that is unusable or taken.
+    """
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("grpc", "grpcs") or not parsed.netloc:
+        raise ValueError("URL must be grpc://host:port or grpcs://host:port")
+    directory = directory or registry_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    name = _new_name(name or _name_for(url), directory)
+    with open(directory / f"{name}.json", "x", encoding="utf-8") as f:
+        f.write(json.dumps({"url": url}) + "\n")
+    return name
+
+
+def deregister(name: str, directory: Optional[Path] = None) -> None:
+    """Remove the url entry named *name*; KeyError when there is none.
+
+    ValueError for a script entry: that is a file on this machine, managed there.
+    """
+    directory = directory or registry_dir()
+    script = directory / f"{name}.py"
+    path = directory / f"{name}.json"
+    if name.startswith("_") or not (
+        path.exists() or script.exists() or script.is_symlink()
+    ):
+        raise KeyError(name)
+    if script.exists() or script.is_symlink():
+        raise ValueError(f"{name} is a local server file; remove it from {directory}")
+    path.unlink()
+
+
 # --------------------------------------------------------------------------- #
 # Probing a server (lazy gRPC)
 # --------------------------------------------------------------------------- #

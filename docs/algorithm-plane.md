@@ -220,6 +220,8 @@ the control, as `failed` and the log tail.
 | `POST /api/algorithms/refresh` | install and describe new or edited entries, probe url entries |
 | `POST /api/algorithms/{ensure,stop,restart}` | one entry by name |
 | `GET /api/algorithms/logs?name=&lines=` | a script entry's log tail |
+| `POST /api/algorithms/register` | add a url entry: `{url, name?}` for a server someone else runs |
+| `POST /api/algorithms/deregister?name=` | remove a url entry; a script entry is a file on this machine and is refused (400) |
 
 The routes sit behind the control's token like the rest of `/api`. A verb
 waits at most `?client_timeout` less five seconds (at most the install bound,

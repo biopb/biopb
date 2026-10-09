@@ -24,6 +24,8 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      its loopback url and token.
 - ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
+- ``POST /api/algorithms/register`` (``{url, name?}``), ``POST
+  /api/algorithms/deregister`` (``?name=``) -> add or remove a url entry.
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
 - ``POST /api/sessions/new``      -> launch a session on this machine; its
@@ -1442,6 +1444,38 @@ def build_app(
             logger.exception("api/algorithms/refresh failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    async def algorithms_register(request: Request) -> JSONResponse:
+        # Add a url entry for a server someone else runs: {"url", "name"?}.
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = None
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            return JSONResponse({"error": "give a url"}, status_code=400)
+        try:
+            added = algorithms.register_url(body["url"], body.get("name") or None)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms/register failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"name": added})
+
+    def algorithms_deregister(request: Request) -> JSONResponse:
+        # Remove a url entry by ?name=; a script entry is a file on this machine
+        # and is refused (400).
+        name = request.query_params.get("name", "")
+        try:
+            algorithms.deregister(name)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except KeyError:
+            return JSONResponse({"error": f"no algorithm {name!r}"}, status_code=404)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms/deregister failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"name": name})
+
     def algorithms_ensure(request: Request) -> JSONResponse:
         return _algorithm_verb(
             request, lambda name, wait: {"server": algorithms.ensure(name, wait)}
@@ -1762,6 +1796,8 @@ def build_app(
         Route("/api/viewer/capture", viewer_capture, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
+        Route("/api/algorithms/register", algorithms_register, methods=["POST"]),
+        Route("/api/algorithms/deregister", algorithms_deregister, methods=["POST"]),
         Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
         Route("/api/algorithms/stop", algorithms_stop, methods=["POST"]),
         Route("/api/algorithms/restart", algorithms_restart, methods=["POST"]),

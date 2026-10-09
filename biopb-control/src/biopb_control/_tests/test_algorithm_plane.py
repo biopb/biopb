@@ -374,3 +374,97 @@ def test_no_control_is_none(monkeypatch):
     assert client.algorithms(timeout=1) is None
     with pytest.raises(RuntimeError, match="no control"):
         client.ensure_algorithm("x", timeout=1)
+
+
+# --------------------------------------------------------------------------- #
+# Adding and removing entries
+# --------------------------------------------------------------------------- #
+
+
+def test_register_url_writes_an_entry(registry):
+    name = _registry.register_url("grpc://host:50051", directory=registry)
+    assert name == "host-50051"
+    assert json.loads((registry / "host-50051.json").read_text()) == {
+        "url": "grpc://host:50051"
+    }
+    assert _registry.entries(registry)[0]["url"] == "grpc://host:50051"
+
+
+@pytest.mark.parametrize("url", ["http://host:1", "host:1", "grpc://", ""])
+def test_register_url_rejects_a_bad_url(registry, url):
+    with pytest.raises(ValueError, match="grpc"):
+        _registry.register_url(url, directory=registry)
+
+
+def test_register_refuses_a_taken_or_reserved_name(registry):
+    (registry / "seg.py").write_text(_server())
+    with pytest.raises(ValueError, match="already exists"):
+        _registry.register_url("grpc://h:1", "seg", directory=registry)
+    with pytest.raises(ValueError, match="name"):
+        _registry.register_url("grpc://h:1", "_x", directory=registry)
+
+
+def test_deregister_deletes_a_url_entry(registry):
+    name = _registry.register_url("grpc://h:1", directory=registry)
+    _registry.deregister(name, directory=registry)
+    assert list(registry.iterdir()) == []
+    with pytest.raises(KeyError):
+        _registry.deregister(name, directory=registry)
+
+
+def test_deregister_refuses_a_script_entry(registry):
+    (registry / "seg.py").write_text(_server())
+    with pytest.raises(ValueError, match="local server file"):
+        _registry.deregister("seg", directory=registry)
+    assert (registry / "seg.py").exists()
+
+
+def test_deregister_knows_no_reserved_name(registry):
+    (registry / "_x.py").write_text(_server())
+    with pytest.raises(KeyError):
+        _registry.deregister("_x", directory=registry)
+
+
+def _post_json(path, body):
+    import urllib.error
+    import urllib.request
+
+    from biopb._control import _client
+
+    req = urllib.request.Request(
+        _client.control_base_url() + path,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_register_and_deregister_over_http(control, registry):
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"}) == (
+        200,
+        {"name": "h-1"},
+    )
+    assert _post_json(
+        "/api/algorithms/register", {"url": "grpc://h:2", "name": "mine"}
+    ) == (
+        200,
+        {"name": "mine"},
+    )
+    assert _post_json("/api/algorithms/register", {"url": "http://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"path": "/x/seg.py"})[0] == 400
+    assert _post_json("/api/algorithms/register", {})[0] == 400
+
+    from biopb import _control as client
+
+    (registry / "seg.py").write_text(_server())
+    assert {r["name"] for r in client.algorithms()} == {"h-1", "mine", "seg"}
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 200
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 404
+    assert _post_json("/api/algorithms/deregister?name=seg", {})[0] == 400
+    assert {r["name"] for r in client.algorithms()} == {"mine", "seg"}

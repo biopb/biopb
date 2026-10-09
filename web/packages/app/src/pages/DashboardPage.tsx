@@ -87,6 +87,7 @@ export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
   const [agents, setAgents] = useState<AgentRec[] | null>(null);
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
+  const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -182,6 +183,54 @@ export default function DashboardPage() {
       /* keep last */
     }
   }, []);
+
+  // Add or remove a registry entry, then re-list. The control reports a
+  // refusal (bad url, taken name) as {error}.
+  const algoEdit = useCallback(
+    async (path: string, body?: object) => {
+      setAlgosBusy(true);
+      try {
+        const r = await sessionFetch(withBase(path), {
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const res = await r.json().catch(() => ({}));
+        if (res && res.error) alert("Failed: " + res.error);
+      } catch (e) {
+        alert("Failed: " + String(e));
+      }
+      await pollAlgos();
+      setAlgosBusy(false);
+    },
+    [pollAlgos],
+  );
+
+  const registerRemote = () => {
+    const url = prompt("URL of the algorithm server (grpc://host:port or grpcs://host:port)");
+    if (!url?.trim()) return;
+    // The server's own default (host and port, made filename-safe), offered for
+    // editing. Cancelling this second dialog cancels the registration; blank
+    // leaves the choice to the server.
+    let host = url.trim();
+    try {
+      host = new URL(url.trim().replace(/^grpcs?:/i, "http:")).host || host;
+    } catch {
+      // not a URL; the server refuses it with its own message
+    }
+    const suggested = host.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    const name = prompt("Name for this server", suggested || "server");
+    if (name === null) return;
+    algoEdit("/api/algorithms/register", { url: url.trim(), name: name.trim() || undefined });
+  };
+  // A script entry is a file on the control's machine: the control starts and
+  // stops it, and the entry itself is managed on disk.
+  const algoVerb = (s: AlgoRec, verb: "ensure" | "stop") =>
+    algoEdit("/api/algorithms/" + verb + "?name=" + encodeURIComponent(s.name));
+  const deregister = (s: AlgoRec) => {
+    if (confirm("Deregister " + s.name + "?"))
+      algoEdit("/api/algorithms/deregister?name=" + encodeURIComponent(s.name));
+  };
 
   // Token-driven unlock gate. Capture a ?token= handed over by the one-time
   // access URL, then — only where the control's /health advertises auth_required
@@ -479,6 +528,9 @@ export default function DashboardPage() {
             <button className="mini" onClick={pollAlgos}>
               ↻
             </button>
+            <button className="mini" disabled={algosBusy} onClick={registerRemote}>
+              Register remote
+            </button>
           </h2>
           <ul>
             {algos == null ? (
@@ -486,7 +538,15 @@ export default function DashboardPage() {
             ) : algos.length === 0 ? (
               <li className="empty">no algorithm servers configured</li>
             ) : (
-              algos.map((s, i) => <AlgoRow key={i} s={s} />)
+              algos.map((s) => (
+                <AlgoRow
+                  key={s.name}
+                  s={s}
+                  busy={algosBusy}
+                  onDeregister={deregister}
+                  onVerb={algoVerb}
+                />
+              ))
             )}
           </ul>
           <p className="note">
@@ -617,7 +677,17 @@ export default function DashboardPage() {
 // One algorithm-plane row: a status dot, host:port (TLS tag for grpcs), the
 // state + op count, and an ops preview (full list in the hover title). A
 // non-serving server shows its error message in the preview slot instead.
-function AlgoRow({ s }: { s: AlgoRec }) {
+function AlgoRow({
+  s,
+  busy,
+  onDeregister,
+  onVerb,
+}: {
+  s: AlgoRec;
+  busy: boolean;
+  onDeregister: (s: AlgoRec) => void;
+  onVerb: (s: AlgoRec, verb: "ensure" | "stop") => void;
+}) {
   const serving = s.state === "up";
   // A script entry that is installed but not running is healthy: it starts
   // on its first call.
@@ -645,6 +715,21 @@ function AlgoRow({ s }: { s: AlgoRec }) {
           {s.error}
         </span>
       ) : null}
+      <span className="agent-btns">
+        {s.kind === "url" ? (
+          <button className="danger" disabled={busy} onClick={() => onDeregister(s)}>
+            Deregister
+          </button>
+        ) : ["new", "stopped", "failed"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "ensure")}>
+            Start
+          </button>
+        ) : ["up", "starting"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "stop")}>
+            Stop
+          </button>
+        ) : null}
+      </span>
     </li>
   );
 }
