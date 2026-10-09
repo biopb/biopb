@@ -545,7 +545,6 @@ tensor = [
     { name = "cachey" },
     { name = "dask", extra = ["array"] },
     { name = "pyarrow" },
-    { name = "zarr" },
 ]
 test = [
     { name = "biopb-mcp" },
@@ -576,7 +575,6 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
     { name = "typer", specifier = ">=0.12.0" },
-    { name = "zarr", marker = "extra == 'tensor'", specifier = ">=2.0.0" },
 ]
 provides-extras = ["test", "shim", "tensor", "doc"]
 

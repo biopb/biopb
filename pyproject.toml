@@ -60,7 +60,6 @@ dependencies = [
     "pyarrow >= 14.0.0",
     "dask[array] >= 2024.0.0",
     "cachey >= 0.1.0",
-    "zarr >= 2.0.0",
   ]
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the
   # release publishes to biopb.org/docs/api/python/ — see docs-api/ and
@@ -73,7 +72,7 @@ dependencies = [
   # source statically (griffe), so it alone needs no heavy runtime deps to
   # build -- but mkdocs-typer2 (the CLI reference, see docs/cli.md) walks the
   # Typer app's actual command tree, which imports biopb.tensor.cli and so
-  # needs the `tensor` extra (pyarrow/dask/zarr) at doc-build time too.
+  # needs the `tensor` extra (pyarrow/dask) at doc-build time too.
   doc = [
     "mkdocs-material==9.5.49",
     "mkdocstrings[python]>=0.27,<0.30",
