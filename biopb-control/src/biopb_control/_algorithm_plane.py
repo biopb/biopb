@@ -549,15 +549,15 @@ class AlgorithmPlane:
 
     def register_url(self, url: str, name: Optional[str] = None) -> str:
         """Add a url entry; answer its name. ValueError for a bad URL or name."""
-        return _algorithms.register_url(url, name, self._directory)
+        return _registry.register_url(url, name, self._directory)
 
     def register_script(self, source: str, name: Optional[str] = None) -> str:
         """Add a script entry for the server file *source*; answer its name."""
-        return _algorithms.register_script(source, name, self._directory)
+        return _registry.register_script(source, name, self._directory)
 
     def deregister(self, name: str) -> None:
         """Remove an entry; a script entry's server is stopped. KeyError if unknown."""
-        _algorithms.deregister(name, self._directory)
+        _registry.deregister(name, self._directory)
         self._entries()
 
     def _find(self, name: str) -> tuple[Optional[dict], Optional[ScriptEntry]]:
