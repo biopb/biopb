@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["biopb-image-base", "cellpose"]
 # ///
 """A cellpose segmentation op, served over the biopb.image Ops protocol."""

@@ -480,7 +480,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
     { name = "typer", specifier = ">=0.12.0" },
-    { name = "zarr", marker = "extra == 'tensor'", specifier = ">=2.0.0" },
+    { name = "zarr", marker = "extra == 'tensor'", specifier = ">=3.0.8" },
 ]
 provides-extras = ["test", "shim", "tensor", "doc"]
 
@@ -532,7 +532,6 @@ stitch = [
 ]
 test = [
     { name = "biopb", extra = ["tensor"] },
-    { name = "biopb-tensor-server" },
     { name = "pytest" },
     { name = "scipy" },
 ]
@@ -542,7 +541,6 @@ requires-dist = [
     { name = "biopb", editable = "." },
     { name = "biopb", extras = ["tensor"], marker = "extra == 'lazy'", editable = "." },
     { name = "biopb", extras = ["tensor"], marker = "extra == 'test'", editable = "." },
-    { name = "biopb-tensor-server", marker = "extra == 'test'", editable = "biopb-tensor-server" },
     { name = "grpcio" },
     { name = "grpcio-health-checking" },
     { name = "numpy" },
