@@ -75,7 +75,6 @@ from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
 from biopb_tensor_server.core.adapter_base import to_catalog_url
-from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
 
@@ -1691,7 +1690,7 @@ class MetadataDatabase:
         adapter's own (a catalog on its own has no attachments)."""
         if self._registry is not None:
             return self._registry.catalog_tensors(source_id, adapter)
-        return Attachments(source_id).catalog_tensors(adapter)
+        return list(adapter.list_tensors())
 
     @staticmethod
     def _tensor_rows(catalog: Sequence[Any]) -> List[Dict[str, Any]]:

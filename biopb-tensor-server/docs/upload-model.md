@@ -117,10 +117,12 @@ one `Attachments` per source id (`core/attachments.py`), scanned from disk once
 at boot and independent of the adapter, so an adapter rebuilt by a refresh
 leaves the tensors and an upload in flight where they were. Adapters know
 nothing of them: the registry resolves a tensor id (`resolve_tensor`), lists a source (`catalog_tensors`) and answers the
-capability token. `label_sets` and `attached_fields` are
-checked views over the index -- `label_sets` is the attached tensors whose
-field parses as a set, each checked against
-`label_binding_error`. A field differs from a label set in
+capability token. A label set is checked once per change, not per
+read: `rebind` (which `SourceRegistry.register` calls on every registration of
+the source, so a refresh and a rebuild after eviction pass through it) snapshots
+the parent's images and judges every set against them, and attaching, detaching
+or publishing a field judges them again. A set must bind to an image of the
+source and span it; one that does not stays listed and raises on read. A field differs from a label set in
 binding to nothing, decoding nothing, and mapping to no axes.
 
 A set may bind to an uploaded field, since a field is a tensor of its

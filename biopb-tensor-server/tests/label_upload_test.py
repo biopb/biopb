@@ -220,10 +220,10 @@ class TestTheExtentOfASet:
 
         store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
         reg = SourceRegistry()
-        adapter = reg.register("img", _adapter(store, "img"))
+        reg.register("img", _adapter(store, "img"))
         old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
 
-        why = reg.attached_to("img").label_binding_error(adapter, "@labels/old", old)
+        why = reg.attached_to("img").conform_label("@labels/old", old)
         assert "does not span" in why
 
     def test_a_channel_axis_at_the_images_length_is_refused(
@@ -325,12 +325,12 @@ class TestWhatTheKindRefuses:
         """Sealed, like any finished upload -- there is no chunk-level edit."""
         from biopb_tensor_server.core.errors import UploadSealedError
 
-        registered = served.sources.get("oz1")
+        served.sources.get("oz1")
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         with pytest.raises(UploadSealedError):
-            served.sources.attached_to("oz1").label_sets(registered)[
-                "@labels/nuclei"
-            ].put_chunk(None, None, None, None)
+            served.sources.attached_to("oz1").get("@labels/nuclei").put_chunk(
+                None, None, None, None
+            )
 
     def test_a_set_that_is_not_an_upload_refuses_a_write_outright(self, tmp_path):
         """A sidecar read back at startup tracks no upload at all."""
@@ -400,9 +400,7 @@ class TestTheSidecar:
         )
         try:
             registered = register_and_catalog(fresh, "oz1", _adapter(image))
-            assert "@labels/nuclei" in fresh.sources.attached_to("oz1").label_sets(
-                registered
-            )
+            assert fresh.sources.attached_to("oz1").get("@labels/nuclei") is not None
             assert "oz1/@labels/nuclei" in [
                 t.array_id for t in fresh.sources.catalog_tensors("oz1", registered)
             ]

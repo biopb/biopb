@@ -1,6 +1,6 @@
 """Label sets are tensors of their image (biopb/biopb#1059 step 2).
 
-The registry answers for them -- ``attached_to(...).label_sets``,
+The registry answers for them -- ``attached_to(...).listed``,
 ``resolve_tensor`` -- so the format's own listing
 and routing stay untouched, the catalog lists them after the image tensors, and
 the serve path reaches them by ``array_id`` like any tensor. Two origins here:
@@ -351,6 +351,11 @@ def _sidecar(
     )
 
 
+def _listed(reg):
+    """The fields of ``oz1`` the catalog lists."""
+    return {field for field, _ in reg.attached_to("oz1").listed()}
+
+
 def _adopting(labels_dir):
     """A registry that took the finished sidecars of ``oz1`` at boot."""
     registry = SourceRegistry()
@@ -366,9 +371,9 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "other", "theirs")
 
         reg = _adopting(labels_dir)
-        adapter = reg.register("oz1", _adapter(image))
+        reg.register("oz1", _adapter(image))
 
-        assert set(reg.attached_to("oz1").label_sets(adapter)) == {"@labels/mine"}
+        assert _listed(reg) == {"@labels/mine"}
         mine = reg.resolve_tensor("oz1", "oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
@@ -384,12 +389,10 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "oz1", "fits")
 
         reg = _adopting(labels_dir)
-        adapter = reg.register("oz1", _adapter(image))
+        reg.register("oz1", _adapter(image))
 
         stale = {"@labels/small", "@labels/extra", "Image:9/@labels/orphan"}
-        assert set(reg.attached_to("oz1").label_sets(adapter)) == (
-            {"@labels/fits"} | stale
-        )
+        assert _listed(reg) == ({"@labels/fits"} | stale)
         for name in sorted(stale):
             with pytest.raises(AttachedTensorMismatch):
                 reg.resolve_tensor("oz1", name)
@@ -403,14 +406,14 @@ class TestASidecarIsAttachedAtRegistration:
         (group / ".zattrs").write_text(json.dumps(attrs))
 
         reg = _adopting(labels_dir)
-        adapter = reg.register("oz1", _adapter(image))
-        assert "@labels/untokened" not in reg.attached_to("oz1").label_sets(adapter)
+        reg.register("oz1", _adapter(image))
+        assert "@labels/untokened" not in _listed(reg)
 
     def test_nothing_adopted_means_no_sidecars(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
         reg = SourceRegistry()
-        adapter = reg.register("oz1", _adapter(image))
-        assert "@labels/mine" not in reg.attached_to("oz1").label_sets(adapter)
+        reg.register("oz1", _adapter(image))
+        assert "@labels/mine" not in _listed(reg)
 
     def test_attach_and_detach_by_hand(self, reg, tmp_path):
         group = _sidecar(tmp_path / "labels", "oz1", "late")

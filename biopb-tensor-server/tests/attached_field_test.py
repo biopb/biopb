@@ -170,7 +170,7 @@ class TestListingAndReading:
         attached = writable_server.sources.attached_to("theirs")
 
         assert "@fields/filling" in writable_server.sources.attachments("theirs")
-        assert attached.attached_fields() == {}
+        assert attached.listed() == []
         status = client.get_upload_status("theirs/@fields/filling")
         assert status["state"] == "PENDING"
         with pytest.raises(flight.FlightError):
@@ -178,7 +178,7 @@ class TestListingAndReading:
 
     def test_a_label_set_binds_to_an_uploaded_field(self, client, discovered):
         """A field is a tensor of its source like any other, so a set may span
-        one (``Attachments.normalized_tensors`` reads the attached fields)."""
+        one (``Attachments`` binds a set against the attached fields)."""
         desc = _add(client, discovered, "raw")
         client.upload_array(desc, _arr())
 
@@ -299,7 +299,7 @@ class TestDiscardAndDelete:
         client.set_upload_status(desc.array_id, "DISCARDED")
 
         assert not store.exists()
-        assert writable_server.sources.attached_to("theirs").attached_fields() == {}
+        assert writable_server.sources.attached_to("theirs").listed() == []
 
     def test_a_field_adopted_from_an_earlier_life_deletes(
         self, writable_server, client, tmp_path
