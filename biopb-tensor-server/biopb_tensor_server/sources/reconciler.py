@@ -632,6 +632,9 @@ class Reconciler:
         """
         if self._server.sources.get(source_id) is not None:
             return True
+        with self._lock:
+            if source_id not in self._state.claims:
+                return True
         with self._registration_lock(source_id):
             with self._lock:
                 claim = self._state.claims.get(source_id)

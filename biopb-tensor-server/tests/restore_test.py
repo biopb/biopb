@@ -513,8 +513,6 @@ class TestRebuildAfterLoss:
         run = _Run(tmp_path)
         run.restore()
         sid = sorted(run.rows())[0]
-        run.server.sources.get_registered(sid)
-        self._lose(run, sid)
         cls = type(run.server.sources.get_registered(sid))
         self._lose(run, sid)
         monkeypatch.setattr(
