@@ -599,3 +599,49 @@ def test_make_channel_schemes():
         _make_channel("http://localhost:1")
     with pytest.raises(ValueError):
         _make_channel("grpc://")
+
+
+# --------------------------------------------------------------------------- #
+# Local or remote
+# --------------------------------------------------------------------------- #
+
+
+def _remote_ops(client, url="grpc://algo.example.org:443"):
+    return _ops(
+        [{"name": "far", "kind": "url", "url": url, "state": "up", "ops": OPS}], client
+    )
+
+
+def test_an_op_shows_the_url_of_its_server(url_ops, client):
+    assert url_ops.double.url.startswith("grpc://127.0.0.1:")
+    assert f"url entry, {url_ops.double.url}" in url_ops.double.__doc__
+    far = _remote_ops(client)
+    assert far.double.url == "grpc://algo.example.org:443"
+    assert "algo.example.org" in far.double.__doc__
+
+
+def test_a_remote_server_is_never_handed_the_plane_token(client):
+    handle = _reference("src/@fields/x", PLANE).lazy
+    handle.auth_token = "plane-secret"
+    client.get_tensor = lambda *_a, **_k: (
+        handle if _k.get("output") == "pb" else (da.ones((2, 2), np.uint8, chunks=2))
+    )
+    far = _remote_ops(client)
+    call = far.lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    with pytest.raises(RuntimeError, match="remote algorithm server"):
+        call._check_no_credential({"image": proto.Arg(lazy=handle)})
+
+
+def test_a_remote_server_gets_inline_data_when_the_plane_advertises_nothing(client):
+    client.advertised_location = None
+    call = _remote_ops(client).lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    assert client.exports == []
+    client.advertised_location = "grpc://plane.example:8815"
+    assert (
+        call._tensor("image", "src/@fields/x", None, client).WhichOneof("kind")
+        == "lazy"
+    )
