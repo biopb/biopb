@@ -562,6 +562,33 @@ function Add-ToUserPath {
     if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
 }
 
+# Absolute path of one of biopb's console scripts (biopb, biopb-shim, ...) as
+# installed by THIS engine's `uv tool install`, or $null if it isn't there.
+# Looks in uv's tool bin dir, never PATH: Add-ToUserPath APPENDS ~/.local/bin, so
+# in a shell with a dev venv active that venv's biopb.exe wins a PATH lookup and
+# the engine would start the control plane -- and point the Desktop shortcut and
+# agent configs -- at the dev checkout instead of what it just installed.
+# -AllowPath falls back to PATH, for the stop-before-replace calls where any
+# biopb that can reach the running control plane will do.
+function Get-BiopbToolExe {
+    param([string]$Name, [switch]$AllowPath)
+    $binDir = $null
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $binDir = @(uv tool dir --bin 2>$null)[0] } catch { }
+        $ErrorActionPreference = $prevEAP
+    }
+    if (-not $binDir) { $binDir = Join-Path $env:USERPROFILE ".local\bin" }
+    $exe = Join-Path "$binDir".Trim() "$Name.exe"
+    if (Test-Path -LiteralPath $exe) { return $exe }
+    if ($AllowPath) {
+        $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    return $null
+}
+
 # Known cloud / synced-folder roots on this machine (OneDrive, iCloud, Dropbox).
 # Returns existing absolute dir paths (no trailing slash), de-duplicated. These
 # are folders whose contents are "Files On-Demand" placeholders that hydrate on
@@ -677,7 +704,7 @@ function Set-McpClients {
     # the install; we gate on $LASTEXITCODE explicitly below.
     $ErrorActionPreference = 'SilentlyContinue'
 
-    $mcpCmd = (Get-Command biopb-shim -ErrorAction SilentlyContinue).Source
+    $mcpCmd = Get-BiopbToolExe biopb-shim
     if (-not $mcpCmd) { $mcpCmd = "biopb-shim" }
 
     # biopb-shim speaks MCP over stdio: the AI agent spawns it as a child process
@@ -695,7 +722,7 @@ function Set-McpClients {
     # so a procedure doc's op requirement is met without the agent re-deriving
     # them. Idempotent (never clobbers a user-edited file); best-effort so a
     # failure never aborts the install.
-    $seedCmd = (Get-Command biopb-mcp-seed-algorithms -ErrorAction SilentlyContinue).Source
+    $seedCmd = Get-BiopbToolExe biopb-mcp-seed-algorithms
     if ($seedCmd) {
         try {
             & $seedCmd | Out-Null
@@ -720,7 +747,9 @@ function Set-McpClients {
     # merge that preserves the user's other servers), so this engine no longer
     # carries a second per-client copy. Output is captured; the summary flag below
     # reads registration state back from the same source of truth.
-    & biopb agents register --all *> $null
+    $biopb = Get-BiopbToolExe biopb
+    if (-not $biopb) { $biopb = "biopb" }
+    & $biopb agents register --all *> $null
     Report-Ok "Registered biopb with detected agent clients (biopb agents)"
 
     # The "register manually" notice fires only if nothing ended up registered.
@@ -728,7 +757,7 @@ function Set-McpClients {
     # here -- one source of truth for the verdict too.
     $script:McpNeedsManual = $true
     try {
-        $agents = (((& biopb agents list --json 2>$null) | Out-String) | ConvertFrom-Json).agents
+        $agents = (((& $biopb agents list --json 2>$null) | Out-String) | ConvertFrom-Json).agents
         if ($agents | Where-Object { $_.state -eq 'registered' }) {
             $script:McpNeedsManual = $false
         }
@@ -849,8 +878,9 @@ function Start-ControlPlane {
         Report-Detail "start it later with: biopb control start"
         return
     }
-    if (-not (Get-Command biopb -ErrorAction SilentlyContinue)) {
-        Report-Warn "biopb not found on PATH; skipping control-plane start"
+    $biopb = Get-BiopbToolExe biopb
+    if (-not $biopb) {
+        Report-Warn "biopb not found in the uv tool bin dir; skipping control-plane start"
         Report-Detail "start it later with: biopb control start"
         return
     }
@@ -864,13 +894,13 @@ function Start-ControlPlane {
     # Retire a prior control plane (+ the data plane it owns) so the new control
     # plane can bind a fresh plane it owns -- it refuses an in-use gRPC port.
     # Best-effort; a no-op on a clean machine.
-    try { & biopb control stop  *> $null } catch { }
+    try { & $biopb control stop  *> $null } catch { }
 
     # Start the control plane; it brings up the data plane by default. Don't
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     $startOut = @()
-    try { $startOut = @(& biopb control start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
+    try { $startOut = @(& $biopb control start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Report-Warn "Control plane failed to start"
@@ -893,7 +923,7 @@ function Start-ControlPlane {
     $serving = $false; $conflict = $false; $controlUp = $false
     for ($i = 0; $i -lt 60; $i++) {
         $out = ""
-        try { $out = (& biopb control status --json 2>$null | Out-String) } catch { $out = "" }
+        try { $out = (& $biopb control status --json 2>$null | Out-String) } catch { $out = "" }
         try {
             $status = $out | ConvertFrom-Json
             $controlUp = [bool]$status.control_api
@@ -1162,12 +1192,11 @@ function Install-DesktopShortcut {
         return
     }
 
-    $cmd = Get-Command biopb -ErrorAction SilentlyContinue
-    if (-not $cmd) {
-        Report-Info "biopb not on PATH; skipping Desktop shortcut"
+    $biopbExe = Get-BiopbToolExe biopb
+    if (-not $biopbExe) {
+        Report-Info "biopb not found in the uv tool bin dir; skipping Desktop shortcut"
         return
     }
-    $biopbExe = $cmd.Source
 
     try {
         $desktop = [Environment]::GetFolderPath('Desktop')
@@ -1416,8 +1445,9 @@ function Invoke-BiopbInstall {
     # anything the next two commands / the force-kill would race. Best-effort
     # (try/catch swallows the benign "nothing running" stderr) and a no-op on a
     # clean machine. Done before the downloads so the OS releases the handles.
-    if (Get-Command biopb -ErrorAction SilentlyContinue) {
-        try { & biopb control stop  *> $null } catch { }
+    $biopbStop = Get-BiopbToolExe biopb -AllowPath
+    if ($biopbStop) {
+        try { & $biopbStop control stop  *> $null } catch { }
         Report-Detail "stopped the running biopb control + data plane so their files can be replaced"
     }
     # Belt-and-suspenders: the graceful stops above miss servers launched ad-hoc
@@ -1955,8 +1985,9 @@ function Invoke-BiopbUninstall {
         # still-running daemon would make `uv tool uninstall` fail to remove the
         # dir on Windows. The control plane goes first -- it owns the data plane, so
         # stopping it is a complete teardown of that pair and stops it respawning.
-        if (Get-Command biopb -ErrorAction SilentlyContinue) {
-            try { & biopb control stop  *> $null } catch { }
+        $biopbStop = Get-BiopbToolExe biopb -AllowPath
+        if ($biopbStop) {
+            try { & $biopbStop control stop  *> $null } catch { }
         }
         # Force-stop any leftover process holding the tool dir open, else the
         # `uv tool uninstall` below fails to delete it with os error 5 (same as
