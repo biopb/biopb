@@ -154,12 +154,14 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
 
   // A listed source carries its url (the tree names its entry from it). One the
   // catalog does not list -- past the listing's limit, or opened from a shared
-  // link -- has none to show, so it falls back to its id.
+  // link before the listing lands -- has none to show, and the row is left out
+  // rather than filled with something that only looks like one. An upload has
+  // an empty url, so its id stands in.
   const sources = useAppStore((s) => s.sources);
-  const sourceUrl = useMemo(
-    () => sources.find((s) => s.source_id === sourceId)?.source_url || sourceId,
-    [sources, sourceId],
-  );
+  const sourceUrl = useMemo(() => {
+    const listed = sources.find((s) => s.source_id === sourceId);
+    return listed ? listed.source_url || sourceId : null;
+  }, [sources, sourceId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -200,8 +202,12 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
                 source. */}
             {activeTensorId ?? sourceId}
           </div>
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
-          <div style={{ fontSize: 12, wordBreak: "break-all" }}>{sourceUrl}</div>
+          {sourceUrl && (
+            <>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
+              <div style={{ fontSize: 12, wordBreak: "break-all" }}>{sourceUrl}</div>
+            </>
+          )}
 
           {tileInfo && (
             <>

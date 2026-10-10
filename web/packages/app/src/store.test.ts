@@ -253,6 +253,32 @@ describe("catalog polling", () => {
       expect(polled(c)).toBe(3);
     });
 
+    it("does not back off while the polls fail", async () => {
+      const c = {
+        listSourcesPage: vi.fn().mockRejectedValue(new Error("server down")),
+        http: { readyz: vi.fn().mockRejectedValue(new Error("server down")) },
+      } as unknown as TensorFlightClient;
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      start(c);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(polled(c)).toBe(3);
+    });
+
+    it("drops a listing that lands after polling was stopped", async () => {
+      let land: (r: { sources: DataSourceDescriptor[]; truncated: boolean }) => void = () => {};
+      const c = {
+        listSourcesPage: vi.fn().mockReturnValue(new Promise((resolve) => (land = resolve))),
+        http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
+      } as unknown as TensorFlightClient;
+      start(c);
+      await vi.advanceTimersByTimeAsync(30_000); // the poll is now in flight
+      useAppStore.getState().stopCatalogPolling();
+      land({ sources: [], truncated: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(useAppStore.getState().sources).toEqual([SOURCE]);
+      expect(useAppStore.getState().catalogTruncated).toBe(false);
+    });
+
     it("stops for good when stopped mid-poll", async () => {
       const c = client([SOURCE]);
       start(c);

@@ -146,11 +146,12 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
     const generation = ++_pollingGeneration;
     let step = 0;
 
-    // One poll. True when the catalog moved or is still being indexed, which is
-    // when the next one should come soon.
+    // One poll. True when the next one should come soon: the catalog moved, is
+    // still being indexed, or no answer was had (not connected, or a failure --
+    // a backoff must not widen while the server is the thing that is wrong).
     const poll = async (): Promise<boolean> => {
       const { client } = get();
-      if (!client || get().connectionState !== "connected") return false;
+      if (!client || get().connectionState !== "connected") return true;
 
       // The listing and the scan-in-progress flag are independent. The flag
       // clears the "Indexing…" hint once the background catalog scan finishes
@@ -159,6 +160,9 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
         fetchCatalog(client),
         client.http.readyz().catch(() => null),
       ]);
+      // Stopped, or pointed at another server, while this was in flight: what
+      // it fetched belongs to the old one.
+      if (generation !== _pollingGeneration || get().client !== client) return true;
       if (readyz) set({ scanning: catalogIsFilling(readyz.backend_health) });
 
       // Read after the awaits: a tensor opened while the listing was in
@@ -186,7 +190,7 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
     };
 
     const tick = async () => {
-      let active = false;
+      let active = true;
       try {
         active = await poll();
       } catch (err) {

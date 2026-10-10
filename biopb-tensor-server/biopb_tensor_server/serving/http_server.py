@@ -1910,20 +1910,31 @@ async def list_sources(
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        # One row past the limit is how a caller learns it was cut, without a
-        # second query for the catalog's size.
-        page = f" LIMIT {limit + 1}" if limit is not None else ""
-        table = client.query(_source_list_sql(client) + " ORDER BY source_id" + page)
-        rows = table.to_pylist()
-        _, _, truncated = _truncation(table, len(rows))
-        if limit is not None and len(rows) > limit:
-            rows, truncated = rows[:limit], True
-        _add_unresolved_reasons(client, rows)
-        result = [_source_row_to_dict(row) for row in rows]
+
+        def listing() -> JSONResponse:
+            # One row past the limit is how a caller learns it was cut, without
+            # a second query for the catalog's size.
+            page = f" LIMIT {limit + 1}" if limit is not None else ""
+            table = client.query(
+                _source_list_sql(client) + " ORDER BY source_id" + page
+            )
+            rows = table.to_pylist()
+            _, _, truncated = _truncation(table, len(rows))
+            if limit is not None and len(rows) > limit:
+                rows, truncated = rows[:limit], True
+            _add_unresolved_reasons(client, rows)
+            # Up to a few 10k rows to query, convert and encode: off the loop,
+            # which tile reads share.
+            return JSONResponse(
+                [_source_row_to_dict(row) for row in rows],
+                headers={"X-Truncated": str(truncated).lower()},
+            )
+
+        response = await run_in_threadpool(listing)
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
-        logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
-        return JSONResponse(result, headers={"X-Truncated": str(truncated).lower()})
+        logger.debug(f"list_sources: answered in {elapsed:.1f}ms")
+        return response
     except HTTPException:
         raise
     except Exception as exc:
