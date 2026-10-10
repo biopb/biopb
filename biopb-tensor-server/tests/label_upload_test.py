@@ -145,7 +145,7 @@ class TestTheRoundTrip:
         assert meta["image-label"]["source"] == {"image": "oz1"}
 
 
-def _image_with_axes(root, axes, shape, source_id="img"):
+def _image_with_axes(root, axes, shape, source_id="img", scale=None, unit=None):
     """A one-level OME-Zarr image whose axes are *axes* (``"tcyx"``, ``"yxs"``...)."""
     import zarr
 
@@ -158,14 +158,18 @@ def _image_with_axes(root, axes, shape, source_id="img"):
             {
                 "version": "0.4",
                 "axes": [
-                    {"name": a, **({"type": types[a]} if a in types else {})}
+                    {
+                        "name": a,
+                        **({"type": types[a]} if a in types else {}),
+                        **({"unit": unit} if unit and a in "zyx" else {}),
+                    }
                     for a in axes
                 ],
                 "datasets": [
                     {
                         "path": "0",
                         "coordinateTransformations": [
-                            {"type": "scale", "scale": [1.0] * len(axes)}
+                            {"type": "scale", "scale": scale or [1.0] * len(axes)}
                         ],
                     }
                 ],
@@ -174,6 +178,59 @@ def _image_with_axes(root, axes, shape, source_id="img"):
     }
     (store / ".zattrs").write_text(json.dumps(meta))
     return store
+
+
+class TestACalibratedImage:
+    """An uploaded tensor and a label set are source-scoped: they take the
+    image's physical scale, matched by axis label."""
+
+    @staticmethod
+    def _serve(server, tmp_path):
+        store = _image_with_axes(
+            tmp_path,
+            "tcyx",
+            (1, 1, 64, 64),
+            scale=[1.0, 1.0, 0.5, 0.25],
+            unit="micrometer",
+        )
+        register_and_catalog(server, "img", _adapter(store, "img"))
+
+    @staticmethod
+    def _scale(client, array_id):
+        d = client.get_descriptor(array_id)
+        return list(d.dim_labels), list(d.physical_scale), list(d.physical_unit)
+
+    def test_a_label_set_takes_the_images_scale(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path)
+        arr = np.zeros((1, 1, 64, 64), "uint32")
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(1, 1, 32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        labels, scale, unit = self._scale(client, "img/@labels/n")
+        assert dict(zip(labels, scale, strict=True)) == {
+            "t": 0,
+            "c": 0,
+            "y": 0.5,
+            "x": 0.25,
+        }
+        assert unit[-2:] == ["micrometer", "micrometer"]
+
+    def test_a_field_takes_it_by_label_and_leaves_other_axes_alone(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path)
+        arr = np.zeros((64, 64), "uint16")
+        desc = client.setup_array_upload(
+            "zarr://img/@fields/smooth", arr, dim_labels=["Y", "X"]
+        )
+        client.upload_array(desc, arr)
+
+        _, scale, unit = self._scale(client, "img/@fields/smooth")
+        assert scale == [0.5, 0.25] and unit == ["micrometer"] * 2
 
 
 class TestTheExtentOfASet:

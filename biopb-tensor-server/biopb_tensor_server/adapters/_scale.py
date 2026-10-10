@@ -168,3 +168,30 @@ def mm_summary_scale(summary, dim_labels) -> Optional[Tuple[List[float], List[st
     pixel_um = _first_positive(("PixelSize_um", "PixelSizeUm", "PixelSize_um_"))
     z_um = _first_positive(("z-step_um", "zStep_um", "z_step_um", "Z-step_um"))
     return scale_by_label(dim_labels, {"x": pixel_um, "y": pixel_um, "z": z_um}, MICRON)
+
+
+def inherit_scale(parent, desc) -> None:
+    """Give *desc* the physical scale of the tensor *parent*, axis by axis.
+
+    An uploaded tensor or label set is source-scoped: it carries no calibration
+    of its own and takes its image's, matched by axis label (case-insensitive).
+    An axis the two do not share stays uncalibrated, and nothing is set when
+    the parent has no calibration or none of its axes appear in *desc*.
+    """
+    shown = parent.get_tensor_descriptor()
+    parent._fill_physical_scale(shown)
+    by_label = {
+        str(label).lower(): (size, unit)
+        for label, size, unit in zip(
+            shown.dim_labels,
+            shown.physical_scale,
+            shown.physical_unit,
+            strict=False,
+        )
+        if size > 0
+    }
+    pairs = [by_label.get(str(label).lower(), (0.0, "")) for label in desc.dim_labels]
+    if not any(size for size, _ in pairs):
+        return
+    desc.physical_scale[:] = [size for size, _ in pairs]
+    desc.physical_unit[:] = [unit for _, unit in pairs]
