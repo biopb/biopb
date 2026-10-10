@@ -1390,6 +1390,58 @@ def prune_annotations(
         db.close()
 
 
+@app.command(name="reset-catalog")
+def reset_catalog(
+    config: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Path to config file (biopb.json)",
+    ),
+):
+    """Empty the source catalog, keeping annotations.
+
+    For a server that will not start because the last run's catalog cannot be
+    restored. The next start finds its sources again by a scan, as a first run
+    does. Annotations and cache measurements in the same file are untouched.
+
+    **The server must be stopped**: DuckDB takes an exclusive lock on the file.
+
+    Example:
+        biopb-tensor-server reset-catalog biopb.json
+    """
+    server_config = _load_config_or_exit(config)
+    store = _catalog_store_path(server_config, config)
+    if store is None:
+        console.print(
+            "[yellow]This config has no persistent catalog, so there is nothing "
+            "on disk to reset.[/yellow]"
+        )
+        raise typer.Exit(0)
+    if not store.exists():
+        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
+        raise typer.Exit(0)
+
+    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
+
+    db = MetadataDatabase(store_path=store)
+    try:
+        db.open()
+    except AnnotationStoreError as exc:
+        if "Conflicting lock" in str(exc):
+            console.print(
+                "[red]The catalog is open in another process -- almost certainly "
+                "the server itself. Stop it first.[/red]"
+            )
+        else:
+            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
+    try:
+        removed = db.clear_source_catalog()
+    finally:
+        db.close()
+    console.print(f"[green]Removed {removed} source(s) from the catalog.[/green]")
+
+
 @app.command()
 def version():
     """Show version information."""

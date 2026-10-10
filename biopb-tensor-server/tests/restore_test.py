@@ -4,6 +4,7 @@ Two runs share one catalog file. The second restores what the first persisted, a
 its first walk is a rescan against those claims.
 """
 
+import json
 import os
 import shutil
 
@@ -654,3 +655,42 @@ class TestCloudFlagFlip:
             run.server.sources.get_registered(source_id)
         assert all(r["is_resolved"] for r in run.rows().values())
         run.stop()
+
+
+class TestARestoreThatFails:
+    def test_start_refuses_and_names_the_cli(self, tmp_path, monkeypatch):
+        from biopb_tensor_server.core.errors import AnnotationStoreError
+
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+
+        def boom(rows):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(run.reconciler, "restore", boom)
+        with pytest.raises(AnnotationStoreError, match="reset-catalog"):
+            run.restore()
+        run.stop()
+
+    def test_reset_catalog_empties_the_catalog_tables(self, tmp_path):
+        from biopb_tensor_server.cli import app
+        from typer.testing import CliRunner
+
+        ids = _first_run(tmp_path)
+        store = tmp_path / "catalog.duckdb"
+        config = tmp_path / "biopb.json"
+        config.write_text(
+            json.dumps({"sources": [], "catalog": {"store_path": str(store)}})
+        )
+
+        result = CliRunner().invoke(app, ["reset-catalog", str(config)])
+
+        assert result.exit_code == 0
+        assert f"Removed {len(ids)}" in result.output
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        try:
+            assert db.restorable_rows() == []
+            assert db.query("SELECT source_id FROM sources").num_rows == 0
+        finally:
+            db.close()

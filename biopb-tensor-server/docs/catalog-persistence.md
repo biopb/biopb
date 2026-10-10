@@ -433,6 +433,9 @@ annotations, so deleting it is not the recovery.
 
 Every start restores the last run's catalog in `SourceManager.start()`, before the first
 tick. A first run has no rows, and its scan is the same walk against an empty snapshot.
+A restore that raises stops the start with the error and a pointer to
+`biopb-tensor-server reset-catalog <config>` (server stopped), which empties the catalog
+tables and leaves annotations and cache measurements.
 
 **What is restored.** A source with a claim under a configured root of kind monitored,
 scan-once or cloud. Mirrors and drops are not (a drop's roots live in memory, so its rows

@@ -28,7 +28,7 @@ from biopb_tensor_server.core.discovery import (
     local_path_is_rooted,
     resolve_local_path,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.errors import CatalogRestoreError, UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.reconciler import Reconciler
@@ -322,7 +322,15 @@ class SourceManager:
         if not rows:
             return
         started = time.monotonic()
-        summary = self._reconciler.restore(rows)
+        try:
+            summary = self._reconciler.restore(rows)
+        except Exception as exc:
+            logger.exception("Catalog restore failed")
+            raise CatalogRestoreError(
+                f"The last run's catalog could not be restored ({exc}). Stop the "
+                "server and run `biopb-tensor-server reset-catalog <config>` to "
+                "empty the catalog tables; annotations are kept."
+            ) from exc
         worker = self._registration_worker
         for source_id in summary["queue"]:
             # Newest-first needs a stat each, which is the walk's to pay: restored

@@ -376,3 +376,12 @@ class AnnotationStoreError(RuntimeError):
     server not serving them degrades to an in-memory catalog instead of raising
     this, since nothing else in the file is load-bearing.
     """
+
+
+class CatalogRestoreError(AnnotationStoreError):
+    """The last run's catalog could not be restored at start.
+
+    Fatal for the same reason as its parent: starting anyway would mean a catalog
+    that is not the one on disk. The catalog tables can be emptied with
+    ``biopb-tensor-server reset-catalog``, which leaves annotations alone.
+    """

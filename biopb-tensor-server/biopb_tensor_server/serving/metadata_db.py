@@ -2008,6 +2008,20 @@ class MetadataDatabase:
                 conn.execute("ROLLBACK")
                 raise
 
+    def clear_source_catalog(self) -> int:
+        """Empty the source catalog and its roots, with the reserved ROI rows the
+        registrations derived. Annotations a user drew stay. Returns the number of
+        sources removed: the next start finds its sources again by a scan."""
+        conn = self._get_connection()
+        ids = [
+            r[0]
+            for r in conn.execute("SELECT source_id FROM source_catalog").fetchall()
+        ]
+        self.drop_catalog_rows(ids)
+        with self._write_lock:
+            conn.execute("DELETE FROM catalog_roots")
+        return len(ids)
+
     def rewrite_row_roots(self, rows: Sequence[Tuple[str, str, str]]) -> None:
         """Re-attribute persisted rows to the roots a restore found them under:
         ``(source_id, root_id, rel)`` each."""
