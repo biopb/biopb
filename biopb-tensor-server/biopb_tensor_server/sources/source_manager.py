@@ -84,6 +84,8 @@ class AddSourceTally:
     # Offline placeholder files the walk passed over because the drop was not a
     # cloud root; non-zero means the import is incomplete.
     skipped_offline: int = 0
+    # Cloud-sync directories (OneDrive) pruned by name; their files are not counted.
+    skipped_cloud_dirs: int = 0
 
 
 class SourceManager:
@@ -1244,6 +1246,7 @@ class SourceManager:
         )
         claims: List[SourceClaim] = list(scratch.claims.values())
         tally.skipped_offline = report.offline_files
+        tally.skipped_cloud_dirs = report.cloud_dirs
 
         # Assign identity to every claim up front so the overlap check below
         # can see the whole drop before any of it is committed.

@@ -1211,6 +1211,19 @@ class TestDropCloudFolder:
         assert sid not in server.registered  # a row and a claim, no adapter
         assert server._metadata_db.pending == [(sid, True)]
 
+    @pytest.mark.parametrize("cloud", [False, True])
+    def test_a_pruned_onedrive_directory_is_counted(self, tmp_path, cloud):
+        folder = tmp_path / "parent"
+        (folder / "OneDrive").mkdir(parents=True)
+        (folder / "OneDrive - Lab").mkdir()
+        (folder / "OneDrive" / "scan.nii").write_bytes(b"payload")
+        (folder / "other").mkdir()
+
+        result = _drop(_make_manager(_FakeServer()), folder, cloud=cloud)
+
+        assert result.added == []
+        assert result.skipped_cloud_dirs == 2
+
     def test_the_root_stays_cloud_for_the_later_checks(
         self, tmp_path, force_nonresident
     ):

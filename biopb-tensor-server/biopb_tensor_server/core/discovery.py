@@ -133,6 +133,12 @@ _OFFLINE_ATTR_MASK = (
 _SKIP_OFFLINE = os.environ.get("BIOPB_DISCOVERY_SKIP_OFFLINE", "1") != "0"
 
 
+def _is_cloud_dir(name: str) -> bool:
+    """True for a OneDrive root: ``OneDrive`` or ``OneDrive - <Org>``."""
+    low = name.lower()
+    return low == "onedrive" or low.startswith(("onedrive -", "onedrive-"))
+
+
 def _is_skippable_system_dir(name: str) -> bool:
     """True for well-known system/cloud directory names discovery must not enter.
 
@@ -140,9 +146,7 @@ def _is_skippable_system_dir(name: str) -> bool:
     named ``OneDrive`` or ``OneDrive - <Org>``.
     """
     low = name.lower()
-    if low in _SKIP_DIR_NAMES:
-        return True
-    return low == "onedrive" or low.startswith(("onedrive -", "onedrive-"))
+    return low in _SKIP_DIR_NAMES or _is_cloud_dir(name)
 
 
 def _is_offline_placeholder(
@@ -577,10 +581,13 @@ class WalkReport:
     ``offline_files`` counts the non-resident placeholder *files* the skip policy
     passed over (it is zero under a cloud root, which admits them), so a caller can
     say "N offline files were skipped" instead of reporting an empty folder.
+    ``cloud_dirs`` counts the cloud-sync directories (OneDrive) pruned by name, whose
+    files are neither entered nor counted in ``offline_files``.
     """
 
     declined_dirs: Set[str] = field(default_factory=set)
     offline_files: int = 0
+    cloud_dirs: int = 0
 
 
 # Directory levels a walk descends below its root before it stops. No real
@@ -609,6 +616,8 @@ def _note_skipped_entry(report: Any, path: Path, is_dir: bool) -> None:
         return
     if is_dir:
         report.declined_dirs.add(str(path))
+        if _is_cloud_dir(path.name):
+            report.cloud_dirs += 1
     elif not path.name.startswith(".") and _is_offline_placeholder(path):
         report.offline_files += 1
 
@@ -1246,6 +1255,7 @@ class _DirVisit:
     subdirs: List[tuple] = field(default_factory=list)  # (path, depth, real)
     declined_dirs: Set[str] = field(default_factory=set)
     offline_files: int = 0
+    cloud_dirs: int = 0
 
 
 def _visit_directory(
@@ -1387,6 +1397,7 @@ def _discover_parallel(
             if report is not None:
                 report.declined_dirs |= visit.declined_dirs
                 report.offline_files += visit.offline_files
+                report.cloud_dirs += visit.cloud_dirs
     if failure is not None:
         raise failure
     return visited

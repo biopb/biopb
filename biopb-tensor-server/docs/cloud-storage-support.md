@@ -146,6 +146,8 @@ time.
   "is this path under a cloud root" later. Without the flag the walk skips
   placeholders and the result's `skipped_offline` count says the import is
   incomplete, so a client can offer to resend with `cloud` set.
+  OneDrive directories are pruned by name even under a cloud root; their number
+  is `skipped_cloud_dirs`, and dropping one directly adds its files.
 - **Shape-presence doesn't protect pre-cache.** An unresolved source
   auto-skips (empty shape), but once resolved-and-persisted it returns with a
   concrete shape, so a naive backlog would re-warm it on restart. Residency

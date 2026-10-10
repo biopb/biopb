@@ -567,6 +567,12 @@ message AddSourceResult {
   // folder. Non-zero means the import is incomplete: resend with `cloud` set to
   // include them (their content is not read until first access).
   int32 skipped_offline = 7;
+
+  // Cloud-sync directories (`OneDrive`, `OneDrive - <Org>`) the walk did not
+  // enter, so everything inside them is missing from the import, uncounted by
+  // `skipped_offline`. Resending with `cloud` does not include them; drop the
+  // directory itself to add its files as cloud sources.
+  int32 skipped_cloud_dirs = 8;
 }
 
 // One message in the "add_source" action's result stream: zero or more
