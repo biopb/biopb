@@ -171,6 +171,9 @@ client.put_rois(image_id, [
 ])
 ```
 
+- **`image_id` is the tensor's `array_id` from the catalog.** A bare source_id
+  is taken for the source's default tensor and filed under that id; an id that
+  names no registered source is refused.
 - **Level-0 pixel coordinates.** A shape measured on a downsampled level has to
   be scaled up first; nothing does it for you.
 - **The 2-D vector arms only**: point, rectangle, ellipse, polygon, polyline

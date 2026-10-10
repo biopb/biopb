@@ -707,12 +707,26 @@ class TestBatchAtomicity:
 class TestFlightActions:
     """One full server -> client gRPC round-trip over the roi flight."""
 
-    def test_round_trip(self):
+    @staticmethod
+    def _server(tmp_path):
+        """A serving server with one single-tensor source, ``zarr_a1b2c3``."""
+        import numpy as np
+        import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        store = zarr.open_array(
+            str(tmp_path / "a.zarr"), mode="w", shape=(8, 8), dtype="uint8"
+        )
+        store[:] = np.zeros((8, 8), dtype="uint8")
+        server = TensorFlightServer("localhost:0", metadata_db=MetadataDatabase())
+        server.register_source("zarr_a1b2c3", ZarrAdapter(store, "zarr_a1b2c3"))
+        server.mark_ready()
+        return server
+
+    def test_round_trip(self, tmp_path):
         from biopb.tensor import TensorFlightClient
 
-        db = MetadataDatabase()
-        server = TensorFlightServer("localhost:0", metadata_db=db)
-        server.mark_ready()
+        server = self._server(tmp_path)
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(1)
 
@@ -739,6 +753,52 @@ class TestFlightActions:
 
             assert client.delete_rois(ARRAY_ID, [roi_id]).deleted == [roi_id]
             assert client.list_rois(ARRAY_ID).rois == []
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_a_bare_source_id_is_the_default_tensor(self, tmp_path):
+        from biopb.tensor import TensorFlightClient
+
+        server = self._server(tmp_path)
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            tensor = "zarr_a1b2c3/Image:0"
+            # A single-tensor OME source: its tensor's id is not the bare one.
+            adapter = server.sources.get("zarr_a1b2c3")
+            adapter.list_tensors = lambda: [mock.Mock(array_id=tensor)]
+
+            put = client.put_rois(
+                "zarr_a1b2c3", [_annotation(array_id="zarr_a1b2c3", label="p")]
+            )
+            (roi_id,) = [r.roi_id for r in put.stored]
+
+            # Filed under the tensor's own id, found through either spelling.
+            assert [r.roi_id for r in client.list_rois(tensor).rois] == [roi_id]
+            assert [r.roi_id for r in client.list_rois("zarr_a1b2c3").rois] == [roi_id]
+            assert server.metadata_db.list_rois("zarr_a1b2c3")[0] == []
+
+            assert client.delete_rois("zarr_a1b2c3", [roi_id]).deleted == [roi_id]
+            assert client.list_rois(tensor).rois == []
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_a_write_to_an_unknown_source_is_refused(self, tmp_path):
+        from biopb.tensor import TensorFlightClient
+
+        server = self._server(tmp_path)
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            for bad in ("nope", "nope/Image:0"):
+                with pytest.raises(flight.FlightServerError, match="no known source"):
+                    client.put_rois(bad, [_annotation()])
+            # What an earlier write left behind can still be listed and removed.
+            assert client.list_rois("nope").rois == []
             client.close()
         finally:
             server.shutdown()
