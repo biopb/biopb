@@ -365,9 +365,9 @@ caller) and runs as a live addition; where it lands is decided after the lock is
 The catalog is a DuckDB database (`serving/metadata_db.py`). Persisted state is kept apart
 from the rest, and one view publishes both:
 
-- **`catalog_roots(root_id, root_url, persisted, epoch, last_scanned)`**: one row per root a
+- **`catalog_roots(root_id, root_url, persisted, epoch)`**: one row per root a
   source sits under. The configured monitored and scan-once roots are `persisted`, merged
-  from config when the manager is built (`sync_roots` keeps `epoch` and `last_scanned` and
+  from config when the manager is built (`sync_roots` keeps `epoch` and
   deletes the persisted roots no longer in config). A drop and an upstream are not persisted;
   the reconciler records each (`ensure_root`) when it first files a source under it, and the
   catalog has one built-in root (`internal`, no url) for a source under none of them (the
@@ -382,8 +382,8 @@ from the rest, and one view publishes both:
   forward-slashed path under the root, `.` for the root itself; for a row under the built-in
   root, its whole url) in place of `source_url`; and, for a source under a persisted root,
   the private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
-  claim-time signature, the adapter `payload`, and the `epoch` of its last write and
-  `last_seen`. A row is resolved, pending, `needs_recall` or failed. A source has a claim when
+  claim-time signature, the adapter `payload`, and the `epoch` of its last write.
+  A row is resolved, pending, `needs_recall` or failed. A source has a claim when
   `primary_path` is not NULL. The rows under roots that are not persisted are deleted at every
   open with those roots, and a restore reads only the rows with a claim.
 - **`sources`**: a view over it exposing the published columns only. `source_url` is the
@@ -512,7 +512,7 @@ so a resolved row could serve a stale shape; and a read of a restored source mus
 trigger a download. The cost is one registration per resident cloud source per restart.
 
 **Confirmation: restored is not confirmed.** `catalog_meta.run_epoch` increments at every
-open. A walk that ran to the end sets its root's `epoch` and `last_scanned`
+open. A walk that ran to the end sets its root's `epoch`
 (`_confirm_root`: one write per root); a root that could not be listed, or whose walk
 raised, is not confirmed. A row's `epoch` is the run that wrote it, and it is *confirmed*
 when the greater of its own and its root's equals `run_epoch`. `mark_sources_seen` and
