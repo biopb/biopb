@@ -837,9 +837,10 @@ class TensorFlightClient:
                 request, not a promise: the server plans on its own grid and
                 answers with it (``chunk_shape`` on the returned descriptor).
             dim_labels: Optional dimension labels
-            ome_metadata: Ignored except for a label set's ``image-label``
+            ome_metadata: Refused except for a label set's ``image-label``
                 block. Metadata is source-scoped: a tensor inherits its
-                source's, and the scratch source has none.
+                source's, physical scale included (matched by axis label),
+                and the scratch source has none.
             ttl_seconds: How long to keep this tensor, in seconds. ``None``
                 asks for no deadline. A source may **cap** the lifetime -- the
                 scratch source caps every upload on it, an unset request

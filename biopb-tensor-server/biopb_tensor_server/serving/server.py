@@ -75,6 +75,7 @@ from biopb.tensor.ticket_pb2 import (
 )
 from google.protobuf.message import DecodeError, Message
 
+from biopb_tensor_server.adapters._scale import inherit_scale
 from biopb_tensor_server.adapters._writable import (
     UploadProgress,
     UploadStatus,
@@ -1645,6 +1646,13 @@ class TensorFlightServer(flight.FlightServerBase):
             # (``adapters/labels.py``), not the source's.
             if tensor_adapter.content_version:
                 read_plan.descriptor.content_version = tensor_adapter.content_version
+
+            # An uploaded tensor or label set carries no calibration of its own:
+            # it takes the image's, by axis.
+            if not read_plan.descriptor.physical_scale:
+                parent = self.sources.attached_parent(source_id, field)
+                if parent is not None:
+                    inherit_scale(parent, read_plan.descriptor)
 
             # Populate metadata_json in response descriptor if requested
             if METADATA_JSON in mask:

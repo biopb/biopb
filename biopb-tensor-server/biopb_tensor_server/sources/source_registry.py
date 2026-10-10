@@ -24,8 +24,10 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.attachments import Attachments
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.normalize import is_canonical, log_reordering, unwrapped
 from biopb_tensor_server.core.weak import weak_or_none
 
@@ -335,6 +337,25 @@ class SourceRegistry:
         adapter = self.get_registered(source_id)
         tensors = adapter.list_tensors() if adapter is not None else []
         return tensors[0].array_id if tensors else None
+
+    def attached_parent(
+        self, source_id: str, field: Optional[str]
+    ) -> Optional[TensorAdapter]:
+        """The tensor *field* was made for, when *field* is an attached one:
+        a label set's image, else the source's default tensor. None for a
+        source's own tensor."""
+        with self._lock:
+            found = self._attachments.get(source_id)
+        if found is None or not field or found.route(field) is None:
+            return None
+        label = split_label_field(field)
+        image = label.image_field if label else ""
+        if not image:
+            default = self.default_array_id(source_id)
+            if default is None:
+                return None
+            image = strip_source_prefix(source_id, default)
+        return self.resolve_tensor(source_id, image or None)
 
     def attached(self, source_id: str, field: str) -> Optional[TensorAdapter]:
         """The tensor attached at *field* of *source_id*, whatever its state."""
