@@ -49,6 +49,7 @@ from biopb.tensor._session import (
     _explain_handshake_failure,
     _plan_request,
     _refetch_flight_info,
+    _rois_from_flight_info,
     split_array_id as split_array_id,
 )
 from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
@@ -713,9 +714,39 @@ class TensorFlightClient:
 
         The server seals it into the plan it answers, so a reference that
         carries no token can still read its tensor's ROI sets: pass it to
-        :meth:`list_rois` as ``roi_ticket``.
+        :meth:`list_rois` as ``roi_ticket``, or read the reference directly
+        with :meth:`list_rois_from_pb`.
         """
         return TensorFlightClient.descriptor_from_pb(pb).roi_ticket or None
+
+    @staticmethod
+    def list_rois_from_pb(pb: SerializedTensor, set_name: str = "") -> RoiListResult:
+        """A SerializedTensor's annotations, read as its holder.
+
+        The counterpart of :meth:`tensor_from_pb` for ROIs: it dials the
+        reference's own location and needs no client. A reference whose sender
+        sealed its plan carries the ticket to read the tensor's ROI sets and no
+        token; one that carries a token reads under it. A reference carrying
+        neither is refused by the server.
+
+        Args:
+            pb: SerializedTensor protobuf object
+            set_name: As :meth:`list_rois`.
+
+        Raises:
+            flight.FlightUnauthenticatedError: the reference grants no read of
+                the annotations (no token, no ticket, or an expired or
+                mismatched ticket).
+        """
+        token = pb.auth_token or None
+        location = normalize_flight_location(pb.location)
+        trust = (
+            anchored_trust(pb.tls_anchor)
+            if pb.tls_anchor and is_tls_location(location)
+            else resolve_tls_trust(location)
+        )
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        return _rois_from_flight_info(info, location, token, set_name, trust)
 
     @staticmethod
     def tensor_from_pb(

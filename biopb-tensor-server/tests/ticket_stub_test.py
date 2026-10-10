@@ -734,6 +734,33 @@ class TestSealedRois:
         assert [r.label for r in got.rois] == ["nucleus"]
         tokenless.close()
 
+    def test_a_reference_alone_reads_its_annotations(self, guarded):
+        # No client of the holder's own: the reference names where to go.
+        _, client, _ = guarded
+        self._put(client)
+        pb = client.get_tensor("img", output="pb")
+        assert not pb.auth_token
+
+        got = TensorFlightClient.list_rois_from_pb(pb)
+        assert [r.label for r in got.rois] == ["nucleus"]
+
+    def test_a_reference_without_ticket_or_token_is_refused(self, guarded):
+        _, client, _ = guarded
+        pb = client.get_tensor("img", output="pb")
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        desc.ClearField("roi_ticket")
+        stripped = flight.FlightInfo(
+            info.schema,
+            flight.FlightDescriptor.for_command(desc.SerializeToString()),
+            info.endpoints,
+            info.total_records,
+            info.total_bytes,
+        )
+        pb.flight_info = stripped.serialize()
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            TensorFlightClient.list_rois_from_pb(pb)
+
     def test_without_it_the_annotations_stay_private(self, guarded):
         server, client, _ = guarded
         self._put(client)
