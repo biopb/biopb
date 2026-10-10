@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { TreeRow, sourceSearchSql } from "./SourceTree";
+import { TreeRow, createSourceSearch, sourceSearchSql } from "./SourceTree";
 import {
   UNRESOLVED_GLYPH,
   type TreeNode,
@@ -423,5 +423,52 @@ describe("sourceSearchSql", () => {
     expect(sourceSearchSql("a\\b")).toContain("LIKE '%a\\\\b%'");
     expect(sourceSearchSql("a\\_b")).toContain("LIKE '%a\\\\\\_b%'");
     expect(sourceSearchSql("it's")).toContain("LIKE '%it''s%'");
+  });
+});
+
+describe("sourceSearchSql columns", () => {
+  it("selects the descriptor, not just the id, so a match needs no loaded copy", () => {
+    expect(sourceSearchSql("x")).toMatch(
+      /^SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources WHERE/,
+    );
+  });
+});
+
+describe("createSourceSearch", () => {
+  const rows = { rows: [], totalSources: 0, returnedSources: 0, truncated: false };
+
+  it("asks for the reason, and keeps asking while it is answered", async () => {
+    const query = vi.fn().mockResolvedValue(rows);
+    const search = createSourceSearch();
+    await search(query, "a");
+    await search(query, "b");
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls.every(([sql]) => sql.includes("unresolved_reason"))).toBe(true);
+  });
+
+  it("asks again without the column a server refuses, and remembers", async () => {
+    const query = vi.fn((sql: string) =>
+      sql.includes("unresolved_reason")
+        ? Promise.reject(new Error("no such column"))
+        : Promise.resolve(rows),
+    );
+    const search = createSourceSearch();
+    await expect(search(query, "a")).resolves.toBe(rows);
+    expect(query).toHaveBeenCalledTimes(2);
+    await search(query, "b");
+    // Straight to the plain form: no third refusal to pay for.
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[2]![0]).not.toContain("unresolved_reason");
+  });
+
+  it("does not take a dropped connection for a missing column", async () => {
+    const down = new Error("network down");
+    const query = vi.fn().mockRejectedValue(down);
+    const search = createSourceSearch();
+    await expect(search(query, "a")).rejects.toBe(down);
+    // Still asks with the reason next time.
+    query.mockResolvedValue(rows);
+    await search(query, "b");
+    expect(query.mock.calls.at(-1)![0]).toContain("unresolved_reason");
   });
 });

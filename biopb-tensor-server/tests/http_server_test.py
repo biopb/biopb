@@ -1160,6 +1160,29 @@ class TestIntegration:
         assert len(r.json()) == 1
         assert r.headers["X-Truncated"] == "false"
 
+    def test_integration_a_search_row_is_the_listed_descriptor(self):
+        # The viewer's server-side search selects the descriptor columns with the
+        # catalog query and renders from them, so a row has to say what the
+        # listing says -- including the column a newer server adds.
+        columns = "source_id, source_url, source_type, is_resolved, tensors"
+        with self._make_tc() as tc:
+            (listed,) = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": f"SELECT {columns}, unresolved_reason FROM sources"},
+                headers=_bearer(_TOKEN),
+            )
+        assert r.status_code == 200
+        (row,) = r.json()
+        for key in ("source_id", "source_url", "source_type", "is_resolved"):
+            assert row[key] == listed[key]
+        assert [t["array_id"] for t in row["tensors"]] == [
+            t["array_id"] for t in listed["tensors"]
+        ]
+        assert row["tensors"][0]["shape"] == listed["tensors"][0]["shape"]
+        assert row["tensors"][0]["dtype"] == listed["tensors"][0]["dtype"]
+        assert "unresolved_reason" in row
+
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
             # The array_id a real server advertises is the whole address.
