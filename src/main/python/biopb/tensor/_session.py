@@ -377,6 +377,73 @@ def _refetch_flight_info(
     return info
 
 
+def _read_rois(
+    client: "flight.FlightClient",
+    call_options: "flight.FlightCallOptions",
+    array_id: str,
+    set_name: str,
+    roi_ticket: Optional[bytes],
+) -> "RoiListResult":
+    """One ``roi_read`` DoGet on *client*, decoded.
+
+    *roi_ticket* is the sealed ticket a plan carried; the one set is merged
+    onto it, since a serialized ``RoiRead{set_name}`` joined to it is one
+    ``RoiRead``. Without one the read is by *array_id* and the connection's own
+    credentials.
+    """
+    if roi_ticket:
+        ticket_bytes = roi_ticket + (
+            TensorTicket(roi_read=RoiRead(set_name=set_name)).SerializeToString()
+            if set_name
+            else b""
+        )
+    else:
+        ticket_bytes = TensorTicket(
+            roi_read=RoiRead(array_id=array_id, set_name=set_name)
+        ).SerializeToString()
+    table = client.do_get(flight.Ticket(ticket_bytes), options=call_options).read_all()
+    metadata = table.schema.metadata or {}
+    sets = [
+        RoiSetInfo(
+            set_name=entry["set_name"],
+            count=int(entry["count"]),
+            reserved=bool(entry.get("reserved")),
+        )
+        for entry in json.loads(metadata.get(b"sets", b"[]"))
+    ]
+    return RoiListResult(
+        rois=table_to_rois(table),
+        truncated=metadata.get(b"truncated", b"").decode() == "True",
+        sets=sets,
+    )
+
+
+def _rois_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    set_name: str,
+    tls_trust: Optional[TlsTrust] = None,
+) -> "RoiListResult":
+    """The annotations of the tensor a plan describes, read as its holder.
+
+    Uses the plan's sealed ``roi_ticket`` when the sender issued one, so a
+    holder with no token reads them; a plan without one is read by the
+    descriptor's array_id under *token*, which the server then judges.
+    """
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    client = _get_thread_client(
+        location, token, tls_trust or resolve_tls_trust(location)
+    )
+    return _read_rois(
+        client,
+        _get_shared_call_options(location, token),
+        descriptor.array_id,
+        set_name,
+        descriptor.roi_ticket or None,
+    )
+
+
 def _plan_request(info: "flight.FlightInfo") -> TensorReadOption:
     """The request a plan answers, as a ``TensorReadOption``, whichever protocol
     wrote it.
@@ -1332,35 +1399,12 @@ class CatalogClient:
         roi_ticket: Optional[bytes] = None,
     ) -> "RoiListResult":
         """Backs TensorFlightClient.list_rois; see that method."""
-        if roi_ticket:
-            # The sealed ticket a plan carried, with the one set merged on: a
-            # serialized RoiRead{set_name} joined to it is one RoiRead.
-            ticket_bytes = roi_ticket + (
-                TensorTicket(roi_read=RoiRead(set_name=set_name)).SerializeToString()
-                if set_name
-                else b""
-            )
-        else:
-            ticket_bytes = TensorTicket(
-                roi_read=RoiRead(array_id=array_id, set_name=set_name)
-            ).SerializeToString()
-        reader = self._state.client.do_get(
-            flight.Ticket(ticket_bytes), options=self._state.call_options
-        )
-        table = reader.read_all()
-        metadata = table.schema.metadata or {}
-        sets = [
-            RoiSetInfo(
-                set_name=entry["set_name"],
-                count=int(entry["count"]),
-                reserved=bool(entry.get("reserved")),
-            )
-            for entry in json.loads(metadata.get(b"sets", b"[]"))
-        ]
-        return RoiListResult(
-            rois=table_to_rois(table),
-            truncated=metadata.get(b"truncated", b"").decode() == "True",
-            sets=sets,
+        return _read_rois(
+            self._state.client,
+            self._state.call_options,
+            array_id,
+            set_name,
+            roi_ticket,
         )
 
     def _roi_put_stream(self, cmd: PutCommand, table: pa.Table) -> bytes:
