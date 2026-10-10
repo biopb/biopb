@@ -93,9 +93,9 @@ to remember when a local, token-protected box can't browse.
 ### Sources
 
 **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
-carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
-there and is **not** a usable grid. The transfer grid belongs to the tensor
-the server binds to serve a read, so ask `/api/tile_info/{array_id}` for it.
+carries `array_id` / `dim_labels` / `shape` / `dtype` and no `chunk_shape`.
+The transfer grid belongs to the tensor the server binds to serve a read, so
+ask `/api/tile_info/{array_id}` for it.
 
 **`/api/sources/{id}` is a single-row lookup** (a catalog query keyed on
 `source_id`), so it is not bounded by the listing's row cap — a source past

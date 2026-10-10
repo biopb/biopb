@@ -118,9 +118,6 @@ export function descriptorFromTileInfo(
         array_id: sourceId,
         dim_labels: info.dim_labels,
         shape: info.shape,
-        // Empty for the reason a listing's entries are: the transfer grid is
-        // answered per resolved tensor, and this descriptor is a listing entry.
-        chunk_shape: [],
         dtype: info.dtype,
       },
     ],

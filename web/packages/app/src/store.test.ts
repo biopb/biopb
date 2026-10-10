@@ -272,7 +272,7 @@ describe("catalog polling", () => {
       ...SOURCE,
       is_resolved: true,
       tensors: [
-        { array_id: "t", dim_labels: ["y", "x"], shape: [4, 4], chunk_shape: [], dtype: "uint16" },
+        { array_id: "t", dim_labels: ["y", "x"], shape: [4, 4], dtype: "uint16" },
       ],
     };
     useAppStore.setState({
@@ -1955,7 +1955,6 @@ describe("catalogFingerprint", () => {
     array_id: "listed",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
     ...over,
   });

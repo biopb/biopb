@@ -11,7 +11,6 @@ const TENSOR: TensorDescriptor = {
   array_id: "hpc__ome-tiff_00b764c29c31/Image:0",
   dim_labels: ["t", "c", "z", "y", "x"],
   shape: [10, 3, 40, 512, 512],
-  chunk_shape: [],
   dtype: "uint16",
 };
 

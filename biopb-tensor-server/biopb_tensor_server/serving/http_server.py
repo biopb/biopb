@@ -3320,16 +3320,14 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
 def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:
     """JSON form of one tensor entry inside a source listing.
 
-    ``chunk_shape`` is carried for shape-compatibility with the TS
-    ``TensorDescriptor`` and is always ``[]`` here: a source listing is
-    structural, and the transfer grid is answered per resolved tensor by
-    ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
+    Structural only. There is no transfer grid here: it belongs to a resolved
+    tensor and is answered per ``array_id`` by ``/api/tile_info`` (which
+    describes the tensor) -- biopb/biopb#812.
     """
     return {
         "array_id": t["array_id"],
         "dim_labels": list(t.get("dim_labels") or []),
         "shape": [int(x) for x in (t.get("shape") or [])],
-        "chunk_shape": [],
         "dtype": t.get("dtype") or "",
     }
 

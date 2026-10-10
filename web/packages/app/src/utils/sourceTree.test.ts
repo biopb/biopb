@@ -144,7 +144,6 @@ describe("isUnresolved", () => {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -174,7 +173,6 @@ describe("isEmptySource", () => {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -200,7 +198,6 @@ function labelTensor(arrayId: string): TensorDescriptor {
     array_id: arrayId,
     dim_labels: ["y", "x"],
     shape: [64, 64],
-    chunk_shape: [],
     dtype: "uint16",
   };
 }

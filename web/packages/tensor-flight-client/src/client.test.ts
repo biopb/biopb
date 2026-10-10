@@ -33,7 +33,6 @@ const SOURCE: DataSourceDescriptor = {
       array_id: "t0",
       dim_labels: ["z", "y", "x"],
       shape: [10, 128, 256],
-      chunk_shape: [1, 64, 64],
       dtype: "uint16",
     },
   ],

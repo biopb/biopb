@@ -1,16 +1,13 @@
-/** Mirror of biopb.tensor.TensorDescriptor (JSON form from FastAPI). */
+/**
+ * One tensor of a source listing: structural only. The transfer grid belongs to
+ * a resolved tensor, not to its source's row; ask `GET /api/tile_info`
+ * (`TileInfo.chunk_shape` / `tile_size`) per `array_id`.
+ */
 export interface TensorDescriptor {
   array_id: string;
   dim_labels: string[];
   /** Full array shape (per dimension). */
   shape: number[];
-  /**
-   * Transfer grid. EMPTY inside a `DataSourceDescriptor.tensors` entry: a source
-   * listing is structural, and the grid is answered per resolved tensor. Use
-   * `GET /api/tile_info` (`TileInfo.chunk_shape` / `tile_size`) when you need
-   * one -- an empty array is not a usable grid.
-   */
-  chunk_shape: number[];
   /** NumPy-style dtype string, e.g. "uint8", "float32". */
   dtype: string;
 }

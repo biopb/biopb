@@ -122,7 +122,6 @@ class LazyTensorArray extends TensorArray {
       array_id: arrayId,
       dim_labels: [],
       shape: [],
-      chunk_shape: [],
       dtype: "uint8",
     });
     this._pendingArrayId = arrayId;

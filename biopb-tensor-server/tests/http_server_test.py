@@ -2641,7 +2641,7 @@ class TestTileGridComesFromTheDescribedTensor:
                 (source,) = tc.get("/api/sources").json()
 
         assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
-        assert source["tensors"][0]["chunk_shape"] == []
+        assert "chunk_shape" not in source["tensors"][0]
 
 
 class TestTileArrayIdAddressing:
