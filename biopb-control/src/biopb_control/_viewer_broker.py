@@ -8,8 +8,8 @@ of what it drew, if the session asked for one and the page is on screen.
 The page asks for work by long-polling :meth:`ViewerBroker.next`; each parked
 poll is also its heartbeat, so a closed tab drops out when its poll ends. A
 hidden page keeps polling and moves its state, but it does not repaint, so it
-says it is hidden and sends no image; a visible page is preferred when there are
-several.
+says it is hidden and sends no image. Every connected page gets a request; the
+first visible one to answer is the answer.
 """
 
 from __future__ import annotations
@@ -113,13 +113,8 @@ class ViewerBroker:
             if parked is not None and parked.fut is fut:
                 del self._parked[tab_id]
 
-    def _pick(self) -> Optional[asyncio.Future]:
-        """The most recently parked visible tab, else the most recent hidden one."""
-        live = [p for p in self._parked.values() if not p.fut.done()]
-        for p in reversed(live):
-            if p.visible:
-                return p.fut
-        return live[-1].fut if live else None
+    def _live(self) -> list[asyncio.Future]:
+        return [p.fut for p in self._parked.values() if not p.fut.done()]
 
     async def show(
         self, view: str, image: bool, max_edge: int, timeout: float = 25.0
@@ -138,36 +133,73 @@ class ViewerBroker:
         self, view: str, image: bool, max_edge: int, deadline: float
     ) -> Shown:
         loop = asyncio.get_running_loop()
-        tab = self._pick()
-        if tab is None:
+        tabs = self._live()
+        if not tabs:
             # The instant between one poll ending and the next arriving.
             self._arrived.clear()
             try:
                 await asyncio.wait_for(self._arrived.wait(), PARK_GRACE)
             except asyncio.TimeoutError:
                 pass
-            tab = self._pick()
-        if tab is None:
+            tabs = self._live()
+        if not tabs:
             raise ViewerUnavailable(
                 "no viewer page is connected: ask the user to open the web viewer "
                 "in a browser tab (build the link with user_base_url(), not a bare "
                 '/viewer: see read_doc("web-viewer"))'
             )
-        req = f"c{next(self._ids)}"
-        fut = asyncio.get_running_loop().create_future()
-        self._pending[req] = fut
-        tab.set_result({"req": req, "view": view, "image": image, "max_edge": max_edge})
+        # Every tab gets it: nothing says which machine the user is sitting at.
+        pending: dict[str, asyncio.Future] = {}
+        for tab in tabs:
+            req = f"c{next(self._ids)}"
+            fut = loop.create_future()
+            self._pending[req] = pending[req] = fut
+            tab.set_result(
+                {"req": req, "view": view, "image": image, "max_edge": max_edge}
+            )
         try:
-            shown = await asyncio.wait_for(fut, max(0.1, deadline - loop.time()))
-        except asyncio.TimeoutError:
-            raise ShowFailed(
-                "the viewer page did not answer in time (a busy tab?)"
-            ) from None
+            return await self._first_answer(list(pending.values()), image, deadline)
         finally:
-            self._pending.pop(req, None)
-        if image and shown.visible and shown.png is None:
-            raise ShowFailed("the viewer page sent no image")
-        return shown
+            for req in pending:
+                self._pending.pop(req, None)
+
+    @staticmethod
+    async def _first_answer(
+        futs: list[asyncio.Future], image: bool, deadline: float
+    ) -> Shown:
+        """The first visible tab's answer, else a hidden tab's, else the first error.
+
+        Waits for a tab that can show the user, since a hidden one answers at
+        once and says nothing about the others; stops at the deadline.
+        """
+        loop = asyncio.get_running_loop()
+        waiting = set(futs)
+        hidden: Optional[Shown] = None
+        failure: Optional[Exception] = None
+        while waiting:
+            left = max(0.1, deadline - loop.time())
+            done, waiting = await asyncio.wait(
+                waiting, timeout=left, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                break
+            for fut in done:
+                try:
+                    shown = fut.result()
+                except ShowFailed as exc:
+                    failure = failure or exc
+                    continue
+                if not shown.visible:
+                    hidden = hidden or shown
+                elif image and shown.png is None:
+                    failure = failure or ShowFailed("the viewer page sent no image")
+                else:
+                    return shown
+        if hidden is not None:
+            return hidden
+        if failure is not None:
+            raise failure
+        raise ShowFailed("the viewer page did not answer in time (a busy tab?)")
 
     def resolve(
         self,

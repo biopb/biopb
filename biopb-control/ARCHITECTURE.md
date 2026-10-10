@@ -87,8 +87,9 @@ prefix mounts — no root catch-all — keep the static `/`-fallback from swallo
 the session and data-plane prefixes.
 
 **Presenting in the viewer.** A session with no napari window cannot show its results,
-so `POST /api/viewer/show` hands the view to an open viewer page, which moves to it and
-acknowledges at once; with `image` set it also draws and returns a PNG. The page
+so `POST /api/viewer/show` hands the view to every open viewer page (nothing says which
+machine the user is at), each of which moves to it and acknowledges at once, the first
+visible one's answer being the result; with `image` set it also draws and returns a PNG. The page
 long-polls `/api/viewer/next` whether or not it is visible, and says which: a hidden
 page still moves its state but does not repaint, so it acknowledges without an image.
 A parked poll is both the heartbeat and the only way to be given work; the answer comes

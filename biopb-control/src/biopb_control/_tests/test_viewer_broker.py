@@ -57,19 +57,26 @@ def test_a_parked_page_receives_the_request_and_its_answer_returns():
     _run(go())
 
 
-def test_the_most_recently_parked_page_is_the_one_asked():
+def test_every_connected_page_gets_the_request_and_the_first_visible_answer_wins():
     async def go():
         broker = ViewerBroker()
-        first = asyncio.create_task(broker.next("old", timeout=5))
-        await asyncio.sleep(0.05)
-        second = asyncio.create_task(broker.next("new", timeout=5))
+        a = asyncio.create_task(broker.next("a", timeout=5))
+        b = asyncio.create_task(broker.next("b", timeout=5, visible=False))
+        c = asyncio.create_task(broker.next("c", timeout=5))
         await asyncio.sleep(0.05)
         asking = asyncio.create_task(broker.show("id=x", True, 64, timeout=5))
-        job = await second
-        assert not first.done()
-        broker.resolve(job["req"], True, b"x")
-        await asking
-        first.cancel()
+        jobs = [await a, await b, await c]
+        assert {j["view"] for j in jobs} == {"id=x"}
+        assert len({j["req"] for j in jobs}) == 3
+        # The hidden tab answers first and does not end the wait.
+        broker.resolve(jobs[1]["req"], False)
+        await asyncio.sleep(0.05)
+        assert not asking.done()
+        broker.resolve(jobs[2]["req"], True, b"PNG")
+        got = await asking
+        assert (got.visible, got.png) == (True, b"PNG")
+        # The slower tab's answer arrives to nothing waiting for it.
+        assert broker.resolve(jobs[0]["req"], True, b"late") is False
 
     _run(go())
 
@@ -257,18 +264,32 @@ def test_a_view_without_an_image_is_acknowledged_with_none():
     _run(go())
 
 
-def test_a_visible_page_is_preferred_over_a_later_hidden_one():
+def test_when_every_page_is_hidden_the_answer_is_hidden():
     async def go():
         broker = ViewerBroker()
-        shown = asyncio.create_task(broker.next("front", timeout=5))
+        polls = [
+            asyncio.create_task(broker.next(t, timeout=5, visible=False))
+            for t in ("a", "b")
+        ]
         await asyncio.sleep(0.05)
-        hidden = asyncio.create_task(broker.next("back", timeout=5, visible=False))
+        asking = asyncio.create_task(broker.show("id=x", True, 64, timeout=5))
+        for poll in polls:
+            broker.resolve((await poll)["req"], False)
+        got = await asking
+        assert (got.visible, got.png) == (False, None)
+
+    _run(go())
+
+
+def test_one_tabs_error_does_not_hide_anothers_success():
+    async def go():
+        broker = ViewerBroker()
+        a = asyncio.create_task(broker.next("a", timeout=5))
+        b = asyncio.create_task(broker.next("b", timeout=5))
         await asyncio.sleep(0.05)
         asking = asyncio.create_task(broker.show("id=x", False, 64, timeout=5))
-        job = await shown
-        assert not hidden.done()
-        broker.resolve(job["req"], True)
-        await asking
-        hidden.cancel()
+        broker.resolve((await a)["req"], True, error="boom")
+        broker.resolve((await b)["req"], True)
+        assert (await asking).visible is True
 
     _run(go())

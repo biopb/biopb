@@ -141,6 +141,9 @@ to load, so it is slower. Leave it off to just present.
   a background tab, still takes the view, but the browser does not repaint it, so
   the answer says the viewer is not visible and returns no image. Ask the user to
   bring it forward; the view is waiting.
+- **Every open tab moves.** The control cannot tell which machine the user is at,
+  so each connected viewer tab gets the view, and the answer is the first one on
+  screen. A tab left open elsewhere is moved too.
 - **A note means partial.** If tiles or an overlay were still loading when the
   page gave up waiting, the image comes back with a note saying so; ask again
   rather than reporting it.
