@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { TreeRow } from "./SourceTree";
+import { TreeRow, sourceSearchSql } from "./SourceTree";
 import {
   UNRESOLVED_GLYPH,
   type TreeNode,
@@ -417,5 +417,21 @@ describe("buildTree", () => {
     const root = buildTree(many);
     expect(performance.now() - t).toBeLessThan(3000);
     expect(root.children[0]!.children).toHaveLength(100_000);
+  });
+});
+
+// DuckDB's LIKE has no default escape character: a backslash escapes only
+// under an explicit ESCAPE clause, otherwise `_` and `%` never match literally.
+describe("sourceSearchSql", () => {
+  it("escapes % and _ and declares the escape character on every LIKE", () => {
+    const sql = sourceSearchSql("protein_transport");
+    expect(sql.match(/LIKE '%protein\\_transport%' ESCAPE '\\'/g)).toHaveLength(3);
+    expect(sourceSearchSql("50%")).toContain("LIKE '%50\\%%' ESCAPE '\\'");
+  });
+
+  it("escapes a literal backslash first, and doubles quotes", () => {
+    expect(sourceSearchSql("a\\b")).toContain("LIKE '%a\\\\b%'");
+    expect(sourceSearchSql("a\\_b")).toContain("LIKE '%a\\\\\\_b%'");
+    expect(sourceSearchSql("it's")).toContain("LIKE '%it''s%'");
   });
 });

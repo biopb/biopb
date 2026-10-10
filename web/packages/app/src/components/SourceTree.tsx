@@ -26,6 +26,22 @@ const SERVER_QUERY_THRESHOLD = 1000;
 // this is asked for, so "there were more" is known without a count.
 const SERVER_QUERY_LIMIT = 2000;
 
+/** The server-side search: a substring match over id, url and type. DuckDB's
+ *  LIKE has no default escape character, so `\` escapes only with an explicit
+ *  ESCAPE clause, and a literal `\` must be escaped first. */
+export function sourceSearchSql(q: string): string {
+  const escaped = q
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "''")
+    .replace(/%/g, "\\%")
+    .replace(/_/g, "\\_");
+  return `SELECT source_id FROM sources WHERE
+      LOWER(source_id) LIKE '%${escaped}%' ESCAPE '\\' OR
+      LOWER(source_url) LIKE '%${escaped}%' ESCAPE '\\' OR
+      LOWER(source_type) LIKE '%${escaped}%' ESCAPE '\\'
+      ORDER BY source_url LIMIT ${SERVER_QUERY_LIMIT + 1}`;
+}
+
 function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
   return parts[parts.length - 1] || arrayId;
@@ -534,13 +550,7 @@ export function SourceTree() {
       return;
     }
 
-    const q = debouncedQuery.trim().toLowerCase();
-    const escaped = q.replace(/'/g, "''").replace(/%/g, "\\%").replace(/_/g, "\\_");
-    const sql = `SELECT source_id FROM sources WHERE
-      LOWER(source_id) LIKE '%${escaped}%' OR
-      LOWER(source_url) LIKE '%${escaped}%' OR
-      LOWER(source_type) LIKE '%${escaped}%'
-      ORDER BY source_url LIMIT ${SERVER_QUERY_LIMIT + 1}`;
+    const sql = sourceSearchSql(debouncedQuery.trim().toLowerCase());
 
     // A query superseded while in flight must not land over the newer one: the
     // answers can arrive out of order.
