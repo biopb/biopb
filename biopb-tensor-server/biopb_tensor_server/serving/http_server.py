@@ -1908,7 +1908,7 @@ async def list_sources(
 
     ``limit`` caps the rows returned (the server's own ``max_query_results`` cap
     applies regardless). ``X-Truncated`` says whether the listing is short of the
-    catalog, by either cap; ``X-Returned-Sources`` is the row count.
+    catalog, by either cap.
     """
     ctx = _sidecar(request)
     ctx.check_token(request)
@@ -1917,24 +1917,18 @@ async def list_sources(
         client = ctx.get_client()
         # One row past the limit is how a caller learns it was cut, without a
         # second query for the catalog's size.
-        page = f" LIMIT {limit + 1}" if limit else ""
+        page = f" LIMIT {limit + 1}" if limit is not None else ""
         table = client.query(_source_list_sql(client) + " ORDER BY source_id" + page)
         rows = table.to_pylist()
         _, _, truncated = _truncation(table, len(rows))
-        if limit and len(rows) > limit:
+        if limit is not None and len(rows) > limit:
             rows, truncated = rows[:limit], True
         _add_unresolved_reasons(client, rows)
         result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
         logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
-        return JSONResponse(
-            result,
-            headers={
-                "X-Returned-Sources": str(len(result)),
-                "X-Truncated": str(truncated).lower(),
-            },
-        )
+        return JSONResponse(result, headers={"X-Truncated": str(truncated).lower()})
     except HTTPException:
         raise
     except Exception as exc:

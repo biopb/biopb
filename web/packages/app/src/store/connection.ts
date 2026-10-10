@@ -20,6 +20,12 @@ export function nextPollStep(step: number, active: boolean): number {
   return active ? 0 : Math.min(step + 1, POLL_BACKOFF_MS.length - 1);
 }
 
+/** One listing, ordered by `source_url` for display and comparison. */
+async function fetchCatalog(client: TensorFlightClient) {
+  const { sources, truncated } = await client.listSourcesPage(CATALOG_LIMIT);
+  return { sorted: sources.sort((a, b) => a.source_url.localeCompare(b.source_url)), truncated };
+}
+
 // Internal timer storage (non-reactive, module-level). The generation tells a
 // poll still in flight that the loop it belonged to was stopped.
 let _pollingTimerId: ReturnType<typeof setTimeout> | undefined;
@@ -106,9 +112,7 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
     if (!client) return;
     set({ sourcesLoading: true });
     try {
-      const { sources, truncated } = await client.listSourcesPage(CATALOG_LIMIT);
-      // Sort sources by source_url for consistent display and comparison
-      const sorted = sources.sort((a, b) => a.source_url.localeCompare(b.source_url));
+      const { sorted, truncated } = await fetchCatalog(client);
       set({
         sources: sorted,
         catalogTruncated: truncated,
@@ -148,18 +152,14 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
       const { client } = get();
       if (!client || get().connectionState !== "connected") return false;
 
-      const { sources: newSources, truncated } = await client.listSourcesPage(CATALOG_LIMIT);
-      const sorted = newSources.sort((a, b) => a.source_url.localeCompare(b.source_url));
-
-      // Refresh the scan-in-progress flag so the "Indexing…" hint clears once
-      // the background catalog scan finishes (best-effort; a readyz blip just
-      // leaves the previous value).
-      try {
-        const readyz = await client.http.readyz();
-        set({ scanning: catalogIsFilling(readyz.backend_health) });
-      } catch {
-        // ignore transient readyz errors
-      }
+      // The listing and the scan-in-progress flag are independent. The flag
+      // clears the "Indexing…" hint once the background catalog scan finishes
+      // (best-effort; a readyz blip just leaves the previous value).
+      const [{ sorted, truncated }, readyz] = await Promise.all([
+        fetchCatalog(client),
+        client.http.readyz().catch(() => null),
+      ]);
+      if (readyz) set({ scanning: catalogIsFilling(readyz.backend_health) });
 
       // Read after the awaits: a tensor opened while the listing was in
       // flight is the one to protect, not the one that was open when it began.

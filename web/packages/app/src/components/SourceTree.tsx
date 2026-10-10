@@ -719,7 +719,8 @@ export function SourceTree() {
         )}
         {catalogTruncated && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more
+            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more; search
+            covers only these
           </div>
         )}
         {useServerQuery && (

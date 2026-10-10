@@ -634,7 +634,6 @@ class TestSourcesEndpoints:
             "s0003",
         ]
         assert r.headers["X-Truncated"] == "true"
-        assert r.headers["X-Returned-Sources"] == "4"
         # One row past the limit is how it learns the catalog is longer.
         assert asked[0].endswith("ORDER BY source_id LIMIT 5")
 
