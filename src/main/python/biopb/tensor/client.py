@@ -518,8 +518,8 @@ class TensorFlightClient:
         """Fetch a tensor's ROI annotations.
 
         There is no plane or bbox filter: a client hit-tests and re-renders
-        from the resident set. Annotations are private data, gated by the
-        tensor's source like its pixels, so they are not on the SQL surface.
+        from the resident set. Reads are gated by the tensor's source like its
+        pixels; the ``rois`` table in ``query`` is full-access only.
 
         Args:
             array_id: Unversioned array_id of the tensor.
