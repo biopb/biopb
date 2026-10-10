@@ -39,7 +39,6 @@ const SOURCE: DataSourceDescriptor = {
   source_id: "listed",
   source_url: "file:///listed",
   source_type: "file",
-  metadata_json: null,
   is_resolved: true,
   tensors: [],
 };

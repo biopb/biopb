@@ -18,7 +18,6 @@ const LISTED: DataSourceDescriptor = {
   source_id: "zarr_a3f2",
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
-  metadata_json: null,
   is_resolved: true,
   tensors: [],
 };
@@ -27,7 +26,6 @@ const UPLOAD: DataSourceDescriptor = {
   source_id: "upload_7f3",
   source_url: "",
   source_type: "",
-  metadata_json: null,
   is_resolved: true,
   tensors: [
     {
@@ -87,7 +85,6 @@ describe("TreeRow for an unresolved source", () => {
     source_id: "onedrive_9c1",
     source_url: "file:///data/cloud/timelapse.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: false,
     tensors: [],
   };
@@ -247,7 +244,6 @@ describe("TreeRow with label sets", () => {
     source_id: "zarr_b1",
     source_url: "file:///data/experiment/cells.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: true,
     tensors: [
       {
@@ -337,7 +333,6 @@ describe("TreeRow with more than one image", () => {
     source_id: "zarr_c2",
     source_url: "file:///data/experiment/wells.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: true,
     tensors: [
       {

@@ -500,6 +500,8 @@ class TestSourcesEndpoints:
         assert body[0]["source_id"] == "src0"
         assert body[0]["source_url"] == "/data/src0"
         assert isinstance(body[0]["tensors"], list)
+        # Source metadata is its own route, not a column of the row.
+        assert "metadata_json" not in body[0]
 
     def test_list_sources_tensor_fields(self, auth_client):
         tc, _ = auth_client
@@ -510,15 +512,10 @@ class TestSourcesEndpoints:
         assert tensor["dtype"] == "uint16"
         assert tensor["dim_labels"] == ["z", "y", "x"]
 
-    def test_get_single_source(self, auth_client):
+    def test_there_is_no_single_source_route(self, auth_client):
+        # A source is addressed by a catalog query (or its array_id), not a route.
         tc, _ = auth_client
         r = tc.get("/api/sources/src0", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()["source_id"] == "src0"
-
-    def test_get_missing_source_returns_404(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources/does-not-exist", headers=_bearer(_TOKEN))
         assert r.status_code == 404
 
     def test_get_source_metadata(self, auth_client):
@@ -3710,12 +3707,11 @@ class TestVolumeStaysWithinTheBudget:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestSingleSourceIsNotCappedByTheListing:
-    """A source past the listing's row cap is unbrowsable but readable.
+class TestListingCap:
+    """A source past the listing's row cap is unlisted but still addressable.
 
-    Real Flight server, real sidecar. `/api/sources/{id}` used to look the id up
-    in the listing, so it inherited the browse cap and answered 404 for a source
-    that reads perfectly well -- purely because of where the id sorted.
+    Real Flight server, real sidecar. The listing says it was cut, and a catalog
+    query keyed on the id still finds the source the cap clipped.
     """
 
     @pytest.fixture(autouse=True)
@@ -3758,22 +3754,22 @@ class TestSingleSourceIsNotCappedByTheListing:
             raise_server_exceptions=True,
         )
 
-    def test_the_listing_is_still_capped(self):
+    def test_the_listing_is_capped_and_says_so(self):
         with self._tc() as tc:
             r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.status_code == 200
         assert [s["source_id"] for s in r.json()] == ["a"]
+        assert r.headers["X-Truncated"] == "true"
 
-    def test_the_clipped_source_still_answers_by_id(self):
+    def test_the_clipped_source_still_answers_a_query_by_id(self):
         with self._tc() as tc:
-            r = tc.get("/api/sources/c", headers=_bearer(_TOKEN))
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": "SELECT source_id FROM sources WHERE source_id = 'c'"},
+                headers=_bearer(_TOKEN),
+            )
         assert r.status_code == 200
-        assert r.json()["source_id"] == "c"
-
-    def test_an_id_nothing_holds_is_still_a_404(self):
-        with self._tc() as tc:
-            r = tc.get("/api/sources/nope", headers=_bearer(_TOKEN))
-        assert r.status_code == 404
+        assert [row["source_id"] for row in r.json()] == ["c"]
 
 
 # ===========================================================================
@@ -3804,9 +3800,7 @@ class TestResolveWarmJobs:
         assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
         mock_fc.resolve_source.assert_called_once()
 
-    def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
-        # /api/sources/{source_id:path} is greedy: without this route ordering
-        # the status GET reads as a source whose id is "cloud0/resolve/status".
+    def test_status_reports_the_job(self, auth_client):
         tc, _ = auth_client
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "done")

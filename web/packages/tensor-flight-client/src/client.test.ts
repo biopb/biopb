@@ -26,7 +26,6 @@ const SOURCE: DataSourceDescriptor = {
   source_id: "src0",
   source_url: "/data/src0",
   source_type: "zarr",
-  metadata_json: null,
   is_resolved: true,
   tensors: [
     {
@@ -246,24 +245,6 @@ describe("TensorHttpClient.listSourcesPage (auth and errors)", () => {
     const err = await c.listSourcesPage(10).catch((e) => e);
     expect(err).toBeInstanceOf(TensorApiError);
     expect((err as TensorApiError).status).toBe(401);
-  });
-});
-
-describe("TensorHttpClient.getSource", () => {
-  it("encodes source_id in path", async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse(SOURCE));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    await c.getSource("path/with spaces");
-    const [url] = mockFetch.mock.calls[0] as [string];
-    expect(url).toContain(encodeURIComponent("path/with spaces"));
-  });
-
-  it("throws 404 TensorApiError for missing source", async () => {
-    mockFetch.mockResolvedValueOnce(errorResponse(404, "Source not found"));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    const err = await c.getSource("nope").catch((e) => e);
-    expect(err).toBeInstanceOf(TensorApiError);
-    expect((err as TensorApiError).status).toBe(404);
   });
 });
 

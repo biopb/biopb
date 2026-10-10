@@ -10,11 +10,10 @@ Endpoints (unauthenticated — probes):
 
 Endpoints (token required):
   GET  /api/diagnostics              — runtime diagnostics
-  GET  /api/sources[?limit=N]        — list DataSourceDescriptors (X-Truncated)
+  GET  /api/sources[?limit=N]        — list the catalog's source rows (X-Truncated)
   POST /api/sources/query            — SQL query against source metadata
-  GET  /api/sources/{source_id}/metadata          — parsed metadata_json
+  GET  /api/sources/{source_id}/metadata          — parsed source metadata
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
-  GET  /api/sources/{source_id}      — single DataSourceDescriptor
   GET  /api/tile_info/{array_id}     — tile grid, pyramid levels + volume plan
   GET  /api/tile/{array_id}          — one tile, cacheable (raw | png | jpeg)
   POST /api/slice                    — fetch array slice as binary (body: array_id);
@@ -24,9 +23,6 @@ Endpoints (token required):
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
   GET  /api/admin/browse             — server-side filesystem browse (data-folder picker)
-
-  The specific /api/sources/{id}/… routes are registered before the greedy
-  /{id:path} catch-all so Starlette does not shadow them (see route defs).
 
 Authentication:
   Pass the website token in the ``Authorization: Bearer <token>`` header or
@@ -1779,10 +1775,9 @@ def _tile_etag(array_id: str, params: Sequence[Tuple[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 #
-# All handlers are module-level functions registered on this one router (the
-# registration order below is load-bearing: the /metadata and /ticket routes
-# must precede the greedy {source_id:path} catch-all). create_app() simply
-# include_router()s it, so per-handler complexity is measured per-handler.
+# All handlers are module-level functions registered on this one router.
+# create_app() simply include_router()s it, so per-handler complexity is
+# measured per-handler.
 # ---------------------------------------------------------------------------
 
 _router = APIRouter()
@@ -2026,9 +2021,6 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         )
 
 
-# NOTE: the /metadata and /ticket routes must be registered before the greedy
-# {source_id:path} route, otherwise Starlette's first-match routing would
-# shadow them.
 @_router.get("/api/sources/{source_id:path}/metadata")
 async def get_source_metadata(source_id: str, request: Request) -> JSONResponse:
     ctx = _sidecar(request)
@@ -2139,10 +2131,6 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
 
 
 # -- Resolve (a consented cloud recall) --------------------------------
-#
-# Registered above the greedy /api/sources/{source_id:path} catch-all, the same
-# way /metadata and /ticket are: route order is what keeps a sub-path from being
-# swallowed as part of the id.
 
 
 def _run_recall(
@@ -2281,47 +2269,13 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     return _start_job("resolve", _resolve_worker, source_id, request)
 
 
-@_router.get("/api/sources/{source_id:path}")
-async def get_source(source_id: str, request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-        # One row, not the whole catalog. This route is addressed -- the id is
-        # already in hand -- so streaming every source to look one up cost
-        # O(catalog) per call and, worse, inherited the listing's safety cap:
-        # a source past it answered 404 while being perfectly readable.
-        rows = client.query(
-            f"{_source_list_sql(client)} WHERE source_id = {sql_literal(source_id)}",
-            format="records",
-        )
-        if not rows:
-            raise HTTPException(
-                status_code=404, detail=f"Source not found: {source_id}"
-            )
-        _add_unresolved_reasons(
-            client, rows, f"AND source_id = {sql_literal(source_id)}"
-        )
-        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_row_to_dict(rows[0]))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("GET_SOURCE_FAILED", str(exc))
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
-
-
 # -- Tiles (cacheable GET reads) --------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # ROI annotations
 #
-# Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
-# /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
+# Its own /api/rois/* namespace. Bodies are canonical proto3 JSON in
 # both directions -- json_format here, protobuf-es in the SPA -- so one schema
 # serves both ends and neither hand-writes a DTO.
 # ---------------------------------------------------------------------------
@@ -3296,15 +3250,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_id": row["source_id"],
         "source_url": row.get("source_url") or "",
         "source_type": row.get("source_type") or "",
-        # Always null on a listing; see _source_list_sql.
-        "metadata_json": None,
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
         # read-mask field, never by a row (biopb/biopb#1035). `is_resolved` is the
         # opposite case and belongs here -- monotonic, so a persisted row can
         # only lag in the harmless direction. Default True for a row from a
         # server predating the column, the right reading for every pre-existing
-        # source.
+        # source. Source metadata is its own route (``/metadata``), not a row field.
         "is_resolved": bool(row.get("is_resolved", True)),
         # Why it is not resolved (cloud recall, queued registration, a failed
         # one); absent for a resolved row and for a server that predates it.

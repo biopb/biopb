@@ -1,8 +1,8 @@
 "use client";
 
 import { memo, useEffect, useState } from "react";
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { selectTileInfo, useAppStore } from "../store";
+import { sqlLiteral } from "../utils/sql";
 import {
   MAX_ROWS,
   autoExpanded,
@@ -150,7 +150,7 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
   // catalog scan's. See `sliderGrid` for why those can differ.
   const tileInfo = useAppStore(selectTileInfo);
   const [metadata, setMetadata] = useState<Record<string, unknown> | null>(null);
-  const [source, setSource] = useState<DataSourceDescriptor | null>(null);
+  const [source, setSource] = useState<{ source_id: string; source_url: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -164,13 +164,14 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
       return;
     }
     client.http
-      .getSource(sourceId)
-      .then((d) => {
-        if (!cancelled) setSource(d);
+      .querySources(`SELECT source_url FROM sources WHERE source_id = ${sqlLiteral(sourceId)}`)
+      .then(({ rows }) => {
+        if (cancelled) return;
+        setSource(rows[0] ? { source_id: sourceId, source_url: String(rows[0].source_url ?? "") } : null);
       })
       .catch(() => {
-        // The metadata request below reports for both; a missing descriptor
-        // just leaves the key-info block out.
+        // The metadata request below reports for both; a missing row just
+        // leaves the key-info block out.
         if (!cancelled) setSource(null);
       });
     return () => {

@@ -478,16 +478,6 @@ export class TensorHttpClient {
     );
   }
 
-  /** Get a single DataSourceDescriptor by source_id. */
-  async getSource(sourceId: string, opts?: RequestOptions): Promise<DataSourceDescriptor> {
-    return this.fetchJson<DataSourceDescriptor>(
-      `/api/sources/${encodeURIComponent(sourceId)}`,
-      undefined,
-      this.metadataTimeoutMs,
-      opts,
-    );
-  }
-
   /**
    * Get the parsed OME-NGFF metadata for a source.
    * Returns an empty object if the source has no metadata.

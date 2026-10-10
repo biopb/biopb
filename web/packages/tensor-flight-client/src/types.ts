@@ -12,13 +12,14 @@ export interface TensorDescriptor {
   dtype: string;
 }
 
-/** Mirror of biopb.tensor.DataSourceDescriptor (JSON form from FastAPI). */
+/**
+ * One row of the server's `sources` catalog, as the sidecar lists it. Source
+ * metadata is not part of it: read that with `getSourceMetadata`.
+ */
 export interface DataSourceDescriptor {
   source_id: string;
   source_url: string;
   source_type: string;
-  /** Raw OME-NGFF JSON string, or null. */
-  metadata_json: string | null;
   /**
    * Deterministic: does a real, hydrated adapter back this source right now?
    * False for an unresolved cloud/synced-folder source awaiting an explicit
@@ -31,8 +32,8 @@ export interface DataSourceDescriptor {
    * Why `is_resolved` is false, or null when it is true. `needs_recall`: a
    * cloud placeholder, opening it downloads it, so ask first. `pending`: a
    * local source whose registration is still queued; reading it, or `resolve`,
-   * registers it at once and costs no download. `failed`: registration raised,
-   * and `metadata_json` carries the error. Absent from an older server's rows.
+   * registers it at once and costs no download. `failed`: registration raised.
+   * Absent from an older server's rows.
    */
   unresolved_reason?: "needs_recall" | "pending" | "failed" | null;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */

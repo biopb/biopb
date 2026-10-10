@@ -382,7 +382,6 @@ describe("sliderGrid", () => {
     source_id: "src_a",
     source_url: "file:///a.tiff",
     source_type: "ome-tiff",
-    metadata_json: null,
     tensors: [TENSOR],
   }] as unknown as Parameters<typeof sliderGrid>[1];
 
