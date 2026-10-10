@@ -1,14 +1,15 @@
-"""Matches a session's request for a picture of the viewer with a browser tab.
+"""Hands a session's view of its results to a browser tab of the web viewer.
 
-A session with no napari window cannot see its own results. The control's SPA
-can draw them, so a request goes from the session to the control, and the control
-hands it to an open viewer page, which renders it and posts the PNG back.
+A session with no napari window cannot show the user anything. The control's SPA
+can, so a request goes from the session to the control, and the control hands it
+to an open viewer page, which moves to that view and acknowledges -- with a PNG
+of what it drew, if the session asked for one and the page is on screen.
 
 The page asks for work by long-polling :meth:`ViewerBroker.next`; each parked
-poll is also its heartbeat, so a closed or hidden tab drops out when its poll
-ends. Only a tab with a poll parked right now can be given a request, and the
-page only polls while it is visible -- a hidden tab does not repaint, so a
-capture sent to one would return a stale frame.
+poll is also its heartbeat, so a closed tab drops out when its poll ends. A
+hidden page keeps polling and moves its state, but it does not repaint, so it
+says it is hidden and sends no image; a visible page is preferred when there are
+several.
 """
 
 from __future__ import annotations
@@ -34,28 +35,38 @@ _STEP = 1.0
 
 
 class ViewerUnavailable(Exception):
-    """No visible viewer page can take the request."""
+    """No viewer page is connected to take the request."""
 
 
-class CaptureFailed(Exception):
+class ShowFailed(Exception):
     """The page took the request and could not answer it."""
 
 
 @dataclass
-class Capture:
-    png: bytes
+class Shown:
+    #: Was the page on screen when it answered? A hidden one moved its state
+    #: but drew nothing.
+    visible: bool
+    #: What it drew, when an image was asked for and the page could draw one.
+    png: Optional[bytes] = None
     partial: bool = False
     notes: list = field(default_factory=list)
+
+
+@dataclass
+class _Parked:
+    fut: asyncio.Future
+    visible: bool
 
 
 class ViewerBroker:
     def __init__(self) -> None:
         # tab id -> its parked poll, oldest park first: the last entry is the
         # tab that polled most recently.
-        self._parked: dict[str, asyncio.Future] = {}
+        self._parked: dict[str, _Parked] = {}
         self._pending: dict[str, asyncio.Future] = {}
         self._arrived = asyncio.Event()
-        # One capture at a time: a tab is un-parked while it renders, so a second
+        # One request at a time: a tab is un-parked while it works, so a second
         # request would find no page and wrongly report that none is open.
         self._one = asyncio.Lock()
         self._ids = itertools.count(1)
@@ -68,19 +79,21 @@ class ViewerBroker:
         self,
         tab_id: str,
         timeout: float = POLL_SECONDS,
+        visible: bool = True,
         disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
     ) -> Optional[dict]:
         """Park until a request is assigned to *tab_id*; ``None`` on timeout.
 
-        *disconnected* is polled so a tab that went away frees its slot at once
+        *visible* is whether the page is on screen as it parks. *disconnected* is
+        polled so a tab that went away frees its slot at once
         rather than at the end of the wait.
         """
         old = self._parked.pop(tab_id, None)
-        if old is not None and not old.done():
+        if old is not None and not old.fut.done():
             # One poll per tab: a reload racing its predecessor's poll wins.
-            old.set_result(None)
+            old.fut.set_result(None)
         fut = asyncio.get_running_loop().create_future()
-        self._parked[tab_id] = fut
+        self._parked[tab_id] = _Parked(fut, visible)
         self._arrived.set()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -96,15 +109,22 @@ class ViewerBroker:
                         break
             return fut.result() if fut.done() else None
         finally:
-            if self._parked.get(tab_id) is fut:
+            parked = self._parked.get(tab_id)
+            if parked is not None and parked.fut is fut:
                 del self._parked[tab_id]
 
     def _pick(self) -> Optional[asyncio.Future]:
-        live = [f for f in self._parked.values() if not f.done()]
-        return live[-1] if live else None
+        """The most recently parked visible tab, else the most recent hidden one."""
+        live = [p for p in self._parked.values() if not p.fut.done()]
+        for p in reversed(live):
+            if p.visible:
+                return p.fut
+        return live[-1].fut if live else None
 
-    async def capture(self, view: str, max_edge: int, timeout: float = 25.0) -> Capture:
-        """Have a viewer page render *view* and return what it drew.
+    async def show(
+        self, view: str, image: bool, max_edge: int, timeout: float = 25.0
+    ) -> Shown:
+        """Have a viewer page move to *view*, and draw it if *image* is asked for.
 
         *view* is the viewer's own query string; the page applies it exactly as
         it would a shared link.
@@ -112,9 +132,11 @@ class ViewerBroker:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         async with self._one:
-            return await self._capture(view, max_edge, deadline)
+            return await self._show(view, image, max_edge, deadline)
 
-    async def _capture(self, view: str, max_edge: int, deadline: float) -> Capture:
+    async def _show(
+        self, view: str, image: bool, max_edge: int, deadline: float
+    ) -> Shown:
         loop = asyncio.get_running_loop()
         tab = self._pick()
         if tab is None:
@@ -127,27 +149,31 @@ class ViewerBroker:
             tab = self._pick()
         if tab is None:
             raise ViewerUnavailable(
-                "no visible viewer page is connected: ask the user to open the "
-                "web viewer in a browser tab and keep it visible (build the link "
-                'with user_base_url(), not a bare /viewer: see read_doc("web-viewer"))'
+                "no viewer page is connected: ask the user to open the web viewer "
+                "in a browser tab (build the link with user_base_url(), not a bare "
+                '/viewer: see read_doc("web-viewer"))'
             )
         req = f"c{next(self._ids)}"
         fut = asyncio.get_running_loop().create_future()
         self._pending[req] = fut
-        tab.set_result({"req": req, "view": view, "max_edge": max_edge})
+        tab.set_result({"req": req, "view": view, "image": image, "max_edge": max_edge})
         try:
-            return await asyncio.wait_for(fut, max(0.1, deadline - loop.time()))
+            shown = await asyncio.wait_for(fut, max(0.1, deadline - loop.time()))
         except asyncio.TimeoutError:
-            raise CaptureFailed(
-                "the viewer page did not answer in time (a hidden or busy tab?)"
+            raise ShowFailed(
+                "the viewer page did not answer in time (a busy tab?)"
             ) from None
         finally:
             self._pending.pop(req, None)
+        if image and shown.visible and shown.png is None:
+            raise ShowFailed("the viewer page sent no image")
+        return shown
 
     def resolve(
         self,
         req: str,
-        png: bytes,
+        visible: bool,
+        png: Optional[bytes] = None,
         partial: bool = False,
         notes: Optional[list] = None,
         error: Optional[str] = None,
@@ -157,7 +183,7 @@ class ViewerBroker:
         if fut is None or fut.done():
             return False
         if error:
-            fut.set_exception(CaptureFailed(error))
+            fut.set_exception(ShowFailed(error))
         else:
-            fut.set_result(Capture(png, partial, notes or []))
+            fut.set_result(Shown(visible, png, partial, notes or []))
         return True

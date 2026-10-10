@@ -18,8 +18,8 @@ both:
 
 - **The user**, by clicking it. This is what a visual check is *for*; opening
   the page yourself shows them nothing.
-- **You**, through `capture_view`, which has the user's open tab draw a view for
-  you; or through your host's browser automation, if it has any.
+- **You**, through `show_view`, which moves the user's open tab to a view (and can
+  return the image to you); or through your host's browser automation, if it has any.
 
 ## Building the link
 
@@ -122,21 +122,27 @@ control requires one (`--remote`), the user unlocks the page themselves; append
 `&token=…` only if they gave you a token for this purpose. Do not go looking for
 one.
 
-## Seeing it yourself
+## Presenting a result
 
-`capture_view(view)` is the replacement for `take_screenshot` on a session with
-no napari window. It has the user's open viewer tab draw `view` — the query
-string from [Parameters](#parameters), `id` required — and returns the PNG. Like
-napari, it changes the viewer: the view stays applied, so the user sees what you
-set. Overlays (`lb`, `rs`) must already be on the server (above); the page
-refetches them for the capture.
+`show_view(view)` is how a session with no napari window presents a result. It
+moves the user's open viewer tab to `view` — the query string from
+[Parameters](#parameters), `id` required — and returns at once. Like napari, it
+changes the viewer: the view stays, so the user sees what you set. Overlays
+(`lb`, `rs`) must already be on the server (above).
 
-- **It needs a tab.** The user must have the web viewer (`/viewer`) open and
-  visible in a browser. Otherwise it fails with "no visible viewer page": give
-  the user the link (from `user_base_url()`, see above) and ask them to open it.
-  A hidden tab cannot render.
+`show_view(view, image=True)` also returns a PNG of what the page drew, which is
+how you check a result you are about to report; it waits for tiles and overlays
+to load, so it is slower. Leave it off to just present.
+
+- **It needs a tab open, not on screen.** The user must have the web viewer
+  (`/viewer`) open. Otherwise it fails with "no viewer page is connected": give the
+  user the link (from `user_base_url()`, see above) and ask them to open it.
+- **A hidden tab moves but does not draw.** A minimised or fully covered window, or
+  a background tab, still takes the view, but the browser does not repaint it, so
+  the answer says the viewer is not visible and returns no image. Ask the user to
+  bring it forward; the view is waiting.
 - **A note means partial.** If tiles or an overlay were still loading when the
-  page gave up waiting, the image comes back with a note saying so; capture again
+  page gave up waiting, the image comes back with a note saying so; ask again
   rather than reporting it.
 - **Your own browser tool is the alternative**, where the host gives you one and
   the link is reachable from where it runs (the link is loopback). Wait for the

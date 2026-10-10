@@ -56,8 +56,8 @@ the user turned it off, napari is not installed, or there is no display;
 *`window: CLOSED`* means the user closed it, and `restart_kernel` restores it
 (ask — layers are lost). Neither is a reason to stop, and neither means the result cannot be seen: upload it and send a
 [[web-viewer]] link, which does not depend on this session having a display at
-all. What you lose is `take_screenshot`; `capture_view` replaces it, having the user's open
-web viewer tab draw the link and return the image.
+all. What you lose is `take_screenshot`; `show_view` replaces it, moving the user's open
+web viewer tab to the link and, if asked, returning the image.
 
 **The data plane.** `## Tensor Server` names the cause (not connected / auth /
 still starting). Check `biopb control status` with the user, or point at

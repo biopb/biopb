@@ -11,7 +11,7 @@ import { SourceTree } from "../components/SourceTree";
 import { ResolveModal } from "../components/ResolveModal";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
-import { useViewerCapture } from "../hooks/useViewerCapture";
+import { useViewerShow } from "../hooks/useViewerShow";
 import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
 import { CaptureOverlay } from "../components/CaptureOverlay";
 import { usePlayback } from "../hooks/usePlayback";
@@ -49,7 +49,7 @@ export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
   useViewerUrlSync();
   usePlayback();
-  const capture = useViewerCapture();
+  const capture = useViewerShow();
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);

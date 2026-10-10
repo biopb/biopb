@@ -92,35 +92,38 @@ def ensure_data_plane(timeout: float = 60.0) -> Optional[dict]:
     return _answer(url)
 
 
-class CaptureError(Exception):
-    """The control could not have a viewer page draw the view; the message says why."""
+class ShowError(Exception):
+    """The control could not have a viewer page show the view; the message says why."""
 
 
-def capture_view(view: str, max_edge: int = 1024, timeout: float = 30.0) -> dict:
-    """Have an open viewer page draw *view*: ``{"png", "partial", "notes"}``.
+def show_view(
+    view: str, image: bool = False, max_edge: int = 1024, timeout: float = 30.0
+) -> dict:
+    """Have an open viewer page move to *view*: ``{"visible", "png", "partial", "notes"}``.
 
-    *view* is the viewer's query string. ``png`` is base64. Raises
-    :class:`CaptureError` with the control's reason when no visible page can
-    answer, and :class:`OSError` when no control does.
+    *view* is the viewer's query string. ``visible`` is whether the page was on
+    screen; ``png`` (base64) is set only when *image* was asked for and it was.
+    Raises :class:`ShowError` with the control's reason when no page is open, and
+    :class:`OSError` when no control does.
     """
     try:
         # The control answers within *timeout*; the margin keeps its verdict from
         # arriving as a socket timeout.
         got = _request(
             "POST",
-            "/api/viewer/capture",
+            "/api/viewer/show",
             {},
             timeout + 5,
-            {"view": view, "max_edge": max_edge, "timeout": timeout},
+            {"view": view, "image": image, "max_edge": max_edge, "timeout": timeout},
         )
-        if not isinstance(got, dict) or not got.get("png"):
-            raise CaptureError("the control answered without an image")
+        if not isinstance(got, dict) or "visible" not in got:
+            raise ShowError("the control gave no answer about the viewer")
         return got
     except ValueError as exc:  # a body that is not JSON
-        raise CaptureError("the control did not answer in JSON") from exc
+        raise ShowError("the control did not answer in JSON") from exc
     except urllib.error.HTTPError as exc:
         try:
             reason = json.loads(exc.read().decode()).get("error")
         except Exception:  # noqa: BLE001 - the status alone will do
             reason = None
-        raise CaptureError(reason or f"the control answered HTTP {exc.code}") from exc
+        raise ShowError(reason or f"the control answered HTTP {exc.code}") from exc

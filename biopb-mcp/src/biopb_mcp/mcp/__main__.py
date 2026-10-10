@@ -207,7 +207,7 @@ def _withdraw_unusable_tools(mcp, viewer):
 
     The mode is fixed for the process, so the list never changes under a client
     (Codex does not follow ``tools/list_changed``). A tool that only refuses
-    costs the model a round; ``capture_view`` is how such a session sees.
+    costs the model a round; ``show_view`` is how such a session presents and sees.
     """
     if not viewer.has_window:
         mcp.remove_tool("take_screenshot")
