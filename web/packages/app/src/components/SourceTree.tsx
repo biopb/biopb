@@ -748,8 +748,7 @@ export function SourceTree() {
         )}
         {catalogTruncated && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more; search to
-            find the rest
+            {CATALOG_LIMIT.toLocaleString()} sources (truncated) - use a filter
           </div>
         )}
         {useServerQuery && (
@@ -758,7 +757,7 @@ export function SourceTree() {
             {serverQueryLoading && " • Searching…"}
             {serverMoreMatches &&
               !serverQueryLoading &&
-              ` • First ${SERVER_QUERY_LIMIT.toLocaleString()} matches shown, refine the search`}
+              ` • ${SERVER_QUERY_LIMIT.toLocaleString()} matches (truncated) - refine the filter`}
           </div>
         )}
       </div>
