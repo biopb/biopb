@@ -61,9 +61,8 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
-| `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
-| `GET` | `/api/sources/{id}` | ✓ | Single descriptor, by targeted lookup — not capped like the listing |
-| `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
+| `GET` | `/api/sources` | ✓ | JSON array of the catalog's source rows (`source_id`, `source_url`, `source_type`, `is_resolved`, `tensors`, and `unresolved_reason` when the server has it), ordered by `source_id`. `?limit=N` caps the rows; `X-Truncated` says whether the listing is short of the catalog (by `limit` or by the server's own row cap) |
+| `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed source metadata |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
 | `POST` | `/api/sources/{id}/resolve` | ✓ | Begin resolving an unresolved source; joins one already running (same-origin guarded) |
@@ -80,10 +79,6 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth note above) |
 
-> **Route ordering:** `/api/sources/{id}/metadata`, `/ticket/{ticket_hex}` and
-> the `/resolve` sub-paths are registered *before* the greedy
-> `{source_id:path}` catch-all to avoid Starlette first-match shadowing.
->
 > **`/readyz` connects.** It opens the Flight connection if none exists yet,
 > so it answers from the backend rather than from whatever traffic happened
 > to arrive first, and it is safe for a supervisor to gate on. `backend_health`
@@ -93,16 +88,16 @@ to remember when a local, token-protected box can't browse.
 ### Sources
 
 **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
-carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
-there and is **not** a usable grid. The transfer grid belongs to the tensor
-the server binds to serve a read, so ask `/api/tile_info/{array_id}` for it.
+carries `array_id` / `dim_labels` / `shape` / `dtype` and no `chunk_shape`.
+The transfer grid belongs to the tensor the server binds to serve a read, so
+ask `/api/tile_info/{array_id}` for it.
 
-**`/api/sources/{id}` is a single-row lookup** (a catalog query keyed on
-`source_id`), so it is not bounded by the listing's row cap — a source past
-that cap has a descriptor here but no entry on `/api/sources`. The catalog is
-public: a token-protected source is listed too (the token gates its pixels),
-but a `cache:` upload has no catalog row at all — reach one through
-`/api/tile_info/{array_id}`.
+**There is no single-source route.** One source is a catalog query keyed on
+`source_id` (`POST /api/sources/query`), which is not bounded by the listing's
+row cap — a source past that cap has no entry on `/api/sources` but is found
+there. The catalog is public: a token-protected source is listed too (the token
+gates its pixels), but a `cache:` upload has no catalog row at all — reach one
+through `/api/tile_info/{array_id}`.
 
 ### ROI annotations
 

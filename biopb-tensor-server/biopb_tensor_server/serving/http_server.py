@@ -10,11 +10,10 @@ Endpoints (unauthenticated — probes):
 
 Endpoints (token required):
   GET  /api/diagnostics              — runtime diagnostics
-  GET  /api/sources                  — list DataSourceDescriptors
+  GET  /api/sources[?limit=N]        — list the catalog's source rows (X-Truncated)
   POST /api/sources/query            — SQL query against source metadata
-  GET  /api/sources/{source_id}/metadata          — parsed metadata_json
+  GET  /api/sources/{source_id}/metadata          — parsed source metadata
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
-  GET  /api/sources/{source_id}      — single DataSourceDescriptor
   GET  /api/tile_info/{array_id}     — tile grid, pyramid levels + volume plan
   GET  /api/tile/{array_id}          — one tile, cacheable (raw | png | jpeg)
   POST /api/slice                    — fetch array slice as binary (body: array_id);
@@ -24,9 +23,6 @@ Endpoints (token required):
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
   GET  /api/admin/browse             — server-side filesystem browse (data-folder picker)
-
-  The specific /api/sources/{id}/… routes are registered before the greedy
-  /{id:path} catch-all so Starlette does not shadow them (see route defs).
 
 Authentication:
   Pass the website token in the ``Authorization: Bearer <token>`` header or
@@ -1779,10 +1775,9 @@ def _tile_etag(array_id: str, params: Sequence[Tuple[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 #
-# All handlers are module-level functions registered on this one router (the
-# registration order below is load-bearing: the /metadata and /ticket routes
-# must precede the greedy {source_id:path} catch-all). create_app() simply
-# include_router()s it, so per-handler complexity is measured per-handler.
+# All handlers are module-level functions registered on this one router.
+# create_app() simply include_router()s it, so per-handler complexity is
+# measured per-handler.
 # ---------------------------------------------------------------------------
 
 _router = APIRouter()
@@ -1869,22 +1864,77 @@ async def diagnostics(request: Request) -> JSONResponse:
 # -- Sources ----------------------------------------------------------------
 
 
+def _truncation(table: Any, n_rows: int) -> Tuple[int, int, bool]:
+    """``(total, returned, truncated)`` of a catalog query result.
+
+    Read from the schema metadata. An untagged Arrow table has
+    ``schema.metadata is None``, not an empty dict, so go through a fallback:
+    a result carrying no truncation keys must degrade to "returned == total"
+    rather than raise an AttributeError that a route's handler would then report
+    as a 502 Flight error.
+    """
+    table_metadata = table.schema.metadata or {}
+    # Prefer this query's own row counts; fall back to the legacy source-count
+    # keys for a server that predates them, then to the table.
+    total = int(
+        table_metadata.get(b"total_rows")
+        or table_metadata.get(b"total_sources")
+        or n_rows
+    )
+    returned = int(
+        table_metadata.get(b"returned_rows")
+        or table_metadata.get(b"returned_sources")
+        or n_rows
+    )
+    # Trust the server's own flag: it is the only party that saw the pre-cap
+    # size. Differencing the counts is what made every filtered query report
+    # truncation -- `total_sources` counts the catalog, not this result. Fall
+    # back to the difference only for a server that predates the flag.
+    flag = table_metadata.get(b"truncated")
+    truncated = flag.decode() == "True" if flag else total > returned
+    return total, returned, truncated
+
+
 @_router.get("/api/sources")
-async def list_sources(request: Request) -> JSONResponse:
+async def list_sources(
+    request: Request, limit: Optional[int] = Query(None, ge=1)
+) -> JSONResponse:
+    """The catalog as DataSourceDescriptors, ordered by ``source_id``.
+
+    ``limit`` caps the rows returned (the server's own ``max_query_results`` cap
+    applies regardless). ``X-Truncated`` says whether the listing is short of the
+    catalog, by either cap.
+    """
     ctx = _sidecar(request)
     ctx.check_token(request)
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        rows = client.query(
-            _source_list_sql(client) + " ORDER BY source_id", format="records"
-        )
-        _add_unresolved_reasons(client, rows)
-        result = [_source_row_to_dict(row) for row in rows]
+
+        def listing() -> JSONResponse:
+            # One row past the limit is how a caller learns it was cut, without
+            # a second query for the catalog's size.
+            page = f" LIMIT {limit + 1}" if limit is not None else ""
+            table = client.query(
+                _source_list_sql(client) + " ORDER BY source_id" + page
+            )
+            rows = table.to_pylist()
+            _, _, truncated = _truncation(table, len(rows))
+            if limit is not None and len(rows) > limit:
+                rows, truncated = rows[:limit], True
+            _add_unresolved_reasons(client, rows)
+            # Up to a few 10k rows to query, convert and encode: off the loop,
+            # which tile reads share.
+            return JSONResponse(
+                [_source_row_to_dict(row) for row in rows],
+                headers={"X-Truncated": str(truncated).lower()},
+            )
+
+        response = await run_in_threadpool(listing)
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
-        logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
-        return JSONResponse(result)
+        logger.debug(f"list_sources: answered in {elapsed:.1f}ms")
+        return response
     except HTTPException:
         raise
     except Exception as exc:
@@ -1955,30 +2005,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
 
-        # Truncation info from schema metadata. An untagged Arrow table has
-        # `schema.metadata is None`, not an empty dict, so go through a fallback:
-        # a result carrying no truncation keys must degrade to "returned ==
-        # total" rather than raise an AttributeError that the handler below would
-        # then report as a 502 Flight error.
-        table_metadata = arrow_table.schema.metadata or {}
-        # Prefer this query's own row counts; fall back to the legacy
-        # source-count keys for a server that predates them, then to the table.
-        total = int(
-            table_metadata.get(b"total_rows")
-            or table_metadata.get(b"total_sources")
-            or len(result)
-        )
-        returned = int(
-            table_metadata.get(b"returned_rows")
-            or table_metadata.get(b"returned_sources")
-            or len(result)
-        )
-        # Trust the server's own flag: it is the only party that saw the pre-cap
-        # size. Differencing the counts is what made every filtered query report
-        # truncation -- `total_sources` counts the catalog, not this result.
-        # Fall back to the difference only for a server that predates the flag.
-        flag = table_metadata.get(b"truncated")
-        truncated = flag.decode() == "True" if flag else total > returned
+        total, returned, truncated = _truncation(arrow_table, len(result))
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -2005,9 +2032,6 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         )
 
 
-# NOTE: the /metadata and /ticket routes must be registered before the greedy
-# {source_id:path} route, otherwise Starlette's first-match routing would
-# shadow them.
 @_router.get("/api/sources/{source_id:path}/metadata")
 async def get_source_metadata(source_id: str, request: Request) -> JSONResponse:
     ctx = _sidecar(request)
@@ -2118,10 +2142,6 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
 
 
 # -- Resolve (a consented cloud recall) --------------------------------
-#
-# Registered above the greedy /api/sources/{source_id:path} catch-all, the same
-# way /metadata and /ticket are: route order is what keeps a sub-path from being
-# swallowed as part of the id.
 
 
 def _run_recall(
@@ -2260,47 +2280,13 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     return _start_job("resolve", _resolve_worker, source_id, request)
 
 
-@_router.get("/api/sources/{source_id:path}")
-async def get_source(source_id: str, request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-        # One row, not the whole catalog. This route is addressed -- the id is
-        # already in hand -- so streaming every source to look one up cost
-        # O(catalog) per call and, worse, inherited the listing's safety cap:
-        # a source past it answered 404 while being perfectly readable.
-        rows = client.query(
-            f"{_source_list_sql(client)} WHERE source_id = {sql_literal(source_id)}",
-            format="records",
-        )
-        if not rows:
-            raise HTTPException(
-                status_code=404, detail=f"Source not found: {source_id}"
-            )
-        _add_unresolved_reasons(
-            client, rows, f"AND source_id = {sql_literal(source_id)}"
-        )
-        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_row_to_dict(rows[0]))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("GET_SOURCE_FAILED", str(exc))
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
-
-
 # -- Tiles (cacheable GET reads) --------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # ROI annotations
 #
-# Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
-# /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
+# Its own /api/rois/* namespace. Bodies are canonical proto3 JSON in
 # both directions -- json_format here, protobuf-es in the SPA -- so one schema
 # serves both ends and neither hand-writes a DTO.
 # ---------------------------------------------------------------------------
@@ -3275,15 +3261,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_id": row["source_id"],
         "source_url": row.get("source_url") or "",
         "source_type": row.get("source_type") or "",
-        # Always null on a listing; see _source_list_sql.
-        "metadata_json": None,
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
         # read-mask field, never by a row (biopb/biopb#1035). `is_resolved` is the
         # opposite case and belongs here -- monotonic, so a persisted row can
         # only lag in the harmless direction. Default True for a row from a
         # server predating the column, the right reading for every pre-existing
-        # source.
+        # source. Source metadata is its own route (``/metadata``), not a row field.
         "is_resolved": bool(row.get("is_resolved", True)),
         # Why it is not resolved (cloud recall, queued registration, a failed
         # one); absent for a resolved row and for a server that predates it.
@@ -3299,16 +3283,14 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
 def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:
     """JSON form of one tensor entry inside a source listing.
 
-    ``chunk_shape`` is carried for shape-compatibility with the TS
-    ``TensorDescriptor`` and is always ``[]`` here: a source listing is
-    structural, and the transfer grid is answered per resolved tensor by
-    ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
+    Structural only. There is no transfer grid here: it belongs to a resolved
+    tensor and is answered per ``array_id`` by ``/api/tile_info`` (which
+    describes the tensor) -- biopb/biopb#812.
     """
     return {
         "array_id": t["array_id"],
         "dim_labels": list(t.get("dim_labels") or []),
         "shape": [int(x) for x in (t.get("shape") or [])],
-        "chunk_shape": [],
         "dtype": t.get("dtype") or "",
     }
 

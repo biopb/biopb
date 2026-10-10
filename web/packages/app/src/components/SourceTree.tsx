@@ -1,7 +1,9 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore } from "../store";
+import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
+import { CATALOG_LIMIT, useAppStore } from "../store";
+import { REASON_COLUMN, SOURCE_COLUMNS, descriptorFromRow } from "../utils/catalogRow";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
   type TreeNode,
@@ -26,21 +28,53 @@ const SERVER_QUERY_THRESHOLD = 1000;
 // this is asked for, so "there were more" is known without a count.
 const SERVER_QUERY_LIMIT = 2000;
 
-/** The server-side search: a substring match over id, url and type. DuckDB's
- *  LIKE has no default escape character, so `\` escapes only with an explicit
- *  ESCAPE clause, and a literal `\` must be escaped first. */
-export function sourceSearchSql(q: string): string {
+/** The server-side search: a substring match over id, url and type, returning
+ *  `columns` of each match. DuckDB's LIKE has no default escape character, so
+ *  `\` escapes only with an explicit ESCAPE clause, and a literal `\` must be
+ *  escaped first. */
+export function sourceSearchSql(q: string, columns = SOURCE_COLUMNS): string {
   const escaped = q
     .replace(/\\/g, "\\\\")
     .replace(/'/g, "''")
     .replace(/%/g, "\\%")
     .replace(/_/g, "\\_");
-  return `SELECT source_id FROM sources WHERE
+  return `SELECT ${columns} FROM sources WHERE
       LOWER(source_id) LIKE '%${escaped}%' ESCAPE '\\' OR
       LOWER(source_url) LIKE '%${escaped}%' ESCAPE '\\' OR
       LOWER(source_type) LIKE '%${escaped}%' ESCAPE '\\'
       ORDER BY source_url LIMIT ${SERVER_QUERY_LIMIT + 1}`;
 }
+
+/**
+ * The search, as a function of the query runner. It asks for
+ * `unresolved_reason` too, which a server older than the column refuses: that
+ * first search asks again without, and the answer is remembered.
+ */
+export function createSourceSearch() {
+  let hasReason: boolean | undefined;
+  return async function search(
+    query: (sql: string) => Promise<QuerySourcesResult>,
+    q: string,
+  ): Promise<QuerySourcesResult> {
+    if (hasReason === false) return query(sourceSearchSql(q));
+    try {
+      const result = await query(sourceSearchSql(q, `${SOURCE_COLUMNS}, ${REASON_COLUMN}`));
+      hasReason = true;
+      return result;
+    } catch (err) {
+      if (hasReason) throw err;
+      // Only an answer without the column says the column was the trouble; a
+      // dropped connection fails this retry too, and teaches nothing.
+      const result = await query(sourceSearchSql(q)).catch(() => {
+        throw err;
+      });
+      hasReason = false;
+      return result;
+    }
+  };
+}
+
+const searchSources = createSourceSearch();
 
 function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
@@ -465,6 +499,7 @@ export function SourceTree() {
   const sources = useAppStore((s) => s.sources);
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
+  const catalogTruncated = useAppStore((s) => s.catalogTruncated);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   // Which tensor row to mark, in the catalog's own spelling: the target's
   // resolved, token-free key, and no row carries a token. Until it resolves,
@@ -504,7 +539,9 @@ export function SourceTree() {
   );
 
   const [query, setQuery] = useState("");
-  const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
+  // The sources a server-side search matched, whole: the catalog is searched,
+  // not the copy of it held here, so a match is shown whether or not it is loaded.
+  const [serverMatches, setServerMatches] = useState<DataSourceDescriptor[] | null>(null);
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
   // More sources matched than `SERVER_QUERY_LIMIT` lets through.
   const [serverMoreMatches, setServerMoreMatches] = useState(false);
@@ -545,29 +582,26 @@ export function SourceTree() {
   // Server-side filtering
   useEffect(() => {
     if (!useServerQuery || !debouncedQuery.trim()) {
-      setServerFilteredIds(null);
+      setServerMatches(null);
       setServerMoreMatches(false);
       return;
     }
-
-    const sql = sourceSearchSql(debouncedQuery.trim().toLowerCase());
 
     // A query superseded while in flight must not land over the newer one: the
     // answers can arrive out of order.
     let stale = false;
     setServerQueryLoading(true);
-    querySources(sql)
+    searchSources(querySources, debouncedQuery.trim().toLowerCase())
       .then((result) => {
         if (stale) return;
-        const ids = result.rows.slice(0, SERVER_QUERY_LIMIT).map((r) => r.source_id as string);
-        setServerFilteredIds(new Set(ids));
+        setServerMatches(result.rows.slice(0, SERVER_QUERY_LIMIT).map(descriptorFromRow));
         setServerMoreMatches(result.rows.length > SERVER_QUERY_LIMIT);
         setServerQueryLoading(false);
       })
       .catch((err) => {
         if (stale) return;
         console.warn("Server query failed:", err);
-        setServerFilteredIds(null);
+        setServerMatches(null);
         setServerMoreMatches(false);
         setServerQueryLoading(false);
       });
@@ -580,16 +614,12 @@ export function SourceTree() {
   // search query narrows further -- a source with nothing on it is never
   // worth a row, matching or not.
   const filteredSources = useMemo(() => {
-    const visible = sources.filter((s) => !isEmptySource(s));
     const q = activeQuery.trim().toLowerCase();
-    if (!q) return visible;
+    if (q && serverMatches) return serverMatches.filter((s) => !isEmptySource(s));
 
-    if (serverFilteredIds) {
-      return visible.filter((s) => serverFilteredIds.has(s.source_id));
-    }
-
-    return visible.filter((s) => matchesQuery(s, q));
-  }, [activeQuery, sources, serverFilteredIds]);
+    const visible = sources.filter((s) => !isEmptySource(s));
+    return q ? visible.filter((s) => matchesQuery(s, q)) : visible;
+  }, [activeQuery, sources, serverMatches]);
 
   // Build tree from filtered sources
   const tree = useMemo(() => buildTree(filteredSources), [filteredSources]);
@@ -606,7 +636,7 @@ export function SourceTree() {
 
   // Filter tree when search is active (client-side only)
   const displayTree = useMemo(() => {
-    if (!activeQuery.trim() || serverFilteredIds) {
+    if (!activeQuery.trim() || serverMatches) {
       return tree;
     }
 
@@ -623,7 +653,7 @@ export function SourceTree() {
       setExpandedFolders(newExpanded);
     }
     return filtered ?? tree;
-  }, [tree, activeQuery, filteredSources, serverFilteredIds, expandedFolders]);
+  }, [tree, activeQuery, filteredSources, serverMatches, expandedFolders]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   // The selection this has already revealed. Latched so a later catalog poll --
@@ -714,6 +744,12 @@ export function SourceTree() {
         {scanning && sources.length > 0 && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             Still indexing the data folder; more sources may appear
+          </div>
+        )}
+        {catalogTruncated && (
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more; search to
+            find the rest
           </div>
         )}
         {useServerQuery && (

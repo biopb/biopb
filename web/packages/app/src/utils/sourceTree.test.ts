@@ -14,7 +14,6 @@ const source = (over: Partial<DataSourceDescriptor> = {}): DataSourceDescriptor 
   source_id: "zarr_a3f2",
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
-  metadata_json: null,
   is_resolved: true,
   tensors: [],
   ...over,
@@ -144,7 +143,6 @@ describe("isUnresolved", () => {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -174,7 +172,6 @@ describe("isEmptySource", () => {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -200,7 +197,6 @@ function labelTensor(arrayId: string): TensorDescriptor {
     array_id: arrayId,
     dim_labels: ["y", "x"],
     shape: [64, 64],
-    chunk_shape: [],
     dtype: "uint16",
   };
 }

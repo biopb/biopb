@@ -377,12 +377,11 @@ describe("vivColor", () => {
 });
 
 describe("sliderGrid", () => {
-  const TENSOR = { array_id: "src_a/Image:0", dim_labels: ["t", "y", "x"], shape: [10, 512, 512], chunk_shape: [], dtype: "uint16" };
+  const TENSOR = { array_id: "src_a/Image:0", dim_labels: ["t", "y", "x"], shape: [10, 512, 512], dtype: "uint16" };
   const SOURCES = [{
     source_id: "src_a",
     source_url: "file:///a.tiff",
     source_type: "ome-tiff",
-    metadata_json: null,
     tensors: [TENSOR],
   }] as unknown as Parameters<typeof sliderGrid>[1];
 

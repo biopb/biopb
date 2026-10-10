@@ -3,18 +3,18 @@
  *
  * Usage:
  *   const client = new TensorFlightClient("http://localhost:8816", token);
- *   const sources = await client.listSources();
+ *   const { sources } = await client.listSourcesPage(20000);
  *   const arr = client.getTensor("my-source/tensor-0");
  *   const data = await arr.compute({ z: 5, c: 0, scaleHint: [1,1,1,8,8] });
  */
 
 import { TensorHttpClient } from "./client.js";
 import { TensorArray, buildAxisMap, isAxisMapAmbiguous } from "./tensor-array.js";
-import type { DataSourceDescriptor } from "./types.js";
+import type { DataSourceDescriptor, SourceListing } from "./types.js";
 
 export class TensorFlightClient {
   private readonly _http: TensorHttpClient;
-  /** Source cache populated by listSources(). */
+  /** Source cache populated by listSourcesPage(). */
   private _sources: Map<string, DataSourceDescriptor> = new Map();
 
   /**
@@ -35,11 +35,11 @@ export class TensorFlightClient {
   // API
   // -------------------------------------------------------------------------
 
-  /** List all data sources from the server. */
-  async listSources(): Promise<DataSourceDescriptor[]> {
-    const sources = await this._http.listSources();
-    this._sources = new Map(sources.map((s) => [s.source_id, s]));
-    return sources;
+  /** List at most `limit` data sources, and whether the catalog is longer. */
+  async listSourcesPage(limit: number): Promise<SourceListing> {
+    const listing = await this._http.listSourcesPage(limit);
+    this._sources = new Map(listing.sources.map((s) => [s.source_id, s]));
+    return listing;
   }
 
   /**
@@ -53,9 +53,9 @@ export class TensorFlightClient {
   /**
    * Return a lazy TensorArray for the given source + tensor.
    *
-   * If the source has already been fetched (via listSources), the descriptor
-   * is resolved from the local cache.  Otherwise a single getSource() call
-   * is made to populate it.
+   * If the source has already been fetched (via listSourcesPage), the descriptor
+   * is resolved from the local cache.  Otherwise the tensor describes itself
+   * on the first .compute() (one tileInfo() call).
    *
    * This method is synchronous-first for the cache-hit path; the returned
    * TensorArray only issues network requests when .compute() is called.
@@ -67,7 +67,7 @@ export class TensorFlightClient {
       if (td) return new TensorArray(this._http, td);
     }
     // Return a "pending" proxy — actual descriptor resolved lazily
-    return new LazyTensorArray(this._http, arrayId, this._sources);
+    return new LazyTensorArray(this._http, arrayId);
   }
 }
 
@@ -104,29 +104,22 @@ function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
 
 /**
  * TensorArray whose descriptor is fetched lazily on the first .compute().
- * Used when getTensor() is called before listSources().
+ * Used when getTensor() is called before listSourcesPage().
  */
 class LazyTensorArray extends TensorArray {
-  /** Single shared resolution promise — prevents concurrent duplicate getSource() calls. */
+  /** Single shared resolution promise — prevents concurrent duplicate tileInfo() calls. */
   private _resolvePromise: Promise<void> | null = null;
   private readonly _pendingArrayId: string;
-  private readonly _sourceCache: Map<string, DataSourceDescriptor>;
 
-  constructor(
-    client: TensorHttpClient,
-    arrayId: string,
-    sourceCache: Map<string, DataSourceDescriptor>,
-  ) {
+  constructor(client: TensorHttpClient, arrayId: string) {
     // Placeholder descriptor — replaced on first compute() via _doResolve()
     super(client, {
       array_id: arrayId,
       dim_labels: [],
       shape: [],
-      chunk_shape: [],
       dtype: "uint8",
     });
     this._pendingArrayId = arrayId;
-    this._sourceCache = sourceCache;
   }
 
   override async compute(options = {}): Promise<import("./types.js").TypedNdArray> {
@@ -136,15 +129,15 @@ class LazyTensorArray extends TensorArray {
   }
 
   private async _doResolve(): Promise<void> {
-    const source = await this._client.getSource(sourceOf(this._pendingArrayId));
-    this._sourceCache.set(source.source_id, source);
-    const td = descriptorIn(source, this._pendingArrayId);
-    if (!td) {
-      throw new Error(
-        `No tensor '${this._pendingArrayId}' (source has ` +
-          `${source.tensors.map((t) => t.array_id).join(", ") || "none"})`,
-      );
-    }
+    // The tensor describes itself: array_id is the whole address, so there is
+    // no source to look up and no guessing among its tensors.
+    const info = await this._client.tileInfo(this._pendingArrayId);
+    const td = {
+      array_id: this._pendingArrayId,
+      dim_labels: info.dim_labels,
+      shape: info.shape,
+      dtype: info.dtype,
+    };
     this._descriptor = td;
     this._axisMap = buildAxisMap(td.dim_labels);
     this._axisMapAmbiguous = isAxisMapAmbiguous(td.dim_labels);

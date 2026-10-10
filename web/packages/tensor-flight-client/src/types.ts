@@ -1,27 +1,25 @@
-/** Mirror of biopb.tensor.TensorDescriptor (JSON form from FastAPI). */
+/**
+ * One tensor of a source listing: structural only. The transfer grid belongs to
+ * a resolved tensor, not to its source's row; ask `GET /api/tile_info`
+ * (`TileInfo.chunk_shape` / `tile_size`) per `array_id`.
+ */
 export interface TensorDescriptor {
   array_id: string;
   dim_labels: string[];
   /** Full array shape (per dimension). */
   shape: number[];
-  /**
-   * Transfer grid. EMPTY inside a `DataSourceDescriptor.tensors` entry: a source
-   * listing is structural, and the grid is answered per resolved tensor. Use
-   * `GET /api/tile_info` (`TileInfo.chunk_shape` / `tile_size`) when you need
-   * one -- an empty array is not a usable grid.
-   */
-  chunk_shape: number[];
   /** NumPy-style dtype string, e.g. "uint8", "float32". */
   dtype: string;
 }
 
-/** Mirror of biopb.tensor.DataSourceDescriptor (JSON form from FastAPI). */
+/**
+ * One row of the server's `sources` catalog, as the sidecar lists it. Source
+ * metadata is not part of it: read that with `getSourceMetadata`.
+ */
 export interface DataSourceDescriptor {
   source_id: string;
   source_url: string;
   source_type: string;
-  /** Raw OME-NGFF JSON string, or null. */
-  metadata_json: string | null;
   /**
    * Deterministic: does a real, hydrated adapter back this source right now?
    * False for an unresolved cloud/synced-folder source awaiting an explicit
@@ -34,8 +32,8 @@ export interface DataSourceDescriptor {
    * Why `is_resolved` is false, or null when it is true. `needs_recall`: a
    * cloud placeholder, opening it downloads it, so ask first. `pending`: a
    * local source whose registration is still queued; reading it, or `resolve`,
-   * registers it at once and costs no download. `failed`: registration raised,
-   * and `metadata_json` carries the error. Absent from an older server's rows.
+   * registers it at once and costs no download. `failed`: registration raised.
+   * Absent from an older server's rows.
    */
   unresolved_reason?: "needs_recall" | "pending" | "failed" | null;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
@@ -193,6 +191,12 @@ export interface ReadyzSnapshot {
    * null `backend_health` could also mean "no request has connected yet."
    */
   backend_error?: string | null;
+}
+
+/** A catalog listing, and whether the server cut it short of the catalog. */
+export interface SourceListing {
+  sources: DataSourceDescriptor[];
+  truncated: boolean;
 }
 
 export interface QuerySourcesResult {

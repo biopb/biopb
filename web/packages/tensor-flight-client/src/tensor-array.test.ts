@@ -34,7 +34,6 @@ function makeDesc(
     array_id: arrayId,
     dim_labels: dimLabels,
     shape: shape ?? dimLabels.map(() => 64),
-    chunk_shape: dimLabels.map(() => 32),
     dtype,
   };
 }

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from biopb.tensor._session import ResolveCancelled
@@ -140,6 +141,18 @@ def _source_row(desc) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _answer(rows, format, **schema_metadata):  # noqa: A002 - mirrors the real kwarg
+    """What ``query`` returns for *rows*: a table, or the records of one."""
+    if format == "records":
+        return rows
+    table = pa.Table.from_pylist(rows)
+    if schema_metadata:
+        table = table.replace_schema_metadata(
+            {k: str(v) for k, v in schema_metadata.items()}
+        )
+    return table
+
+
 def _build_mock_client(src_desc=None) -> MagicMock:
     """Return a MagicMock that satisfies the TensorFlightClient interface."""
     mc = MagicMock()
@@ -149,14 +162,13 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     # query() over `sources`. The fake answers the two shapes the
     # routes ask for -- the whole listing, and one `WHERE source_id = '...'`.
     def query(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
-        assert format == "records", sql
         rows = [_source_row(src)]
         if "WHERE source_id = " in sql:
             wanted = sql.split("WHERE source_id = ", 1)[1].strip().strip("'")
             rows = [r for r in rows if r["source_id"] == wanted]
         if sql.startswith("SELECT tensors "):
-            return [{"tensors": r["tensors"]} for r in rows]
-        return rows
+            rows = [{"tensors": r["tensors"]} for r in rows]
+        return _answer(rows, format)
 
     mc.query.side_effect = query
 
@@ -488,6 +500,8 @@ class TestSourcesEndpoints:
         assert body[0]["source_id"] == "src0"
         assert body[0]["source_url"] == "/data/src0"
         assert isinstance(body[0]["tensors"], list)
+        # Source metadata is its own route, not a column of the row.
+        assert "metadata_json" not in body[0]
 
     def test_list_sources_tensor_fields(self, auth_client):
         tc, _ = auth_client
@@ -498,15 +512,10 @@ class TestSourcesEndpoints:
         assert tensor["dtype"] == "uint16"
         assert tensor["dim_labels"] == ["z", "y", "x"]
 
-    def test_get_single_source(self, auth_client):
+    def test_there_is_no_single_source_route(self, auth_client):
+        # A source is addressed by a catalog query (or its array_id), not a route.
         tc, _ = auth_client
         r = tc.get("/api/sources/src0", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()["source_id"] == "src0"
-
-    def test_get_missing_source_returns_404(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources/does-not-exist", headers=_bearer(_TOKEN))
         assert r.status_code == 404
 
     def test_get_source_metadata(self, auth_client):
@@ -539,7 +548,7 @@ class TestSourcesEndpoints:
         def query(sql, format="arrow"):  # noqa: A002
             if "unresolved_reason" in sql:
                 return [{"source_id": "src0", "unresolved_reason": "pending"}]
-            return [row]
+            return _answer([row], format)
 
         mock_fc.query.side_effect = query
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
@@ -556,7 +565,7 @@ class TestSourcesEndpoints:
         def query(sql, format="arrow"):  # noqa: A002
             if "unresolved_reason" in sql:
                 raise RuntimeError("Binder Error: column not found")
-            return [row]
+            return _answer([row], format)
 
         mock_fc.query.side_effect = query
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
@@ -566,9 +575,9 @@ class TestSourcesEndpoints:
 
     def test_a_resolved_source_carries_no_reason(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": [  # noqa: A006
-            _source_row(_make_source_desc())
-        ]
+        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
+            [_source_row(_make_source_desc())], format
+        )
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert "unresolved_reason" not in r.json()[0]
 
@@ -579,16 +588,81 @@ class TestSourcesEndpoints:
         # all; the default reads as resolved, the correct answer for every
         # pre-existing source.
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": [  # noqa: A006
-            {
-                "source_id": "src0",
-                "source_url": "/data/src0",
-                "source_type": "zarr",
-                "tensors": [],
-            }
-        ]
+        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
+            [
+                {
+                    "source_id": "src0",
+                    "source_url": "/data/src0",
+                    "source_type": "zarr",
+                    "tensors": [],
+                }
+            ],
+            format,
+        )
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is True
+
+    @staticmethod
+    def _catalog_of(mock_fc, n, **schema_metadata):
+        """A catalog of *n* sources that honours the LIMIT it is asked for."""
+        asked = []
+
+        def query(sql, format="arrow"):  # noqa: A002
+            asked.append(sql)
+            rows = [
+                {**_source_row(_make_source_desc()), "source_id": f"s{i:04d}"}
+                for i in range(n)
+            ]
+            if " LIMIT " in sql:
+                rows = rows[: int(sql.rsplit(" LIMIT ", 1)[1])]
+            return _answer(rows, format, **schema_metadata)
+
+        mock_fc.query.side_effect = query
+        return asked
+
+    def test_limit_cuts_the_listing_and_says_so(self, auth_client):
+        tc, mock_fc = auth_client
+        asked = self._catalog_of(mock_fc, 10)
+        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
+        assert [s["source_id"] for s in r.json()] == [
+            "s0000",
+            "s0001",
+            "s0002",
+            "s0003",
+        ]
+        assert r.headers["X-Truncated"] == "true"
+        # One row past the limit is how it learns the catalog is longer.
+        assert asked[0].endswith("ORDER BY source_id LIMIT 5")
+
+    def test_a_catalog_within_the_limit_is_not_truncated(self, auth_client):
+        tc, mock_fc = auth_client
+        self._catalog_of(mock_fc, 4)
+        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 4
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_without_a_limit_the_listing_is_whole(self, auth_client):
+        tc, mock_fc = auth_client
+        asked = self._catalog_of(mock_fc, 10)
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 10
+        assert r.headers["X-Truncated"] == "false"
+        assert "LIMIT" not in asked[0]
+
+    def test_the_servers_own_cap_is_reported_too(self, auth_client):
+        # max_query_results cuts a listing the caller never limited; the flag
+        # rides on the table's schema metadata.
+        tc, mock_fc = auth_client
+        self._catalog_of(mock_fc, 3, truncated=True, total_rows=9, returned_rows=3)
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 3
+        assert r.headers["X-Truncated"] == "true"
+
+    @pytest.mark.parametrize("limit", ["0", "-1", "abc"])
+    def test_a_bad_limit_is_refused(self, auth_client, limit):
+        tc, _ = auth_client
+        r = tc.get(f"/api/sources?limit={limit}", headers=_bearer(_TOKEN))
+        assert r.status_code == 422
 
 
 # ===========================================================================
@@ -1076,6 +1150,38 @@ class TestIntegration:
         # source_id comes from DataSourceDescriptor returned by the server
         assert body[0]["source_id"] is not None
         assert body[0]["tensors"][0]["shape"] == list(self._shape)
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_integration_list_sources_with_a_limit(self):
+        # The real metadata DB has to accept the LIMIT the route appends.
+        with self._make_tc() as tc:
+            r = tc.get("/api/sources?limit=1", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert len(r.json()) == 1
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_integration_a_search_row_is_the_listed_descriptor(self):
+        # The viewer's server-side search selects the descriptor columns with the
+        # catalog query and renders from them, so a row has to say what the
+        # listing says -- including the column a newer server adds.
+        columns = "source_id, source_url, source_type, is_resolved, tensors"
+        with self._make_tc() as tc:
+            (listed,) = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": f"SELECT {columns}, unresolved_reason FROM sources"},
+                headers=_bearer(_TOKEN),
+            )
+        assert r.status_code == 200
+        (row,) = r.json()
+        for key in ("source_id", "source_url", "source_type", "is_resolved"):
+            assert row[key] == listed[key]
+        assert [t["array_id"] for t in row["tensors"]] == [
+            t["array_id"] for t in listed["tensors"]
+        ]
+        assert row["tensors"][0]["shape"] == listed["tensors"][0]["shape"]
+        assert row["tensors"][0]["dtype"] == listed["tensors"][0]["dtype"]
+        assert "unresolved_reason" in row
 
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
@@ -2555,7 +2661,7 @@ class TestTileGridComesFromTheDescribedTensor:
                 (source,) = tc.get("/api/sources").json()
 
         assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
-        assert source["tensors"][0]["chunk_shape"] == []
+        assert "chunk_shape" not in source["tensors"][0]
 
 
 class TestTileArrayIdAddressing:
@@ -3624,12 +3730,11 @@ class TestVolumeStaysWithinTheBudget:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestSingleSourceIsNotCappedByTheListing:
-    """A source past the listing's row cap is unbrowsable but readable.
+class TestListingCap:
+    """A source past the listing's row cap is unlisted but still addressable.
 
-    Real Flight server, real sidecar. `/api/sources/{id}` used to look the id up
-    in the listing, so it inherited the browse cap and answered 404 for a source
-    that reads perfectly well -- purely because of where the id sorted.
+    Real Flight server, real sidecar. The listing says it was cut, and a catalog
+    query keyed on the id still finds the source the cap clipped.
     """
 
     @pytest.fixture(autouse=True)
@@ -3672,22 +3777,22 @@ class TestSingleSourceIsNotCappedByTheListing:
             raise_server_exceptions=True,
         )
 
-    def test_the_listing_is_still_capped(self):
+    def test_the_listing_is_capped_and_says_so(self):
         with self._tc() as tc:
             r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.status_code == 200
         assert [s["source_id"] for s in r.json()] == ["a"]
+        assert r.headers["X-Truncated"] == "true"
 
-    def test_the_clipped_source_still_answers_by_id(self):
+    def test_the_clipped_source_still_answers_a_query_by_id(self):
         with self._tc() as tc:
-            r = tc.get("/api/sources/c", headers=_bearer(_TOKEN))
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": "SELECT source_id FROM sources WHERE source_id = 'c'"},
+                headers=_bearer(_TOKEN),
+            )
         assert r.status_code == 200
-        assert r.json()["source_id"] == "c"
-
-    def test_an_id_nothing_holds_is_still_a_404(self):
-        with self._tc() as tc:
-            r = tc.get("/api/sources/nope", headers=_bearer(_TOKEN))
-        assert r.status_code == 404
+        assert [row["source_id"] for row in r.json()] == ["c"]
 
 
 # ===========================================================================
@@ -3718,9 +3823,7 @@ class TestResolveWarmJobs:
         assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
         mock_fc.resolve_source.assert_called_once()
 
-    def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
-        # /api/sources/{source_id:path} is greedy: without this route ordering
-        # the status GET reads as a source whose id is "cloud0/resolve/status".
+    def test_status_reports_the_job(self, auth_client):
         tc, _ = auth_client
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "done")
