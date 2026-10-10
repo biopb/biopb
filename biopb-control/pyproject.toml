@@ -33,8 +33,8 @@ classifiers = [
 # the lean-control discipline holds.
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    # The algorithm Ops protocol (biopb.image); .dev0 admits a pre-tag dev build.
-    "biopb >= 0.11.1",
+    # The algorithm Ops protocol (biopb.image).
+    "biopb >= 0.12.0",
     "starlette>=0.37",
     # No websockets extra: the control proxies HTTP only and runs uvicorn with
     # ws="none", so neither a server impl nor a client library is pulled in.
