@@ -990,7 +990,8 @@ class MetadataDatabase:
         )
         conn.execute(_ROIS_DDL)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_array ON rois(array_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_rois_source ON rois(source_id)")
+        # Earlier builds also indexed source_id; no query gains from it.
+        conn.execute("DROP INDEX IF EXISTS idx_rois_source")
         self._reconcile_roi_schema(conn, had_rois)
 
         # Reserved sets are scan output like `sources` itself -- derived from a

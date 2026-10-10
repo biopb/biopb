@@ -1130,6 +1130,25 @@ class TestPersistence:
         assert back[0].roi == written.roi
         assert back[0].rev == written.rev
 
+    def test_a_catalog_from_an_earlier_build_loses_the_source_index(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db._get_connection().execute("CREATE INDEX idx_rois_source ON rois(source_id)")
+        db.close()
+
+        db = MetadataDatabase(store_path=store)
+        try:
+            names = {
+                r[0]
+                for r in db._get_connection()
+                .execute("SELECT index_name FROM duckdb_indexes()")
+                .fetchall()
+            }
+        finally:
+            db.close()
+        assert "idx_rois_source" not in names
+        assert "idx_rois_array" in names
+
     @pytest.mark.parametrize(("mb", "expected"), [(None, "1.0 GiB"), (64, "64.0 MiB")])
     def test_the_checkpoint_threshold_reaches_the_file_backed_catalog(
         self, tmp_path, mb, expected
