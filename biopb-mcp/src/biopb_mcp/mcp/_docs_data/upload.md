@@ -100,7 +100,10 @@ moves it. The ladder only climbs:
 **`"READY"` publishes and seals in one move.** Once a consumer can read it, it
 takes no more chunks — so a partial upload is published by declaring it done,
 not by leaving it open. A chunk you never sent reads back as zeros, which is
-how a sparse result (one labelled frame of a thousand) costs one frame.
+how a sparse result (one labelled frame of a thousand) costs one frame —
+when a frame is at least a transfer chunk (~64 MB). The server grows a smaller
+`chunk_shape` toward that size, so a small frame shares its chunk with its
+neighbours.
 
 The reason the two are one moment: **a chunk already read is not read again.**
 A `chunk_id` names fixed bytes everywhere else in this system, so both the
@@ -171,6 +174,9 @@ client.put_rois(image_id, [
 ])
 ```
 
+- **`image_id` is the tensor's `array_id` from the catalog.** A bare source_id
+  is taken for the source's default tensor and filed under that id; an id that
+  names no registered source is refused.
 - **Level-0 pixel coordinates.** A shape measured on a downsampled level has to
   be scaled up first; nothing does it for you.
 - **The 2-D vector arms only**: point, rectangle, ellipse, polygon, polyline

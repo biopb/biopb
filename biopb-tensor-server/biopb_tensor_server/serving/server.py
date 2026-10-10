@@ -75,6 +75,7 @@ from biopb.tensor.ticket_pb2 import (
 )
 from google.protobuf.message import DecodeError, Message
 
+from biopb_tensor_server.adapters._scale import inherit_scale
 from biopb_tensor_server.adapters._writable import (
     UploadProgress,
     UploadStatus,
@@ -912,6 +913,33 @@ class TensorFlightServer(flight.FlightServerBase):
             return None
         return strip_source_prefix(source_id, tensor_id)
 
+    def _roi_array_id(self, array_id: str, *, strict: bool = False) -> str:
+        """The tensor id annotations are filed under for *array_id*.
+
+        A bare ``source_id`` is the alias every read accepts for a source's
+        default tensor; annotations live under that tensor's own id, so they
+        are filed there and a read of either finds them. *strict* (a write)
+        also refuses an id whose source is not registered, which no viewer
+        could ever show; a read or a delete of such an id passes through, so
+        what an earlier write left behind can still be listed and removed.
+        """
+        source_id, field = split_array_id(array_id)
+        if field:
+            if strict and source_id not in self.sources:
+                raise ValueError(f"array_id {array_id!r} names no known source")
+            return array_id
+        default = self._default_array_id(source_id)
+        if default is None and strict:
+            raise ValueError(f"array_id {array_id!r} names no known source")
+        return default or array_id
+
+    def _default_array_id(self, source_id: str) -> Optional[str]:
+        """``SourceRegistry.default_array_id``, its refusals as Flight errors."""
+        try:
+            return self.sources.default_array_id(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise to_flight_error(exc) from exc
+
     @staticmethod
     def _catalog_endpoint(sql: str) -> flight.FlightEndpoint:
         """The one endpoint every catalog ``FlightInfo`` carries: a ticket with
@@ -1544,13 +1572,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            default_adapter = self._registered(source_id)
-            if default_adapter is not None:
-                descriptors = default_adapter.list_tensors()
-                if descriptors:
-                    field = self._field_within_source(
-                        source_id, descriptors[0].array_id
-                    )
+            default = self._default_array_id(source_id)
+            if default is not None:
+                field = self._field_within_source(source_id, default)
 
         logger.debug(
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}, field={field}"
@@ -1622,6 +1646,13 @@ class TensorFlightServer(flight.FlightServerBase):
             # (``adapters/labels.py``), not the source's.
             if tensor_adapter.content_version:
                 read_plan.descriptor.content_version = tensor_adapter.content_version
+
+            # An uploaded tensor or label set carries no calibration of its own:
+            # it takes the image's, by axis.
+            if not read_plan.descriptor.physical_scale:
+                parent = self.sources.attached_parent(source_id, field)
+                if parent is not None:
+                    inherit_scale(parent, read_plan.descriptor)
 
             # Populate metadata_json in response descriptor if requested
             if METADATA_JSON in mask:
@@ -1938,10 +1969,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 READ_ANNOTATIONS,
                 sealed=self._roi_sealed(req),
             )
-            rois, truncated = db.list_rois(req.array_id, req.set_name)
+            array_id = self._roi_array_id(req.array_id)
+            rois, truncated = db.list_rois(array_id, req.set_name)
             sets = [
                 {"set_name": name, "count": count, "reserved": is_reserved_set(name)}
-                for name, count in db.list_roi_sets(req.array_id)
+                for name, count in db.list_roi_sets(array_id)
             ]
         except ValueError as e:
             raise flight.FlightServerError(str(e))
@@ -2085,15 +2117,22 @@ class TensorFlightServer(flight.FlightServerBase):
             if arm == "roi_put":
                 self._authorize(context)
                 rois = table_to_rois(reader.read_all())
+                asked = cmd.roi_put.array_id
+                array_id = self._roi_array_id(asked, strict=True)
+                for roi in rois:
+                    if roi.array_id == asked:
+                        roi.array_id = array_id
                 stored, conflicts = db.put_rois(
-                    cmd.roi_put.array_id, rois, check_rev=cmd.roi_put.check_rev
+                    array_id, rois, check_rev=cmd.roi_put.check_rev
                 )
                 reply = RoiPutResult(stored=stored, conflicts=conflicts)
             else:
                 self._authorize(context)
                 roi_ids = table_to_roi_ids(reader.read_all())
                 deleted = db.delete_rois(
-                    cmd.roi_delete.array_id, roi_ids, cmd.roi_delete.set_name
+                    self._roi_array_id(cmd.roi_delete.array_id),
+                    roi_ids,
+                    cmd.roi_delete.set_name,
                 )
                 reply = RoiDeleteResult(deleted=deleted)
         except ValueError as e:
