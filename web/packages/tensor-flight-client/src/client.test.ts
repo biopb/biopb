@@ -189,6 +189,33 @@ describe("TensorHttpClient.readyz", () => {
 // Sources
 // ---------------------------------------------------------------------------
 
+describe("TensorHttpClient.listSourcesPage", () => {
+  const page = (body: unknown, truncated: string) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "X-Truncated": truncated },
+    });
+
+  it("asks for a limit and reports the server's truncation flag", async () => {
+    mockFetch.mockResolvedValueOnce(page([SOURCE], "true"));
+    const c = new TensorHttpClient(BASE, TOKEN);
+    const listing = await c.listSourcesPage(20_000);
+    const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${BASE}/api/sources?limit=20000`);
+    expect((opts.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
+    expect(listing.sources).toHaveLength(1);
+    expect(listing.truncated).toBe(true);
+  });
+
+  it("is not truncated unless the server says so", async () => {
+    mockFetch.mockResolvedValueOnce(page([SOURCE], "false"));
+    expect((await new TensorHttpClient(BASE, TOKEN).listSourcesPage(10)).truncated).toBe(false);
+    // A server that predates the header lists everything it has.
+    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
+    expect((await new TensorHttpClient(BASE, TOKEN).listSourcesPage(10)).truncated).toBe(false);
+  });
+});
+
 describe("TensorHttpClient.listSources", () => {
   it("GETs /api/sources and returns array", async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));

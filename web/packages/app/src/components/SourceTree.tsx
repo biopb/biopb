@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore } from "../store";
+import { CATALOG_LIMIT, useAppStore } from "../store";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
   type TreeNode,
@@ -465,6 +465,7 @@ export function SourceTree() {
   const sources = useAppStore((s) => s.sources);
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
+  const catalogTruncated = useAppStore((s) => s.catalogTruncated);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   // Which tensor row to mark, in the catalog's own spelling: the target's
   // resolved, token-free key, and no row carries a token. Until it resolves,
@@ -714,6 +715,11 @@ export function SourceTree() {
         {scanning && sources.length > 0 && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             Still indexing the data folder; more sources may appear
+          </div>
+        )}
+        {catalogTruncated && (
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more
           </div>
         )}
         {useServerQuery && (

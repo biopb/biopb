@@ -20,6 +20,7 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
+  SourceListing,
   SourceJobStatus,
   SliceRequest,
   TileInfo,
@@ -411,6 +412,24 @@ export class TensorHttpClient {
       undefined,
       this.metadataTimeoutMs,
       opts,
+    );
+  }
+
+  /**
+   * List at most `limit` data sources, and whether that cut the catalog short.
+   * The server's own cap can cut a listing too, so `truncated` is the server's
+   * word, not a comparison against `limit`.
+   */
+  async listSourcesPage(limit: number, opts?: RequestOptions): Promise<SourceListing> {
+    return this.send(
+      `/api/sources?limit=${limit}`,
+      { headers: this.headers() },
+      this.metadataTimeoutMs,
+      opts,
+      async (res) => ({
+        sources: (await res.json()) as DataSourceDescriptor[],
+        truncated: res.headers.get("X-Truncated") === "true",
+      }),
     );
   }
 

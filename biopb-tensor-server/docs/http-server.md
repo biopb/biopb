@@ -61,7 +61,7 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
-| `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
+| `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects, ordered by `source_id`. `?limit=N` caps the rows; `X-Truncated` says whether the listing is short of the catalog (by `limit` or by the server's own row cap), `X-Returned-Sources` is the row count |
 | `GET` | `/api/sources/{id}` | ✓ | Single descriptor, by targeted lookup — not capped like the listing |
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |

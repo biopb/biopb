@@ -26,6 +26,9 @@ import {
   selectUrlLabelOverlay,
   selectUrlVisibleSets,
   catalogFingerprint,
+  CATALOG_LIMIT,
+  POLL_BACKOFF_MS,
+  nextPollStep,
   useAppStore,
   EMPTY_VIEW,
 } from "./store";
@@ -116,9 +119,9 @@ async function openLink(query: string) {
   await settle();
 }
 
-const client = (sources: DataSourceDescriptor[]) =>
+const client = (sources: DataSourceDescriptor[], truncated = false) =>
   ({
-    listSources: vi.fn().mockResolvedValue(sources),
+    listSourcesPage: vi.fn().mockResolvedValue({ sources, truncated }),
     http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
   }) as unknown as TensorFlightClient;
 
@@ -164,7 +167,9 @@ describe("catalog polling", () => {
     const other = { ...SOURCE, source_id: "other-source" };
     let land: (sources: DataSourceDescriptor[]) => void = () => {};
     const slow = {
-      listSources: vi.fn().mockReturnValue(new Promise((resolve) => (land = resolve))),
+      listSourcesPage: vi.fn().mockReturnValue(
+        new Promise((resolve) => (land = (sources) => resolve({ sources, truncated: false }))),
+      ),
       http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
     } as unknown as TensorFlightClient;
     useAppStore.setState({
@@ -182,6 +187,143 @@ describe("catalog polling", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(useAppStore.getState().activeSourceId).toBe("other-source");
+  });
+
+  describe("schedule", () => {
+    const polled = (c: TensorFlightClient) =>
+      (c.listSourcesPage as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    const start = (c: TensorFlightClient) => {
+      vi.useFakeTimers();
+      useAppStore.setState({ client: c, connectionState: "connected", sources: [SOURCE] });
+      useAppStore.getState().startCatalogPolling();
+    };
+
+    it("first asks after 30 seconds, for at most the limit", async () => {
+      const c = client([SOURCE]);
+      start(c);
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(polled(c)).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(polled(c)).toBe(1);
+      expect(c.listSourcesPage).toHaveBeenCalledWith(CATALOG_LIMIT);
+    });
+
+    it("backs off while the catalog is unchanged", async () => {
+      const c = client([SOURCE]);
+      start(c);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(polled(c)).toBe(1);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(polled(c)).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(polled(c)).toBe(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(polled(c)).toBe(3);
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(polled(c)).toBe(4);
+      // and it stays at the longest delay
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(polled(c)).toBe(5);
+    });
+
+    it("returns to 30 seconds when the catalog changes", async () => {
+      const grown = { ...SOURCE, source_id: "second" };
+      const c = client([SOURCE]);
+      start(c);
+      await vi.advanceTimersByTimeAsync(30_000); // poll 1: unchanged -> next in 60 s
+      (c.listSourcesPage as ReturnType<typeof vi.fn>).mockResolvedValue({
+        sources: [SOURCE, grown],
+        truncated: false,
+      });
+      await vi.advanceTimersByTimeAsync(60_000); // poll 2: changed -> next in 30 s
+      expect(polled(c)).toBe(2);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(polled(c)).toBe(3);
+    });
+
+    it("stays at 30 seconds while the catalog is still being indexed", async () => {
+      const c = {
+        listSourcesPage: vi.fn().mockResolvedValue({ sources: [SOURCE], truncated: false }),
+        http: {
+          readyz: vi.fn().mockResolvedValue({ backend_health: { full_scan_in_progress: true } }),
+        },
+      } as unknown as TensorFlightClient;
+      start(c);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(polled(c)).toBe(3);
+    });
+
+    it("stops for good when stopped mid-poll", async () => {
+      const c = client([SOURCE]);
+      start(c);
+      await vi.advanceTimersByTimeAsync(30_000);
+      useAppStore.getState().stopCatalogPolling();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(polled(c)).toBe(1);
+    });
+  });
+
+  it("sees a source resolve in place, as a change", async () => {
+    // Same id and url, now resolved with tensors: only is_resolved and the
+    // tensors moved, which is what a signature on urls alone cannot see.
+    vi.useFakeTimers();
+    const resolved = {
+      ...SOURCE,
+      is_resolved: true,
+      tensors: [
+        { array_id: "t", dim_labels: ["y", "x"], shape: [4, 4], chunk_shape: [], dtype: "uint16" },
+      ],
+    };
+    useAppStore.setState({
+      client: client([resolved]),
+      connectionState: "connected",
+      sources: [{ ...SOURCE, is_resolved: false, tensors: [] }],
+    });
+    useAppStore.getState().startCatalogPolling();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(useAppStore.getState().sources[0]!.is_resolved).toBe(true);
+  });
+
+  it("notes a truncated catalog, and does not mistake the cut for a removal", async () => {
+    vi.useFakeTimers();
+    useAppStore.setState({
+      client: client([], true),
+      connectionState: "connected",
+      sources: [SOURCE],
+      ...viewOf(SOURCE.source_id),
+    });
+    useAppStore.getState().startCatalogPolling();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(useAppStore.getState().catalogTruncated).toBe(true);
+    // The open source may be past the limit, not gone.
+    expect(useAppStore.getState().activeSourceId).toBe(SOURCE.source_id);
+  });
+
+  it("clears the truncation note when the catalog fits again", async () => {
+    vi.useFakeTimers();
+    useAppStore.setState({
+      client: client([SOURCE], false),
+      connectionState: "connected",
+      sources: [SOURCE],
+      catalogTruncated: true,
+    });
+    useAppStore.getState().startCatalogPolling();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(useAppStore.getState().catalogTruncated).toBe(false);
+  });
+});
+
+describe("nextPollStep", () => {
+  it("backs off to the last delay and stays, and a change starts over", () => {
+    let step = 0;
+    const seen = [];
+    for (let i = 0; i < 6; i++) {
+      step = nextPollStep(step, false);
+      seen.push(POLL_BACKOFF_MS[step]);
+    }
+    expect(seen).toEqual([60_000, 120_000, 300_000, 300_000, 300_000, 300_000]);
+    expect(nextPollStep(3, true)).toBe(0);
   });
 });
 
@@ -1693,7 +1835,7 @@ describe("recent sources", () => {
     tileInfo: (id: string) => Promise<TileInfo>,
   ) =>
     ({
-      listSources: vi.fn().mockResolvedValue(sources),
+      listSourcesPage: vi.fn().mockResolvedValue({ sources, truncated: false }),
       http: {
         readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
         tileInfo: vi.fn(tileInfo),
@@ -1898,7 +2040,10 @@ describe("resolve jobs", () => {
   });
 
   const stubClient = (http: Record<string, unknown>) =>
-    ({ http, listSources: vi.fn().mockResolvedValue([]) }) as unknown as TensorFlightClient;
+    ({
+      http,
+      listSourcesPage: vi.fn().mockResolvedValue({ sources: [], truncated: false }),
+    }) as unknown as TensorFlightClient;
 
   afterEach(() => {
     useAppStore.getState().stopJobPolling();
@@ -1954,9 +2099,9 @@ describe("resolve jobs", () => {
 
   it("re-reads the catalog when a resolve lands", async () => {
     // The row still lists the pre-resolve tensors the moment a resolve lands.
-    const listSources = vi.fn().mockResolvedValue([]);
+    const listSourcesPage = vi.fn().mockResolvedValue({ sources: [], truncated: false });
     const client = {
-      listSources,
+      listSourcesPage,
       http: {
         startResolve: vi.fn().mockResolvedValue(status()),
         jobStatus: vi.fn().mockResolvedValue(status({ state: "done" })),
@@ -1972,7 +2117,7 @@ describe("resolve jobs", () => {
         ),
       { timeout: 3000 },
     );
-    expect(listSources).toHaveBeenCalled();
+    expect(listSourcesPage).toHaveBeenCalled();
   });
 
   describe("opening the source a resolve finished", () => {
@@ -1981,7 +2126,7 @@ describe("resolve jobs", () => {
 
     const resolveClient = (final: SourceJobStatus, first = status()) =>
       ({
-        listSources: vi.fn().mockResolvedValue([]),
+        listSourcesPage: vi.fn().mockResolvedValue({ sources: [], truncated: false }),
         http: {
           startResolve: vi.fn().mockResolvedValue(first),
           jobStatus: vi.fn().mockResolvedValue(final),

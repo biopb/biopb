@@ -22,7 +22,7 @@ Low-level wrapper over the REST API. `new TensorHttpClient(apiBase, token)`.
 | Method | Endpoint |
 |--------|----------|
 | `livez()` / `readyz()` | `GET /livez` / `GET /readyz` |
-| `listSources()` | `GET /api/sources` |
+| `listSources()` / `listSourcesPage(limit)` | `GET /api/sources[?limit=N]` (the page also reports `truncated`) |
 | `getSource(id)` / `getSourceMetadata(id)` | `GET /api/sources/{id}[/metadata]` |
 | `slice(req)` | `POST /api/slice` |
 | `diagnostics()` | `GET /api/diagnostics` |

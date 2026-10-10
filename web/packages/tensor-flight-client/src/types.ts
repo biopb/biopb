@@ -195,6 +195,12 @@ export interface ReadyzSnapshot {
   backend_error?: string | null;
 }
 
+/** A catalog listing, and whether the server cut it short of the catalog. */
+export interface SourceListing {
+  sources: DataSourceDescriptor[];
+  truncated: boolean;
+}
+
 export interface QuerySourcesResult {
   rows: Record<string, unknown>[];
   totalSources: number;

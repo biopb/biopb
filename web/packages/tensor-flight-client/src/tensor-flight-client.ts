@@ -10,7 +10,7 @@
 
 import { TensorHttpClient } from "./client.js";
 import { TensorArray, buildAxisMap, isAxisMapAmbiguous } from "./tensor-array.js";
-import type { DataSourceDescriptor } from "./types.js";
+import type { DataSourceDescriptor, SourceListing } from "./types.js";
 
 export class TensorFlightClient {
   private readonly _http: TensorHttpClient;
@@ -40,6 +40,13 @@ export class TensorFlightClient {
     const sources = await this._http.listSources();
     this._sources = new Map(sources.map((s) => [s.source_id, s]));
     return sources;
+  }
+
+  /** List at most `limit` data sources, and whether the catalog is longer. */
+  async listSourcesPage(limit: number): Promise<SourceListing> {
+    const listing = await this._http.listSourcesPage(limit);
+    this._sources = new Map(listing.sources.map((s) => [s.source_id, s]));
+    return listing;
   }
 
   /**
