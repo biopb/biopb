@@ -86,12 +86,15 @@ never mix. Observe uses SSE, so its proxy is a streaming passthrough; explicit
 prefix mounts — no root catch-all — keep the static `/`-fallback from swallowing
 the session and data-plane prefixes.
 
-**Viewer capture.** A session with no napari window cannot see its own results, so
-`POST /api/viewer/capture` hands a request to an open viewer page and returns the PNG
-it draws. The page long-polls `/api/viewer/next` only while its tab is visible (a
-hidden tab does not repaint), so a parked poll is both the heartbeat and the only way
-to be given work; the answer comes back on `/api/viewer/answer/<req>`. With no
-visible page the request fails at once. The broker is `_viewer_broker.py`.
+**Presenting in the viewer.** A session with no napari window cannot show its results,
+so `POST /api/viewer/show` hands the view to every open viewer page (nothing says which
+machine the user is at), each of which moves to it and acknowledges at once, the first
+visible one's answer being the result; with `image` set it also draws and returns a PNG. The page
+long-polls `/api/viewer/next` whether or not it is visible, and says which: a hidden
+page still moves its state but does not repaint, so it acknowledges without an image.
+A parked poll is both the heartbeat and the only way to be given work; the answer comes
+back on `/api/viewer/answer/<req>`. With no page open the request fails at once. The
+broker is `_viewer_broker.py`.
 
 Because the data plane is the control's child, clients ask the control to *ensure*
 it rather than starting one themselves.

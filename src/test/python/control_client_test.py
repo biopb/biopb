@@ -126,16 +126,21 @@ def test_local_trust_error_is_public_on_biopb_tensor():
     assert "LocalTrustError" in biopb.tensor.__all__
 
 
-def test_capture_view_posts_the_view_and_returns_the_pages_answer(monkeypatch):
-    seen = _serve(monkeypatch, {"png": "UE5H", "partial": False, "notes": []})
-    got = _client.capture_view("id=a&z=2", 256, timeout=7)
+def test_show_view_posts_the_view_and_returns_the_pages_answer(monkeypatch):
+    seen = _serve(monkeypatch, {"visible": True, "png": "UE5H", "partial": False})
+    got = _client.show_view("id=a&z=2", True, 256, timeout=7)
     req = seen[-1]
-    assert req.full_url.endswith("/api/viewer/capture") and req.method == "POST"
-    assert json.loads(req.data) == {"view": "id=a&z=2", "max_edge": 256, "timeout": 7}
-    assert got["png"] == "UE5H"
+    assert req.full_url.endswith("/api/viewer/show") and req.method == "POST"
+    assert json.loads(req.data) == {
+        "view": "id=a&z=2",
+        "image": True,
+        "max_edge": 256,
+        "timeout": 7,
+    }
+    assert got["png"] == "UE5H" and got["visible"] is True
 
 
-def test_capture_view_carries_the_controls_reason_when_it_refuses(monkeypatch):
+def test_show_view_carries_the_controls_reason_when_it_refuses(monkeypatch):
     import urllib.error
 
     def refuse(req, timeout=None):
@@ -144,9 +149,9 @@ def test_capture_view_carries_the_controls_reason_when_it_refuses(monkeypatch):
             409,
             "Conflict",
             {},
-            io.BytesIO(b'{"error": "no visible viewer page"}'),
+            io.BytesIO(b'{"error": "no viewer page is connected"}'),
         )
 
     monkeypatch.setattr(_client.urllib.request, "urlopen", refuse)
-    with pytest.raises(_client.CaptureError, match="no visible viewer page"):
-        _client.capture_view("id=a")
+    with pytest.raises(_client.ShowError, match="no viewer page"):
+        _client.show_view("id=a")

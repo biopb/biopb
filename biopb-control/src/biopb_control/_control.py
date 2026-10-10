@@ -133,7 +133,7 @@ from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
     MAX_PNG_BYTES,
-    CaptureFailed,
+    ShowFailed,
     ViewerBroker,
     ViewerUnavailable,
 )
@@ -236,7 +236,7 @@ def _session_proxy_roots(
 # (GET/HEAD/OPTIONS) don't.
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-#: What a viewer page's answer must open with.
+#: What a viewer page's image must open with.
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
@@ -1354,36 +1354,44 @@ def build_app(
     viewer = ViewerBroker()
 
     async def viewer_next(request: Request) -> Response:
-        # A viewer page's long poll for a capture request: 200 with the request,
-        # 204 when none came within the window.
+        # A viewer page's long poll for a request: 200 with the request, 204
+        # when none came within the window. ``visible=0`` says the page is
+        # hidden: it still takes requests, but cannot draw an image.
+        query = request.query_params
         job = await viewer.next(
-            request.query_params.get("client", ""), disconnected=request.is_disconnected
+            query.get("client", ""),
+            visible=query.get("visible") != "0",
+            disconnected=request.is_disconnected,
         )
         return JSONResponse(job) if job else Response(status_code=204)
 
     async def viewer_answer(request: Request) -> JSONResponse:
-        # The page's answer: a PNG body, or ?error= with none.
+        # The page's acknowledgement: ``?visible=`` says whether it was on
+        # screen, a PNG body is the image if it drew one, ``?error=`` a failure.
         query = request.query_params
         body = await request.body()
         if len(body) > MAX_PNG_BYTES:
             return JSONResponse({"error": "image too large"}, status_code=413)
         error = query.get("error")
-        if not error and not body.startswith(_PNG_SIGNATURE):
-            error = "the viewer page sent no image"
+        if body and not body.startswith(_PNG_SIGNATURE):
+            error = error or "the viewer page sent no image"
         ok = viewer.resolve(
             request.path_params["req"],
-            body,
+            visible=query.get("visible") != "0",
+            png=body or None,
             partial=query.get("partial") == "1",
             notes=query.getlist("note"),
             error=error,
         )
         return JSONResponse({"ok": ok}, status_code=200 if ok else 404)
 
-    async def viewer_capture(request: Request) -> JSONResponse:
-        # A session's request for a picture: blocks until a page answers.
+    async def viewer_show(request: Request) -> JSONResponse:
+        # A session's request to show the user a view: blocks until a page
+        # acknowledges.
         try:
             payload = await request.json()
             view = str(payload["view"])
+            image = bool(payload.get("image", False))
             max_edge = int(payload.get("max_edge", 1024))
             timeout = float(payload.get("timeout", 25))
         except (ValueError, KeyError, TypeError, OverflowError):
@@ -1393,14 +1401,15 @@ def build_app(
         max_edge = max_edge if 16 <= max_edge <= 4096 else 1024
         timeout = timeout if 0 < timeout <= 60 else 25.0
         try:
-            got = await viewer.capture(view, max_edge, timeout)
+            got = await viewer.show(view, image, max_edge, timeout)
         except ViewerUnavailable as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
-        except CaptureFailed as exc:
+        except ShowFailed as exc:
             return JSONResponse({"error": str(exc)}, status_code=504)
         return JSONResponse(
             {
-                "png": base64.b64encode(got.png).decode("ascii"),
+                "visible": got.visible,
+                "png": base64.b64encode(got.png).decode("ascii") if got.png else None,
                 "partial": got.partial,
                 "notes": got.notes,
             }
@@ -1793,7 +1802,7 @@ def build_app(
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/viewer/next", viewer_next, methods=["GET"]),
         Route("/api/viewer/answer/{req}", viewer_answer, methods=["POST"]),
-        Route("/api/viewer/capture", viewer_capture, methods=["POST"]),
+        Route("/api/viewer/show", viewer_show, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
         Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
         Route("/api/algorithms/register", algorithms_register, methods=["POST"]),

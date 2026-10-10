@@ -225,46 +225,71 @@ class TestTheReferenceDocs:
 # -----------------------------------------------------------------------
 
 
-class TestCaptureView:
+class TestShowView:
     def test_returns_the_page_png_for_the_view_as_given(self, monkeypatch):
         seen = {}
 
-        def fake(view, max_edge):
-            seen["args"] = (view, max_edge)
-            return {"png": "UE5H", "partial": False, "notes": []}
+        def fake(view, image, max_edge):
+            seen["args"] = (view, image, max_edge)
+            return {"visible": True, "png": "UE5H", "partial": False, "notes": []}
 
-        monkeypatch.setattr(_server._control_client, "capture_view", fake)
-        result = _tool(_server.capture_view, "id=a&z=2", 256)
-        assert seen["args"] == ("id=a&z=2", 256)
+        monkeypatch.setattr(_server._control_client, "show_view", fake)
+        result = _tool(_server.show_view, "id=a&z=2", True, 256)
+        assert seen["args"] == ("id=a&z=2", True, 256)
         assert [c.type for c in result] == ["image"]
         assert result[0].data == "UE5H"
 
-    def test_a_partial_capture_says_so(self, monkeypatch):
+    def test_presenting_without_an_image_is_a_short_ack(self, monkeypatch):
         monkeypatch.setattr(
             _server._control_client,
-            "capture_view",
-            lambda *a: {"png": "x", "partial": True, "notes": ["timed out"]},
+            "show_view",
+            lambda *a: {"visible": True, "png": None, "partial": False, "notes": []},
         )
-        result = _tool(_server.capture_view, "id=a")
+        result = _tool(_server.show_view, "id=a")
+        assert [c.type for c in result] == ["text"]
+        assert "Shown" in result[0].text
+
+    def test_a_hidden_viewer_is_said_so_and_returns_no_image(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "show_view",
+            lambda *a: {"visible": False, "png": None, "partial": False, "notes": []},
+        )
+        result = _tool(_server.show_view, "id=a", True)
+        assert [c.type for c in result] == ["text"]
+        assert "not visible" in result[0].text and "no image" in result[0].text
+
+    def test_a_partial_image_says_so(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "show_view",
+            lambda *a: {
+                "visible": True,
+                "png": "x",
+                "partial": True,
+                "notes": ["timed out"],
+            },
+        )
+        result = _tool(_server.show_view, "id=a", True)
         assert result[1].type == "text"
         assert "incomplete" in result[1].text and "timed out" in result[1].text
 
     def test_a_refusal_is_text_with_the_controls_reason(self, monkeypatch):
         def refuse(*a):
-            raise _server._control_client.CaptureError("no visible viewer page")
+            raise _server._control_client.ShowError("no viewer page is connected")
 
-        monkeypatch.setattr(_server._control_client, "capture_view", refuse)
-        result = _tool(_server.capture_view, "id=a")
+        monkeypatch.setattr(_server._control_client, "show_view", refuse)
+        result = _tool(_server.show_view, "id=a")
         assert [c.type for c in result] == ["text"]
-        assert "no visible viewer page" in result[0].text
+        assert "no viewer page" in result[0].text
 
     def test_no_control_is_text_not_a_crash(self, monkeypatch):
         def down(*a):
             raise ConnectionRefusedError("refused")
 
-        monkeypatch.setattr(_server._control_client, "capture_view", down)
-        result = _tool(_server.capture_view, "id=a")
-        assert "No capture" in result[0].text and "refused" in result[0].text
+        monkeypatch.setattr(_server._control_client, "show_view", down)
+        result = _tool(_server.show_view, "id=a")
+        assert "Not shown" in result[0].text and "refused" in result[0].text
 
 
 class TestTakeScreenshot:
@@ -1699,7 +1724,7 @@ class TestToolReturnShape:
         ("read_doc", {"id": "index"}, True),
         ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
-        ("capture_view", {"view": "id=a"}, False),
+        ("show_view", {"view": "id=a"}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("verify_workflow", {"document": "```python\n1\n```"}, True),
         ("poll_job", {"job_id": "job-1"}, True),
@@ -1718,12 +1743,12 @@ class TestToolReturnShape:
         # path that formats one.
         monkeypatch.setattr(_app, "_kernel_host", None)
 
-        # capture_view reaches the control, not the kernel: keep it off the
+        # show_view reaches the control, not the kernel: keep it off the
         # developer's real one.
         def no_page(*args):
-            raise _server._control_client.CaptureError("no visible viewer page")
+            raise _server._control_client.ShowError("no viewer page is connected")
 
-        monkeypatch.setattr(_server._control_client, "capture_view", no_page)
+        monkeypatch.setattr(_server._control_client, "show_view", no_page)
 
     def test_every_tool_is_covered(self):
         """A new tool must land in the table above, with its shape chosen."""

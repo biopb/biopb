@@ -74,17 +74,30 @@ export async function waitFor(
   }
 }
 
-const nextFrame = () => new Promise<void>((res) => requestAnimationFrame(() => res()));
+/** How long a frame may take before the tab is taken to be hidden: a hidden page runs none. */
+const FRAME_TIMEOUT_MS = 1000;
+
+/** Resolves true on the next frame, false if none comes in time. */
+const nextFrame = () =>
+  new Promise<boolean>((res) => {
+    const timer = setTimeout(() => res(false), FRAME_TIMEOUT_MS);
+    requestAnimationFrame(() => {
+      clearTimeout(timer);
+      res(true);
+    });
+  });
 
 /**
  * The deck canvas as a PNG at most `maxEdge` on a side, composited onto the
  * viewer's own background: the canvas is transparent outside the image, which
  * an agent's image reader would show as white or black at random.
+ *
+ * Null when the page stopped running frames, which is what hiding it does: the
+ * canvas would hold the picture from before.
  */
-export async function readCanvas(maxEdge: number): Promise<Blob> {
+export async function readCanvas(maxEdge: number): Promise<Blob | null> {
   // Two frames: deck redraws after the load report, and the read must see it.
-  await nextFrame();
-  await nextFrame();
+  if (!(await nextFrame()) || !(await nextFrame())) return null;
   const canvas =
     document.querySelector<HTMLCanvasElement>("canvas#deckgl-overlay") ??
     document.querySelector<HTMLCanvasElement>("canvas");
