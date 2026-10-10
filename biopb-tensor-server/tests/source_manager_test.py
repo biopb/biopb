@@ -67,6 +67,9 @@ class _FakeMetadataDb:
         self.seen_calls = 0
         self.pruned = []
 
+    def restorable_rows(self):
+        return []
+
     def ensure_root(self, root_id, root_url):
         pass
 

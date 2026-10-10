@@ -775,12 +775,8 @@ class MetadataDatabase:
         store_path: Optional[Path] = None,
         annotations_enabled: bool = True,
         checkpoint_threshold_mb: int = 1024,
-        restore_sources: bool = False,
     ):
         self._checkpoint_threshold_mb = checkpoint_threshold_mb
-        #: Keep ``source_catalog`` across a restart (``catalog.restore``): its rows
-        #: are read back by :meth:`restorable_rows`, not cleared at open.
-        self.restore_sources = restore_sources and store_path is not None
         #: How many times the file has been opened: what a row's ``epoch`` and its
         #: root's are compared with to say a row was confirmed this run.
         self.run_epoch = 0
@@ -1047,11 +1043,10 @@ class MetadataDatabase:
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
-        Rows are cleared at open unless ``restore_sources`` (showing last run's
-        rows with no adapter behind them would be a catalog that lies, so a
-        restore registers or marks pending every row it keeps), and the rows under
-        roots that are not persisted are cleared either way: nothing could rebuild
-        them.
+        Rows are kept across an open and read back by :meth:`restorable_rows` (a
+        restore registers or marks pending every row it keeps, so none is listed
+        with no adapter behind it); the rows under roots that are not persisted are
+        cleared: nothing could rebuild them.
         """
         conn.execute(
             "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
@@ -1146,15 +1141,11 @@ class MetadataDatabase:
                 last_scanned TIMESTAMP
             )
         """)
-        if not self.restore_sources:
-            conn.execute("DELETE FROM source_catalog")
-            conn.execute("DELETE FROM catalog_roots")
-        else:
-            conn.execute(
-                "DELETE FROM source_catalog WHERE root_id IN "
-                "(SELECT root_id FROM catalog_roots WHERE NOT persisted)"
-            )
-            conn.execute("DELETE FROM catalog_roots WHERE NOT persisted")
+        conn.execute(
+            "DELETE FROM source_catalog WHERE root_id IN "
+            "(SELECT root_id FROM catalog_roots WHERE NOT persisted)"
+        )
+        conn.execute("DELETE FROM catalog_roots WHERE NOT persisted")
         conn.execute(
             "INSERT INTO catalog_roots (root_id, root_url, persisted) "
             "VALUES (?, '', FALSE)",
@@ -1936,16 +1927,15 @@ class MetadataDatabase:
         """The rows with a claim, which a restore rebuilds claims from, without the
         payload and the metadata (large, and read per source when it is hydrated).
 
-        Empty unless ``restore_sources``: the table was cleared at open.
+        ``idle_runs`` is how many earlier runs neither wrote the row nor finished a
+        walk of its root.
         """
-        if not self.restore_sources:
-            return []
         conn = self._get_connection()
         cursor = conn.execute(
             "SELECT c.source_id, c.source_type, c.is_resolved, "
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
-            "c.last_seen, r.last_scanned "
+            f"{self.run_epoch} - 1 - greatest(c.epoch, r.epoch) AS idle_runs "
             "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id "
             "WHERE c.primary_path IS NOT NULL"
         )

@@ -398,6 +398,9 @@ class _FakeMetadataDb:
         self.added = []
         self.pending = []  # (source_id, recall) of each pending row written
 
+    def restorable_rows(self):
+        return []
+
     def ensure_root(self, root_id, root_url):
         pass
 

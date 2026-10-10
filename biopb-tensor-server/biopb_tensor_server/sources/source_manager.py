@@ -314,20 +314,15 @@ class SourceManager:
     def _restore_catalog(self) -> None:
         """Put the last run's sources back as claims, before the first scan.
 
-        Only with ``catalog.restore``. A failure leaves the catalog as a fresh one:
-        a restore that cannot be trusted is a rebuild, never a half-restored state.
+        Nothing on a first run, when there are no rows. The first scan then
+        verifies each claim like any rescan.
         """
         db = self._metadata_db
-        if db is None or not getattr(db, "restore_sources", False):
+        rows = db.restorable_rows() if db is not None else []
+        if not rows:
             return
         started = time.monotonic()
-        rows = db.restorable_rows()
-        try:
-            summary = self._reconciler.restore(rows)
-        except Exception:
-            logger.exception("Catalog restore failed; rebuilding the catalog")
-            db.drop_catalog_rows([r["source_id"] for r in rows])
-            return
+        summary = self._reconciler.restore(rows)
         worker = self._registration_worker
         for source_id in summary["queue"]:
             # Newest-first needs a stat each, which is the walk's to pay: restored

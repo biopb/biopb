@@ -37,7 +37,6 @@ import os
 import stat
 import threading
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -115,9 +114,10 @@ _EXPERIMENTAL_SOURCE_MESSAGES = {
 }
 
 
-# How long a persisted source survives without its row being written or its root
-# walked, before a restore stops bringing it back.
-_RESTORE_MAX_AGE = timedelta(days=30)
+# How many runs a persisted source survives with neither its row written nor a walk
+# of its root finished, before a restore stops bringing it back. Counted in runs,
+# not days: a server that was off for a month has not lost sight of anything.
+_RESTORE_MAX_IDLE_RUNS = 10
 
 
 def _same_signature(
@@ -378,21 +378,21 @@ class Reconciler:
         whose root or path under it differs is rewritten. A claim that conflicts
         with one already restored is dropped, the first holding it.
 
-        A row last seen, and whose root was last walked, more than
-        ``_RESTORE_MAX_AGE`` ago is dropped too: a root that is never reachable
-        (a drive that is gone) must not leave its sources listed for ever.
+        A row that ``_RESTORE_MAX_IDLE_RUNS`` runs in a row neither wrote nor had its
+        root's walk finish is dropped too: a root that is never reachable (a drive
+        that is gone) must not leave its sources listed for ever.
 
         Returns the counts ``restored``, ``dropped`` and ``rewritten``, and the
         ``queue`` of sources to register in the background.
         """
         plan = []
         dropped: List[str] = []
-        cutoff = datetime.now() - _RESTORE_MAX_AGE
         for row in rows:
             source_id = row["source_id"]
-            seen = [t for t in (row.get("last_seen"), row.get("last_scanned")) if t]
             restored = (
-                None if seen and max(seen) < cutoff else self._restored_claim(row)
+                None
+                if row["idle_runs"] >= _RESTORE_MAX_IDLE_RUNS
+                else self._restored_claim(row)
             )
             if restored is None:
                 dropped.append(source_id)

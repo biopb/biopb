@@ -289,7 +289,7 @@ class TestRows:
 class TestAcrossAnOpen:
     def test_only_the_rows_with_a_claim_survive_a_restoring_open(self, tmp_path):
         store = tmp_path / "catalog.duckdb"
-        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db = MetadataDatabase(store_path=store)
         db.open()
         db.sync_roots([("r1", "file:///d")])
         db.sync_source_added(
@@ -300,7 +300,7 @@ class TestAcrossAnOpen:
         )
         db.close()
 
-        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db = MetadataDatabase(store_path=store)
         db.open()
         try:
             assert [r["source_id"] for r in db.restorable_rows()] == ["s1"]
