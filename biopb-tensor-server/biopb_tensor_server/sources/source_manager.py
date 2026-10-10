@@ -84,7 +84,8 @@ class AddSourceTally:
     # Offline placeholder files the walk passed over because the drop was not a
     # cloud root; non-zero means the import is incomplete.
     skipped_offline: int = 0
-    # Cloud-sync directories (OneDrive) pruned by name; their files are not counted.
+    # OneDrive directories pruned because the drop was not a cloud root; their
+    # files are not counted.
     skipped_cloud_dirs: int = 0
 
 

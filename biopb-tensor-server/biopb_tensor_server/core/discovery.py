@@ -218,14 +218,17 @@ def should_skip_walk_entry(
 
     ``admit_nonresident`` flips the offline-placeholder rule for a ``cloud``-opted
     root (cloud-storage phase 2): instead of skipping a dehydrated file, the walk
-    admits it so ``claim()`` can register it as an *unresolved* source. The
-    hidden-entry and system/cloud-directory prunes still apply -- only the
-    file-residency skip is lifted, and only under an explicitly configured root.
+    admits it so ``claim()`` can register it as an *unresolved* source, and enters
+    OneDrive directories, which a plain walk prunes. The hidden-entry and other
+    system-directory prunes still apply; only the cloud skips are lifted, and only
+    under an explicitly configured root.
     """
     name = path.name
     if name.startswith("."):
         return True
     if is_dir:
+        if admit_nonresident and _is_cloud_dir(name):
+            return False
         return _is_skippable_system_dir(name)
     if admit_nonresident:
         return False
@@ -581,8 +584,8 @@ class WalkReport:
     ``offline_files`` counts the non-resident placeholder *files* the skip policy
     passed over (it is zero under a cloud root, which admits them), so a caller can
     say "N offline files were skipped" instead of reporting an empty folder.
-    ``cloud_dirs`` counts the cloud-sync directories (OneDrive) pruned by name, whose
-    files are neither entered nor counted in ``offline_files``.
+    ``cloud_dirs`` counts the OneDrive directories pruned by name (never under a
+    cloud root), whose files are neither entered nor counted in ``offline_files``.
     """
 
     declined_dirs: Set[str] = field(default_factory=set)

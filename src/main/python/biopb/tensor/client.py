@@ -464,8 +464,7 @@ class TensorFlightClient:
             over because ``cloud`` was not set; when it is non-zero the import
             is incomplete, and a second call with ``cloud=True`` includes them.
             ``skipped_cloud_dirs`` counts OneDrive directories the walk did not
-            enter; ``cloud=True`` does not include them, so add one by passing
-            the directory itself.
+            enter; ``cloud=True`` includes them too.
 
         Raises:
             flight.FlightServerError: whole-request failure (path not found /
