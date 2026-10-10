@@ -293,3 +293,24 @@ def test_one_tabs_error_does_not_hide_anothers_success():
         assert (await asking).visible is True
 
     _run(go())
+
+
+def test_a_frozen_hidden_tab_does_not_hold_the_call_to_its_deadline(monkeypatch):
+    from biopb_control import _viewer_broker
+
+    monkeypatch.setattr(_viewer_broker, "HIDDEN_GRACE", 0.2)
+
+    async def go():
+        broker = ViewerBroker()
+        a = asyncio.create_task(broker.next("a", timeout=5, visible=False))
+        b = asyncio.create_task(broker.next("b", timeout=5, visible=False))
+        await asyncio.sleep(0.05)
+        asking = asyncio.create_task(broker.show("id=x", False, 64, timeout=5))
+        broker.resolve((await a)["req"], False)
+        await b  # takes the job and never answers
+        started = asyncio.get_running_loop().time()
+        got = await asking
+        assert got.visible is False
+        assert asyncio.get_running_loop().time() - started < 1.5
+
+    _run(go())

@@ -30,6 +30,11 @@ PARK_GRACE = 1.5
 #: Largest PNG the control accepts back.
 MAX_PNG_BYTES = 16 * 1024 * 1024
 
+#: How long the tabs that parked hidden are waited for once every tab that
+#: parked visible has answered: a hidden tab answers at once, and one that does
+#: not (frozen by the browser) must not hold the call to its deadline.
+HIDDEN_GRACE = 2.0
+
 #: How often a parked poll checks that its page is still there.
 _STEP = 1.0
 
@@ -113,8 +118,8 @@ class ViewerBroker:
             if parked is not None and parked.fut is fut:
                 del self._parked[tab_id]
 
-    def _live(self) -> list[asyncio.Future]:
-        return [p.fut for p in self._parked.values() if not p.fut.done()]
+    def _live(self) -> list[_Parked]:
+        return [p for p in self._parked.values() if not p.fut.done()]
 
     async def show(
         self, view: str, image: bool, max_edge: int, timeout: float = 25.0
@@ -149,12 +154,13 @@ class ViewerBroker:
                 '/viewer: see read_doc("web-viewer"))'
             )
         # Every tab gets it: nothing says which machine the user is sitting at.
-        pending: dict[str, asyncio.Future] = {}
+        pending: dict[str, tuple[asyncio.Future, bool]] = {}
         for tab in tabs:
             req = f"c{next(self._ids)}"
             fut = loop.create_future()
-            self._pending[req] = pending[req] = fut
-            tab.set_result(
+            self._pending[req] = fut
+            pending[req] = (fut, tab.visible)
+            tab.fut.set_result(
                 {"req": req, "view": view, "image": image, "max_edge": max_edge}
             )
         try:
@@ -165,18 +171,22 @@ class ViewerBroker:
 
     @staticmethod
     async def _first_answer(
-        futs: list[asyncio.Future], image: bool, deadline: float
+        tabs: list[tuple[asyncio.Future, bool]], image: bool, deadline: float
     ) -> Shown:
         """The first visible tab's answer, else a hidden tab's, else the first error.
 
-        Waits for a tab that can show the user, since a hidden one answers at
-        once and says nothing about the others; stops at the deadline.
+        A hidden tab's answer does not end the wait while a tab that parked
+        visible is still drawing. Once none is, the rest get only
+        :data:`HIDDEN_GRACE`.
         """
         loop = asyncio.get_running_loop()
-        waiting = set(futs)
+        visible_of = dict(tabs)
+        waiting = set(visible_of)
         hidden: Optional[Shown] = None
         failure: Optional[Exception] = None
         while waiting:
+            if not any(visible_of[f] for f in waiting):
+                deadline = min(deadline, loop.time() + HIDDEN_GRACE)
             left = max(0.1, deadline - loop.time())
             done, waiting = await asyncio.wait(
                 waiting, timeout=left, return_when=asyncio.FIRST_COMPLETED
