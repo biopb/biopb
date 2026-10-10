@@ -63,9 +63,9 @@ the viewer's own default, so send the shortest link that says what you mean.
 | `g` | gamma |
 | `v=1` / `v=0` | render as a volume, or as a plane |
 | `vm` | volume mode: `mip`, `additive`, `minip` |
-| `tg=x,y` or `tg=x,y,z` | camera target — two components is a plane, three a volume |
+| `tg=x,y` or `tg=x,y,z` | camera target — two components is a plane, three a volume; in pixels or voxels, not physical units (below) |
 | `zm` | zoom, as log2 pixels per world unit |
-| `rx`, `ro` | 3-D pitch (±90) and orbit (degrees) |
+| `rx`, `ro` | 3-D pitch (±90) and orbit (degrees); part of the camera, so they need `tg` and `zm` (below) |
 | `lb` | a label set drawn over the image, as *its* `array_id` |
 | `lo` | the label overlay's alpha, 0–1 |
 | `rs` | an annotation set to show; repeat it per set (`rs=default&rs=@ome`). Absent means the tensor's default, `rs=` alone means none |
@@ -76,7 +76,17 @@ alone, so you can hand a link back and forth without losing anything.
 
 A camera is all-or-nothing on `tg` **and** `zm`: a target without a zoom frames
 the volume somewhere nobody chose, so it is ignored. Send neither and the view
-opens fitted, which is usually what you want.
+opens fitted, which is usually what you want. **`rx` and `ro` belong to that
+camera**: without `tg` and `zm` they are dropped, and a volume asked for at
+`rx=30&ro=45` opens face-on.
+
+**The target is in the viewer's own units, not µm.** On a plane it is image
+pixels at full resolution, so `tg=128,128` is the middle of a 256 × 256 image.
+On a volume it is the rendered volume's voxels with each axis stretched by its
+physical size relative to the finest one: a 256 × 256 × 60 stack with 0.26 µm
+pixels and 0.29 µm z-steps has its centre at about `tg=128,128,33.5`. Rather than
+work that out, open the view, orbit it by hand, and read `tg`/`zm`/`rx`/`ro` off
+the address bar.
 
 ## Showing something you made
 
@@ -146,6 +156,6 @@ back with `rs`. And it shows nothing that is not on the server, which is a step
 
 - [[napari-viewer]] — the napari window: the other display surface, and the one that
   can show an array without an upload.
-- [[tensor-server-client]] — uploading a result so this page can read it.
+- [[upload]] — uploading a result so this page can read it.
 - [[tensor-server-client]] — what an `array_id` addresses, and the pyramid
   behind it.
