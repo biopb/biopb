@@ -615,12 +615,6 @@ class TestConfirmation:
 
     def test_a_long_downtime_is_not_idle_runs(self, tmp_path):
         ids = _first_run(tmp_path)
-        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
-        db.open()
-        conn = db._get_connection()
-        conn.execute("UPDATE catalog_roots SET last_scanned = now() - INTERVAL 400 DAY")
-        conn.execute("UPDATE source_catalog SET last_seen = now() - INTERVAL 400 DAY")
-        db.close()
 
         run = _Run(tmp_path)
         run.restore()

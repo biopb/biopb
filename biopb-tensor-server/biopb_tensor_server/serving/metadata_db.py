@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when a field of the persisted source row or payload changes meaning (an
 # added key needs none). A mismatch drops ``source_catalog`` whole at open.
-SOURCE_CATALOG_FORMAT = 4
+SOURCE_CATALOG_FORMAT = 5
 
 # The columns ``sources`` publishes, in table order. ``source_catalog`` carries
 # them first, then the claim.
@@ -102,14 +102,13 @@ _SOURCE_COLUMNS = (
 # whole url.
 INTERNAL_ROOT_ID = "internal"
 _LOCATION_COLUMN_NAMES = ("root_id", "rel")
-# The claim, the columns a source with no claim leaves NULL (bar the last two).
+# The claim, the columns a source with no claim leaves NULL (bar the last).
 _CLAIM_COLUMN_NAMES = (
     "primary_path",
     "member_paths",
     "extra_config",
     "signature",
     "payload",
-    "last_seen",
     "epoch",
 )
 # The columns a row is written with, in the order every writer builds its values.
@@ -1128,7 +1127,6 @@ class MetadataDatabase:
                 -- What the adapter needs to be built without a parse. NULL when
                 -- it has none: a restart rebuilds it from the claim.
                 payload TEXT,
-                last_seen TIMESTAMP,
                 -- The run that wrote it (``run_epoch``).
                 epoch BIGINT NOT NULL DEFAULT 0
             )
@@ -1141,9 +1139,8 @@ class MetadataDatabase:
                 -- config names is; a drop, an upstream and the built-in root are
                 -- gone at open.
                 persisted BOOLEAN NOT NULL DEFAULT TRUE,
-                -- The last run whose walk of this root finished, and when.
-                epoch BIGINT NOT NULL DEFAULT 0,
-                last_scanned TIMESTAMP
+                -- The last run whose walk of this root finished.
+                epoch BIGINT NOT NULL DEFAULT 0
             )
         """)
         if not self.restore_sources:
@@ -1617,7 +1614,7 @@ class MetadataDatabase:
                     None,
                 ]
                 params += self._placement(
-                    CatalogRecord(None, {}, root_id, r.rel), r.rel, None, now
+                    CatalogRecord(None, {}, root_id, r.rel), r.rel, None
                 )
             width = len(params) // len(chunk)
             statements.append(
@@ -1745,7 +1742,6 @@ class MetadataDatabase:
         record: Optional[CatalogRecord],
         url: str,
         payload: Optional[Dict[str, Any]],
-        seen: datetime,
     ) -> List[Any]:
         """The ``source_catalog`` columns after the public ones, in table order.
 
@@ -1769,7 +1765,7 @@ class MetadataDatabase:
                     None if payload is None else json.dumps(payload, sort_keys=True),
                 ]
             )
-        return location + claim_values + [seen, self.run_epoch]
+        return location + claim_values + [self.run_epoch]
 
     @staticmethod
     def _pending_row(
@@ -1821,10 +1817,10 @@ class MetadataDatabase:
         the wall time and a quarter of the CPU of an ``INSERT OR REPLACE`` on the
         indexed table.
         """
-        source_id, url, indexed_at = row[0], row[1], row[3]
+        source_id, url = row[0], row[1]
         # Serialized before the lock: a payload can be large, and every other
         # writer waits while it is held.
-        values = row[:1] + row[2:] + self._placement(record, url, payload, indexed_at)
+        values = row[:1] + row[2:] + self._placement(record, url, payload)
         if record is None:
             update_set, upsert_set = _LISTING_SET, _LISTING_UPSERT_SET
             set_values = row[2:] + [url]
@@ -1896,7 +1892,7 @@ class MetadataDatabase:
                     row.claim, row.catalog_url, row.recall, None, now
                 )
                 params += values[:1] + values[2:]
-                params += self._placement(row.record, values[1], None, now)
+                params += self._placement(row.record, values[1], None)
             width = len(params) // len(chunk)
             statements.append(
                 (
@@ -2044,9 +2040,8 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             conn.execute(
-                "UPDATE catalog_roots SET epoch = ?, last_scanned = ? "
-                "WHERE root_id = ?",
-                [self.run_epoch, datetime.now(), root_id],
+                "UPDATE catalog_roots SET epoch = ? WHERE root_id = ?",
+                [self.run_epoch, root_id],
             )
 
     def sweep_root(self, root_id: str, is_claimed: Callable[[str], bool]) -> int:
