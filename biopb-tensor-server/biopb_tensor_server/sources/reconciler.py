@@ -117,7 +117,7 @@ _EXPERIMENTAL_SOURCE_MESSAGES = {
 # How many runs a persisted source survives with neither its row written nor a walk
 # of its root finished, before a restore stops bringing it back. Counted in runs,
 # not days: a server that was off for a month has not lost sight of anything.
-_RESTORE_MAX_IDLE_RUNS = 10
+_RESTORE_MAX_IDLE_RUNS = 5
 
 
 def _same_signature(

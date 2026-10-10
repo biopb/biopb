@@ -464,7 +464,7 @@ tables:
   one `catalog_roots` row and the view follows.
 - A root whose cloudness changed makes its rows read as changed: the persisted signature
   form depends on cloudness, so the two never compare equal and the claim is refreshed.
-- A row that 10 runs in a row (`_RESTORE_MAX_IDLE_RUNS`) neither wrote nor had its root's
+- A row that 5 runs in a row (`_RESTORE_MAX_IDLE_RUNS`) neither wrote nor had its root's
   walk finish is dropped, so an unreachable root does not leave its sources listed forever.
   Counted in runs, not days: a server that was off for a month has seen nothing go missing.
 
