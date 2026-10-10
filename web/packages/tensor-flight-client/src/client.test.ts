@@ -216,11 +216,11 @@ describe("TensorHttpClient.listSourcesPage", () => {
   });
 });
 
-describe("TensorHttpClient.listSources", () => {
+describe("TensorHttpClient.listSourcesPage (auth and errors)", () => {
   it("GETs /api/sources and returns array", async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
     const c = new TensorHttpClient(BASE, TOKEN);
-    const sources = await c.listSources();
+    const sources = (await c.listSourcesPage(10)).sources;
     expect(sources).toHaveLength(1);
     expect(sources[0]!.source_id).toBe("src0");
   });
@@ -228,7 +228,7 @@ describe("TensorHttpClient.listSources", () => {
   it("sends Authorization header", async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse([]));
     const c = new TensorHttpClient(BASE, TOKEN);
-    await c.listSources();
+    await c.listSourcesPage(10);
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect((opts.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
   });
@@ -236,7 +236,7 @@ describe("TensorHttpClient.listSources", () => {
   it("does NOT send Authorization when token is null", async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse([]));
     const c = new TensorHttpClient(BASE, null);
-    await c.listSources();
+    await c.listSourcesPage(10);
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect((opts.headers as Record<string, string>)["Authorization"]).toBeUndefined();
   });
@@ -244,7 +244,7 @@ describe("TensorHttpClient.listSources", () => {
   it("throws TensorApiError on 401", async () => {
     mockFetch.mockResolvedValueOnce(errorResponse(401, "Invalid or missing token"));
     const c = new TensorHttpClient(BASE, "wrong");
-    const err = await c.listSources().catch((e) => e);
+    const err = await c.listSourcesPage(10).catch((e) => e);
     expect(err).toBeInstanceOf(TensorApiError);
     expect((err as TensorApiError).status).toBe(401);
   });
@@ -621,7 +621,7 @@ describe("client-side cancellation", () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
     const ctrl = new AbortController();
-    await c.listSources({ signal: ctrl.signal });
+    await c.listSourcesPage(10, { signal: ctrl.signal });
     const init = mockFetch.mock.calls[0]![1] as RequestInit;
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
@@ -636,7 +636,7 @@ describe("client-side cancellation", () => {
       });
     });
     const ctrl = new AbortController();
-    const p = c.listSources({ signal: ctrl.signal });
+    const p = c.listSourcesPage(10, { signal: ctrl.signal });
     expect(seen!.aborted).toBe(false);
     ctrl.abort();
     await expect(p).rejects.toThrow();
@@ -664,7 +664,7 @@ describe("client-side cancellation", () => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
     const ctrl = new AbortController();
-    const p = c.listSources({ signal: ctrl.signal });
+    const p = c.listSourcesPage(10, { signal: ctrl.signal });
     ctrl.abort();
     await expect(p).rejects.toMatchObject({ name: "AbortError" });
   });
@@ -676,7 +676,7 @@ describe("client-side cancellation", () => {
       new Promise((_res, rej) => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
-    const p = c.listSources({ signal: new AbortController().signal });
+    const p = c.listSourcesPage(10, { signal: new AbortController().signal });
     await expect(p).rejects.toBeInstanceOf(TensorApiError);
     await expect(p).rejects.toThrow(/Timeout after 5ms/);
   });
@@ -691,7 +691,7 @@ describe("client-side cancellation", () => {
     });
     const ctrl = new AbortController();
     ctrl.abort();
-    await expect(c.listSources({ signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(c.listSourcesPage(10, { signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
   });
 
   it("removes its listener so one long-lived signal does not accumulate them", async () => {
@@ -710,7 +710,7 @@ describe("client-side cancellation", () => {
     // One controller per viewport, reused across many tiles.
     for (let i = 0; i < 20; i++) {
       mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-      await c.listSources({ signal: ctrl.signal });
+      await c.listSourcesPage(10, { signal: ctrl.signal });
     }
     expect(added).toHaveLength(0);
   });
@@ -718,7 +718,7 @@ describe("client-side cancellation", () => {
   it("works without a signal, as before", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-    await expect(c.listSources()).resolves.toHaveLength(1);
+    expect((await c.listSourcesPage(10)).sources).toHaveLength(1);
   });
 });
 

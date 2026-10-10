@@ -7,7 +7,7 @@
  *
  * Usage:
  *   const client = new TensorHttpClient("http://localhost:8816", token);
- *   const sources = await client.listSources();
+ *   const { sources } = await client.listSourcesPage(20000);
  *   const arr = await client.slice({ array_id: "my-source/tensor-0", ... });
  */
 
@@ -404,16 +404,6 @@ export class TensorHttpClient {
   // -------------------------------------------------------------------------
   // Sources
   // -------------------------------------------------------------------------
-
-  /** List all data sources registered with the server. */
-  async listSources(opts?: RequestOptions): Promise<DataSourceDescriptor[]> {
-    return this.fetchJson<DataSourceDescriptor[]>(
-      "/api/sources",
-      undefined,
-      this.metadataTimeoutMs,
-      opts,
-    );
-  }
 
   /**
    * List at most `limit` data sources, and whether that cut the catalog short.

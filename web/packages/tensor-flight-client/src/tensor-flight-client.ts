@@ -3,7 +3,7 @@
  *
  * Usage:
  *   const client = new TensorFlightClient("http://localhost:8816", token);
- *   const sources = await client.listSources();
+ *   const { sources } = await client.listSourcesPage(20000);
  *   const arr = client.getTensor("my-source/tensor-0");
  *   const data = await arr.compute({ z: 5, c: 0, scaleHint: [1,1,1,8,8] });
  */
@@ -14,7 +14,7 @@ import type { DataSourceDescriptor, SourceListing } from "./types.js";
 
 export class TensorFlightClient {
   private readonly _http: TensorHttpClient;
-  /** Source cache populated by listSources(). */
+  /** Source cache populated by listSourcesPage(). */
   private _sources: Map<string, DataSourceDescriptor> = new Map();
 
   /**
@@ -35,13 +35,6 @@ export class TensorFlightClient {
   // API
   // -------------------------------------------------------------------------
 
-  /** List all data sources from the server. */
-  async listSources(): Promise<DataSourceDescriptor[]> {
-    const sources = await this._http.listSources();
-    this._sources = new Map(sources.map((s) => [s.source_id, s]));
-    return sources;
-  }
-
   /** List at most `limit` data sources, and whether the catalog is longer. */
   async listSourcesPage(limit: number): Promise<SourceListing> {
     const listing = await this._http.listSourcesPage(limit);
@@ -60,7 +53,7 @@ export class TensorFlightClient {
   /**
    * Return a lazy TensorArray for the given source + tensor.
    *
-   * If the source has already been fetched (via listSources), the descriptor
+   * If the source has already been fetched (via listSourcesPage), the descriptor
    * is resolved from the local cache.  Otherwise a single getSource() call
    * is made to populate it.
    *
@@ -111,7 +104,7 @@ function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
 
 /**
  * TensorArray whose descriptor is fetched lazily on the first .compute().
- * Used when getTensor() is called before listSources().
+ * Used when getTensor() is called before listSourcesPage().
  */
 class LazyTensorArray extends TensorArray {
   /** Single shared resolution promise — prevents concurrent duplicate getSource() calls. */
