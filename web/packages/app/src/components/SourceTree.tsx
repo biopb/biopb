@@ -753,11 +753,13 @@ export function SourceTree() {
         )}
         {useServerQuery && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            {sources.length.toLocaleString()} sources • Server-side filter
+            {serverMatches
+              ? `${serverMatches.length.toLocaleString()} matches${
+                  serverMoreMatches && !serverQueryLoading ? " (truncated)" : ""
+                }`
+              : `${sources.length.toLocaleString()} sources`}{" "}
+            - server-side filter
             {serverQueryLoading && " • Searching…"}
-            {serverMoreMatches &&
-              !serverQueryLoading &&
-              ` • ${SERVER_QUERY_LIMIT.toLocaleString()} matches (truncated) - refine the filter`}
           </div>
         )}
       </div>
