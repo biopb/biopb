@@ -1944,9 +1944,10 @@ class MetadataDatabase:
             "SELECT c.source_id, c.source_type, c.is_resolved, "
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
-            f"{self.run_epoch} - 1 - greatest(c.epoch, r.epoch) AS idle_runs "
+            "? - 1 - greatest(c.epoch, r.epoch) AS idle_runs "
             "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id "
-            "WHERE c.primary_path IS NOT NULL"
+            "WHERE c.primary_path IS NOT NULL",
+            [self.run_epoch],
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -2016,20 +2017,6 @@ class MetadataDatabase:
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
-
-    def clear_source_catalog(self) -> int:
-        """Empty the source catalog and its roots, with the reserved ROI rows the
-        registrations derived. Annotations a user drew stay. Returns the number of
-        sources removed: the next start finds its sources again by a scan."""
-        conn = self._get_connection()
-        ids = [
-            r[0]
-            for r in conn.execute("SELECT source_id FROM source_catalog").fetchall()
-        ]
-        self.drop_catalog_rows(ids)
-        with self._write_lock:
-            conn.execute("DELETE FROM catalog_roots")
-        return len(ids)
 
     def rewrite_row_roots(self, rows: Sequence[Tuple[str, str, str]]) -> None:
         """Re-attribute persisted rows to the roots a restore found them under:

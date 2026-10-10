@@ -676,7 +676,7 @@ class TestARestoreThatFails:
         from biopb_tensor_server.cli import app
         from typer.testing import CliRunner
 
-        ids = _first_run(tmp_path)
+        _first_run(tmp_path)
         store = tmp_path / "catalog.duckdb"
         config = tmp_path / "biopb.json"
         config.write_text(
@@ -686,7 +686,7 @@ class TestARestoreThatFails:
         result = CliRunner().invoke(app, ["reset-catalog", str(config)])
 
         assert result.exit_code == 0
-        assert f"Removed {len(ids)}" in result.output
+        assert "Catalog emptied" in result.output
         db = MetadataDatabase(store_path=store)
         db.open()
         try:
