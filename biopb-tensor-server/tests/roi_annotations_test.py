@@ -413,15 +413,11 @@ class TestStore:
         db.put_rois("zarr_a1b2c3/Image:1", [_annotation()])
         assert len(db.list_rois(ARRAY_ID)[0]) == 1
 
-    def test_rois_are_not_on_the_sql_surface(self):
-        """Annotations are private data, gated per source on the roi flight;
-        the public catalog query has no source to authorize against
-        (biopb/biopb#1010)."""
+    def test_rois_are_on_the_sql_surface(self):
         db = MetadataDatabase()
         db.put_rois(ARRAY_ID, [_annotation(label="mitotic")])
-        with pytest.raises(ValueError, match="disallowed table: rois"):
-            db.query("SELECT label FROM rois")
-        assert "rois" not in db.allowed_tables
+        got = db.query("SELECT label FROM rois").to_pylist()
+        assert got == [{"label": "mitotic"}]
 
     def test_a_filtered_query_is_not_reported_as_truncated(self):
         """Truncation is the server's own flag, not a difference of counts.
@@ -1966,9 +1962,6 @@ class TestDisabledAnnotationsTouchNothing:
             db._validate_query("SELECT * FROM rois")
         db._validate_query("SELECT * FROM sources")
 
-    def test_rois_is_never_queryable(self):
-        # Enabled or not: annotations are private data on the roi flight, and
-        # a query has no source to authorize against (biopb/biopb#1010).
-        db = MetadataDatabase()
-        with pytest.raises(ValueError, match="disallowed table: rois"):
-            db._validate_query("SELECT count(*) FROM rois")
+    def test_rois_is_queryable_only_when_annotations_are_on(self):
+        assert "rois" in MetadataDatabase().allowed_tables
+        assert "rois" not in MetadataDatabase(annotations_enabled=False).allowed_tables

@@ -750,12 +750,15 @@ class MetadataDatabase:
         )
     """
 
-    # The public catalog: what the ``catalog`` flight lists and SQL may read.
-    # ``rois`` is deliberately absent -- annotations are private data, gated
-    # per source on the ``roi`` flight, and a query has no source to authorize
-    # against (biopb/biopb#1010). Enforced on DuckDB's own parse of the
-    # statement (``_validate_query``), never on the SQL text.
-    ALLOWED_TABLES: Set[str] = {"sources", "decode_rates"}
+    # The queryable catalog: what the ``catalog`` flight lists and SQL may
+    # read. Querying is full access (the server-wide token, or open in local
+    # mode), and a caller with that can read every annotation on the ``roi``
+    # flight anyway; a narrow grant or a seal never reaches this surface. A
+    # query permission narrower than full access would need a set-level view
+    # (array_id, set_name, count) here instead of ``rois``.
+    # Enforced on DuckDB's own parse of the statement (``_validate_query``),
+    # never on the SQL text.
+    ALLOWED_TABLES: Set[str] = {"sources", "decode_rates", "rois"}
 
     # Table-valued functions a query may use. ``unnest`` is the documented
     # per-tensor idiom (``FROM sources, UNNEST(tensors)``); the rest generate

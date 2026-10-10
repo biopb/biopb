@@ -73,8 +73,8 @@ def test_one_flight_per_public_table_with_its_schema():
 
     infos = list(server.list_flights(_Context(), b""))
     by_path = {"/".join(p.decode() for p in i.descriptor.path): i for i in infos}
-    assert set(by_path) == set(db.allowed_tables) == {"sources", "decode_rates"}
-    assert "rois" not in by_path  # private data is not a catalog flight
+    assert set(by_path) == set(db.allowed_tables) == {"sources", "decode_rates", "rois"}
+    assert "source_catalog" not in by_path  # a physical table, not a public one
 
     sources = by_path["sources"]
     assert sources.schema.names[:3] == ["source_id", "source_url", "source_type"]
@@ -113,7 +113,9 @@ def test_a_path_descriptor_names_a_table():
     )
     assert info.schema.names[:1] == ["source_id"]
     with pytest.raises(flight.FlightServerError, match="unknown catalog table"):
-        server.get_flight_info(_Context(), flight.FlightDescriptor.for_path("rois"))
+        server.get_flight_info(
+            _Context(), flight.FlightDescriptor.for_path("source_catalog")
+        )
 
 
 def test_a_catalog_less_server_serves_its_sources_but_lists_nothing():
@@ -159,4 +161,4 @@ def test_the_catalog_tier_is_the_server_token():
         list(server.list_flights(_Context(), b""))
     with pytest.raises(flight.FlightUnauthenticatedError):
         list(server.list_flights(_Context("wrong"), b""))
-    assert len(list(server.list_flights(_Context("secret"), b""))) == 2
+    assert len(list(server.list_flights(_Context("secret"), b""))) == 3
