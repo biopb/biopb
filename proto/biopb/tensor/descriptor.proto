@@ -567,6 +567,12 @@ message AddSourceResult {
   // folder. Non-zero means the import is incomplete: resend with `cloud` set to
   // include them (their content is not read until first access).
   int32 skipped_offline = 7;
+
+  // OneDrive directories (`OneDrive`, `OneDrive - <Org>`) skipped because the
+  // request was not for a cloud folder. Everything inside them is missing from
+  // the import and uncounted by `skipped_offline`; resend with `cloud` set to
+  // include them.
+  int32 skipped_cloud_dirs = 8;
 }
 
 // One message in the "add_source" action's result stream: zero or more

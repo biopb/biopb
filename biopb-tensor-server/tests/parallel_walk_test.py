@@ -183,3 +183,22 @@ class TestTheScheduler:
         registry.get_claims_for_path = boom
         with pytest.raises(RuntimeError, match="probe blew up"):
             discover_sources(tmp_path, registry, walk_threads=3)
+
+
+@pytest.mark.parametrize("walk_threads", [1, 4])
+def test_a_cloud_root_enters_onedrive_directories(tmp_path, walk_threads):
+    (tmp_path / "OneDrive").mkdir()
+    (tmp_path / "OneDrive" / "scan.nii").write_bytes(b"x")
+
+    def claimed(cloud):
+        found = discover_sources(
+            tmp_path,
+            get_default_registry(),
+            admit_nonresident=cloud,
+            cloud_root=cloud,
+            walk_threads=walk_threads,
+        )
+        return len(found.claims)
+
+    assert claimed(False) == 0
+    assert claimed(True) == 1

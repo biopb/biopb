@@ -1483,6 +1483,7 @@ class TensorFlightServer(flight.FlightServerBase):
                         refreshed=tally.refreshed,
                         removed=tally.removed,
                         skipped_offline=tally.skipped_offline,
+                        skipped_cloud_dirs=tally.skipped_cloud_dirs,
                     )
                     for path, reason in tally.failed:
                         result.failed.add(path=path, reason=reason)

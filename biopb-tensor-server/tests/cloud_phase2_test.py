@@ -112,7 +112,7 @@ class TestShouldSkipAdmit:
     def test_admit_still_prunes_hidden_and_system(self, monkeypatch):
         from pathlib import Path
 
-        # Hidden entries and system/cloud dirs are pruned even under admit.
+        # Hidden entries and system dirs are pruned even under admit; OneDrive is not.
         assert (
             should_skip_walk_entry(
                 Path("/data/.hidden"), is_dir=False, admit_nonresident=True
@@ -122,6 +122,12 @@ class TestShouldSkipAdmit:
         assert (
             should_skip_walk_entry(
                 Path("/home/u/OneDrive"), is_dir=True, admit_nonresident=True
+            )
+            is False
+        )
+        assert (
+            should_skip_walk_entry(
+                Path("/data/.git"), is_dir=True, admit_nonresident=True
             )
             is True
         )
@@ -1210,6 +1216,30 @@ class TestDropCloudFolder:
         (sid,) = result.added
         assert sid not in server.registered  # a row and a claim, no adapter
         assert server._metadata_db.pending == [(sid, True)]
+
+    def test_without_cloud_onedrive_directories_are_counted(self, tmp_path):
+        folder = tmp_path / "parent"
+        (folder / "OneDrive").mkdir(parents=True)
+        (folder / "OneDrive - Lab").mkdir()
+        (folder / "OneDrive" / "scan.nii").write_bytes(b"payload")
+        (folder / "other").mkdir()
+
+        result = _drop(_make_manager(_FakeServer()), folder)
+
+        assert result.added == []
+        assert result.skipped_cloud_dirs == 2
+
+    def test_with_cloud_onedrive_directories_are_entered(
+        self, tmp_path, force_nonresident
+    ):
+        folder = tmp_path / "parent"
+        (folder / "OneDrive").mkdir(parents=True)
+        (folder / "OneDrive" / "scan.nii").write_bytes(b"payload")
+
+        result = _drop(_make_manager(_FakeServer()), folder, cloud=True)
+
+        assert len(result.added) == 1
+        assert result.skipped_cloud_dirs == 0
 
     def test_the_root_stays_cloud_for_the_later_checks(
         self, tmp_path, force_nonresident
