@@ -192,8 +192,9 @@ filter, since a client hit-tests the resident set — and drop them with
 `delete_rois(array_id, roi_ids=(), set_name="")`, which without ids deletes
 every annotation on the tensor, narrowed by `set_name` when given.
 
-ROIs are private data gated by their tensor's source, so they are **not** on the
-SQL browse surface; `list_rois` is the only way to read them.
+`list_rois` reads one tensor's annotations. The `rois` table is also on the SQL
+browse surface (`SELECT set_name, count(*) FROM rois GROUP BY set_name`), for
+questions that span tensors.
 
 ## Then show it
 

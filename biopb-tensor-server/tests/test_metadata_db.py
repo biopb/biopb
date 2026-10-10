@@ -655,7 +655,7 @@ class TestQueryHandling:
         db = MetadataDatabase()
         assert db.table_schema("sources").names[:2] == ["source_id", "source_url"]
         with pytest.raises(ValueError, match="unknown catalog table"):
-            db.table_schema("rois")
+            db.table_schema("source_catalog")
 
 
 class TestSQLValidation:
@@ -739,15 +739,15 @@ class TestSQLValidation:
     @pytest.mark.parametrize(
         "sql",
         [
-            'SELECT * FROM "rois"',
-            "SELECT * FROM 'rois'",
-            "SELECT * FROM main.rois",
-            "SELECT r.* FROM sources s, rois r",
-            "SELECT * FROM sources s JOIN rois r ON true",
-            "WITH x AS (SELECT * FROM rois) SELECT * FROM x",
-            "SELECT * FROM sources WHERE source_id IN (SELECT roi_id FROM rois)",
-            "SELECT (SELECT count(*) FROM rois)",
-            "FROM rois",
+            'SELECT * FROM "source_catalog"',
+            "SELECT * FROM 'source_catalog'",
+            "SELECT * FROM main.source_catalog",
+            "SELECT r.* FROM sources s, source_catalog r",
+            "SELECT * FROM sources s JOIN source_catalog r ON true",
+            "WITH x AS (SELECT * FROM source_catalog) SELECT * FROM x",
+            "SELECT * FROM sources WHERE source_id IN (SELECT source_id FROM source_catalog)",
+            "SELECT (SELECT count(*) FROM source_catalog)",
+            "FROM source_catalog",
         ],
     )
     def test_every_way_of_naming_a_private_table_is_refused(self, sql):
@@ -755,12 +755,12 @@ class TestSQLValidation:
         qualification, comma joins, CTEs and subqueries all resolve to the
         table they read (biopb/biopb#1010)."""
         db = MetadataDatabase()
-        with pytest.raises(ValueError, match="disallowed table: rois"):
+        with pytest.raises(ValueError, match="disallowed table: source_catalog"):
             db._validate_query(sql)
 
     def test_describe_and_show_are_refused(self):
         db = MetadataDatabase()
-        for sql in ("DESCRIBE rois", "SUMMARIZE sources", "SHOW TABLES"):
+        for sql in ("DESCRIBE source_catalog", "SUMMARIZE sources", "SHOW TABLES"):
             with pytest.raises(ValueError, match="not available here"):
                 db._validate_query(sql)
 
