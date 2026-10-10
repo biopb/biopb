@@ -649,6 +649,7 @@ def _open_catalog(
             store_path=path,
             annotations_enabled=server_config.annotations.enabled,
             checkpoint_threshold_mb=server_config.catalog.checkpoint_threshold_mb,
+            restore_sources=server_config.catalog.restore,
         )
         db.open()
         return db

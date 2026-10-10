@@ -775,8 +775,12 @@ class MetadataDatabase:
         store_path: Optional[Path] = None,
         annotations_enabled: bool = True,
         checkpoint_threshold_mb: int = 1024,
+        restore_sources: bool = True,
     ):
         self._checkpoint_threshold_mb = checkpoint_threshold_mb
+        #: Keep ``source_catalog`` across a restart (``catalog.restore``); off
+        #: empties it at open, so the first scan rebuilds it.
+        self.restore_sources = restore_sources
         #: How many times the file has been opened: what a row's ``epoch`` and its
         #: root's are compared with to say a row was confirmed this run.
         self.run_epoch = 0
@@ -1043,10 +1047,11 @@ class MetadataDatabase:
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
-        Rows are kept across an open and read back by :meth:`restorable_rows` (a
-        restore registers or marks pending every row it keeps, so none is listed
-        with no adapter behind it); the rows under roots that are not persisted are
-        cleared: nothing could rebuild them.
+        Rows are kept across an open unless ``restore_sources`` is off, and read
+        back by :meth:`restorable_rows` (a restore registers or marks pending every
+        row it keeps, so none is listed with no adapter behind it); the rows under
+        roots that are not persisted are cleared either way: nothing could rebuild
+        them.
         """
         conn.execute(
             "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
@@ -1141,11 +1146,15 @@ class MetadataDatabase:
                 last_scanned TIMESTAMP
             )
         """)
-        conn.execute(
-            "DELETE FROM source_catalog WHERE root_id IN "
-            "(SELECT root_id FROM catalog_roots WHERE NOT persisted)"
-        )
-        conn.execute("DELETE FROM catalog_roots WHERE NOT persisted")
+        if not self.restore_sources:
+            conn.execute("DELETE FROM source_catalog")
+            conn.execute("DELETE FROM catalog_roots")
+        else:
+            conn.execute(
+                "DELETE FROM source_catalog WHERE root_id IN "
+                "(SELECT root_id FROM catalog_roots WHERE NOT persisted)"
+            )
+            conn.execute("DELETE FROM catalog_roots WHERE NOT persisted")
         conn.execute(
             "INSERT INTO catalog_roots (root_id, root_url, persisted) "
             "VALUES (?, '', FALSE)",

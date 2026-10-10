@@ -432,7 +432,7 @@ annotations, so deleting it is not the recovery.
 ## 8. Restore
 
 Every start restores the last run's catalog in `SourceManager.start()`, before the first
-tick. A first run has no rows, and its scan is the same walk against an empty snapshot.
+tick, unless `catalog.restore` is false, which empties the catalog tables at open. A first run has no rows, and its scan is the same walk against an empty snapshot.
 A restore that raises stops the start with the error and a pointer to
 `biopb-tensor-server reset-catalog <config>` (server stopped), which empties the catalog
 tables and leaves annotations and cache measurements.

@@ -694,3 +694,14 @@ class TestARestoreThatFails:
             assert db.query("SELECT source_id FROM sources").num_rows == 0
         finally:
             db.close()
+
+
+def test_restore_off_empties_the_catalog_at_open(tmp_path):
+    _first_run(tmp_path)
+    db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb", restore_sources=False)
+    db.open()
+    try:
+        assert db.restorable_rows() == []
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
+    finally:
+        db.close()
