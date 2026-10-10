@@ -927,13 +927,17 @@ class TensorFlightServer(flight.FlightServerBase):
             if strict and source_id not in self.sources:
                 raise ValueError(f"array_id {array_id!r} names no known source")
             return array_id
-        adapter = self._registered(source_id)
-        if adapter is None:
-            if strict:
-                raise ValueError(f"array_id {array_id!r} names no known source")
-            return array_id
-        tensors = adapter.list_tensors()
-        return tensors[0].array_id if tensors else array_id
+        default = self._default_array_id(source_id)
+        if default is None and strict:
+            raise ValueError(f"array_id {array_id!r} names no known source")
+        return default or array_id
+
+    def _default_array_id(self, source_id: str) -> Optional[str]:
+        """``SourceRegistry.default_array_id``, its refusals as Flight errors."""
+        try:
+            return self.sources.default_array_id(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise to_flight_error(exc) from exc
 
     @staticmethod
     def _catalog_endpoint(sql: str) -> flight.FlightEndpoint:
@@ -1567,13 +1571,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            default_adapter = self._registered(source_id)
-            if default_adapter is not None:
-                descriptors = default_adapter.list_tensors()
-                if descriptors:
-                    field = self._field_within_source(
-                        source_id, descriptors[0].array_id
-                    )
+            default = self._default_array_id(source_id)
+            if default is not None:
+                field = self._field_within_source(source_id, default)
 
         logger.debug(
             f"get_flight_info: source_id={source_id}, tensor_id={tensor_id}, field={field}"

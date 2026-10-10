@@ -328,6 +328,14 @@ class SourceRegistry:
             found = self._attachments.get(source_id)
             return found.items() if found is not None else {}
 
+    def default_array_id(self, source_id: str) -> Optional[str]:
+        """The array_id a bare *source_id* stands for: the source's first tensor.
+        None for an unknown source or one with no tensors. Raises what
+        :meth:`get_registered` raises."""
+        adapter = self.get_registered(source_id)
+        tensors = adapter.list_tensors() if adapter is not None else []
+        return tensors[0].array_id if tensors else None
+
     def attached(self, source_id: str, field: str) -> Optional[TensorAdapter]:
         """The tensor attached at *field* of *source_id*, whatever its state."""
         with self._lock:
