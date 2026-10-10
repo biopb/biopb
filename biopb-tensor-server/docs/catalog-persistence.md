@@ -5,9 +5,9 @@ Scope: `biopb-tensor-server` (`core/discovery.py`, `sources/source_manager.py`,
 client indexing-state hint in `biopb-mcp` and the webapp.
 
 The server binds and serves before it has scanned anything. Discovery fills the catalog
-from behind `SERVING`; a separate signal says when that is finished. With `catalog.restore`
-on, the last run's catalog is read back first, so a restart lists every source at once and
-registers none that is unchanged. This page states what discovery and the catalog
+from behind `SERVING`; a separate signal says when that is finished. The last run's catalog is
+read back first, so a restart lists every source at once and registers none that is
+unchanged. This page states what discovery and the catalog
 guarantee: which path string is used where, how a scan decides, what is persisted and how
 it comes back.
 
@@ -431,8 +431,11 @@ annotations, so deleting it is not the recovery.
 
 ## 8. Restore
 
-`catalog.restore` (off by default; otherwise the persisted tables are cleared at open)
-turns on a restore in `SourceManager.start()`, before the first tick.
+Every start restores the last run's catalog in `SourceManager.start()`, before the first
+tick, unless `catalog.restore` is false, which empties the catalog tables at open. A first run has no rows, and its scan is the same walk against an empty snapshot.
+A restore that raises stops the start with the error and a pointer to
+`biopb-tensor-server reset-catalog <config>` (server stopped), which empties the catalog
+tables and leaves annotations and cache measurements.
 
 **What is restored.** A source with a claim under a configured root of kind monitored,
 scan-once or cloud. Mirrors and drops are not (a drop's roots live in memory, so its rows
@@ -451,8 +454,7 @@ any scan. Restored sources are queued to the pool as found, without a stat each.
 resolved source with no adapter is registered on a read, where a fresh pending source raises
 "resolve it"; a failed hydration makes the row `failed` like any registration. A row that
 cannot be read (a payload or claim that does not decode) is deleted and logged, and the walk
-finds its file again as a new claim. A restore that raises leaves a fresh catalog: the rows
-are dropped, never a half-restored state.
+finds its file again as a new claim.
 
 **Ownership is re-derived from the current config.** Roots come from config, not from the
 tables:
@@ -465,9 +467,9 @@ tables:
   one `catalog_roots` row and the view follows.
 - A root whose cloudness changed makes its rows read as changed: the persisted signature
   form depends on cloudness, so the two never compare equal and the claim is refreshed.
-- A row older than 30 days by both `last_seen` and its root's `last_scanned`
-  (`_RESTORE_MAX_AGE`) is dropped, so an unreachable root does not leave its sources listed
-  forever.
+- A row that 5 runs in a row (`_RESTORE_MAX_IDLE_RUNS`) neither wrote nor had its root's
+  walk finish is dropped, so an unreachable root does not leave its sources listed forever.
+  Counted in runs, not days: a server that was off for a month has seen nothing go missing.
 
 **Hydration from the payload.** Registering a restored source rebuilds it from its row
 with no check of the files: the walk is what compares them with the persisted signature and
@@ -563,7 +565,7 @@ not yet verified: `confirmed` is not in the published schema, so "verifying" is 
 - **`confirmed` is not exposed to clients.** The SPA and SDK read it only through the
   freshness signal; adding it to `sources` is a protocol change.
 - **A corrupt catalog is not loud.** When the store will not open the server serves from
-  memory, which silently turns restore off.
+  memory, which silently turns restore off (nothing is kept).
 - **What a hydration still reads.** `read_hydration` decodes the row's payload and its
   `metadata_json`, which for a micromanager dataset is several MB; that decode is most of
   what is left of its hydration (about 2 s at the 95th percentile on `/labs`). Passing the

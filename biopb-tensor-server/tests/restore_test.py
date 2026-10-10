@@ -1,9 +1,10 @@
-"""Restoring the last run's sources (``catalog.restore``).
+"""Restoring the last run's sources.
 
 Two runs share one catalog file. The second restores what the first persisted, and
 its first walk is a rescan against those claims.
 """
 
+import json
 import os
 import shutil
 
@@ -16,6 +17,7 @@ from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
 )
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.sources.reconciler import _RESTORE_MAX_IDLE_RUNS
 
 from tests import catalog_server, deferred_registration_test as drt, make_manager
 
@@ -27,15 +29,12 @@ class _Run:
         self,
         tmp_path,
         *,
-        restore=True,
         aliases=None,
         once=(),
         cloud=False,
         **server_kwargs,
     ):
-        self.db = MetadataDatabase(
-            store_path=tmp_path / "catalog.duckdb", restore_sources=restore
-        )
+        self.db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
         self.db.open()
         self.server = catalog_server(
             "localhost:0", metadata_db=self.db, **server_kwargs
@@ -185,7 +184,7 @@ class TestRestore:
 
     def test_a_failed_row_comes_back_failed_and_is_not_retried(self, tmp_path):
         # A failed row, as a registration that raised leaves it.
-        first = _Run(tmp_path, restore=False)
+        first = _Run(tmp_path)
         drt._make_zarr(first.monitored, "a.zarr")
         first.reconciler.set_defer_registration(True)
         first.manager._handle_rescan()
@@ -255,9 +254,8 @@ class TestRestore:
             run.server.sources.get_registered(source_id)
         run.stop()
 
-    def test_nothing_is_restored_when_the_setting_is_off(self, tmp_path):
-        _first_run(tmp_path)
-        run = _Run(tmp_path, restore=False)
+    def test_a_first_run_restores_nothing(self, tmp_path):
+        run = _Run(tmp_path)
         run.restore()
         assert run.rows() == {}
         assert run.reconciler.claim_ids() == []
@@ -265,9 +263,7 @@ class TestRestore:
 
     def test_an_unreadable_row_is_dropped_and_found_again(self, tmp_path):
         ids = _first_run(tmp_path)
-        db = MetadataDatabase(
-            store_path=tmp_path / "catalog.duckdb", restore_sources=True
-        )
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
         db.open()
         db._get_connection().execute(
             "UPDATE source_catalog SET signature = 'not json' WHERE source_id = ?",
@@ -592,21 +588,22 @@ class TestConfirmation:
         assert len(run.rows()) == 2
         run.stop()
 
-    def test_a_source_nobody_has_seen_for_a_month_is_not_restored(self, tmp_path):
+    def test_a_source_idle_for_many_runs_is_not_restored(self, tmp_path):
         ids = _first_run(tmp_path)
-        db = MetadataDatabase(
-            store_path=tmp_path / "catalog.duckdb", restore_sources=True
-        )
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
         db.open()
         conn = db._get_connection()
-        conn.execute("UPDATE catalog_roots SET last_scanned = now() - INTERVAL 60 DAY")
+        conn.execute("UPDATE catalog_roots SET epoch = 0")
         conn.execute(
-            "UPDATE source_catalog SET last_seen = now() - INTERVAL 60 DAY "
-            "WHERE source_id = ?",
-            [ids[0]],
+            "UPDATE source_catalog SET epoch = 0 WHERE source_id = ?", [ids[0]]
         )
         conn.execute(
-            "UPDATE source_catalog SET last_seen = now() WHERE source_id = ?", [ids[1]]
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('run_epoch', ?)",
+            [str(_RESTORE_MAX_IDLE_RUNS + 5)],
+        )
+        conn.execute(
+            "UPDATE source_catalog SET epoch = ? WHERE source_id = ?",
+            [_RESTORE_MAX_IDLE_RUNS + 5, ids[1]],
         )
         db.close()
 
@@ -614,6 +611,21 @@ class TestConfirmation:
         run.restore()
 
         assert list(run.rows()) == [ids[1]]
+        run.stop()
+
+    def test_a_long_downtime_is_not_idle_runs(self, tmp_path):
+        ids = _first_run(tmp_path)
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
+        db.open()
+        conn = db._get_connection()
+        conn.execute("UPDATE catalog_roots SET last_scanned = now() - INTERVAL 400 DAY")
+        conn.execute("UPDATE source_catalog SET last_seen = now() - INTERVAL 400 DAY")
+        db.close()
+
+        run = _Run(tmp_path)
+        run.restore()
+
+        assert sorted(run.rows()) == ids
         run.stop()
 
 
@@ -643,3 +655,53 @@ class TestCloudFlagFlip:
             run.server.sources.get_registered(source_id)
         assert all(r["is_resolved"] for r in run.rows().values())
         run.stop()
+
+
+class TestARestoreThatFails:
+    def test_start_refuses_and_names_the_cli(self, tmp_path, monkeypatch):
+        from biopb_tensor_server.core.errors import AnnotationStoreError
+
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+
+        def boom(rows):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(run.reconciler, "restore", boom)
+        with pytest.raises(AnnotationStoreError, match="reset-catalog"):
+            run.restore()
+        run.stop()
+
+    def test_reset_catalog_empties_the_catalog_tables(self, tmp_path):
+        from biopb_tensor_server.cli import app
+        from typer.testing import CliRunner
+
+        _first_run(tmp_path)
+        store = tmp_path / "catalog.duckdb"
+        config = tmp_path / "biopb.json"
+        config.write_text(
+            json.dumps({"sources": [], "catalog": {"store_path": str(store)}})
+        )
+
+        result = CliRunner().invoke(app, ["reset-catalog", str(config)])
+
+        assert result.exit_code == 0
+        assert "Catalog emptied" in result.output
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        try:
+            assert db.restorable_rows() == []
+            assert db.query("SELECT source_id FROM sources").num_rows == 0
+        finally:
+            db.close()
+
+
+def test_restore_off_empties_the_catalog_at_open(tmp_path):
+    _first_run(tmp_path)
+    db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb", restore_sources=False)
+    db.open()
+    try:
+        assert db.restorable_rows() == []
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
+    finally:
+        db.close()

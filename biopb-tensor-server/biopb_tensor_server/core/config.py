@@ -768,13 +768,13 @@ class CatalogConfig:
         },
     )
     restore: bool = field(
-        default=False,
+        default=True,
         metadata={
-            "help": "(experimental) Keep the sources of the last run in the "
-            "catalog across a restart, so they are listed at once and registered "
-            "as they are read or as the pool reaches them, and the first scan "
-            "only verifies them. Off rebuilds the catalog from the scan, as "
-            "every start did. Needs catalog.persist."
+            "help": "Keep the sources of the last run in the catalog across a "
+            "restart, so they are listed at once and registered as they are read "
+            "or as the pool reaches them, and the first scan only verifies them. "
+            "Off empties the catalog at every start and rebuilds it from the scan. "
+            "Needs catalog.persist."
         },
     )
     store_path: str = field(

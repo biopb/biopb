@@ -775,12 +775,12 @@ class MetadataDatabase:
         store_path: Optional[Path] = None,
         annotations_enabled: bool = True,
         checkpoint_threshold_mb: int = 1024,
-        restore_sources: bool = False,
+        restore_sources: bool = True,
     ):
         self._checkpoint_threshold_mb = checkpoint_threshold_mb
-        #: Keep ``source_catalog`` across a restart (``catalog.restore``): its rows
-        #: are read back by :meth:`restorable_rows`, not cleared at open.
-        self.restore_sources = restore_sources and store_path is not None
+        #: Keep ``source_catalog`` across a restart (``catalog.restore``); off
+        #: empties it at open, so the first scan rebuilds it.
+        self.restore_sources = restore_sources
         #: How many times the file has been opened: what a row's ``epoch`` and its
         #: root's are compared with to say a row was confirmed this run.
         self.run_epoch = 0
@@ -1047,9 +1047,9 @@ class MetadataDatabase:
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
-        Rows are cleared at open unless ``restore_sources`` (showing last run's
-        rows with no adapter behind them would be a catalog that lies, so a
-        restore registers or marks pending every row it keeps), and the rows under
+        Rows are kept across an open unless ``restore_sources`` is off, and read
+        back by :meth:`restorable_rows` (a restore registers or marks pending every
+        row it keeps, so none is listed with no adapter behind it); the rows under
         roots that are not persisted are cleared either way: nothing could rebuild
         them.
         """
@@ -1936,18 +1936,18 @@ class MetadataDatabase:
         """The rows with a claim, which a restore rebuilds claims from, without the
         payload and the metadata (large, and read per source when it is hydrated).
 
-        Empty unless ``restore_sources``: the table was cleared at open.
+        ``idle_runs`` is how many earlier runs neither wrote the row nor finished a
+        walk of its root.
         """
-        if not self.restore_sources:
-            return []
         conn = self._get_connection()
         cursor = conn.execute(
             "SELECT c.source_id, c.source_type, c.is_resolved, "
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
-            "c.last_seen, r.last_scanned "
+            "? - 1 - greatest(c.epoch, r.epoch) AS idle_runs "
             "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id "
-            "WHERE c.primary_path IS NOT NULL"
+            "WHERE c.primary_path IS NOT NULL",
+            [self.run_epoch],
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]

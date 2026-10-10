@@ -83,11 +83,11 @@ class TestTheViewAndTheOpen:
         )
         assert confirmed == [(True,)]
 
-    def test_a_restoring_open_drops_the_roots_that_are_not_persisted_and_their_rows(
+    def test_an_open_drops_the_roots_that_are_not_persisted_and_their_rows(
         self, tmp_path
     ):
         store = tmp_path / "catalog.duckdb"
-        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db = MetadataDatabase(store_path=store)
         db.open()
         db.sync_roots([("r1", "file:///d")])
         drop = self._drop_row(db)
@@ -97,7 +97,7 @@ class TestTheViewAndTheOpen:
         assert drop.root_id in _roots(db)
         db.close()
 
-        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db = MetadataDatabase(store_path=store)
         db.open()
         try:
             assert set(_roots(db)) == {"r1", INTERNAL_ROOT_ID}

@@ -74,9 +74,7 @@ class TestAHydratedSourceListsWhatIsOnDisk:
     def test_a_field_the_row_does_not_list_is_relisted(self, tmp_path):
         sid = _first_run(tmp_path)
         # The row as an earlier write (or a re-sync that failed) left it.
-        db = MetadataDatabase(
-            store_path=tmp_path / "catalog.duckdb", restore_sources=True
-        )
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb")
         db.open()
         db._get_connection().execute(
             "UPDATE source_catalog SET tensors = [t for t in tensors "

@@ -1271,6 +1271,50 @@ def list_tensors(
         raise typer.Exit(1)
 
 
+def _open_catalog_offline(
+    server_config: ServerConfig, config: Path, **db_kwargs
+) -> MetadataDatabase:
+    """Open the catalog file for an offline command, or exit.
+
+    Exits 0 when the config keeps no catalog on disk or the file does not exist
+    yet, and 1 when it cannot be opened -- almost always because the server holds
+    DuckDB's exclusive lock, which readers feel as well as writers.
+    """
+    store = _catalog_store_path(server_config, config)
+    if store is None:
+        console.print(
+            "[yellow]This config has no persistent catalog, so there is nothing "
+            "on disk to act on.[/yellow]"
+        )
+        raise typer.Exit(0)
+    if not store.exists():
+        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
+        raise typer.Exit(0)
+
+    # The open retries a held lock, which is right for a server racing a restart
+    # but is only noise ahead of a message this command formats itself.
+    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
+
+    db = MetadataDatabase(store_path=store, **db_kwargs)
+    try:
+        db.open()
+    except AnnotationStoreError as exc:
+        if "Conflicting lock" in str(exc):
+            # Much the likeliest reason to land here, and the server-facing
+            # message ("set persist false") is beside the point for this command.
+            console.print(
+                "[red]The catalog is open in another process -- almost certainly "
+                "the server itself.[/red]\n"
+                "DuckDB's lock is exclusive for readers as well as writers, so "
+                "this command needs the server stopped."
+            )
+        else:
+            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
+        raise typer.Exit(1) from None
+    return db
+
+
 @app.command(name="prune-annotations")
 def prune_annotations(
     config: Path = typer.Argument(
@@ -1318,39 +1362,7 @@ def prune_annotations(
         )
         raise typer.Exit(2)
 
-    store = _catalog_store_path(server_config, config)
-    if store is None:
-        console.print(
-            "[yellow]This config has no persistent catalog, so there is nothing "
-            "on disk to prune.[/yellow]"
-        )
-        raise typer.Exit(0)
-    if not store.exists():
-        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
-        raise typer.Exit(0)
-
-    # The open retries a held lock, which is right for a server racing a restart
-    # but is only noise ahead of a message this command formats itself.
-    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
-
-    db = MetadataDatabase(store_path=store)
-    try:
-        db.open()
-    except AnnotationStoreError as exc:
-        if "Conflicting lock" in str(exc):
-            # Much the likeliest reason to land here, and the server-facing
-            # message ("set persist false") is beside the point for this command.
-            console.print(
-                "[red]The catalog is open in another process -- almost certainly "
-                "the server itself.[/red]\n"
-                "DuckDB's lock is exclusive for readers as well as writers, so "
-                "this command needs the server stopped."
-            )
-        else:
-            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
-        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
-        raise typer.Exit(1) from None
-
+    db = _open_catalog_offline(server_config, config)
     try:
         cutoff = datetime.now() - timedelta(days=threshold)
         groups = db.unseen_rois(cutoff)
@@ -1389,6 +1401,31 @@ def prune_annotations(
         console.print(f"[red]Deleted {db.prune_unseen(cutoff)} annotation(s).[/red]")
     finally:
         db.close()
+
+
+@app.command(name="reset-catalog")
+def reset_catalog(
+    config: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Path to config file (biopb.json)",
+    ),
+):
+    """Empty the source catalog, keeping annotations.
+
+    For a server that will not start because the last run's catalog cannot be
+    restored. The next start finds its sources again by a scan, as a first run
+    does. Annotations and cache measurements in the same file are untouched.
+
+    **The server must be stopped**: DuckDB takes an exclusive lock on the file.
+
+    Example:
+        biopb-tensor-server reset-catalog biopb.json
+    """
+    server_config = _load_config_or_exit(config)
+    # Opening without a restore is what empties the tables.
+    _open_catalog_offline(server_config, config, restore_sources=False).close()
+    console.print("[green]Catalog emptied.[/green]")
 
 
 @app.command()
