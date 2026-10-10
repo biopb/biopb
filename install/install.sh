@@ -435,7 +435,7 @@ _setup_mcp() {
     # (per-client registration resolves its own path inside `biopb agents`). GUI
     # agents don't inherit the shell PATH, so the absolute path is what works.
     local mcp_cmd
-    mcp_cmd=$(command -v biopb-shim 2>/dev/null || echo "biopb-shim")
+    mcp_cmd=$(_biopb_tool_bin biopb-shim || echo "biopb-shim")
 
     mkdir -p "$CONFIG_DIR"
 
@@ -447,7 +447,7 @@ _setup_mcp() {
     # them. Idempotent (never clobbers a user-edited file); best-effort so a
     # failure never aborts the install.
     local seed_cmd
-    seed_cmd=$(command -v biopb-mcp-seed-algorithms 2>/dev/null || true)
+    seed_cmd=$(_biopb_tool_bin biopb-mcp-seed-algorithms || true)
     if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
         _ok "Seeded bundled algorithm ops: $CONFIG_DIR/algorithms/"
     else
@@ -477,7 +477,7 @@ EOF
     # no longer carries a second copy. `|| true`: a per-client failure must never
     # abort the install (set -e). Its per-client results print directly.
     local biopb_cmd
-    biopb_cmd=$(command -v biopb 2>/dev/null || echo "biopb")
+    biopb_cmd=$(_biopb_tool_bin biopb || echo "biopb")
     "$biopb_cmd" agents register --all || true
 
     # Manual-fallback notice fires only if nothing ended up registered. Ask the
@@ -488,6 +488,31 @@ EOF
     else
         MCP_NEEDS_MANUAL=1
     fi
+}
+
+# Absolute path of one of biopb's console scripts (biopb, biopb-shim, ...) as
+# installed by THIS script's `uv tool install`; prints nothing (and fails) if it
+# isn't there. Looks in uv's tool bin dir rather than trusting `command -v`: a
+# shell with a dev venv active (or a UV_TOOL_BIN_DIR that isn't ~/.local/bin)
+# can put another biopb first on PATH, and the installer would then start the
+# control plane -- and point the Desktop launcher and agent configs -- at that
+# one instead of what it just installed. --allow-path falls back to PATH, for
+# the stop-before-replace calls where any biopb that reaches the running
+# control plane will do.
+_biopb_tool_bin() {
+    local name="$1" bin_dir=""
+    if command -v uv >/dev/null 2>&1; then
+        bin_dir=$(uv tool dir --bin 2>/dev/null) || bin_dir=""
+    fi
+    [ -n "$bin_dir" ] || bin_dir="$HOME/.local/bin"
+    if [ -x "$bin_dir/$name" ]; then
+        printf '%s\n' "$bin_dir/$name"
+        return 0
+    fi
+    if [ "${2:-}" = "--allow-path" ]; then
+        command -v "$name" 2>/dev/null && return 0
+    fi
+    return 1
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -767,10 +792,11 @@ _pid_is_biopb() {
 # pidfile locations are version-independent constants, so this works without
 # knowing which release wrote them. Best-effort throughout.
 _stop_all_biopb_services() {
-    if command -v biopb >/dev/null 2>&1; then
-        biopb control stop >/dev/null 2>&1 || true   # v0.11+ control plane
-        biopb server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
-        biopb mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
+    local biopb_stop
+    if biopb_stop=$(_biopb_tool_bin biopb --allow-path); then
+        "$biopb_stop" control stop >/dev/null 2>&1 || true   # v0.11+ control plane
+        "$biopb_stop" server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
+        "$biopb_stop" mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
     fi
 
     # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
@@ -827,8 +853,9 @@ _start_control_plane() {
         _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
-    if ! command -v biopb >/dev/null 2>&1; then
-        _warn "biopb not found on PATH; skipping control-plane start"
+    local biopb_cmd
+    if ! biopb_cmd=$(_biopb_tool_bin biopb); then
+        _warn "biopb not found in the uv tool bin dir; skipping control-plane start"
         _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
@@ -844,7 +871,7 @@ _start_control_plane() {
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     local start_out
-    if ! start_out=$(biopb control start 2>&1); then
+    if ! start_out=$("$biopb_cmd" control start 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
@@ -868,7 +895,7 @@ _start_control_plane() {
     # does no Flight health query, so no source_count here -- it climbs in the background).
     local out i=0
     while [ "$i" -lt 60 ]; do
-        out=$(biopb control status --json 2>/dev/null || echo "")
+        out=$("$biopb_cmd" control status --json 2>/dev/null || echo "")
         if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"serving"'; then
             _ok "Control plane started — data plane serving; catalog + pre-cache building in the background"
             return 0
@@ -1105,7 +1132,7 @@ _install_desktop_shortcut() {
     fi
 
     local biopb_bin
-    biopb_bin=$(command -v biopb 2>/dev/null || echo "$HOME/.local/bin/biopb")
+    biopb_bin=$(_biopb_tool_bin biopb || echo "$HOME/.local/bin/biopb")
 
     # Only place an icon where a desktop already exists -- creating ~/Desktop on a
     # headless box (a compute node, a container) would leave a launcher nobody sees.
