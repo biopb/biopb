@@ -202,6 +202,5 @@ session.
 
 ## Related
 
-- [[tensor-server-client]] — the read side: browsing the catalog and loading a tensor.
-- [[tensor-server-client]] — what an `array_id` addresses, and the axis order an
-  upload expects.
+- [[tensor-server-client]] — the read side: browsing the catalog and loading a
+  tensor, what an `array_id` addresses, and the axis order an upload expects.
