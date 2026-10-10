@@ -748,17 +748,18 @@ export function SourceTree() {
         )}
         {catalogTruncated && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            First {CATALOG_LIMIT.toLocaleString()} sources shown, the catalog has more; search to
-            find the rest
+            {CATALOG_LIMIT.toLocaleString()} sources (truncated) - use a filter
           </div>
         )}
         {useServerQuery && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            {sources.length.toLocaleString()} sources • Server-side filter
+            {serverMatches
+              ? `${serverMatches.length.toLocaleString()} matches${
+                  serverMoreMatches && !serverQueryLoading ? " (truncated)" : ""
+                }`
+              : `${sources.length.toLocaleString()} sources`}{" "}
+            - server-side filter
             {serverQueryLoading && " • Searching…"}
-            {serverMoreMatches &&
-              !serverQueryLoading &&
-              ` • First ${SERVER_QUERY_LIMIT.toLocaleString()} matches shown, refine the search`}
           </div>
         )}
       </div>
