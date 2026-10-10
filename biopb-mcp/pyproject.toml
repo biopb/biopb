@@ -68,7 +68,7 @@ dependencies = [
     "matplotlib",
     "scikit-learn",
     # biopb.control, biopb.tensor.Connection and the Ops protocol (.dev0: a pre-tag dev build).
-    "biopb[tensor,shim] >= 0.11.1",
+    "biopb[tensor,shim] >= 0.12.0",
 ]
 
 [project.optional-dependencies]
@@ -91,7 +91,7 @@ napari = [
     "pyqt6",
     "qtpy",
     # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
-    "biopb-napari-widget >= 0.1.1rc5",
+    "biopb-napari-widget >= 0.2.0",
 ]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
