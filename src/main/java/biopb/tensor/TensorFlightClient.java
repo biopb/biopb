@@ -842,8 +842,8 @@ public class TensorFlightClient implements AutoCloseable {
      * Fetch a tensor's ROI annotations.
      *
      * <p>There is no plane or bbox filter: a client hit-tests and re-renders
-     * from the resident set. Annotations are private data, gated by the
-     * tensor's source like its pixels, so they are not on the SQL surface.
+     * from the resident set. Reads are gated by the tensor's source like its
+     * pixels; the {@code rois} table in a catalog query is full-access only.
      *
      * @param arrayId unversioned array_id of the tensor
      * @return the annotations, a {@code truncated} flag, and {@code sets} --
