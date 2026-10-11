@@ -51,50 +51,29 @@ meta = client.get_source_metadata("source_id")
 print(meta)
 ```
 
-## Cloud / unresolved sources (experimental)
+## Unresolved sources
 
-**Experimental — this surface is unstable and may change.** Keep to what is
-below rather than building on the details.
+A row with `is_resolved == False` has an empty `tensors`: its structure is not
+known yet. `unresolved_reason` says why:
 
-Some sources are catalogued by URL only (cloud, or a synced folder like OneDrive
-"Files-On-Demand"): their shape, dtype and field list are unknown until first
-read. They list with `is_resolved == False` (`unresolved_reason ==
-'needs_recall'`) and an empty `tensors`, and `get_tensor` on one raises.
+| `unresolved_reason` | what it is | what to do |
+|---|---|---|
+| *(resolved)* | the server has read its structure | read it |
+| `pending` | found at startup, not read yet; nothing is downloaded | wait (`health_check()["registration_pending"]` counts what is left; `0` is a whole catalog), or read it: `get_tensor`, `get_descriptor` or `resolve_source` registers it at once |
+| `needs_recall` | cloud / synced-folder placeholder (OneDrive Files-On-Demand): shape and dtype unknown until read | `client.resolve_source(id)` downloads the whole file, so ask first; it returns the populated row |
+| `failed` | could not be read (a corrupt file, say) | `resolve_source` raises with the reason |
 
-```python
-client.resolve_source("source_id")     # downloads the whole thing; minutes, disk, needs network
-```
-
-Resolving is deliberately explicit — browsing never triggers it — because it is
-a full download. It returns the source's `sources` row, now populated. For a
-multi-file source it fetches metadata only; the member files recall as they are read.
-
-**Resolved is not the same as local.** `is_resolved` says the server has read
-the source's structure; it says nothing about where the bytes are, and a synced
-folder re-dehydrates under storage pressure. Assume any cloud or synced-folder
-source may need to fetch on first read — slow, and impossible offline — and plan
-for it: warn the user before a long read rather than after it, and crop
-rather than reaching for the whole thing.
-
-**Filter footgun:** an unresolved source has an empty `tensors`, so
-`query("... WHERE tensors[1].dtype = 'uint8'")` silently drops it —
-hidden for being unresolved, not for failing to match. `WHERE NOT is_resolved`
-is how you ask for them on purpose.
-
-## Sources the server has found but not read yet
-
-After a start the server lists every source it finds before it has read any of
-them: each row has `is_resolved == False`, `unresolved_reason == 'pending'` and
-an empty `tensors`, and fills in as the server works through them (newest first;
-`client.health_check()["registration_pending"]` counts what is left, `0` means
-the catalog is whole). This is not a cloud source: nothing is downloaded, and
-reading a pending source (`get_tensor`, `get_descriptor`, `resolve_source`)
-registers it on the spot.
-
-A search by structure (`WHERE tensors[1].dtype = 'uint16'`) cannot see a pending
-source, so an empty result while `registration_pending > 0` means "not known
-yet", not "none". Say so, or wait. A row with `unresolved_reason == 'failed'`
-could not be read (corrupt file, say); `resolve_source` raises with the reason.
+- **A structural filter hides them.** `WHERE tensors[1].dtype = 'uint8'` drops
+  every unresolved source silently. While `registration_pending > 0`, an empty
+  result means "not known yet", not "none". `WHERE NOT is_resolved` asks for them
+  on purpose.
+- **Resolved is not local.** It says the server has read the structure, not where
+  the bytes are, and a synced folder re-dehydrates under storage pressure. Assume a
+  cloud source may fetch on first read, slow and impossible offline: warn before a
+  long read and crop instead of reaching for the whole thing.
+- Resolving is explicit and browsing never triggers it; for a multi-file source it
+  fetches metadata only, and the member files recall as they are read. Cloud
+  support is experimental; keep to what is here.
 
 ## Loading a tensor
 
@@ -124,18 +103,6 @@ watch and cancel ([[kernel]]).
 `client.get_descriptor(array_id)` is the only call that answers the transfer
 `chunk_shape`; `client.get_physical_scale(array_id)` answers pixel size.
 
-## Upload to Server
+## Writing back
 
-The write side is [[upload]] — tensors, label sets and ROI annotations, and what
-each refuses. The short form:
-
-```python
-desc = client.setup_array_upload("zarr://scratch/@fields/my_result", arr)
-client.upload_array(desc, arr)
-```
-
-An upload adds a tensor to a source that already exists and creates none, so a
-result of your own goes on `scratch` — the temp store every writable server
-serves at that fixed id. What lands there has a deadline (`desc.ttl_seconds` is
-the one you got). A field is taken while its tensor is served, so re-running a
-cell needs a new field name.
+[[upload]] covers tensors, label sets and ROI annotations, and what each refuses.

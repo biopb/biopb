@@ -817,17 +817,13 @@ async def execute_code(
       surface; there is no other. Structure is a per-tensor question, so ask it
       of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,
       or `tensors[1].dtype` for the source's first tensor (DuckDB lists are
-      1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)
-      source has an empty `tensors`, so any such predicate hides it; use
-      `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
-      to list what hasn't been resolved yet). Right after a server start many
-      sources are `is_resolved = false` with `unresolved_reason = 'pending'`:
-      found, not read yet, filling in (`client.health_check()
-      ["registration_pending"]` counts them). Reading one registers it at once,
-      and until they are done an empty structural search means "not known yet".
-    - resolved is not the same as local. Assume a cloud or synced-folder
-      source's bytes may not be on the serving machine, so its first read can
-      be slow or fail offline -- say so before starting one, not after.
+      1-indexed, unlike `tensors[0]` in Python/TS code). A source not yet read
+      (`is_resolved = false`: `pending`, `needs_recall`, `failed`) has an empty
+      `tensors`, so a structural predicate silently drops it; `WHERE NOT is_resolved`
+      asks for them on purpose, and an empty result while
+      `client.health_check()["registration_pending"]` is above 0 means "not known
+      yet". Resolved is not local: a cloud source's first read can be slow or fail
+      offline, so say so before starting one, not after.
     - client.get_tensor(array_id) returns a lazy dask array;
       viewer.add_tensor(array_id), where there is a viewer, loads it as a layer
       (auto-handles the multiscale pyramid). Both take the same id: "source_id/t1"

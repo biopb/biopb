@@ -79,7 +79,8 @@ With `"eager"` and `"lazy"`, the input's axes outside the op's `Tensor(...)`
 must be size 1 — slice before calling. Only `"blocks"` maps over them.
 
 * `"eager"` (default): numpy arrays. An `array_id` is read in the kernel and
-  sent inline; one over 2 GiB is refused rather than pulled whole.
+  sent inline; one over 2 GiB is refused rather than pulled whole (the table in
+  [[ops]] says where `lazy` and `blocks` input goes).
 * `"lazy"`: dask arrays; the function may return one, which is written to the
   plane chunk by chunk.
 * `"blocks"`: the function is mapped over blocks, and over every axis not in
@@ -92,7 +93,7 @@ A function that `yield`s is a streaming op, for work that carries state frame
 to frame (tracking, localization): a yielded string is progress, anything else
 one item's result, and what it `return`s is the final result.
 
-## A GPU torch
+## Appendix: a GPU torch
 
 On Linux PyPI's torch is built for one CUDA version, and on Windows it is
 CPU-only. To choose the build, point torch at PyTorch's index in the header:
