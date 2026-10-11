@@ -24,9 +24,9 @@ const DND_URL_PREFIX = "dnd://";
 export const RECENT_FOLDER_ID = " recent";
 
 // Row ids under "Recent" are namespaced away from the catalog row for the same
-// source, which is a different node holding the same descriptor. Sharing an id
-// would make `folderPathTo` reveal whichever copy it reached first, and the
-// reveal is meant to find the source in its real place in the hierarchy.
+// source, which is a different node holding the same descriptor. Only the
+// catalog row answers to the source id, so revealing a source scrolls to its
+// real place in the hierarchy and not to this shortcut.
 const RECENT_ROW_PREFIX = `${RECENT_FOLDER_ID}:`;
 
 export interface TreeNode {

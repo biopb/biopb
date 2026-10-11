@@ -439,6 +439,36 @@ describe("catalog tree", () => {
     expect(await useAppStore.getState().revealSource("nope")).toBe(false);
   });
 
+  it("forgets a source that has left its level, so it is no longer listed", async () => {
+    useAppStore.setState({
+      client: client({}),
+      ...loadedTop(SOURCE),
+      sourceIndex: { [SOURCE.source_id]: SOURCE },
+    });
+    expect(await useAppStore.getState().refreshTree()).toBe(true);
+    expect(useAppStore.getState().sourceIndex[SOURCE.source_id]).toBeUndefined();
+  });
+
+  it("keeps a source that is still in its level, and reads an unchanged level as unchanged", async () => {
+    const levels = { "": levelOf("", [SOURCE]) };
+    const c = client(levels);
+    useAppStore.setState({ client: c });
+    await useAppStore.getState().loadLevel("");
+    expect(await useAppStore.getState().refreshTree()).toBe(false);
+    expect(useAppStore.getState().sourceIndex[SOURCE.source_id]).toBe(SOURCE);
+  });
+
+  it("reads a level written without an etag as changed once, then holds the server's", async () => {
+    const c = client({ "": levelOf("", [SOURCE]) });
+    useAppStore.setState({
+      client: c,
+      treeLevels: { "": { level: levelOf("", [SOURCE]), etag: null } },
+    });
+    expect(await useAppStore.getState().refreshTree()).toBe(true);
+    expect(useAppStore.getState().treeLevels[""]!.etag).not.toBeNull();
+    expect(await useAppStore.getState().refreshTree()).toBe(false);
+  });
+
   it("swaps a resolved row into its level and the index", () => {
     useAppStore.setState(loadedTop({ ...SOURCE, is_resolved: false }));
     useAppStore.getState().applySourceRow(SOURCE);

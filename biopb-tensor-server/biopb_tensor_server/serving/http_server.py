@@ -2269,11 +2269,33 @@ def _json_bytes(content: Any) -> bytes:
 
 def _etag_response(request: Request, body: bytes) -> Response:
     """*body* under a strong ETag of its bytes; 304 for a caller holding it."""
-    etag = '"' + hashlib.sha1(body).hexdigest() + '"'
+    etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
     held = [t.strip() for t in request.headers.get("if-none-match", "").split(",")]
     if etag in held or "*" in held:
         return Response(status_code=304, headers={"ETag": etag})
     return Response(body, media_type="application/json", headers={"ETag": etag})
+
+
+async def _tree_response(request: Request, build: Callable[[Any], Any]) -> Response:
+    """Run *build* on the Flight client off the event loop and answer what it
+    returns as JSON under an ETag. It may raise ``HTTPException`` (a 404); any
+    other failure is a 502."""
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    t0 = time.monotonic()
+    try:
+        client = ctx.get_client()
+        body = await run_in_threadpool(lambda: _json_bytes(build(client)))
+        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
+        return _etag_response(request, body)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("TREE_FAILED", str(exc))
+        logger.error(f"tree request failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail=f"Flight error: {type(exc).__name__}"
+        )
 
 
 @_router.get("/api/tree")
@@ -2290,26 +2312,7 @@ async def get_tree(
     the level. The body is hashed into an ``ETag``, so a client revalidates a
     level it holds with ``If-None-Match``.
     """
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-
-        def build() -> bytes:
-            return _json_bytes(_tree_level(client, key, limit))
-
-        body = await run_in_threadpool(build)
-        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return _etag_response(request, body)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("TREE_FAILED", str(exc))
-        logger.error(f"get_tree failed: {exc}")
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
+    return await _tree_response(request, lambda client: _tree_level(client, key, limit))
 
 
 @_router.get("/api/tree/reveal")
@@ -2320,24 +2323,14 @@ async def reveal_in_tree(
 ) -> Response:
     """Every level from the top down to the one holding *source_id*, in one
     request: ``{levels: [<level>...], descriptor}``."""
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-        revealed = await run_in_threadpool(_tree_reveal, client, source_id, limit)
-        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
+
+    def build(client: Any) -> Dict[str, Any]:
+        revealed = _tree_reveal(client, source_id, limit)
         if revealed is None:
             raise HTTPException(status_code=404, detail=f"No such source: {source_id}")
-        return _etag_response(request, _json_bytes(revealed))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("TREE_FAILED", str(exc))
-        logger.error(f"reveal_in_tree failed: {exc}")
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
+        return revealed
+
+    return await _tree_response(request, build)
 
 
 @_router.get("/api/sources/{source_id:path}/metadata")

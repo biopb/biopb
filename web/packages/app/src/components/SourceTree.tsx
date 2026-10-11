@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
+import { toggled, useAppStore } from "../store";
 import { REASON_COLUMN, SOURCE_COLUMNS, descriptorFromRow } from "../utils/catalogRow";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
@@ -136,7 +136,7 @@ function ChevronSlot() {
 /** A line under an open folder: loading, failed, or cut short. */
 function TreeNote({ text, indent }: { text: string; indent: number }) {
   return (
-    <div style={{ paddingLeft: indent + 20, fontSize: 11, color: "#64748b", padding: "2px 0 2px" }}>
+    <div style={{ fontSize: 11, color: "#64748b", padding: "2px 0" }}>
       <span style={{ paddingLeft: indent + 20 }}>{text}</span>
     </div>
   );
@@ -523,7 +523,6 @@ export function SourceTree() {
     const timer = setTimeout(() => setDebouncedQuery(query), 300);
     return () => clearTimeout(timer);
   }, [query]);
-  const activeQuery = debouncedQuery;
 
   // Server-side search
   useEffect(() => {
@@ -560,7 +559,7 @@ export function SourceTree() {
   // `SERVER_QUERY_LIMIT` rows. Until the first answer lands the catalog stays up
   // (the header says the search is under way): swapping it for a notice would
   // unmount every row and mount them again when the answer came.
-  const searching = activeQuery.trim() !== "" && serverMatches !== null;
+  const searching = debouncedQuery.trim() !== "" && serverMatches !== null;
   // Empty sources are dropped, as the server drops them from the catalog's own
   // levels: a source with nothing on it is never worth a row.
   const matches = useMemo(
@@ -579,11 +578,11 @@ export function SourceTree() {
   // Recents filter client-side: that query is SQL against the catalog, which by
   // construction does not hold the uploads this node exists to show.
   const recent = useMemo(() => {
-    const q = activeQuery.trim().toLowerCase();
+    const q = debouncedQuery.trim().toLowerCase();
     const visible = recentSources.filter((s) => !isEmptySource(s));
     const matching = q ? visible.filter((s) => matchesQuery(s, q)) : visible;
     return recentNode(matching);
-  }, [recentSources, activeQuery]);
+  }, [recentSources, debouncedQuery]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   // The selection this has already revealed. Latched so a later poll cannot
@@ -633,17 +632,10 @@ export function SourceTree() {
     row.scrollIntoView({ block: "nearest" });
   });
 
-  const toggleFolder = useCallback((id: string) => {
-    setExpandedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
-  }, []);
+  const toggleFolder = useCallback(
+    (id: string) => setExpandedFolders((prev) => toggled(prev, id)),
+    [],
+  );
 
   /**
    * Selecting from "Recent", which must leave the catalog exactly where it is.

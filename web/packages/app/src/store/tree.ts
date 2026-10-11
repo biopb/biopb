@@ -6,39 +6,60 @@ import type { AppState } from "./types";
 /** Most children one folder asks for. The server says when a folder holds more. */
 export const LEVEL_LIMIT = 2000;
 
-/** A level as last read, with the validator the server gave it. */
+/**
+ * A level as last read, with the validator the server gave it. A level written
+ * from a reveal or a resolved row has none: it counts as changed at the next
+ * poll, which stores the server's.
+ */
 export interface LoadedLevel {
   level: TreeLevel;
   etag: string | null;
 }
 
-/** Whether two reads of one level are the same. Etags decide when both have one. */
+/** Whether two reads of one level are the same: only equal etags say so. */
 function sameLevel(a: LoadedLevel, b: LoadedLevel): boolean {
-  if (a.etag !== null && b.etag !== null) return a.etag === b.etag;
-  return JSON.stringify(a.level) === JSON.stringify(b.level);
+  return a.etag !== null && a.etag === b.etag;
 }
 
 const loaded = ({ level, etag }: TreeLevelResult): LoadedLevel => ({ level, etag });
 
-/** The source ids a set of levels holds. */
-function idsIn(levels: Record<string, LoadedLevel>): Set<string> {
-  const ids = new Set<string>();
-  for (const { level } of Object.values(levels)) {
-    for (const s of level.sources) ids.add(s.descriptor.source_id);
-  }
-  return ids;
+/** Whether some level holds `sourceId`. */
+function holds(levels: Record<string, LoadedLevel>, sourceId: string): boolean {
+  return Object.values(levels).some((l) =>
+    l.level.sources.some((x) => x.descriptor.source_id === sourceId),
+  );
 }
 
-/** `index` plus the descriptors the levels carry. */
-function indexed(
-  index: Record<string, DataSourceDescriptor>,
-  levels: Iterable<TreeLevel>,
-): Record<string, DataSourceDescriptor> {
-  const next = { ...index };
-  for (const level of levels) {
-    for (const s of level.sources) next[s.descriptor.source_id] = s.descriptor;
-  }
+/** `ids` with `id` removed if it is there, else added. */
+export function toggled(ids: ReadonlySet<string>, id: string): Set<string> {
+  const next = new Set(ids);
+  if (!next.delete(id)) next.add(id);
   return next;
+}
+
+/**
+ * The levels, status and index after reading `entries` (folder key, level).
+ *
+ * The index follows the levels: what a level held before and no longer holds
+ * leaves it, so a source that is gone from the catalog is not still "listed".
+ * A level that was read is no longer loading or failed.
+ */
+function withLevels(
+  s: AppState,
+  entries: Array<[string, LoadedLevel]>,
+): Pick<AppState, "treeLevels" | "levelStatus" | "sourceIndex"> {
+  const treeLevels = { ...s.treeLevels };
+  const levelStatus = { ...s.levelStatus };
+  const sourceIndex = { ...s.sourceIndex };
+  for (const [key, entry] of entries) {
+    for (const old of s.treeLevels[key]?.level.sources ?? []) {
+      delete sourceIndex[old.descriptor.source_id];
+    }
+    for (const src of entry.level.sources) sourceIndex[src.descriptor.source_id] = src.descriptor;
+    treeLevels[key] = entry;
+    delete levelStatus[key];
+  }
+  return { treeLevels, levelStatus, sourceIndex };
 }
 
 /**
@@ -90,15 +111,7 @@ export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, 
       const result = loaded(await client.http.treeLevel(key, LEVEL_LIMIT));
       // Another server was connected to while this was in flight.
       if (get().client !== client) return;
-      set((s) => {
-        const status = { ...s.levelStatus };
-        delete status[key];
-        return {
-          treeLevels: { ...s.treeLevels, [key]: result },
-          levelStatus: status,
-          sourceIndex: indexed(s.sourceIndex, [result.level]),
-        };
-      });
+      set((s) => withLevels(s, [[key, result]]));
     } catch (err) {
       if (get().client !== client) return;
       console.warn("Tree level failed:", err);
@@ -108,16 +121,11 @@ export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, 
   },
 
   toggleFolder(key) {
-    const { openFolders, treeLevels, levelStatus, loadLevel } = get();
-    const next = new Set(openFolders);
-    if (next.delete(key)) {
-      set({ openFolders: next });
-      return;
-    }
-    next.add(key);
+    const { openFolders, treeLevels, loadLevel } = get();
+    const next = toggled(openFolders, key);
     set({ openFolders: next });
-    // An error level is read again by opening it again.
-    if (!treeLevels[key] && levelStatus[key] !== "loading") void loadLevel(key).catch(() => {});
+    // A level that failed is read again by opening it again.
+    if (next.has(key) && !treeLevels[key]) void loadLevel(key).catch(() => {});
   },
 
   async revealSource(sourceId) {
@@ -132,19 +140,14 @@ export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, 
     }
     if (get().client !== client) return false;
     set((s) => {
-      const open = new Set(s.openFolders);
-      const levels = { ...s.treeLevels };
-      for (const level of reveal.levels) {
-        levels[level.key] = { level, etag: null };
-        if (level.key !== "") open.add(level.key);
-      }
+      const merged = withLevels(
+        s,
+        reveal.levels.map((level): [string, LoadedLevel] => [level.key, { level, etag: null }]),
+      );
       return {
-        treeLevels: levels,
-        openFolders: open,
-        sourceIndex: {
-          ...indexed(s.sourceIndex, reveal.levels),
-          [reveal.descriptor.source_id]: reveal.descriptor,
-        },
+        ...merged,
+        openFolders: new Set([...s.openFolders, ...reveal.levels.map((l) => l.key).filter(Boolean)]),
+        sourceIndex: { ...merged.sourceIndex, [reveal.descriptor.source_id]: reveal.descriptor },
       };
     });
     return true;
@@ -175,34 +178,21 @@ export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, 
 
     const changed = results.filter(
       (r): r is { key: string; result: LoadedLevel } =>
-        r !== null && (!(r.key in before) || !sameLevel(before[r.key]!, r.result)),
+        r !== null && !(r.key in before && sameLevel(before[r.key]!, r.result)),
     );
     if (changed.length === 0) return failed;
-
-    const { activeSourceId, target, openTensor } = get();
-    const idsBefore = idsIn(get().treeLevels);
-    set((s) => {
-      const levels = { ...s.treeLevels };
-      for (const { key, result } of changed) levels[key] = result;
-      return {
-        treeLevels: levels,
-        sourceIndex: indexed(
-          s.sourceIndex,
-          changed.map((c) => c.result.level),
-        ),
-      };
-    });
 
     // A source that was on screen and is gone from its level is gone from the
     // catalog -- unless a level is cut short, which says nothing about what it
     // left out, or the source came from a shared link, which does not need to
     // be listed.
+    const { activeSourceId, target, openTensor } = get();
+    const watching = activeSourceId !== null && !target.linked && holds(get().treeLevels, activeSourceId);
+    set((s) => withLevels(s, changed.map((c): [string, LoadedLevel] => [c.key, c.result])));
     const after = get().treeLevels;
     if (
-      activeSourceId &&
-      !target.linked &&
-      idsBefore.has(activeSourceId) &&
-      !idsIn(after).has(activeSourceId) &&
+      watching &&
+      !holds(after, activeSourceId) &&
       !Object.values(after).some((l) => l.level.truncated)
     ) {
       openTensor(null);

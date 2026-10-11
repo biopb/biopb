@@ -115,9 +115,9 @@ describe("recentNode", () => {
   });
 
   it("namespaces its row ids away from the catalog's", () => {
-    // The same source can appear twice, as two nodes holding one descriptor. A
-    // shared node id would make `folderPathTo` reveal whichever copy it found
-    // first, and the reveal is meant to find the source in its real place.
+    // The same source can appear twice, as two nodes holding one descriptor.
+    // Only the catalog row may answer to the source id, so a reveal finds the
+    // source in its real place and not the shortcut.
     expect(recentNode([source()])?.children[0]?.id).not.toBe("zarr_a3f2");
   });
 
