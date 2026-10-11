@@ -97,15 +97,13 @@ export interface TreeSlice {
   resetTree: () => void;
 }
 
-export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, get) => ({
-  treeLevels: {},
-  openFolders: new Set(),
-  levelStatus: {},
-  sourceIndex: {},
+/** Reads in flight by folder key, so a second caller waits for the first. */
+const reading = new Map<string, Promise<void>>();
 
-  async loadLevel(key) {
+export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, get) => {
+  const read = async (key: string): Promise<void> => {
     const { client } = get();
-    if (!client || get().levelStatus[key] === "loading") return;
+    if (!client) return;
     set((s) => ({ levelStatus: { ...s.levelStatus, [key]: "loading" } }));
     try {
       const result = loaded(await client.http.treeLevel(key, LEVEL_LIMIT));
@@ -118,112 +116,138 @@ export const createTreeSlice: StateCreator<AppState, [], [], TreeSlice> = (set, 
       set((s) => ({ levelStatus: { ...s.levelStatus, [key]: "error" } }));
       throw err;
     }
-  },
+  };
 
-  toggleFolder(key) {
-    const { openFolders, treeLevels, loadLevel } = get();
-    const next = toggled(openFolders, key);
-    set({ openFolders: next });
-    // A level that failed is read again by opening it again.
-    if (next.has(key) && !treeLevels[key]) void loadLevel(key).catch(() => {});
-  },
+  return {
+    treeLevels: {},
+    openFolders: new Set(),
+    levelStatus: {},
+    sourceIndex: {},
 
-  async revealSource(sourceId) {
-    const { client } = get();
-    if (!client) return false;
-    let reveal;
-    try {
-      reveal = await client.http.treeReveal(sourceId);
-    } catch (err) {
-      if (err instanceof TensorApiError && err.status === 404) return false;
-      throw err;
-    }
-    if (get().client !== client) return false;
-    set((s) => {
-      const merged = withLevels(
-        s,
-        reveal.levels.map((level): [string, LoadedLevel] => [level.key, { level, etag: null }]),
-      );
-      return {
-        ...merged,
-        openFolders: new Set([...s.openFolders, ...reveal.levels.map((l) => l.key).filter(Boolean)]),
-        sourceIndex: { ...merged.sourceIndex, [reveal.descriptor.source_id]: reveal.descriptor },
-      };
-    });
-    return true;
-  },
+    loadLevel(key) {
+      const held = reading.get(key);
+      if (held) return held;
+      const run = read(key).finally(() => reading.delete(key));
+      reading.set(key, run);
+      return run;
+    },
 
-  async refreshTree() {
-    const { client } = get();
-    if (!client) return false;
-    const before = get().treeLevels;
-    let failed = false;
-    // The top first among the keys: it is what a first poll is for.
-    const keys = ["", ...[...get().openFolders].filter((k) => k !== "")];
-    const results = await Promise.all(
-      keys.map((key) =>
-        client.http.treeLevel(key, LEVEL_LIMIT).then(
-          (r) => ({ key, result: loaded(r) }),
-          // A level that fails keeps its last read: nothing says it changed.
-          (err: unknown) => {
-            console.warn("Tree level refresh failed:", err);
-            failed = true;
-            return null;
-          },
-        ),
-      ),
-    );
-    // Pointed at another server while this was in flight.
-    if (get().client !== client) return true;
+    toggleFolder(key) {
+      const { openFolders, treeLevels, loadLevel } = get();
+      const next = toggled(openFolders, key);
+      set({ openFolders: next });
+      // A level that failed is read again by opening it again.
+      if (next.has(key) && !treeLevels[key]) void loadLevel(key).catch(() => {});
+    },
 
-    const changed = results.filter(
-      (r): r is { key: string; result: LoadedLevel } =>
-        r !== null && !(r.key in before && sameLevel(before[r.key]!, r.result)),
-    );
-    if (changed.length === 0) return failed;
-
-    // A source that was on screen and is gone from its level is gone from the
-    // catalog -- unless a level is cut short, which says nothing about what it
-    // left out, or the source came from a shared link, which does not need to
-    // be listed.
-    const { activeSourceId, target, openTensor } = get();
-    const watching = activeSourceId !== null && !target.linked && holds(get().treeLevels, activeSourceId);
-    set((s) => withLevels(s, changed.map((c): [string, LoadedLevel] => [c.key, c.result])));
-    const after = get().treeLevels;
-    if (
-      watching &&
-      !holds(after, activeSourceId) &&
-      !Object.values(after).some((l) => l.level.truncated)
-    ) {
-      openTensor(null);
-    }
-    return true;
-  },
-
-  applySourceRow(row) {
-    set((s) => {
-      const levels: Record<string, LoadedLevel> = {};
-      for (const [key, entry] of Object.entries(s.treeLevels)) {
-        levels[key] = entry.level.sources.some((x) => x.descriptor.source_id === row.source_id)
-          ? {
-              etag: null,
-              level: {
-                ...entry.level,
-                sources: entry.level.sources.map((x) =>
-                  x.descriptor.source_id === row.source_id ? { ...x, descriptor: row } : x,
-                ),
-              },
-            }
-          : entry;
+    async revealSource(sourceId) {
+      const { client } = get();
+      if (!client) return false;
+      let reveal;
+      try {
+        reveal = await client.http.treeReveal(sourceId);
+      } catch (err) {
+        if (err instanceof TensorApiError && err.status === 404) return false;
+        throw err;
       }
-      return {
-        treeLevels: levels,
-        sourceIndex: { ...s.sourceIndex, [row.source_id]: row },
-      };
-    });
-  },
+      if (get().client !== client) return false;
+      set((s) => {
+        const merged = withLevels(
+          s,
+          reveal.levels.map((level): [string, LoadedLevel] => [level.key, { level, etag: null }]),
+        );
+        return {
+          ...merged,
+          openFolders: new Set([...s.openFolders, ...reveal.levels.map((l) => l.key).filter(Boolean)]),
+          sourceIndex: { ...merged.sourceIndex, [reveal.descriptor.source_id]: reveal.descriptor },
+        };
+      });
+      return true;
+    },
 
-  resetTree() {
-    set({ treeLevels: {}, openFolders: new Set(), levelStatus: {}, sourceIndex: {} });
-  },
-});
+    async refreshTree() {
+      const { client } = get();
+      if (!client) return false;
+      const before = get().treeLevels;
+      let failed = false;
+      // The top first among the keys: it is what a first poll is for. The level
+      // holding the open source is read too, closed or not, or its removal from the
+      // catalog would never be seen.
+      const openId = get().activeSourceId;
+      const openKey = openId
+        ? Object.entries(before).find(([, l]) =>
+            l.level.sources.some((x) => x.descriptor.source_id === openId),
+          )?.[0]
+        : undefined;
+      const keys = [
+        ...new Set(["", ...get().openFolders, ...(openKey === undefined ? [] : [openKey])]),
+      ];
+      const results = await Promise.all(
+        keys.map((key) =>
+          client.http.treeLevel(key, LEVEL_LIMIT).then(
+            (r) => ({ key, result: loaded(r) }),
+            // A level that fails keeps its last read: nothing says it changed.
+            (err: unknown) => {
+              console.warn("Tree level refresh failed:", err);
+              failed = true;
+              return null;
+            },
+          ),
+        ),
+      );
+      // Pointed at another server while this was in flight.
+      if (get().client !== client) return true;
+
+      const changed = results.filter(
+        (r): r is { key: string; result: LoadedLevel } =>
+          r !== null && !(r.key in before && sameLevel(before[r.key]!, r.result)),
+      );
+      if (changed.length === 0) return failed;
+
+      // A source that was on screen and is gone from its level is gone from the
+      // catalog -- unless a level is cut short, which says nothing about what it
+      // left out, or the source came from a shared link, which does not need to
+      // be listed.
+      const { activeSourceId, target, openTensor } = get();
+      const watching = activeSourceId !== null && !target.linked && holds(get().treeLevels, activeSourceId);
+      set((s) => withLevels(s, changed.map((c): [string, LoadedLevel] => [c.key, c.result])));
+      const after = get().treeLevels;
+      if (
+        watching &&
+        !holds(after, activeSourceId) &&
+        !Object.values(after).some((l) => l.level.truncated)
+      ) {
+        openTensor(null);
+      }
+      return true;
+    },
+
+    applySourceRow(row) {
+      set((s) => {
+        const levels: Record<string, LoadedLevel> = {};
+        for (const [key, entry] of Object.entries(s.treeLevels)) {
+          levels[key] = entry.level.sources.some((x) => x.descriptor.source_id === row.source_id)
+            ? {
+                etag: null,
+                level: {
+                  ...entry.level,
+                  sources: entry.level.sources.map((x) =>
+                    x.descriptor.source_id === row.source_id ? { ...x, descriptor: row } : x,
+                  ),
+                },
+              }
+            : entry;
+        }
+        return {
+          treeLevels: levels,
+          sourceIndex: { ...s.sourceIndex, [row.source_id]: row },
+        };
+      });
+    },
+
+    resetTree() {
+      reading.clear();
+      set({ treeLevels: {}, openFolders: new Set(), levelStatus: {}, sourceIndex: {} });
+    },
+  };
+};

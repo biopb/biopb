@@ -10,7 +10,6 @@ Endpoints (unauthenticated — probes):
 
 Endpoints (token required):
   GET  /api/diagnostics              — runtime diagnostics
-  GET  /api/sources[?limit=N]        — list the catalog's source rows (X-Truncated)
   POST /api/sources/query            — SQL query against source metadata
   GET  /api/tree[?key=&limit=]       — one level of the source tree (ETag)
   GET  /api/tree/reveal?source_id=   — every level down to one source
@@ -1897,56 +1896,6 @@ def _truncation(table: Any, n_rows: int) -> Tuple[int, int, bool]:
     return total, returned, truncated
 
 
-@_router.get("/api/sources")
-async def list_sources(
-    request: Request, limit: Optional[int] = Query(None, ge=1)
-) -> JSONResponse:
-    """The catalog as DataSourceDescriptors, ordered by ``source_id``.
-
-    ``limit`` caps the rows returned (the server's own ``max_query_results`` cap
-    applies regardless). ``X-Truncated`` says whether the listing is short of the
-    catalog, by either cap.
-    """
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-
-        def listing() -> JSONResponse:
-            # One row past the limit is how a caller learns it was cut, without
-            # a second query for the catalog's size.
-            page = f" LIMIT {limit + 1}" if limit is not None else ""
-            table = client.query(
-                _source_list_sql(client) + " ORDER BY source_id" + page
-            )
-            rows = table.to_pylist()
-            _, _, truncated = _truncation(table, len(rows))
-            if limit is not None and len(rows) > limit:
-                rows, truncated = rows[:limit], True
-            _add_unresolved_reasons(client, rows)
-            # Up to a few 10k rows to query, convert and encode: off the loop,
-            # which tile reads share.
-            return JSONResponse(
-                [_source_row_to_dict(row) for row in rows],
-                headers={"X-Truncated": str(truncated).lower()},
-            )
-
-        response = await run_in_threadpool(listing)
-        elapsed = (time.monotonic() - t0) * 1000
-        ctx.diag.latency.record(elapsed)
-        logger.debug(f"list_sources: answered in {elapsed:.1f}ms")
-        return response
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("LIST_SOURCES_FAILED", str(exc))
-        logger.error(f"list_sources failed: {exc}")
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
-
-
 def _query_json_default(value: Any) -> Any:
     """Spell the Arrow value types `json.dumps` has no encoding for.
 
@@ -3534,14 +3483,6 @@ def create_app(
 # ---------------------------------------------------------------------------
 # Serialisation helpers
 # ---------------------------------------------------------------------------
-
-
-def _source_list_sql(client: Any) -> str:
-    """The query the source routes project. Deliberately not ``metadata_json``:
-    the listing is structural, and the OME tree is its own route
-    (``/api/sources/{id}/metadata``). ``unresolved_reason`` rides along when the
-    server has the column."""
-    return f"SELECT {client.source_row_columns()} FROM sources"
 
 
 def _add_unresolved_reasons(

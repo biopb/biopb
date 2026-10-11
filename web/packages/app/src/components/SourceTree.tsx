@@ -638,7 +638,8 @@ export function SourceTree() {
   );
 
   /**
-   * Selecting from "Recent", which must leave the catalog exactly where it is.
+   * Selecting from "Recent" or from a search's matches, which must leave the
+   * catalog exactly where it is.
    *
    * The reveal effect above keys on `activeSourceId` alone and so cannot tell a
    * catalog click from a shortcut; without this, picking a row near the top of
@@ -651,7 +652,7 @@ export function SourceTree() {
    * "shown", so a later poll does not reopen the question either. A catalog
    * click and a shared link leave it unlatched and still reveal.
    */
-  const selectFromRecent = useCallback(
+  const selectInPlace = useCallback(
     (sourceId: string, tensorId?: string) => {
       revealed.current = sourceId;
       selectSource(sourceId, tensorId);
@@ -707,7 +708,7 @@ export function SourceTree() {
                 {...rowProps}
                 expandedFolders={expandedFolders}
                 toggleFolder={toggleFolder}
-                selectSource={selectFromRecent}
+                selectSource={selectInPlace}
                 startResolve={undefined}
                 resolving={undefined}
               />
@@ -724,6 +725,7 @@ export function SourceTree() {
                     key={child.id}
                     node={child}
                     {...rowProps}
+                    selectSource={selectInPlace}
                     expandedFolders={expandedFolders}
                     toggleFolder={toggleFolder}
                   />

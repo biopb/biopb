@@ -436,7 +436,7 @@ export class TensorHttpClient {
   async treeReveal(sourceId: string, opts?: RequestOptions): Promise<TreeReveal> {
     return this.fetchJson<TreeReveal>(
       `/api/tree/reveal?source_id=${encodeURIComponent(sourceId)}`,
-      undefined,
+      { cache: "no-cache" },
       this.metadataTimeoutMs,
       opts,
     );

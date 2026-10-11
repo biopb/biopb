@@ -153,6 +153,34 @@ def _answer(rows, format, **schema_metadata):  # noqa: A002 - mirrors the real k
     return table
 
 
+def _serve_tree(mock_fc, rows, reasons=None):
+    """Make *mock_fc* answer ``/api/tree`` at the top level with *rows* as the
+    sources sitting there. *reasons* is ``{source_id: reason}`` for the narrow
+    unresolved-reason query, or an exception for a server that refuses it."""
+
+    def query(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
+        if "unresolved_reason" in sql:
+            if isinstance(reasons, Exception):
+                raise reasons
+            return [
+                {"source_id": k, "unresolved_reason": v}
+                for k, v in (reasons or {}).items()
+            ]
+        if "GROUPING SETS" in sql:
+            count = {"seg": "", "lo": None, "hi": None, "direct": len(rows), "total": 1}
+            return _answer([count], format)
+        return _answer([{**r, "name": r["source_id"]} for r in rows], format)
+
+    mock_fc.query.side_effect = query
+
+
+def _tree_descriptors(tc, headers=None):
+    """The descriptors of the sources at the top of ``/api/tree``."""
+    r = tc.get("/api/tree", headers=headers or {})
+    assert r.status_code == 200
+    return [s["descriptor"] for s in r.json()["sources"]]
+
+
 def _build_mock_client(src_desc=None) -> MagicMock:
     """Return a MagicMock that satisfies the TensorFlightClient interface."""
     mc = MagicMock()
@@ -425,34 +453,37 @@ class TestReadyzTracksBackend:
 
 
 class TestAuthentication:
-    def test_sources_requires_token(self, auth_client):
+    def test_tree_requires_token(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources")
+        r = tc.get("/api/tree")
         assert r.status_code == 401
 
-    def test_sources_wrong_token_bearer(self, auth_client):
+    def test_tree_wrong_token_bearer(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_WRONG))
+        r = tc.get("/api/tree", headers=_bearer(_WRONG))
         assert r.status_code == 401
 
-    def test_sources_wrong_token_xbiopb(self, auth_client):
+    def test_tree_wrong_token_xbiopb(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_xbiopb(_WRONG))
+        r = tc.get("/api/tree", headers=_xbiopb(_WRONG))
         assert r.status_code == 401
 
-    def test_sources_valid_bearer_token(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+    def test_tree_valid_bearer_token(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree", headers=_bearer(_TOKEN))
         assert r.status_code == 200
 
-    def test_sources_valid_xbiopb_token(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_xbiopb(_TOKEN))
+    def test_tree_valid_xbiopb_token(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree", headers=_xbiopb(_TOKEN))
         assert r.status_code == 200
 
     def test_dev_mode_bypasses_auth(self, dev_client):
-        tc, _ = dev_client
-        r = tc.get("/api/sources")
+        tc, mock_fc = dev_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree")
         assert r.status_code == 200
 
     def test_diagnostics_requires_token(self, auth_client):
@@ -490,23 +521,21 @@ class TestCorsHeaders:
 
 
 class TestSourcesEndpoints:
-    def test_list_sources_returns_list(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        body = r.json()
-        assert isinstance(body, list)
-        assert len(body) == 1
-        assert body[0]["source_id"] == "src0"
-        assert body[0]["source_url"] == "/data/src0"
-        assert isinstance(body[0]["tensors"], list)
+    def test_tree_descriptor_shape(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        assert body["source_id"] == "src0"
+        assert body["source_url"] == "/data/src0"
+        assert isinstance(body["tensors"], list)
         # Source metadata is its own route, not a column of the row.
-        assert "metadata_json" not in body[0]
+        assert "metadata_json" not in body
 
-    def test_list_sources_tensor_fields(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        tensor = r.json()[0]["tensors"][0]
+    def test_tree_descriptor_tensor_fields(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        tensor = body["tensors"][0]
         assert tensor["array_id"] == "src0"
         assert tensor["shape"] == [4, 8, 16]
         assert tensor["dtype"] == "uint16"
@@ -524,145 +553,48 @@ class TestSourcesEndpoints:
         assert r.status_code == 200
         assert "ome_ngff" in r.json()
 
-    def test_list_sources_calls_flight_client(self, auth_client):
+    def test_tree_is_resolved_field(self, auth_client):
         tc, mock_fc = auth_client
-        tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.query.assert_called()
-
-    def test_list_sources_is_resolved_field(self):
         unresolved = _make_source_desc(tensors=[], is_resolved=False)
-        mock_fc = _build_mock_client(unresolved)
-        with patch(
-            "biopb_tensor_server.serving.http_server.TensorFlightClient",
-            return_value=mock_fc,
-        ):
-            app = create_app(token=_TOKEN)
-            with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["is_resolved"] is False
+        _serve_tree(mock_fc, [_source_row(unresolved)])
+        assert _tree_descriptors(tc, _bearer(_TOKEN))[0]["is_resolved"] is False
 
-    def test_list_sources_carries_why_a_source_is_unresolved(self, auth_client):
+    def test_tree_carries_why_a_source_is_unresolved(self, auth_client):
         tc, mock_fc = auth_client
         row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+        _serve_tree(mock_fc, [row], reasons={"src0": "pending"})
+        body = _tree_descriptors(tc, _bearer(_TOKEN))[0]
+        assert body["unresolved_reason"] == "pending"
 
-        def query(sql, format="arrow"):  # noqa: A002
-            if "unresolved_reason" in sql:
-                return [{"source_id": "src0", "unresolved_reason": "pending"}]
-            return _answer([row], format)
-
-        mock_fc.query.side_effect = query
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["unresolved_reason"] == "pending"
-
-    def test_list_sources_still_lists_against_a_server_without_the_column(
-        self, auth_client
-    ):
+    def test_tree_still_lists_against_a_server_without_the_column(self, auth_client):
         # The reason is a second, narrow query: a server older than the column
-        # refuses it, and the listing must not go with it.
+        # refuses it, and the level must not go with it.
         tc, mock_fc = auth_client
         row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
-
-        def query(sql, format="arrow"):  # noqa: A002
-            if "unresolved_reason" in sql:
-                raise RuntimeError("Binder Error: column not found")
-            return _answer([row], format)
-
-        mock_fc.query.side_effect = query
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()[0]["is_resolved"] is False
-        assert "unresolved_reason" not in r.json()[0]
+        _serve_tree(mock_fc, [row], reasons=RuntimeError("Binder Error: no column"))
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        assert body["is_resolved"] is False
+        assert "unresolved_reason" not in body
 
     def test_a_resolved_source_carries_no_reason(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
-            [_source_row(_make_source_desc())], format
-        )
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert "unresolved_reason" not in r.json()[0]
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        body = _tree_descriptors(tc, _bearer(_TOKEN))[0]
+        assert "unresolved_reason" not in body
 
-    def test_list_sources_is_resolved_defaults_true_on_missing_column(
-        self, auth_client
-    ):
+    def test_tree_is_resolved_defaults_true_on_missing_column(self, auth_client):
         # A server predating this column has no is_resolved key in the row at
         # all; the default reads as resolved, the correct answer for every
         # pre-existing source.
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
-            [
-                {
-                    "source_id": "src0",
-                    "source_url": "/data/src0",
-                    "source_type": "zarr",
-                    "tensors": [],
-                }
-            ],
-            format,
-        )
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["is_resolved"] is True
-
-    @staticmethod
-    def _catalog_of(mock_fc, n, **schema_metadata):
-        """A catalog of *n* sources that honours the LIMIT it is asked for."""
-        asked = []
-
-        def query(sql, format="arrow"):  # noqa: A002
-            asked.append(sql)
-            rows = [
-                {**_source_row(_make_source_desc()), "source_id": f"s{i:04d}"}
-                for i in range(n)
-            ]
-            if " LIMIT " in sql:
-                rows = rows[: int(sql.rsplit(" LIMIT ", 1)[1])]
-            return _answer(rows, format, **schema_metadata)
-
-        mock_fc.query.side_effect = query
-        return asked
-
-    def test_limit_cuts_the_listing_and_says_so(self, auth_client):
-        tc, mock_fc = auth_client
-        asked = self._catalog_of(mock_fc, 10)
-        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
-        assert [s["source_id"] for s in r.json()] == [
-            "s0000",
-            "s0001",
-            "s0002",
-            "s0003",
-        ]
-        assert r.headers["X-Truncated"] == "true"
-        # One row past the limit is how it learns the catalog is longer.
-        assert asked[0].endswith("ORDER BY source_id LIMIT 5")
-
-    def test_a_catalog_within_the_limit_is_not_truncated(self, auth_client):
-        tc, mock_fc = auth_client
-        self._catalog_of(mock_fc, 4)
-        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 4
-        assert r.headers["X-Truncated"] == "false"
-
-    def test_without_a_limit_the_listing_is_whole(self, auth_client):
-        tc, mock_fc = auth_client
-        asked = self._catalog_of(mock_fc, 10)
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 10
-        assert r.headers["X-Truncated"] == "false"
-        assert "LIMIT" not in asked[0]
-
-    def test_the_servers_own_cap_is_reported_too(self, auth_client):
-        # max_query_results cuts a listing the caller never limited; the flag
-        # rides on the table's schema metadata.
-        tc, mock_fc = auth_client
-        self._catalog_of(mock_fc, 3, truncated=True, total_rows=9, returned_rows=3)
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 3
-        assert r.headers["X-Truncated"] == "true"
-
-    @pytest.mark.parametrize("limit", ["0", "-1", "abc"])
-    def test_a_bad_limit_is_refused(self, auth_client, limit):
-        tc, _ = auth_client
-        r = tc.get(f"/api/sources?limit={limit}", headers=_bearer(_TOKEN))
-        assert r.status_code == 422
+        row = {
+            "source_id": "src0",
+            "source_url": "/data/src0",
+            "source_type": "zarr",
+            "tensors": [],
+        }
+        _serve_tree(mock_fc, [row])
+        assert _tree_descriptors(tc, _bearer(_TOKEN))[0]["is_resolved"] is True
 
 
 # ===========================================================================
@@ -1003,7 +935,7 @@ class TestRedact:
         mock_fc.query.side_effect = RuntimeError(
             "failed to open /home/user/secret/data.zarr"
         )
-        tc.get("/api/sources", headers=_bearer(_TOKEN))
+        tc.get("/api/tree", headers=_bearer(_TOKEN))
         mock_fc.query.side_effect = None
 
         # The error should be recorded and redacted in diagnostics
@@ -1141,32 +1073,42 @@ class TestIntegration:
         )
         return TestClient(app, raise_server_exceptions=True)
 
-    def test_integration_list_sources(self):
-        with self._make_tc() as tc:
-            r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+    def _reveal(self, tc):
+        r = tc.get(
+            "/api/tree/reveal",
+            params={"source_id": "int-tensor"},
+            headers=_bearer(_TOKEN),
+        )
         assert r.status_code == 200
-        body = r.json()
-        assert len(body) == 1
-        # source_id comes from DataSourceDescriptor returned by the server
-        assert body[0]["source_id"] is not None
-        assert body[0]["tensors"][0]["shape"] == list(self._shape)
-        assert r.headers["X-Truncated"] == "false"
+        return r.json()
 
-    def test_integration_list_sources_with_a_limit(self):
-        # The real metadata DB has to accept the LIMIT the route appends.
-        with self._make_tc() as tc:
-            r = tc.get("/api/sources?limit=1", headers=_bearer(_TOKEN))
+    def _array_id(self, tc):
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT tensors FROM sources"},
+            headers=_bearer(_TOKEN),
+        )
         assert r.status_code == 200
-        assert len(r.json()) == 1
-        assert r.headers["X-Truncated"] == "false"
+        return r.json()[0]["tensors"][0]["array_id"]
 
-    def test_integration_a_search_row_is_the_listed_descriptor(self):
+    def test_integration_tree_reveals_the_source(self):
+        with self._make_tc() as tc:
+            revealed = self._reveal(tc)
+        body = revealed["descriptor"]
+        assert body["source_id"] == "int-tensor"
+        assert body["tensors"][0]["shape"] == list(self._shape)
+        assert not revealed["levels"][-1]["truncated"]
+        assert any(
+            s["descriptor"] == body for lv in revealed["levels"] for s in lv["sources"]
+        )
+
+    def test_integration_a_search_row_is_the_tree_descriptor(self):
         # The viewer's server-side search selects the descriptor columns with the
         # catalog query and renders from them, so a row has to say what the
-        # listing says -- including the column a newer server adds.
+        # tree says -- including the column a newer server adds.
         columns = "source_id, source_url, source_type, is_resolved, tensors"
         with self._make_tc() as tc:
-            (listed,) = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+            listed = self._reveal(tc)["descriptor"]
             r = tc.post(
                 "/api/sources/query",
                 json={"sql": f"SELECT {columns}, unresolved_reason FROM sources"},
@@ -1186,9 +1128,7 @@ class TestIntegration:
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
             # The array_id a real server advertises is the whole address.
-            src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-            assert src_r.status_code == 200
-            array_id = src_r.json()[0]["tensors"][0]["array_id"]
+            array_id = self._array_id(tc)
             r = tc.post(
                 "/api/slice",
                 json={"array_id": array_id},
@@ -1203,8 +1143,7 @@ class TestIntegration:
 
     def test_integration_slice_subregion(self):
         with self._make_tc() as tc:
-            src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-            array_id = src_r.json()[0]["tensors"][0]["array_id"]
+            array_id = self._array_id(tc)
             r = tc.post(
                 "/api/slice",
                 json={
@@ -2651,14 +2590,16 @@ class TestTileGridComesFromTheDescribedTensor:
         assert body["tile_size"] == 256
         assert mock_fc.get_descriptor.called
 
-    def test_the_source_listing_publishes_no_grid(self):
+    def test_the_tree_descriptor_publishes_no_grid(self):
         mock_fc = self._client()
+        listed = _make_tensor_desc("s", [1, 1, 1, 512, 512], "uint16", list("TCZYX"))
+        _serve_tree(mock_fc, [_source_row(_make_source_desc("s", tensors=[listed]))])
         with patch(
             "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
         ):
             with TestClient(create_app(token=None)) as tc:
-                (source,) = tc.get("/api/sources").json()
+                (source,) = _tree_descriptors(tc)
 
         assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
         assert "chunk_shape" not in source["tensors"][0]
@@ -3730,11 +3671,11 @@ class TestVolumeStaysWithinTheBudget:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestListingCap:
-    """A source past the listing's row cap is unlisted but still addressable.
+class TestQueryCap:
+    """A source past the server's row cap is still addressable by id.
 
-    Real Flight server, real sidecar. The listing says it was cut, and a catalog
-    query keyed on the id still finds the source the cap clipped.
+    Real Flight server, real sidecar. A catalog query keyed on the id finds the
+    source the cap clipped from an unfiltered query.
     """
 
     @pytest.fixture(autouse=True)
@@ -3744,7 +3685,7 @@ class TestListingCap:
         from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
         # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
-        # clipped from the listing (which is a catalog query).
+        # clipped from an unfiltered query.
         db = MetadataDatabase(max_query_results=1)
         server = TensorFlightServer("127.0.0.1:0", metadata_db=db)
         for sid in ("a", "b", "c"):
@@ -3776,13 +3717,6 @@ class TestListingCap:
             create_app(flight_location=self._loc, token=_TOKEN),
             raise_server_exceptions=True,
         )
-
-    def test_the_listing_is_capped_and_says_so(self):
-        with self._tc() as tc:
-            r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert [s["source_id"] for s in r.json()] == ["a"]
-        assert r.headers["X-Truncated"] == "true"
 
     def test_the_clipped_source_still_answers_a_query_by_id(self):
         with self._tc() as tc:
@@ -3986,14 +3920,18 @@ class TestTree:
         assert keys["chain/one/two/three"] == "chain/one/two/three"
         assert keys["grpc://host:8815/remote"] == "grpc://host:8815/remote"
 
-    def test_a_source_carries_the_listing_descriptor(self, tc):
-        listing = {
-            s["source_id"]: s
-            for s in tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
-        }
+    def test_a_source_carries_the_catalog_row_as_its_descriptor(self, tc):
+        row = tc.post(
+            "/api/sources/query",
+            json={
+                "sql": "SELECT source_id, source_url, source_type, is_resolved,"
+                " tensors FROM sources WHERE source_id = 'solo'"
+            },
+            headers=_bearer(_TOKEN),
+        ).json()[0]
         level = self._level(tc)
         solo = next(s for s in level["sources"] if s["name"] == "solo.zarr")
-        assert solo["descriptor"] == listing["solo"]
+        assert solo["descriptor"] == row
 
     def test_a_pathless_source_is_top_level_and_named_by_its_id(self, tc):
         level = self._level(tc)

@@ -469,6 +469,36 @@ describe("catalog tree", () => {
     expect(await useAppStore.getState().refreshTree()).toBe(false);
   });
 
+  it("lets a second read of a level wait for the one in flight", async () => {
+    const c = connect({ "": levelOf("", [SOURCE]) });
+    const both = Promise.all([
+      useAppStore.getState().loadLevel(""),
+      useAppStore.getState().loadLevel(""),
+    ]);
+    await both;
+    expect(treeLevelOf(c)).toHaveBeenCalledTimes(1);
+    // Both callers resumed with the level held.
+    expect(useAppStore.getState().treeLevels[""]).toBeDefined();
+  });
+
+  it("reads the level holding the open source even when its folder is closed", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const c = connect({ "": levelOf("", [], [FOLDER]), "data/plate": levelOf("data/plate") });
+    const inside = { ...SOURCE, source_id: "inside" };
+    useAppStore.setState({
+      treeLevels: {
+        "": { level: levelOf("", [], [FOLDER]), etag: JSON.stringify(levelOf("", [], [FOLDER])) },
+        "data/plate": { level: levelOf("data/plate", [inside]), etag: "old" },
+      },
+      openFolders: new Set(),
+      ...viewOf("inside"),
+    });
+    await useAppStore.getState().refreshTree();
+    expect(treeLevelOf(c).mock.calls.map((x) => x[0]).sort()).toEqual(["", "data/plate"]);
+    // The source is gone from its closed folder, and the viewer lets go of it.
+    expect(useAppStore.getState().activeSourceId).toBeNull();
+  });
+
   it("swaps a resolved row into its level and the index", () => {
     useAppStore.setState(loadedTop({ ...SOURCE, is_resolved: false }));
     useAppStore.getState().applySourceRow(SOURCE);
