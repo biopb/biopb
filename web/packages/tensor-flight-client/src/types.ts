@@ -193,10 +193,37 @@ export interface ReadyzSnapshot {
   backend_error?: string | null;
 }
 
-/** A catalog listing, and whether the server cut it short of the catalog. */
-export interface SourceListing {
-  sources: DataSourceDescriptor[];
+/** A folder of the catalog tree. `key` is opaque: hand it back to open the folder. */
+export interface TreeFolder {
+  name: string;
+  key: string;
+}
+
+/** A source directly in a folder, under the name the tree shows it by. */
+export interface TreeSource {
+  name: string;
+  descriptor: DataSourceDescriptor;
+}
+
+/** One level of the catalog tree: a folder's direct children. */
+export interface TreeLevel {
+  key: string;
+  folders: TreeFolder[];
+  sources: TreeSource[];
+  /** The folder holds more than the server sent. */
   truncated: boolean;
+}
+
+/** A level and its validator: equal etags are equal levels. */
+export interface TreeLevelResult {
+  level: TreeLevel;
+  etag: string | null;
+}
+
+/** Every level from the top down to the one holding a source, and the source. */
+export interface TreeReveal {
+  levels: TreeLevel[];
+  descriptor: DataSourceDescriptor;
 }
 
 export interface QuerySourcesResult {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { TensorFlightClient } from "./tensor-flight-client.js";
-import type { DataSourceDescriptor, TileInfo, TypedNdArray } from "./types.js";
+import type { TileInfo, TypedNdArray } from "./types.js";
 
 const SLICE = { data: new Uint16Array(4), shape: [2, 2], dtype: "uint16", dim_labels: ["y", "x"] };
 
@@ -12,14 +12,6 @@ const TILE_INFO = {
   chunk_shape: [2, 2],
   dtype: "uint16",
 } as unknown as TileInfo;
-
-const LISTED: DataSourceDescriptor = {
-  source_id: "src0",
-  source_url: "/data/src0",
-  source_type: "zarr",
-  is_resolved: true,
-  tensors: [{ array_id: "src0", dim_labels: ["y", "x"], shape: [2, 2], dtype: "uint16" }],
-};
 
 describe("TensorFlightClient.getTensor", () => {
   it("describes an unlisted tensor itself, from its own array_id", async () => {
@@ -44,18 +36,5 @@ describe("TensorFlightClient.getTensor", () => {
     await Promise.all([t.compute(), t.compute()]);
 
     expect(tileInfo).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses a listed source without asking the server", async () => {
-    const c = new TensorFlightClient("http://x", null);
-    vi.spyOn(c.http, "listSourcesPage").mockResolvedValue({ sources: [LISTED], truncated: false });
-    const tileInfo = vi.spyOn(c.http, "tileInfo");
-    const slice = vi.spyOn(c.http, "slice").mockResolvedValue(SLICE as unknown as TypedNdArray);
-
-    await c.listSourcesPage(10);
-    await c.getTensor("src0").compute();
-
-    expect(tileInfo).not.toHaveBeenCalled();
-    expect(slice).toHaveBeenCalledTimes(1);
   });
 });

@@ -36,7 +36,12 @@ function write(key: string, value: string) {
 }
 
 export function TipBar() {
-  const sourceCount = useAppStore((s) => s.sources.length);
+  // Whether there is anything at the top of the tree: the tips ask only if
+  // the catalog is empty, and the tree holds no count of it.
+  const sourceCount = useAppStore((s) => {
+    const top = s.treeLevels[""]?.level;
+    return top ? top.folders.length + top.sources.length : 0;
+  });
   const scanning = useAppStore((s) => s.scanning);
   const hasSelection = useAppStore((s) => !!s.activeSourceId && !!s.activeTensorId);
 

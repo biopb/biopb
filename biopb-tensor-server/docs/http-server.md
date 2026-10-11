@@ -61,7 +61,8 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
-| `GET` | `/api/sources` | ✓ | JSON array of the catalog's source rows (`source_id`, `source_url`, `source_type`, `is_resolved`, `tensors`, and `unresolved_reason` when the server has it), ordered by `source_id`. `?limit=N` caps the rows; `X-Truncated` says whether the listing is short of the catalog (by `limit` or by the server's own row cap) |
+| `GET` | `/api/tree` | ✓ | One level of the source tree: `?key=` (a folder's key, `""` is the top) and `?limit=` (default 2000, folders and sources together). `{key, folders: [{name, key}], sources: [{name, descriptor}], truncated}`; carries an `ETag` and honours `If-None-Match` |
+| `GET` | `/api/tree/reveal` | ✓ | `?source_id=`: `{levels: [<level>…], descriptor}`, every level from the top down to the one holding the source; 404 if it is unknown or hidden |
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed source metadata |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
@@ -87,17 +88,30 @@ to remember when a local, token-protected box can't browse.
 
 ### Sources
 
-**Source listings are structural.** Each `tensors[]` entry on `/api/sources`
-carries `array_id` / `dim_labels` / `shape` / `dtype` and no `chunk_shape`.
+**Source descriptors are structural.** Each `tensors[]` entry on `/api/tree`
+descriptors and `/api/sources/query` rows carries `array_id` / `dim_labels` / `shape` / `dtype` and no `chunk_shape`.
 The transfer grid belongs to the tensor the server binds to serve a read, so
 ask `/api/tile_info/{array_id}` for it.
 
 **There is no single-source route.** One source is a catalog query keyed on
-`source_id` (`POST /api/sources/query`), which is not bounded by the listing's
-row cap — a source past that cap has no entry on `/api/sources` but is found
-there. The catalog is public: a token-protected source is listed too (the token
+`source_id` (`POST /api/sources/query`), or a tree level
+(`/api/tree/reveal?source_id=`). The catalog is public: a token-protected source is listed too (the token
 gates its pixels), but a `cache:` upload has no catalog row at all — reach one
 through `/api/tile_info/{array_id}`.
+
+**The tree is built per level.** A source's place comes from its `source_url`
+alone: `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
+roots at the endpoint `scheme://host` (an empty host, as in `file:///`, is just
+the path), anything else is the string itself; empty segments are dropped. A
+source with no path sits at the top, named by its `source_id`. A level lists
+the folders directly under `key` and the sources directly in it, each by byte
+order of `name`; a chain of single-child folders is one folder
+(`chain/one/two`), which ends where a source sits or the chain forks. A
+folder's `key` is its full path and is what `?key=` takes. A resolved source
+with no tensor is hidden; an unresolved one is shown, since it is read when
+opened. `descriptor` has the shape of a
+`/api/sources/query` row of the `sources` view. `truncated` says that `limit` or the server's row cap cut the
+level. The query lives behind `_tree_level` and reads only the `sources` view.
 
 ### ROI annotations
 

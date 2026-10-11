@@ -66,9 +66,8 @@ export const createRecentsSlice: StateCreator<AppState, [], [], RecentsSlice> = 
   },
 
   async hydrateRecents() {
-    const { client, recentIds, sources, recentSources } = get();
+    const { client, recentIds, sourceIndex, recentSources } = get();
     if (!client) return;
-    const listed = new Map(sources.map((s) => [s.source_id, s]));
     // Already resolved last pass: an unlisted id (a `cache://` upload) never
     // starts appearing in `listed`, so without this a hydrate triggered by an
     // unrelated catalog change, or by this same hydrate pruning a sibling id,
@@ -77,7 +76,7 @@ export const createRecentsSlice: StateCreator<AppState, [], [], RecentsSlice> = 
 
     const results = await Promise.all(
       recentIds.map(async (id) => {
-        const desc = listed.get(id) ?? known.get(id);
+        const desc = sourceIndex[id] ?? known.get(id);
         if (desc) return { id, desc, evicted: false };
         try {
           // Registry-backed, unlike /api/sources, which reads the catalog and so

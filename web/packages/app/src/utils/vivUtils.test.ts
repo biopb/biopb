@@ -378,34 +378,34 @@ describe("vivColor", () => {
 
 describe("sliderGrid", () => {
   const TENSOR = { array_id: "src_a/Image:0", dim_labels: ["t", "y", "x"], shape: [10, 512, 512], dtype: "uint16" };
-  const SOURCES = [{
+  const SOURCE = {
     source_id: "src_a",
     source_url: "file:///a.tiff",
     source_type: "ome-tiff",
     tensors: [TENSOR],
-  }] as unknown as Parameters<typeof sliderGrid>[1];
+  } as unknown as Parameters<typeof sliderGrid>[1];
 
   /** The same tensor after it grew, as `tile_info` would report it. */
   const LIVE = { ...TENSOR, array_id: "src_a@9f1c4e2b/Image:0", shape: [20, 512, 512] } as unknown as Parameters<typeof sliderGrid>[0];
 
   it("prefers the live grid over the catalog's", () => {
     // The point of the whole thing: the catalog says T=10, the tensor has 20.
-    expect(sliderGrid(LIVE, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([20, 512, 512]);
+    expect(sliderGrid(LIVE, SOURCE, "src_a/Image:0")?.shape).toEqual([20, 512, 512]);
   });
 
   it("takes the live grid even though its array_id is the versioned form", () => {
     // `tile_info` answers with `id@token`; matching it against the stable id
     // would silently never hold, so the slot is trusted rather than compared.
-    expect(sliderGrid(LIVE, [] as unknown as Parameters<typeof sliderGrid>[1], "src_a", "src_a/Image:0")).toBe(LIVE);
+    expect(sliderGrid(LIVE, undefined, "src_a/Image:0")).toBe(LIVE);
   });
 
   it("falls back to the catalog before a viewer has loaded", () => {
-    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([10, 512, 512]);
+    expect(sliderGrid(null, SOURCE, "src_a/Image:0")?.shape).toEqual([10, 512, 512]);
   });
 
   it("is null when neither knows the tensor", () => {
-    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Nope")).toBeNull();
-    expect(sliderGrid(null, SOURCES, "gone", "gone")).toBeNull();
+    expect(sliderGrid(null, SOURCE, "src_a/Nope")).toBeNull();
+    expect(sliderGrid(null, undefined, "gone")).toBeNull();
   });
 });
 

@@ -2,7 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
-import { CATALOG_LIMIT, useAppStore } from "../store";
+import { toggled, useAppStore } from "../store";
 import { REASON_COLUMN, SOURCE_COLUMNS, descriptorFromRow } from "../utils/catalogRow";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
@@ -15,13 +15,13 @@ import {
   groupTensors,
   isEmptySource,
   isUnresolved,
+  lazyTreeNodes,
+  levelNote,
   matchesQuery,
   recentNode,
   unresolvedKind,
 } from "../utils/sourceTree";
 
-// Threshold for switching to server-side SQL query
-const SERVER_QUERY_THRESHOLD = 1000;
 // Most matches a search shows. The server's own cap (100k rows by default) is a
 // safety valve, not a page size: every row is an id to ship, a tree node to build
 // and a row to render, and nobody reads a hundred thousand results. One more than
@@ -97,70 +97,6 @@ function compactShape(shape: number[]): string {
   return formatShape(first < 0 ? shape.slice(-1) : shape.slice(first));
 }
 
-// Deepest folder level a search opens by itself. A match deep in a big tree
-// would otherwise open every folder on the way down, and a result list of
-// thousands of rows is no longer a list anyone reads: the top level shows where
-// the matches are, and the user opens what they want.
-const AUTO_EXPAND_DEPTH = 1;
-
-// Filter tree to show only matching sources, auto-expand the top-level folders
-// holding matches
-function filterTree(
-  node: TreeNode,
-  matchingSourceIds: Set<string>,
-  expandedFolders: Set<string>
-): TreeNode | null {
-  if (node.type === "source") {
-    if (matchingSourceIds.has(node.id)) {
-      return node;
-    }
-    return null;
-  }
-
-  // Folder: filter children
-  const filteredChildren: TreeNode[] = [];
-  for (const child of node.children) {
-    const filtered = filterTree(child, matchingSourceIds, expandedFolders);
-    if (filtered) {
-      filteredChildren.push(filtered);
-      // Auto-expand folders containing matches
-      if (
-        node.depth <= AUTO_EXPAND_DEPTH &&
-        (filtered.type === "source" || filtered.children.length > 0)
-      ) {
-        expandedFolders.add(node.id);
-      }
-    }
-  }
-
-  if (filteredChildren.length === 0) {
-    return null;
-  }
-
-  return { ...node, children: filteredChildren };
-}
-
-/**
- * The folders between the root and `sourceId`, outermost first, or null when no
- * source node answers to it.
- *
- * Walked rather than derived from `source_url`: `flattenPaths` merges a
- * single-child chain into one node and takes the *grandchild's* id, so a folder
- * id is not a prefix of the path it displays. The built tree is the only thing
- * that knows which ids survived.
- */
-function folderPathTo(node: TreeNode, sourceId: string): string[] | null {
-  for (const child of node.children) {
-    if (child.type === "source") {
-      if (child.id === sourceId) return [];
-      continue;
-    }
-    const below = folderPathTo(child, sourceId);
-    if (below) return [child.id, ...below];
-  }
-  return null;
-}
-
 /** Indent per tree level, px: half the Chevron slot. */
 const INDENT_STEP = 8;
 
@@ -194,6 +130,15 @@ function ChevronSlot() {
       aria-hidden="true"
       style={{ display: "inline-block", width: 16, flexShrink: 0 }}
     />
+  );
+}
+
+/** A line under an open folder: loading, failed, or cut short. */
+function TreeNote({ text, indent }: { text: string; indent: number }) {
+  return (
+    <div style={{ fontSize: 11, color: "#64748b", padding: "2px 0" }}>
+      <span style={{ paddingLeft: indent + 20 }}>{text}</span>
+    </div>
   );
 }
 
@@ -284,6 +229,7 @@ export function TreeRow({
               setLabelOverlay={setLabelOverlay}
             />
           ))}
+        {expanded && node.note && <TreeNote text={node.note} indent={indent + INDENT_STEP} />}
       </>
     );
   }
@@ -496,10 +442,13 @@ export function TreeRow({
 }
 
 export function SourceTree() {
-  const sources = useAppStore((s) => s.sources);
+  const treeLevels = useAppStore((s) => s.treeLevels);
+  const openFolders = useAppStore((s) => s.openFolders);
+  const levelStatus = useAppStore((s) => s.levelStatus);
+  const toggleOpenFolder = useAppStore((s) => s.toggleFolder);
+  const revealSource = useAppStore((s) => s.revealSource);
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
-  const catalogTruncated = useAppStore((s) => s.catalogTruncated);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   // Which tensor row to mark, in the catalog's own spelling: the target's
   // resolved, token-free key, and no row carries a token. Until it resolves,
@@ -545,6 +494,9 @@ export function SourceTree() {
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
   // More sources matched than `SERVER_QUERY_LIMIT` lets through.
   const [serverMoreMatches, setServerMoreMatches] = useState(false);
+  // Open folders of the trees built here -- "Recent" and a search's matches. The
+  // catalog's own open folders are in the store, because reading a folder is
+  // what opening it does.
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     () => new Set(),
   );
@@ -557,31 +509,24 @@ export function SourceTree() {
     return subscribeRecents(syncRecents);
   }, [syncRecents]);
 
-  // Re-resolved when the list changes or the catalog does: a recent id that the
-  // catalog has just listed should stop costing a `tile_info` round trip, and
-  // one the server has dropped should leave the node.
+  // Re-resolved when the list changes or the tree does: a recent id that the
+  // tree has just shown should stop costing a `tile_info` round trip.
   useEffect(() => {
     void hydrateRecents();
-  }, [hydrateRecents, recentIds, sources]);
+  }, [hydrateRecents, recentIds, treeLevels]);
 
-  // Determine if we should use server-side queries
-  const useServerQuery = sources.length > SERVER_QUERY_THRESHOLD;
-
-  // The box itself stays on `query` so typing is never held up; everything
-  // derived from it -- the server query, the match, the tree rebuild and its
-  // re-render -- follows the debounced value, so a burst of keystrokes costs
-  // one pass over the catalog instead of one per key. A small catalog filters
-  // locally for next to nothing, so it keeps following every key.
+  // The box itself stays on `query` so typing is never held up; the server
+  // query and everything derived from it follow the debounced value, so a burst
+  // of keystrokes costs one query instead of one per key.
   const [debouncedQuery, setDebouncedQuery] = useState("");
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 300);
     return () => clearTimeout(timer);
   }, [query]);
-  const activeQuery = useServerQuery ? debouncedQuery : query;
 
-  // Server-side filtering
+  // Server-side search
   useEffect(() => {
-    if (!useServerQuery || !debouncedQuery.trim()) {
+    if (!debouncedQuery.trim()) {
       setServerMatches(null);
       setServerMoreMatches(false);
       return;
@@ -608,58 +553,41 @@ export function SourceTree() {
     return () => {
       stale = true;
     };
-  }, [debouncedQuery, useServerQuery, querySources]);
+  }, [debouncedQuery, querySources]);
 
-  // Client-side filter. Empty sources are dropped unconditionally, before the
-  // search query narrows further -- a source with nothing on it is never
-  // worth a row, matching or not.
-  const filteredSources = useMemo(() => {
-    const q = activeQuery.trim().toLowerCase();
-    if (q && serverMatches) return serverMatches.filter((s) => !isEmptySource(s));
+  // A search shows its matches as a tree of their own, built here from at most
+  // `SERVER_QUERY_LIMIT` rows. Until the first answer lands the catalog stays up
+  // (the header says the search is under way): swapping it for a notice would
+  // unmount every row and mount them again when the answer came.
+  const searching = debouncedQuery.trim() !== "" && serverMatches !== null;
+  // Empty sources are dropped, as the server drops them from the catalog's own
+  // levels: a source with nothing on it is never worth a row.
+  const matches = useMemo(
+    () => (searching ? serverMatches.filter((s) => !isEmptySource(s)) : []),
+    [searching, serverMatches],
+  );
+  const searchTree = useMemo(() => buildTree(matches), [matches]);
 
-    const visible = sources.filter((s) => !isEmptySource(s));
-    return q ? visible.filter((s) => matchesQuery(s, q)) : visible;
-  }, [activeQuery, sources, serverMatches]);
+  const top = treeLevels[""]?.level;
+  const catalogNodes = useMemo(
+    () => lazyTreeNodes(treeLevels, levelStatus, openFolders),
+    [treeLevels, levelStatus, openFolders],
+  );
+  const topNote = levelNote(top, levelStatus[""]);
 
-  // Build tree from filtered sources
-  const tree = useMemo(() => buildTree(filteredSources), [filteredSources]);
-
-  // Recents filter client-side even when the catalog has switched to a
-  // server-side query: that query is SQL against the catalog, which by
+  // Recents filter client-side: that query is SQL against the catalog, which by
   // construction does not hold the uploads this node exists to show.
   const recent = useMemo(() => {
-    const q = activeQuery.trim().toLowerCase();
+    const q = debouncedQuery.trim().toLowerCase();
     const visible = recentSources.filter((s) => !isEmptySource(s));
     const matching = q ? visible.filter((s) => matchesQuery(s, q)) : visible;
     return recentNode(matching);
-  }, [recentSources, activeQuery]);
-
-  // Filter tree when search is active (client-side only)
-  const displayTree = useMemo(() => {
-    if (!activeQuery.trim() || serverMatches) {
-      return tree;
-    }
-
-    const q = activeQuery.trim().toLowerCase();
-    const matchingIds = new Set(
-      filteredSources
-        .filter((s) => `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase().includes(q))
-        .map((s) => s.source_id)
-    );
-
-    const newExpanded = new Set(expandedFolders);
-    const filtered = filterTree(tree, matchingIds, newExpanded);
-    if (filtered && newExpanded.size !== expandedFolders.size) {
-      setExpandedFolders(newExpanded);
-    }
-    return filtered ?? tree;
-  }, [tree, activeQuery, filteredSources, serverMatches, expandedFolders]);
+  }, [recentSources, debouncedQuery]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
-  // The selection this has already revealed. Latched so a later catalog poll --
-  // which rebuilds the tree every 60s -- cannot re-open a folder the user just
-  // collapsed, while a selection the catalog does not hold *yet* stays unlatched
-  // and is revealed by whichever poll first brings it in.
+  // The selection this has already revealed. Latched so a later poll cannot
+  // re-open a folder the user just collapsed; a selection the server does not
+  // show *yet* is unlatched, and revealed once a level that holds it lands.
   const revealed = useRef<string | null>(null);
   const pendingScroll = useRef<string | null>(null);
 
@@ -669,22 +597,29 @@ export function SourceTree() {
       return;
     }
     if (revealed.current === activeSourceId) return;
-    // A link can select a source that is filtered out by the search box, or one
-    // the catalog has not listed (still scanning, or past its cap). Nothing to
-    // reveal then, and nothing latched, so clearing the search brings it in.
-    const folders = folderPathTo(tree, activeSourceId);
-    if (!folders) return;
     revealed.current = activeSourceId;
-    pendingScroll.current = activeSourceId;
-    if (folders.length > 0) {
-      setExpandedFolders((prev) => {
-        if (folders.every((id) => prev.has(id))) return prev;
-        const next = new Set(prev);
-        for (const id of folders) next.add(id);
-        return next;
-      });
+    // A row the user can already see needs no reveal -- the common case, a click
+    // in the tree. The rest is a link or a recent: the server walks down to it
+    // in one request and the folders open on the way.
+    const { treeLevels: levels, openFolders: open } = useAppStore.getState();
+    const visible = Object.entries(levels).some(
+      ([key, l]) =>
+        (key === "" || open.has(key)) &&
+        l.level.sources.some((x) => x.descriptor.source_id === activeSourceId),
+    );
+    if (visible) {
+      pendingScroll.current = activeSourceId;
+      return;
     }
-  }, [activeSourceId, tree]);
+    revealSource(activeSourceId)
+      .then((ok) => {
+        if (ok) pendingScroll.current = activeSourceId;
+        else if (revealed.current === activeSourceId) revealed.current = null;
+      })
+      .catch(() => {
+        if (revealed.current === activeSourceId) revealed.current = null;
+      });
+  }, [activeSourceId, treeLevels, revealSource]);
 
   // Deliberately every commit: the row this wants may not exist until the
   // expansion above has rendered, and it is one ref read until it does.
@@ -697,33 +632,27 @@ export function SourceTree() {
     row.scrollIntoView({ block: "nearest" });
   });
 
-  const toggleFolder = useCallback((id: string) => {
-    setExpandedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
-  }, []);
+  const toggleFolder = useCallback(
+    (id: string) => setExpandedFolders((prev) => toggled(prev, id)),
+    [],
+  );
 
   /**
-   * Selecting from "Recent", which must leave the catalog exactly where it is.
+   * Selecting from "Recent" or from a search's matches, which must leave the
+   * catalog exactly where it is.
    *
    * The reveal effect above keys on `activeSourceId` alone and so cannot tell a
    * catalog click from a shortcut; without this, picking a row near the top of
-   * the pane expands a folder chain further down and scrolls the tree to it --
-   * a jump to somewhere the reader did not click. Recording the origin here is
+   * the pane opens a folder chain further down and scrolls the tree to it -- a
+   * jump to somewhere the reader did not click. Recording the origin here is
    * what the effect cannot work out for itself.
    *
    * Marking it *revealed* rather than adding a flag to skip: the two say the
    * same thing (this selection needs no reveal) and the latch already means
-   * "shown", so a later catalog poll does not reopen the question either. A
-   * catalog click and a shared link leave it unlatched and still reveal.
+   * "shown", so a later poll does not reopen the question either. A catalog
+   * click and a shared link leave it unlatched and still reveal.
    */
-  const selectFromRecent = useCallback(
+  const selectInPlace = useCallback(
     (sourceId: string, tensorId?: string) => {
       revealed.current = sourceId;
       selectSource(sourceId, tensorId);
@@ -731,44 +660,44 @@ export function SourceTree() {
     [selectSource],
   );
 
+  const rowProps = {
+    activeSourceId,
+    activeTensorId,
+    selectSource,
+    startResolve,
+    resolving,
+    labelOverlay,
+    setLabelOverlay,
+  };
+  const topEmpty = !top || top.folders.length + top.sources.length === 0;
+
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
       <div style={{ padding: "0.5rem 1rem" }}>
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder={useServerQuery ? "Search (SQL filter)" : "Search sources"}
+          placeholder="Search (SQL filter)"
           aria-label="Search sources"
           style={{ width: "100%" }}
         />
-        {scanning && sources.length > 0 && (
+        {scanning && !topEmpty && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             Still indexing the data folder; more sources may appear
           </div>
         )}
-        {catalogTruncated && (
+        {(searching || serverQueryLoading) && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            {CATALOG_LIMIT.toLocaleString()} sources (truncated) - use a filter
-          </div>
-        )}
-        {useServerQuery && (
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-            {serverMatches
-              ? `${serverMatches.length.toLocaleString()} matches${
-                  serverMoreMatches && !serverQueryLoading ? " (truncated)" : ""
-                }`
-              : `${sources.length.toLocaleString()} sources`}{" "}
-            - server-side filter
-            {serverQueryLoading && " • Searching…"}
+            {searching &&
+              `${serverMatches.length.toLocaleString()} matches${
+                serverMoreMatches && !serverQueryLoading ? " (truncated)" : ""
+              } - server-side filter`}
+            {serverQueryLoading && `${searching ? " • " : ""}Searching…`}
           </div>
         )}
       </div>
 
       <div ref={listRef} style={{ overflow: "auto" }}>
-        {/* A search leaves the list up (the header says it is under way):
-            swapping it for a notice unmounted every row and mounted them all
-            again when the answer landed, which is most of what a big
-            catalog's filter cost. */}
         {sourcesLoading ? (
           <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>Loading sources...</div>
         ) : (
@@ -776,40 +705,51 @@ export function SourceTree() {
             {recent && (
               <TreeRow
                 node={recent}
-                activeSourceId={activeSourceId}
-                activeTensorId={activeTensorId}
+                {...rowProps}
                 expandedFolders={expandedFolders}
                 toggleFolder={toggleFolder}
-                selectSource={selectFromRecent}
-                labelOverlay={labelOverlay}
-                setLabelOverlay={setLabelOverlay}
+                selectSource={selectInPlace}
+                startResolve={undefined}
+                resolving={undefined}
               />
             )}
             {/* The empty notice is about the catalog, so it is suppressed while
                 "Recent" has rows -- "No sources" above a list of sources reads
                 as a bug. */}
-            {filteredSources.length === 0 && !recent ? (
+            {searching ? (
+              matches.length === 0 && !recent ? (
+                <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>No sources</div>
+              ) : (
+                searchTree.children.map((child) => (
+                  <TreeRow
+                    key={child.id}
+                    node={child}
+                    {...rowProps}
+                    selectSource={selectInPlace}
+                    expandedFolders={expandedFolders}
+                    toggleFolder={toggleFolder}
+                  />
+                ))
+              )
+            ) : topEmpty && !recent ? (
               <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
-                {scanning && sources.length === 0
+                {scanning
                   ? "Indexing data folder… (sources will appear as they are found)"
                   : "No sources"}
               </div>
             ) : (
-              displayTree.children.map((child) => (
-                <TreeRow
-                  key={child.id}
-                  node={child}
-                  activeSourceId={activeSourceId}
-                  activeTensorId={activeTensorId}
-                  expandedFolders={expandedFolders}
-                  toggleFolder={toggleFolder}
-                  selectSource={selectSource}
-                  startResolve={startResolve}
-                  resolving={resolving}
-                  labelOverlay={labelOverlay}
-                  setLabelOverlay={setLabelOverlay}
-                />
-              ))
+              <>
+                {catalogNodes.map((child) => (
+                  <TreeRow
+                    key={child.id}
+                    node={child}
+                    {...rowProps}
+                    expandedFolders={openFolders}
+                    toggleFolder={toggleOpenFolder}
+                  />
+                ))}
+                {topNote && <TreeNote text={topNote} indent={0} />}
+              </>
             )}
           </>
         )}
