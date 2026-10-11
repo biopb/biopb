@@ -187,64 +187,64 @@ describe("TensorHttpClient.readyz", () => {
 // Sources
 // ---------------------------------------------------------------------------
 
-describe("TensorHttpClient.listSourcesPage", () => {
-  const page = (body: unknown, truncated: string) =>
-    new Response(JSON.stringify(body), {
+describe("TensorHttpClient.treeLevel", () => {
+  const LEVEL = {
+    key: "data/lab",
+    folders: [{ name: "plate01", key: "data/lab/plate01" }],
+    sources: [{ name: "a.zarr", descriptor: SOURCE }],
+    truncated: false,
+  };
+  const levelResponse = (etag?: string) =>
+    new Response(JSON.stringify(LEVEL), {
       status: 200,
-      headers: { "Content-Type": "application/json", "X-Truncated": truncated },
+      headers: { "Content-Type": "application/json", ...(etag ? { ETag: etag } : {}) },
     });
 
-  it("asks for a limit and reports the server's truncation flag", async () => {
-    mockFetch.mockResolvedValueOnce(page([SOURCE], "true"));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    const listing = await c.listSourcesPage(20_000);
+  it("asks for a folder by its escaped key, revalidating, with the token", async () => {
+    mockFetch.mockResolvedValueOnce(levelResponse('"abc"'));
+    const { level, etag } = await new TensorHttpClient(BASE, TOKEN).treeLevel("data/a b&c", 2000);
     const [url, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${BASE}/api/sources?limit=20000`);
+    expect(url).toBe(`${BASE}/api/tree?key=data%2Fa%20b%26c&limit=2000`);
+    expect(opts.cache).toBe("no-cache");
     expect((opts.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
-    expect(listing.sources).toHaveLength(1);
-    expect(listing.truncated).toBe(true);
+    expect(level.folders[0]!.key).toBe("data/lab/plate01");
+    expect(level.sources[0]!.descriptor.source_id).toBe("src0");
+    expect(etag).toBe('"abc"');
   });
 
-  it("is not truncated unless the server says so", async () => {
-    mockFetch.mockResolvedValueOnce(page([SOURCE], "false"));
-    expect((await new TensorHttpClient(BASE, TOKEN).listSourcesPage(10)).truncated).toBe(false);
-    // A server that predates the header lists everything it has.
-    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-    expect((await new TensorHttpClient(BASE, TOKEN).listSourcesPage(10)).truncated).toBe(false);
-  });
-});
-
-describe("TensorHttpClient.listSourcesPage (auth and errors)", () => {
-  it("GETs /api/sources and returns array", async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    const sources = (await c.listSourcesPage(10)).sources;
-    expect(sources).toHaveLength(1);
-    expect(sources[0]!.source_id).toBe("src0");
-  });
-
-  it("sends Authorization header", async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse([]));
-    const c = new TensorHttpClient(BASE, TOKEN);
-    await c.listSourcesPage(10);
-    const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
-    expect((opts.headers as Record<string, string>)["Authorization"]).toBe(`Bearer ${TOKEN}`);
+  it("has no etag when the server sends none", async () => {
+    mockFetch.mockResolvedValueOnce(levelResponse());
+    expect((await new TensorHttpClient(BASE, null).treeLevel("", 10)).etag).toBeNull();
   });
 
   it("does NOT send Authorization when token is null", async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse([]));
-    const c = new TensorHttpClient(BASE, null);
-    await c.listSourcesPage(10);
+    mockFetch.mockResolvedValueOnce(levelResponse());
+    await new TensorHttpClient(BASE, null).treeLevel("", 10);
     const [, opts] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect((opts.headers as Record<string, string>)["Authorization"]).toBeUndefined();
   });
 
   it("throws TensorApiError on 401", async () => {
     mockFetch.mockResolvedValueOnce(errorResponse(401, "Invalid or missing token"));
-    const c = new TensorHttpClient(BASE, "wrong");
-    const err = await c.listSourcesPage(10).catch((e) => e);
+    const err = await new TensorHttpClient(BASE, "wrong").treeLevel("", 10).catch((e) => e);
     expect(err).toBeInstanceOf(TensorApiError);
     expect((err as TensorApiError).status).toBe(401);
+  });
+});
+
+describe("TensorHttpClient.treeReveal", () => {
+  it("GETs the levels down to a source by its escaped id", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ levels: [], descriptor: SOURCE }));
+    const r = await new TensorHttpClient(BASE, TOKEN).treeReveal("a/b c");
+    const [url] = mockFetch.mock.calls[0] as [string];
+    expect(url).toBe(`${BASE}/api/tree/reveal?source_id=a%2Fb%20c`);
+    expect(r.descriptor.source_id).toBe("src0");
+  });
+
+  it("rejects with a 404 TensorApiError for a source the tree does not show", async () => {
+    mockFetch.mockResolvedValueOnce(errorResponse(404, "no such source"));
+    const err = await new TensorHttpClient(BASE, TOKEN).treeReveal("nope").catch((e) => e);
+    expect((err as TensorApiError).status).toBe(404);
   });
 });
 
@@ -601,7 +601,7 @@ describe("client-side cancellation", () => {
     const c = new TensorHttpClient(BASE, TOKEN);
     mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
     const ctrl = new AbortController();
-    await c.listSourcesPage(10, { signal: ctrl.signal });
+    await c.treeLevel("", 10, { signal: ctrl.signal });
     const init = mockFetch.mock.calls[0]![1] as RequestInit;
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
@@ -616,7 +616,7 @@ describe("client-side cancellation", () => {
       });
     });
     const ctrl = new AbortController();
-    const p = c.listSourcesPage(10, { signal: ctrl.signal });
+    const p = c.treeLevel("", 10, { signal: ctrl.signal });
     expect(seen!.aborted).toBe(false);
     ctrl.abort();
     await expect(p).rejects.toThrow();
@@ -644,7 +644,7 @@ describe("client-side cancellation", () => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
     const ctrl = new AbortController();
-    const p = c.listSourcesPage(10, { signal: ctrl.signal });
+    const p = c.treeLevel("", 10, { signal: ctrl.signal });
     ctrl.abort();
     await expect(p).rejects.toMatchObject({ name: "AbortError" });
   });
@@ -656,7 +656,7 @@ describe("client-side cancellation", () => {
       new Promise((_res, rej) => {
         (init.signal as AbortSignal).addEventListener("abort", () => rej(abortRejection()));
       }));
-    const p = c.listSourcesPage(10, { signal: new AbortController().signal });
+    const p = c.treeLevel("", 10, { signal: new AbortController().signal });
     await expect(p).rejects.toBeInstanceOf(TensorApiError);
     await expect(p).rejects.toThrow(/Timeout after 5ms/);
   });
@@ -671,7 +671,7 @@ describe("client-side cancellation", () => {
     });
     const ctrl = new AbortController();
     ctrl.abort();
-    await expect(c.listSourcesPage(10, { signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
+    await expect(c.treeLevel("", 10, { signal: ctrl.signal })).rejects.toBeInstanceOf(TensorAbortError);
   });
 
   it("removes its listener so one long-lived signal does not accumulate them", async () => {
@@ -690,15 +690,17 @@ describe("client-side cancellation", () => {
     // One controller per viewport, reused across many tiles.
     for (let i = 0; i < 20; i++) {
       mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-      await c.listSourcesPage(10, { signal: ctrl.signal });
+      await c.treeLevel("", 10, { signal: ctrl.signal });
     }
     expect(added).toHaveLength(0);
   });
 
   it("works without a signal, as before", async () => {
     const c = new TensorHttpClient(BASE, TOKEN);
-    mockFetch.mockResolvedValueOnce(jsonResponse([SOURCE]));
-    expect((await c.listSourcesPage(10)).sources).toHaveLength(1);
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ key: "", folders: [], sources: [{ name: "a", descriptor: SOURCE }], truncated: false }),
+    );
+    expect((await c.treeLevel("", 10)).level.sources).toHaveLength(1);
   });
 });
 

@@ -3796,6 +3796,402 @@ class TestListingCap:
 
 
 # ===========================================================================
+# Tree levels (/api/tree, /api/tree/reveal)
+# ===========================================================================
+
+
+# What the browser's `getPathParts` (web/packages/app/src/utils/sourceTree.ts)
+# answers for each url, as the tree path's segments.
+_PATH_PARTS = [
+    ("file:///data/experiment/plate1.zarr", ["data", "experiment", "plate1.zarr"]),
+    (
+        "grpc://host:8815/remote/plate1.zarr",
+        ["grpc://host:8815", "remote", "plate1.zarr"],
+    ),
+    ("s3://bucket/key", ["s3://bucket", "key"]),
+    ("grpc://host:8815", ["grpc://host:8815"]),
+    ("dnd://scratch/exp:2.zarr", ["scratch", "exp:2.zarr"]),
+    ("dnd://a\\b\\\\c//d", ["a", "b", "c", "d"]),
+    ("just/a/path", ["just", "a", "path"]),
+    ("/abs//path/", ["abs", "path"]),
+    ("file:///", []),
+    ("", []),
+]
+
+
+def _tree_path_of(url: str) -> list:
+    import duckdb
+    from biopb_tensor_server.serving.http_server import (
+        _TREE_BODY_SQL,
+        _TREE_PATH_SQL,
+        _dec,
+    )
+
+    row = (
+        duckdb.connect()
+        .execute(
+            f"WITH t AS (SELECT {_TREE_BODY_SQL} AS b FROM (SELECT ? AS source_url))"
+            f" SELECT {_TREE_PATH_SQL} FROM t",
+            [url],
+        )
+        .fetchone()
+    )
+    return [_dec(part) for part in row[0].split("\x01")] if row[0] else []
+
+
+class TestTreePath:
+    @pytest.mark.parametrize("url,parts", _PATH_PARTS)
+    def test_agrees_with_getPathParts(self, url, parts):
+        assert _tree_path_of(url) == parts
+
+    def test_dnd_is_stripped_not_parsed_as_a_host(self):
+        assert _tree_path_of("dnd://exp:2.zarr") == ["exp:2.zarr"]
+
+    def test_an_authority_url_roots_at_its_endpoint(self):
+        assert _tree_path_of("grpc://h:1/a/b")[0] == "grpc://h:1"
+
+    def test_an_empty_host_is_just_the_path(self):
+        assert _tree_path_of("file:///x/y.zarr") == ["x", "y.zarr"]
+
+
+@contextmanager
+def _tree_catalog(tmp_path, urls, pending=(), empty=(), **db_kwargs):
+    """A real server whose catalog lists *urls* ``{source_id: url}``; a source
+    in *pending* is claimed, not registered (an unresolved placeholder row), and
+    one in *empty* is resolved and holds no tensor."""
+    import zarr
+    from biopb_tensor_server import ZarrAdapter
+    from biopb_tensor_server.core.discovery import SourceClaim
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    db = MetadataDatabase(**db_kwargs)
+    server = catalog_server("127.0.0.1:0", metadata_db=db)
+    z = zarr.open_array(
+        str(tmp_path / "a.zarr"), mode="w", shape=(8, 8), chunks=(8, 8), dtype="u2"
+    )
+    for sid, url in urls.items():
+        adapter = ZarrAdapter(z, sid, ["y", "x"])
+        adapter._catalog_url = url or "file:///placeholder"
+        register_and_catalog(server, sid, adapter)
+        if not url:
+            # A source with no url at all: an upload.
+            db._get_connection().execute(
+                "UPDATE source_catalog SET rel = '' WHERE source_id = ?", [sid]
+            )
+    for sid, url in dict(pending).items():
+        db.sync_pending_source(SourceClaim("zarr", url, sid), url)
+    for sid, url in dict(empty).items():
+        adapter = ZarrAdapter(z, sid, ["y", "x"])
+        adapter._catalog_url = url
+        register_and_catalog(server, sid, adapter)
+        db._get_connection().execute(
+            "UPDATE source_catalog SET tensors = [] WHERE source_id = ?", [sid]
+        )
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(0.5)
+    try:
+        yield server, f"grpc://localhost:{server.port}"
+    finally:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+
+_TREE_URLS = {
+    "solo": "file:///solo.zarr",
+    "c1": "file:///chain/one/two/three/plate01/x.zarr",
+    "c2": "file:///chain/one/two/three/plate02/x.zarr",
+    "st1": "file:///stop/direct.zarr",
+    "st2": "file:///stop/a/x.zarr",
+    "m1": "file:///mid/a/x.zarr",
+    "m2": "file:///mid/a/b/y.zarr",
+    "o1": "file:///ord/a/p.zarr",
+    "o2": "file:///ord/a-b/q.zarr",
+    "o3": "file:///ord/a/r/s.zarr",
+    "w1": "file:///we_ird/100%/it's/z.zarr",
+    "w2": "file:///weXird/100%/it's/z.zarr",
+    "g1": "grpc://host:8815/remote/plate1.zarr",
+    "g2": "grpc://host:8815/remote/b/plate2.zarr",
+    "d1": "dnd://scratch\\exp:2.zarr",
+    "d2": "dnd://scratch/other.zarr",
+    "upload_7f3": "",
+    "wide00": "file:///wide/f00.zarr",
+    "wide01": "file:///wide/f01.zarr",
+    "wide02": "file:///wide/f02.zarr",
+    "wide03": "file:///wide/f03.zarr",
+    "wide04": "file:///wide/f04.zarr",
+}
+_TREE_PENDING = {
+    "ghost": "file:///pending/ghost.zarr",
+    "ghost2": "file:///wide/f99.zarr",
+}
+_TREE_EMPTY = {
+    "void": "file:///hidden/void.zarr",
+    "void2": "file:///wide/f98.zarr",
+}
+
+
+@pytest.fixture(scope="module")
+def tree_loc(tmp_path_factory):
+    with _tree_catalog(
+        tmp_path_factory.mktemp("tree"), _TREE_URLS, _TREE_PENDING, _TREE_EMPTY
+    ) as (
+        _,
+        loc,
+    ):
+        yield loc
+
+
+class TestTree:
+    @pytest.fixture
+    def tc(self, tree_loc):
+        loc = tree_loc
+        with TestClient(
+            create_app(flight_location=loc, token=_TOKEN),
+            raise_server_exceptions=True,
+        ) as tc:
+            yield tc
+
+    def _get(self, tc, **params):
+        return tc.get("/api/tree", params=params, headers=_bearer(_TOKEN))
+
+    def _level(self, tc, key="", **params):
+        r = self._get(tc, key=key, **params)
+        assert r.status_code == 200
+        return r.json()
+
+    def test_top_level(self, tc):
+        level = self._level(tc)
+        assert level["key"] == ""
+        assert level["truncated"] is False
+        assert [f["name"] for f in level["folders"]] == [
+            "chain/one/two/three",
+            "grpc://host:8815/remote",
+            "mid/a",
+            "ord",
+            "pending",
+            "scratch",
+            "stop",
+            "weXird/100%/it's",
+            "we_ird/100%/it's",
+            "wide",
+        ]
+        # Sources at a level sit beside its folders, byte-ordered by name.
+        assert [s["name"] for s in level["sources"]] == ["solo.zarr", "upload_7f3"]
+
+    def test_folder_keys_are_the_tree_path(self, tc):
+        level = self._level(tc)
+        keys = {f["name"]: f["key"] for f in level["folders"]}
+        assert keys["chain/one/two/three"] == "chain/one/two/three"
+        assert keys["grpc://host:8815/remote"] == "grpc://host:8815/remote"
+
+    def test_a_source_carries_the_listing_descriptor(self, tc):
+        listing = {
+            s["source_id"]: s
+            for s in tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+        }
+        level = self._level(tc)
+        solo = next(s for s in level["sources"] if s["name"] == "solo.zarr")
+        assert solo["descriptor"] == listing["solo"]
+
+    def test_a_pathless_source_is_top_level_and_named_by_its_id(self, tc):
+        level = self._level(tc)
+        assert "upload_7f3" in [s["name"] for s in level["sources"]]
+
+    def test_a_chain_merges_to_the_first_fork(self, tc):
+        level = self._level(tc, key="chain/one/two/three")
+        assert [f["name"] for f in level["folders"]] == ["plate01", "plate02"]
+        assert level["sources"] == []
+        leaf = self._level(tc, key="chain/one/two/three/plate01")
+        assert [s["name"] for s in leaf["sources"]] == ["x.zarr"]
+        assert leaf["folders"] == []
+
+    def test_a_source_in_an_intermediate_folder_stops_the_merge(self, tc):
+        level = self._level(tc, key="stop")
+        assert [f["name"] for f in level["folders"]] == ["a"]
+        assert [s["name"] for s in level["sources"]] == ["direct.zarr"]
+
+    def test_a_source_in_the_last_merged_folder_ends_the_chain_there(self, tc):
+        level = self._level(tc, key="mid/a")
+        assert [f["name"] for f in level["folders"]] == ["b"]
+        assert [s["name"] for s in level["sources"]] == ["x.zarr"]
+
+    def test_the_merge_follows_component_order_not_string_order(self, tc):
+        # "ord/a-b" sorts between "ord/a" and "ord/a/r" as a string; as
+        # components "a-b" is a sibling of "a", so nothing merges below "ord".
+        level = self._level(tc, key="ord")
+        assert [f["name"] for f in level["folders"]] == ["a", "a-b"]
+        assert [s["name"] for s in self._level(tc, key="ord/a")["sources"]] == [
+            "p.zarr"
+        ]
+
+    def test_underscore_percent_and_quote_in_a_key_match_literally(self, tc):
+        level = self._level(tc, key="we_ird/100%/it's")
+        assert [s["name"] for s in level["sources"]] == ["z.zarr"]
+        assert level["sources"][0]["descriptor"]["source_id"] == "w1"
+        other = self._level(tc, key="weXird/100%/it's")
+        assert other["sources"][0]["descriptor"]["source_id"] == "w2"
+
+    def test_a_key_that_matches_nothing_is_an_empty_level(self, tc):
+        level = self._level(tc, key="no/such%")
+        assert level == {
+            "key": "no/such%",
+            "folders": [],
+            "sources": [],
+            "truncated": False,
+        }
+
+    def test_a_remote_mirror_roots_at_its_endpoint(self, tc):
+        level = self._level(tc, key="grpc://host:8815/remote")
+        assert [f["name"] for f in level["folders"]] == ["b"]
+        assert [s["name"] for s in level["sources"]] == ["plate1.zarr"]
+        assert level["folders"][0]["key"] == "grpc://host:8815/remote/b"
+
+    def test_a_dropped_source_is_rooted_without_its_scheme(self, tc):
+        level = self._level(tc, key="scratch")
+        assert [s["name"] for s in level["sources"]] == ["exp:2.zarr", "other.zarr"]
+
+    def test_a_resolved_source_with_no_tensor_is_hidden(self, tc):
+        top = [f["name"] for f in self._level(tc)["folders"]]
+        assert "hidden" not in top
+        wide = self._level(tc, key="wide")
+        assert "f98.zarr" not in [s["name"] for s in wide["sources"]]
+
+    def test_an_unresolved_source_is_shown_to_be_resolved_from(self, tc):
+        wide = self._level(tc, key="wide")
+        pending = [s for s in wide["sources"] if s["name"] == "f99.zarr"]
+        assert len(pending) == 1
+        assert pending[0]["descriptor"]["is_resolved"] is False
+        assert len(wide["sources"]) == 6
+
+    def test_limit_cuts_the_level_and_says_so(self, tc):
+        level = self._level(tc, key="wide", limit=3)
+        assert [s["name"] for s in level["sources"]] == [
+            "f00.zarr",
+            "f01.zarr",
+            "f02.zarr",
+        ]
+        assert level["truncated"] is True
+        assert self._level(tc, key="wide", limit=6)["truncated"] is False
+
+    def test_limit_is_shared_with_folders_which_come_first(self, tc):
+        level = self._level(tc, key="stop", limit=1)
+        assert [f["name"] for f in level["folders"]] == ["a"]
+        assert level["sources"] == []
+        assert level["truncated"] is True
+        assert self._level(tc, key="stop", limit=2)["truncated"] is False
+
+    def test_limit_must_be_positive(self, tc):
+        assert self._get(tc, key="", limit=0).status_code == 422
+
+    def test_the_level_has_a_strong_etag_and_revalidates_to_304(self, tc):
+        first = self._get(tc, key="wide")
+        etag = first.headers["ETag"]
+        assert etag.startswith('"') and not etag.startswith("W/")
+        again = tc.get(
+            "/api/tree",
+            params={"key": "wide"},
+            headers={**_bearer(_TOKEN), "If-None-Match": etag},
+        )
+        assert again.status_code == 304
+        assert again.content == b""
+        assert again.headers["ETag"] == etag
+        assert self._get(tc, key="wide").headers["ETag"] == etag
+
+    def test_a_different_level_has_a_different_etag(self, tc):
+        assert (
+            self._get(tc, key="wide").headers["ETag"]
+            != self._get(tc, key="stop").headers["ETag"]
+        )
+
+    def test_it_needs_the_token(self, tc):
+        assert tc.get("/api/tree").status_code == 401
+
+    # -- reveal ------------------------------------------------------------
+
+    def _reveal(self, tc, source_id):
+        return tc.get(
+            "/api/tree/reveal",
+            params={"source_id": source_id},
+            headers=_bearer(_TOKEN),
+        )
+
+    def test_reveal_returns_every_level_top_to_bottom(self, tc):
+        r = self._reveal(tc, "c2")
+        assert r.status_code == 200
+        body = r.json()
+        assert [lv["key"] for lv in body["levels"]] == [
+            "",
+            "chain/one/two/three",
+            "chain/one/two/three/plate02",
+        ]
+        assert [s["name"] for s in body["levels"][-1]["sources"]] == ["x.zarr"]
+        assert body["descriptor"]["source_id"] == "c2"
+        assert body["levels"][0] == self._level(tc)
+
+    def test_reveal_descends_through_an_endpoint(self, tc):
+        body = self._reveal(tc, "g2").json()
+        assert [lv["key"] for lv in body["levels"]] == [
+            "",
+            "grpc://host:8815/remote",
+            "grpc://host:8815/remote/b",
+        ]
+
+    def test_reveal_of_a_pathless_source_is_the_top_level(self, tc):
+        body = self._reveal(tc, "upload_7f3").json()
+        assert [lv["key"] for lv in body["levels"]] == [""]
+        assert body["descriptor"]["source_id"] == "upload_7f3"
+
+    def test_reveal_of_an_unknown_source_is_404(self, tc):
+        r = self._reveal(tc, "nope")
+        assert r.status_code == 404
+        assert "nope" in r.json()["detail"]
+
+    def test_reveal_of_a_hidden_source_is_404(self, tc):
+        assert self._reveal(tc, "void").status_code == 404
+
+    def test_reveal_finds_an_unresolved_source(self, tc):
+        r = self._reveal(tc, "ghost")
+        assert r.status_code == 200
+        assert r.json()["descriptor"]["is_resolved"] is False
+
+    def test_reveal_escapes_the_id(self, tc):
+        assert self._reveal(tc, "x' OR '1'='1").status_code == 404
+
+
+class TestTreeLiveCatalog:
+    def test_a_changed_level_changes_its_etag(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import ZarrAdapter
+
+        with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (server, loc):
+            with TestClient(create_app(flight_location=loc, token=_TOKEN)) as tc:
+                headers = _bearer(_TOKEN)
+                before = tc.get("/api/tree", params={"key": "d"}, headers=headers)
+                z = zarr.open_array(str(tmp_path / "a.zarr"), mode="r")
+                added = ZarrAdapter(z, "b", ["y", "x"])
+                added._catalog_url = "file:///d/b.zarr"
+                register_and_catalog(server, "b", added)
+                stale = tc.get(
+                    "/api/tree",
+                    params={"key": "d"},
+                    headers={**headers, "If-None-Match": before.headers["ETag"]},
+                )
+        assert stale.status_code == 200
+        assert stale.headers["ETag"] != before.headers["ETag"]
+        assert [s["name"] for s in stale.json()["sources"]] == ["a.zarr", "b.zarr"]
+
+    def test_the_servers_own_cap_marks_the_level_truncated(self, tmp_path):
+        urls = {f"s{i}": f"file:///d/{i}.zarr" for i in range(4)}
+        with _tree_catalog(tmp_path, urls, max_query_results=2) as (_, loc):
+            with TestClient(create_app(flight_location=loc, token=_TOKEN)) as tc:
+                r = tc.get("/api/tree", params={"key": "d"}, headers=_bearer(_TOKEN))
+        assert r.json()["truncated"] is True
+        assert len(r.json()["sources"]) == 2
+
+
+# ===========================================================================
 # Resolve / warm jobs
 # ===========================================================================
 

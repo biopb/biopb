@@ -7,6 +7,7 @@ import type {
   SourceJobStatus,
   TensorFlightClient,
   TileInfo,
+  TreeLevel,
 } from "@biopb/tensor-flight-client";
 import {
   selectRoiScopes,
@@ -25,8 +26,6 @@ import {
   selectLabelOverlay,
   selectUrlLabelOverlay,
   selectUrlVisibleSets,
-  catalogFingerprint,
-  CATALOG_LIMIT,
   POLL_BACKOFF_MS,
   nextPollStep,
   useAppStore,
@@ -118,25 +117,54 @@ async function openLink(query: string) {
   await settle();
 }
 
-const client = (sources: DataSourceDescriptor[], truncated = false) =>
+/** A level of the tree, as the server answers it. */
+const levelOf = (
+  key: string,
+  sources: DataSourceDescriptor[] = [],
+  folders: Array<{ name: string; key: string }> = [],
+  truncated = false,
+): TreeLevel => ({
+  key,
+  folders,
+  sources: sources.map((descriptor) => ({ name: descriptor.source_id, descriptor })),
+  truncated,
+});
+
+/** A client whose levels are `levels` by key (an unknown key is an empty level). */
+const client = (levels: Record<string, TreeLevel>) =>
   ({
-    listSourcesPage: vi.fn().mockResolvedValue({ sources, truncated }),
-    http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
+    http: {
+      treeLevel: vi.fn(async (key: string) => {
+        const level = levels[key] ?? levelOf(key);
+        return { level, etag: JSON.stringify(level) };
+      }),
+      treeReveal: vi.fn(),
+      readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
+    },
   }) as unknown as TensorFlightClient;
+
+/** The tree as a poll finds it already loaded. */
+const loadedTop = (...sources: DataSourceDescriptor[]) => {
+  const level = levelOf("", sources);
+  return { treeLevels: { "": { level, etag: JSON.stringify(level) } } };
+};
+
+const treeLevelOf = (c: TensorFlightClient) => c.http.treeLevel as ReturnType<typeof vi.fn>;
 
 afterEach(() => {
   useAppStore.setState({ views: {} });
   useAppStore.getState().stopCatalogPolling();
+  useAppStore.getState().resetTree();
   vi.useRealTimers();
 });
 
 describe("catalog polling", () => {
-  it("keeps a URL-hydrated source that is absent from the listing", async () => {
+  it("keeps a URL-hydrated source that is absent from the tree", async () => {
     vi.useFakeTimers();
     useAppStore.setState({
-      client: client([]),
+      client: client({}),
       connectionState: "connected",
-      sources: [SOURCE],
+      ...loadedTop(SOURCE),
       ...viewOf("shared-source/Image:0", { linked: true }),
     });
 
@@ -146,12 +174,12 @@ describe("catalog polling", () => {
     expect(useAppStore.getState().activeSourceId).toBe("shared-source");
   });
 
-  it("clears a clicked source that is absent from the listing", async () => {
+  it("clears a clicked source that has left its level", async () => {
     vi.useFakeTimers();
     useAppStore.setState({
-      client: client([]),
+      client: client({}),
       connectionState: "connected",
-      sources: [SOURCE],
+      ...loadedTop(SOURCE),
       ...viewOf(SOURCE.source_id),
     });
 
@@ -161,55 +189,64 @@ describe("catalog polling", () => {
     expect(useAppStore.getState().activeSourceId).toBeNull();
   });
 
-  it("judges the source in view when the listing lands, not when it was asked for", async () => {
+  it("judges the source in view when the levels land, not when they were asked for", async () => {
     vi.useFakeTimers();
     const other = { ...SOURCE, source_id: "other-source" };
-    let land: (sources: DataSourceDescriptor[]) => void = () => {};
+    let land: (level: TreeLevel) => void = () => {};
     const slow = {
-      listSourcesPage: vi.fn().mockReturnValue(
-        new Promise((resolve) => (land = (sources) => resolve({ sources, truncated: false }))),
-      ),
-      http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
+      http: {
+        treeLevel: vi.fn().mockReturnValue(
+          new Promise((resolve) => (land = (level) => resolve({ level, etag: "x" }))),
+        ),
+        readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
+      },
     } as unknown as TensorFlightClient;
     useAppStore.setState({
       client: slow,
       connectionState: "connected",
-      sources: [SOURCE],
+      ...loadedTop(SOURCE),
       ...viewOf(SOURCE.source_id),
     });
 
     useAppStore.getState().startCatalogPolling();
     await vi.advanceTimersByTimeAsync(60000);
-    // The user opens another source while the listing is in flight.
+    // The user opens another source while the poll is in flight.
     useAppStore.setState(viewOf(other.source_id));
-    land([other]);
+    land(levelOf("", [other]));
     await vi.advanceTimersByTimeAsync(0);
 
     expect(useAppStore.getState().activeSourceId).toBe("other-source");
   });
 
   describe("schedule", () => {
-    const polled = (c: TensorFlightClient) =>
-      (c.listSourcesPage as ReturnType<typeof vi.fn>).mock.calls.length;
+    const polled = (c: TensorFlightClient) => treeLevelOf(c).mock.calls.length;
 
     const start = (c: TensorFlightClient) => {
       vi.useFakeTimers();
-      useAppStore.setState({ client: c, connectionState: "connected", sources: [SOURCE] });
+      useAppStore.setState({ client: c, connectionState: "connected", ...loadedTop(SOURCE) });
       useAppStore.getState().startCatalogPolling();
     };
 
-    it("first asks after 30 seconds, for at most the limit", async () => {
-      const c = client([SOURCE]);
+    it("first asks after 30 seconds, for the top", async () => {
+      const c = client({ "": levelOf("", [SOURCE]) });
       start(c);
       await vi.advanceTimersByTimeAsync(29_999);
       expect(polled(c)).toBe(0);
       await vi.advanceTimersByTimeAsync(1);
       expect(polled(c)).toBe(1);
-      expect(c.listSourcesPage).toHaveBeenCalledWith(CATALOG_LIMIT);
+      expect(treeLevelOf(c).mock.calls[0]![0]).toBe("");
     });
 
-    it("backs off while the catalog is unchanged", async () => {
-      const c = client([SOURCE]);
+    it("asks for the open folders too, and only those", async () => {
+      const c = client({ "": levelOf("", [SOURCE]) });
+      start(c);
+      useAppStore.setState({ openFolders: new Set(["a", "a/b"]) });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(treeLevelOf(c).mock.calls.map((x) => x[0]).sort()).toEqual(["", "a", "a/b"]);
+    });
+
+    it("backs off while the tree is unchanged", async () => {
+      const c = client({ "": levelOf("", [SOURCE]) });
       start(c);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(polled(c)).toBe(1);
@@ -226,15 +263,13 @@ describe("catalog polling", () => {
       expect(polled(c)).toBe(5);
     });
 
-    it("returns to 30 seconds when the catalog changes", async () => {
+    it("returns to 30 seconds when a level changes", async () => {
       const grown = { ...SOURCE, source_id: "second" };
-      const c = client([SOURCE]);
+      const levels = { "": levelOf("", [SOURCE]) };
+      const c = client(levels);
       start(c);
       await vi.advanceTimersByTimeAsync(30_000); // poll 1: unchanged -> next in 60 s
-      (c.listSourcesPage as ReturnType<typeof vi.fn>).mockResolvedValue({
-        sources: [SOURCE, grown],
-        truncated: false,
-      });
+      levels[""] = levelOf("", [SOURCE, grown]);
       await vi.advanceTimersByTimeAsync(60_000); // poll 2: changed -> next in 30 s
       expect(polled(c)).toBe(2);
       await vi.advanceTimersByTimeAsync(30_000);
@@ -242,9 +277,10 @@ describe("catalog polling", () => {
     });
 
     it("stays at 30 seconds while the catalog is still being indexed", async () => {
+      const level = levelOf("", [SOURCE]);
       const c = {
-        listSourcesPage: vi.fn().mockResolvedValue({ sources: [SOURCE], truncated: false }),
         http: {
+          treeLevel: vi.fn().mockResolvedValue({ level, etag: JSON.stringify(level) }),
           readyz: vi.fn().mockResolvedValue({ backend_health: { full_scan_in_progress: true } }),
         },
       } as unknown as TensorFlightClient;
@@ -255,8 +291,10 @@ describe("catalog polling", () => {
 
     it("does not back off while the polls fail", async () => {
       const c = {
-        listSourcesPage: vi.fn().mockRejectedValue(new Error("server down")),
-        http: { readyz: vi.fn().mockRejectedValue(new Error("server down")) },
+        http: {
+          treeLevel: vi.fn().mockRejectedValue(new Error("server down")),
+          readyz: vi.fn().mockRejectedValue(new Error("server down")),
+        },
       } as unknown as TensorFlightClient;
       vi.spyOn(console, "warn").mockImplementation(() => {});
       start(c);
@@ -264,23 +302,24 @@ describe("catalog polling", () => {
       expect(polled(c)).toBe(3);
     });
 
-    it("drops a listing that lands after polling was stopped", async () => {
-      let land: (r: { sources: DataSourceDescriptor[]; truncated: boolean }) => void = () => {};
+    it("drops a level that lands after another server was connected", async () => {
+      let land: (r: { level: TreeLevel; etag: string }) => void = () => {};
       const c = {
-        listSourcesPage: vi.fn().mockReturnValue(new Promise((resolve) => (land = resolve))),
-        http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
+        http: {
+          treeLevel: vi.fn().mockReturnValue(new Promise((resolve) => (land = resolve))),
+          readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
+        },
       } as unknown as TensorFlightClient;
       start(c);
       await vi.advanceTimersByTimeAsync(30_000); // the poll is now in flight
-      useAppStore.getState().stopCatalogPolling();
-      land({ sources: [], truncated: true });
+      useAppStore.setState({ client: client({}) });
+      land({ level: levelOf("", []), etag: "x" });
       await vi.advanceTimersByTimeAsync(0);
-      expect(useAppStore.getState().sources).toEqual([SOURCE]);
-      expect(useAppStore.getState().catalogTruncated).toBe(false);
+      expect(useAppStore.getState().treeLevels[""]!.level.sources).toHaveLength(1);
     });
 
     it("stops for good when stopped mid-poll", async () => {
-      const c = client([SOURCE]);
+      const c = client({ "": levelOf("", [SOURCE]) });
       start(c);
       await vi.advanceTimersByTimeAsync(30_000);
       useAppStore.getState().stopCatalogPolling();
@@ -291,51 +330,120 @@ describe("catalog polling", () => {
 
   it("sees a source resolve in place, as a change", async () => {
     // Same id and url, now resolved with tensors: only is_resolved and the
-    // tensors moved, which is what a signature on urls alone cannot see.
+    // tensors moved, which a signature on urls alone cannot see.
     vi.useFakeTimers();
     const resolved = {
       ...SOURCE,
       is_resolved: true,
-      tensors: [
-        { array_id: "t", dim_labels: ["y", "x"], shape: [4, 4], dtype: "uint16" },
-      ],
+      tensors: [{ array_id: "t", dim_labels: ["y", "x"], shape: [4, 4], dtype: "uint16" }],
     };
     useAppStore.setState({
-      client: client([resolved]),
+      client: client({ "": levelOf("", [resolved]) }),
       connectionState: "connected",
-      sources: [{ ...SOURCE, is_resolved: false, tensors: [] }],
+      ...loadedTop({ ...SOURCE, is_resolved: false, tensors: [] }),
     });
     useAppStore.getState().startCatalogPolling();
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(useAppStore.getState().sources[0]!.is_resolved).toBe(true);
+    expect(useAppStore.getState().treeLevels[""]!.level.sources[0]!.descriptor.is_resolved).toBe(true);
+    expect(useAppStore.getState().sourceIndex[SOURCE.source_id]!.is_resolved).toBe(true);
   });
 
-  it("notes a truncated catalog, and does not mistake the cut for a removal", async () => {
+  it("does not mistake a cut level for a removal", async () => {
     vi.useFakeTimers();
     useAppStore.setState({
-      client: client([], true),
+      client: client({ "": levelOf("", [], [], true) }),
       connectionState: "connected",
-      sources: [SOURCE],
+      ...loadedTop(SOURCE),
       ...viewOf(SOURCE.source_id),
     });
     useAppStore.getState().startCatalogPolling();
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(useAppStore.getState().catalogTruncated).toBe(true);
-    // The open source may be past the limit, not gone.
+    expect(useAppStore.getState().treeLevels[""]!.level.truncated).toBe(true);
+    // The open source may be past what was sent, not gone.
     expect(useAppStore.getState().activeSourceId).toBe(SOURCE.source_id);
   });
+});
 
-  it("clears the truncation note when the catalog fits again", async () => {
-    vi.useFakeTimers();
-    useAppStore.setState({
-      client: client([SOURCE], false),
-      connectionState: "connected",
-      sources: [SOURCE],
-      catalogTruncated: true,
+describe("catalog tree", () => {
+  const FOLDER = { name: "plate", key: "data/plate" };
+  const INSIDE = { ...SOURCE, source_id: "inside", source_url: "file:///data/plate/inside" };
+
+  const connect = (levels: Record<string, TreeLevel>) => {
+    const c = client(levels);
+    useAppStore.setState({ client: c });
+    return c;
+  };
+
+  it("reads the top, and indexes what it holds", async () => {
+    connect({ "": levelOf("", [SOURCE], [FOLDER]) });
+    await useAppStore.getState().loadLevel("");
+    const state = useAppStore.getState();
+    expect(state.treeLevels[""]!.level.folders).toEqual([FOLDER]);
+    expect(state.sourceIndex[SOURCE.source_id]).toBe(SOURCE);
+    expect(state.levelStatus).toEqual({});
+  });
+
+  it("opens a folder by reading it once, and closes it without a request", async () => {
+    const c = connect({ "data/plate": levelOf("data/plate", [INSIDE]) });
+    useAppStore.getState().toggleFolder("data/plate");
+    expect(useAppStore.getState().openFolders.has("data/plate")).toBe(true);
+    await settle();
+    expect(treeLevelOf(c)).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().sourceIndex["inside"]).toBeDefined();
+
+    useAppStore.getState().toggleFolder("data/plate");
+    expect(useAppStore.getState().openFolders.has("data/plate")).toBe(false);
+    // Opened again, it is already held.
+    useAppStore.getState().toggleFolder("data/plate");
+    await settle();
+    expect(treeLevelOf(c)).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks a folder that failed to read, and reads it again when reopened", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const c = connect({});
+    treeLevelOf(c).mockRejectedValueOnce(new Error("boom"));
+    useAppStore.getState().toggleFolder("data/plate");
+    await settle();
+    expect(useAppStore.getState().levelStatus["data/plate"]).toBe("error");
+
+    useAppStore.getState().toggleFolder("data/plate"); // close
+    useAppStore.getState().toggleFolder("data/plate"); // reopen
+    await settle();
+    expect(useAppStore.getState().levelStatus["data/plate"]).toBeUndefined();
+    expect(treeLevelOf(c)).toHaveBeenCalledTimes(2);
+  });
+
+  it("reveals a source: loads every level down to it and opens the folders", async () => {
+    const c = connect({});
+    (c.http.treeReveal as ReturnType<typeof vi.fn>).mockResolvedValue({
+      levels: [
+        levelOf("", [], [{ name: "data", key: "data" }]),
+        levelOf("data", [], [FOLDER]),
+        levelOf("data/plate", [INSIDE]),
+      ],
+      descriptor: INSIDE,
     });
-    useAppStore.getState().startCatalogPolling();
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(useAppStore.getState().catalogTruncated).toBe(false);
+    expect(await useAppStore.getState().revealSource("inside")).toBe(true);
+    const state = useAppStore.getState();
+    expect([...state.openFolders].sort()).toEqual(["data", "data/plate"]);
+    expect(Object.keys(state.treeLevels).sort()).toEqual(["", "data", "data/plate"]);
+    expect(state.sourceIndex["inside"]).toBe(INSIDE);
+  });
+
+  it("says no when the server does not show the source", async () => {
+    const c = connect({});
+    (c.http.treeReveal as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new TensorApiError(404, "Not Found", ""),
+    );
+    expect(await useAppStore.getState().revealSource("nope")).toBe(false);
+  });
+
+  it("swaps a resolved row into its level and the index", () => {
+    useAppStore.setState(loadedTop({ ...SOURCE, is_resolved: false }));
+    useAppStore.getState().applySourceRow(SOURCE);
+    expect(useAppStore.getState().treeLevels[""]!.level.sources[0]!.descriptor).toBe(SOURCE);
+    expect(useAppStore.getState().sourceIndex[SOURCE.source_id]).toBe(SOURCE);
   });
 });
 
@@ -1855,12 +1963,8 @@ describe("the overlay toggle governs the whole annotation surface", () => {
 });
 
 describe("recent sources", () => {
-  const recentClient = (
-    sources: DataSourceDescriptor[],
-    tileInfo: (id: string) => Promise<TileInfo>,
-  ) =>
+  const recentClient = (tileInfo: (id: string) => Promise<TileInfo>) =>
     ({
-      listSourcesPage: vi.fn().mockResolvedValue({ sources, truncated: false }),
       http: {
         readyz: vi.fn().mockResolvedValue({ backend_health: {} }),
         tileInfo: vi.fn(tileInfo),
@@ -1882,8 +1986,8 @@ describe("recent sources", () => {
     // The whole point: a cache:// upload is deliberately never in the catalog
     // (biopb/biopb#265), so /api/sources 404s it and only the registry-backed
     // tile_info can describe it.
-    const client = recentClient([], async () => UPLOAD_INFO);
-    useAppStore.setState({ client, sources: [], recentIds: ["upload_7f3"] });
+    const client = recentClient(async () => UPLOAD_INFO);
+    useAppStore.setState({ client, sourceIndex: {}, recentIds: ["upload_7f3"] });
 
     await useAppStore.getState().hydrateRecents();
 
@@ -1894,8 +1998,8 @@ describe("recent sources", () => {
 
   it("reuses the catalog descriptor instead of a round trip", async () => {
     const tileInfo = vi.fn(async () => UPLOAD_INFO);
-    const client = recentClient([SOURCE], tileInfo);
-    useAppStore.setState({ client, sources: [SOURCE], recentIds: [SOURCE.source_id] });
+    const client = recentClient(tileInfo);
+    useAppStore.setState({ client, sourceIndex: { [SOURCE.source_id]: SOURCE }, recentIds: [SOURCE.source_id] });
 
     await useAppStore.getState().hydrateRecents();
 
@@ -1904,10 +2008,10 @@ describe("recent sources", () => {
   });
 
   it("drops an id the server says is gone", async () => {
-    const client = recentClient([], async () => {
+    const client = recentClient(async () => {
       throw apiError(404);
     });
-    useAppStore.setState({ client, sources: [], recentIds: ["evicted"] });
+    useAppStore.setState({ client, sourceIndex: {}, recentIds: ["evicted"] });
 
     await useAppStore.getState().hydrateRecents();
 
@@ -1918,10 +2022,10 @@ describe("recent sources", () => {
   it("keeps an id the server merely failed to answer for", async () => {
     // A 502 says nothing about the id. Pruning on it would empty the list
     // exactly when the server is down -- when it is most worth keeping.
-    const client = recentClient([], async () => {
+    const client = recentClient(async () => {
       throw apiError(502);
     });
-    useAppStore.setState({ client, sources: [], recentIds: ["upload_7f3"] });
+    useAppStore.setState({ client, sourceIndex: {}, recentIds: ["upload_7f3"] });
 
     await useAppStore.getState().hydrateRecents();
 
@@ -1930,10 +2034,10 @@ describe("recent sources", () => {
   });
 
   it("keeps recency order across both resolution paths", async () => {
-    const client = recentClient([SOURCE], async () => UPLOAD_INFO);
+    const client = recentClient(async () => UPLOAD_INFO);
     useAppStore.setState({
       client,
-      sources: [SOURCE],
+      sourceIndex: { [SOURCE.source_id]: SOURCE },
       recentIds: ["upload_7f3", SOURCE.source_id],
     });
 
@@ -1975,82 +2079,6 @@ describe("recent sources", () => {
   });
 });
 
-describe("catalogFingerprint", () => {
-  const tensor = (over = {}) => ({
-    array_id: "listed",
-    dim_labels: ["y", "x"],
-    shape: [4, 4],
-    dtype: "uint16",
-    ...over,
-  });
-
-  it("is stable across separately-built but equal listings", () => {
-    expect(catalogFingerprint([{ ...SOURCE }])).toBe(
-      catalogFingerprint([{ ...SOURCE }]),
-    );
-  });
-
-  it("changes when a source resolves in place", () => {
-    // The url set is identical here -- the whole point. Before this keyed on
-    // more than urls, a resolve that completed was invisible to the poll.
-    const before = catalogFingerprint([
-      { ...SOURCE, is_resolved: false, tensors: [] },
-    ]);
-    const after = catalogFingerprint([
-      { ...SOURCE, is_resolved: true, tensors: [tensor()] },
-    ]);
-    expect(before).not.toBe(after);
-  });
-
-  it("changes on a field it was never told about", () => {
-    // The point of stringifying the whole descriptor: a field added to
-    // DataSourceDescriptor later is covered without anyone remembering to
-    // extend this, which is how the url-only check went blind.
-    const before = catalogFingerprint([{ ...SOURCE, source_type: "zarr" }]);
-    const after = catalogFingerprint([{ ...SOURCE, source_type: "nd2" }]);
-    expect(before).not.toBe(after);
-  });
-
-  it("changes when a tensor's shape grows", () => {
-    const small = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
-    const grown = catalogFingerprint([
-      { ...SOURCE, tensors: [tensor({ shape: [8, 4, 4] })] },
-    ]);
-    expect(small).not.toBe(grown);
-  });
-
-  it("changes when a source gains a second tensor", () => {
-    const one = catalogFingerprint([{ ...SOURCE, tensors: [tensor()] }]);
-    const two = catalogFingerprint([
-      { ...SOURCE, tensors: [tensor(), tensor({ array_id: "listed/b" })] },
-    ]);
-    expect(one).not.toBe(two);
-  });
-
-  it("does not collide across a field boundary", () => {
-    // Both of these concatenated to "abRD" under the hand-rolled version this
-    // replaced, so a poll could miss a change outright. JSON's own framing is
-    // what makes them distinguishable.
-    expect(
-      catalogFingerprint([{ ...SOURCE, source_id: "a", source_url: "b" }]),
-    ).not.toBe(
-      catalogFingerprint([{ ...SOURCE, source_id: "ab", source_url: "" }]),
-    );
-  });
-
-  it("does not collide across a source boundary", () => {
-    // Same failure one level up: two sources ran together into one string.
-    expect(
-      catalogFingerprint([
-        { ...SOURCE, source_id: "x", source_url: "" },
-        { ...SOURCE, source_id: "y", source_url: "" },
-      ]),
-    ).not.toBe(
-      catalogFingerprint([{ ...SOURCE, source_id: "xRDy", source_url: "" }]),
-    );
-  });
-});
-
 describe("resolve jobs", () => {
   const status = (over: Partial<SourceJobStatus> = {}): SourceJobStatus => ({
     kind: "resolve",
@@ -2065,8 +2093,7 @@ describe("resolve jobs", () => {
 
   const stubClient = (http: Record<string, unknown>) =>
     ({
-      http,
-      listSourcesPage: vi.fn().mockResolvedValue({ sources: [], truncated: false }),
+      http: { ...http, treeLevel: vi.fn().mockResolvedValue({ level: levelOf("", []), etag: "x" }), },
     }) as unknown as TensorFlightClient;
 
   afterEach(() => {
@@ -2121,12 +2148,12 @@ describe("resolve jobs", () => {
     expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe("running");
   });
 
-  it("re-reads the catalog when a resolve lands", async () => {
+  it("re-reads the tree when a resolve lands", async () => {
     // The row still lists the pre-resolve tensors the moment a resolve lands.
-    const listSourcesPage = vi.fn().mockResolvedValue({ sources: [], truncated: false });
+    const treeLevel = vi.fn().mockResolvedValue({ level: levelOf("", []), etag: "x" });
     const client = {
-      listSourcesPage,
       http: {
+        treeLevel,
         startResolve: vi.fn().mockResolvedValue(status()),
         jobStatus: vi.fn().mockResolvedValue(status({ state: "done" })),
       },
@@ -2141,7 +2168,7 @@ describe("resolve jobs", () => {
         ),
       { timeout: 3000 },
     );
-    expect(listSourcesPage).toHaveBeenCalled();
+    expect(treeLevel).toHaveBeenCalled();
   });
 
   describe("opening the source a resolve finished", () => {
@@ -2150,8 +2177,8 @@ describe("resolve jobs", () => {
 
     const resolveClient = (final: SourceJobStatus, first = status()) =>
       ({
-        listSourcesPage: vi.fn().mockResolvedValue({ sources: [], truncated: false }),
         http: {
+          treeLevel: vi.fn().mockResolvedValue({ level: levelOf("", []), etag: "x" }),
           startResolve: vi.fn().mockResolvedValue(first),
           jobStatus: vi.fn().mockResolvedValue(final),
         },

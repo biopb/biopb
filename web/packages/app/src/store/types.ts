@@ -4,10 +4,12 @@ import type { PreferencesSlice } from "./preferences";
 import type { RecentsSlice } from "./recents";
 import type { RuntimeSlice } from "./runtime";
 import type { TargetSlice } from "./target";
+import type { TreeSlice } from "./tree";
 import type { ViewsSlice } from "./views";
 
 /** The whole store: one slice per lifetime, composed in `index.ts`. */
 export type AppState = ConnectionSlice &
+  TreeSlice &
   RecentsSlice &
   JobsSlice &
   PreferencesSlice &

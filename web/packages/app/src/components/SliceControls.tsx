@@ -84,7 +84,7 @@ const VALUE_READOUT: CSSProperties = {
 };
 
 export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
-  const sources = useAppStore((s) => s.sources);
+  const source = useAppStore((s) => s.sourceIndex[sourceId]);
   const tileInfo = useAppStore(selectTileInfo);
   const position = useAppStore((s) => s.position);
   const display = useAppStore((s) => s.display);
@@ -148,8 +148,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // See `sliderGrid`: the live grid bounds the sliders, the catalog is only a
   // fallback for before a viewer has loaded.
   const descriptor = useMemo(
-    () => sliderGrid(tileInfo, sources, sourceId, tensorId),
-    [tileInfo, sources, sourceId, tensorId],
+    () => sliderGrid(tileInfo, source, tensorId),
+    [tileInfo, source, tensorId],
   );
 
   // Not buildAxisMap: its positional fallback would title a TIFF sequence's

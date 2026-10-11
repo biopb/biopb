@@ -88,7 +88,7 @@ export function ResolveModalView({
 
 export function ResolveModal() {
   const sourceJobs = useAppStore((s) => s.sourceJobs);
-  const sources = useAppStore((s) => s.sources);
+  const sourceIndex = useAppStore((s) => s.sourceIndex);
   const cancelSourceJob = useAppStore((s) => s.cancelSourceJob);
   const dismissSourceJob = useAppStore((s) => s.dismissSourceJob);
 
@@ -98,7 +98,7 @@ export function ResolveModal() {
     if (j.kind !== "resolve") return false;
     if (j.state === "error") return true;
     if (j.state !== "running") return false;
-    const src = sources.find((x) => x.source_id === j.source_id);
+    const src = sourceIndex[j.source_id];
     return !src || unresolvedKind(src) === "recall";
   });
   if (!job) return null;

@@ -44,7 +44,7 @@ async function waitForServer(
 
 export function ClientBootstrap() {
   const initClient = useAppStore((s) => s.initClient);
-  const loadSources = useAppStore((s) => s.loadSources);
+  const loadCatalog = useAppStore((s) => s.loadCatalog);
   const startCatalogPolling = useAppStore((s) => s.startCatalogPolling);
   const stopCatalogPolling = useAppStore((s) => s.stopCatalogPolling);
   const initialised = useRef(false);
@@ -85,7 +85,7 @@ export function ClientBootstrap() {
           // Dev mode active - bypass token requirement
           initClient(apiBase, null, true);
           useAppStore.setState({ scanning });
-          await loadSources();
+          await loadCatalog();
           startCatalogPolling();
           return;
         }
@@ -106,7 +106,7 @@ export function ClientBootstrap() {
 
         initClient(apiBase, token, false);
         useAppStore.setState({ scanning });
-        await loadSources();
+        await loadCatalog();
         startCatalogPolling();
       } catch (err) {
         useAppStore.setState({
@@ -116,7 +116,7 @@ export function ClientBootstrap() {
         });
       }
     })();
-  }, [initClient, loadSources, startCatalogPolling, navigate, searchParams, setSearchParams]);
+  }, [initClient, loadCatalog, startCatalogPolling, navigate, searchParams, setSearchParams]);
 
   // Stop polling on unmount
   useEffect(() => {

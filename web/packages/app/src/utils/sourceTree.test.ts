@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
-import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-flight-client";
+import type {
+  DataSourceDescriptor,
+  TensorDescriptor,
+  TreeLevel,
+} from "@biopb/tensor-flight-client";
 import {
   getPathParts,
   groupTensors,
   isEmptySource,
   isUnresolved,
+  lazyTreeNodes,
+  levelNote,
   unresolvedKind,
   recentNode,
   sourceLabel,
@@ -261,5 +267,88 @@ describe("groupTensors", () => {
 
   it("is empty for a source with no tensors", () => {
     expect(groupTensors([])).toEqual([]);
+  });
+});
+
+describe("lazyTreeNodes", () => {
+  const level = (
+    key: string,
+    folders: Array<[string, string]> = [],
+    sources: Array<[string, DataSourceDescriptor]> = [],
+    truncated = false,
+  ): { level: TreeLevel } => ({
+    level: {
+      key,
+      folders: folders.map(([name, k]) => ({ name, key: k })),
+      sources: sources.map(([name, descriptor]) => ({ name, descriptor })),
+      truncated,
+    },
+  });
+  const A = source({ source_id: "a" });
+  const B = source({ source_id: "b" });
+
+  it("lists the top: folders first, then sources, in the server's order", () => {
+    const nodes = lazyTreeNodes(
+      { "": level("", [["lab", "lab"]], [["a.zarr", A]]) },
+      {},
+      new Set(),
+    );
+    expect(nodes.map((n) => [n.type, n.name, n.id, n.depth])).toEqual([
+      ["folder", "lab", "lab", 1],
+      ["source", "a.zarr", "a", 1],
+    ]);
+    expect(nodes[1]!.source).toBe(A);
+  });
+
+  it("gives an open, loaded folder its children one level deeper", () => {
+    const levels = {
+      "": level("", [["lab", "lab"]]),
+      lab: level("lab", [["plate", "lab/plate"]], [["b.zarr", B]]),
+      "lab/plate": level("lab/plate", [], [["a.zarr", A]]),
+    };
+    const [lab] = lazyTreeNodes(levels, {}, new Set(["lab", "lab/plate"]));
+    expect(lab!.children.map((n) => [n.name, n.depth])).toEqual([
+      ["plate", 2],
+      ["b.zarr", 2],
+    ]);
+    expect(lab!.children[0]!.children.map((n) => [n.name, n.depth])).toEqual([["a.zarr", 3]]);
+  });
+
+  it("does not look inside a closed folder, though its level is held", () => {
+    const levels = {
+      "": level("", [["lab", "lab"]]),
+      lab: level("lab", [], [["b.zarr", B]]),
+    };
+    const [lab] = lazyTreeNodes(levels, {}, new Set());
+    expect(lab!.children).toEqual([]);
+    expect(lab!.note).toBeUndefined();
+  });
+
+  it("notes an open folder that is loading, failed, or cut short", () => {
+    const levels = {
+      "": level("", [
+        ["a", "a"],
+        ["b", "b"],
+        ["c", "c"],
+      ]),
+      c: level("c", [], [], true),
+    };
+    const nodes = lazyTreeNodes(levels, { a: "loading", b: "error" }, new Set(["a", "b", "c"]));
+    expect(nodes.map((n) => n.note)).toEqual([
+      "Loading…",
+      "Could not load this folder",
+      "Only part of this folder is shown - search to find the rest",
+    ]);
+  });
+
+  it("is empty before the top has loaded", () => {
+    expect(lazyTreeNodes({}, {}, new Set())).toEqual([]);
+  });
+});
+
+describe("levelNote", () => {
+  it("says nothing of a level that read fine and is whole", () => {
+    expect(levelNote({ key: "", folders: [], sources: [], truncated: false }, undefined)).toBeUndefined();
+    expect(levelNote(undefined, undefined)).toBeUndefined();
   });
 });

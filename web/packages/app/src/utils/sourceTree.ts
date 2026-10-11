@@ -6,7 +6,11 @@
 // and what belongs under "Recent", both have answers worth pinning.
 
 import { splitLabelArrayId } from "@biopb/tensor-flight-client";
-import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-flight-client";
+import type {
+  DataSourceDescriptor,
+  TensorDescriptor,
+  TreeLevel,
+} from "@biopb/tensor-flight-client";
 
 // Origin scheme the tensor server stamps on a drag-dropped source's source_url
 // (server-side DND_URL_PREFIX). Display-only marker of drop provenance; the tree
@@ -32,6 +36,61 @@ export interface TreeNode {
   children: TreeNode[];
   source?: DataSourceDescriptor;  // only for source nodes
   depth: number;
+  /** A line shown under an open folder: it is loading, failed, or is cut short. */
+  note?: string;
+}
+
+/** Shown under a folder the server holds more of than it sent. */
+export const FOLDER_CUT_NOTE = "Only part of this folder is shown - search to find the rest";
+
+/** The note under a folder, from how reading it went. */
+export function levelNote(
+  level: TreeLevel | undefined,
+  status: "loading" | "error" | undefined,
+): string | undefined {
+  if (status === "loading") return "Loading…";
+  if (status === "error") return "Could not load this folder";
+  return level?.truncated ? FOLDER_CUT_NOTE : undefined;
+}
+
+/**
+ * The tree the levels read so far describe, as far as it is open.
+ *
+ * Only an open folder with a loaded level gets children, so the work follows
+ * what is on screen. The order is the server's: folders, then sources, each by
+ * name. A folder's id is its key, which is also what opens it.
+ */
+export function lazyTreeNodes(
+  levels: Readonly<Record<string, { level: TreeLevel }>>,
+  status: Readonly<Record<string, "loading" | "error">>,
+  open: ReadonlySet<string>,
+  key = "",
+  depth = 1,
+): TreeNode[] {
+  const level = levels[key]?.level;
+  if (!level) return [];
+  const folders = level.folders.map((f): TreeNode => {
+    const isOpen = open.has(f.key);
+    return {
+      id: f.key,
+      name: f.name,
+      type: "folder",
+      depth,
+      children: isOpen ? lazyTreeNodes(levels, status, open, f.key, depth + 1) : [],
+      note: isOpen ? levelNote(levels[f.key]?.level, status[f.key]) : undefined,
+    };
+  });
+  const sources = level.sources.map(
+    (s): TreeNode => ({
+      id: s.descriptor.source_id,
+      name: s.name,
+      type: "source",
+      children: [],
+      source: s.descriptor,
+      depth,
+    }),
+  );
+  return [...folders, ...sources];
 }
 
 export function getPathParts(url: string): string[] {

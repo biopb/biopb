@@ -12,6 +12,8 @@ Endpoints (token required):
   GET  /api/diagnostics              — runtime diagnostics
   GET  /api/sources[?limit=N]        — list the catalog's source rows (X-Truncated)
   POST /api/sources/query            — SQL query against source metadata
+  GET  /api/tree[?key=&limit=]       — one level of the source tree (ETag)
+  GET  /api/tree/reveal?source_id=   — every level down to one source
   GET  /api/sources/{source_id}/metadata          — parsed source metadata
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
   GET  /api/tile_info/{array_id}     — tile grid, pyramid levels + volume plan
@@ -2027,6 +2029,312 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
     except Exception as exc:
         ctx.diag.mark_error("QUERY_SOURCES_FAILED", str(exc))
         logger.error(f"query_sources failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail=f"Flight error: {type(exc).__name__}"
+        )
+
+
+# -- Tree (lazy folder levels) ----------------------------------------------
+
+# Where a url sits in the tree, from ``source_url`` alone. The same rules as the
+# browser's ``getPathParts``:
+#   dnd://rest            -> rest, backslashes as '/'
+#   scheme://host/path    -> the endpoint "scheme://host" as one first node,
+#                            then path; an empty host (file:///p) is just path
+#   anything else         -> the string itself
+# then empty segments are dropped ('//', leading and trailing '/').
+#
+# In SQL the segments are joined with chr(1), not '/': no segment contains it,
+# and byte order of the joined strings is then component order (with '/', the
+# paths ``ord/a-b/q`` and ``ord/a/r`` sort against the components). The
+# endpoint's "://" is chr(2) so it is one segment; ``_dec`` spells it back. A row
+# with no path is "".
+#
+# Plain string operations, no lists or regex: this runs on every row of a level
+# that has no selective prefix, and a lambda over a list per row cost five times
+# what these do on a catalog of 600k. ``file:///`` is the common case and goes
+# first, so the other branches only run on the rows that are not.
+_TREE_BODY_SQL = (
+    "CASE WHEN starts_with(source_url, 'file:///') THEN substr(source_url, 9)"
+    " WHEN starts_with(source_url, 'dnd://')"
+    " THEN replace(substr(source_url, 7), chr(92), '/')"
+    " WHEN strpos(source_url, '://') > 1"
+    " AND NOT contains(substr(source_url, 1, strpos(source_url, '://') - 1), '/')"
+    " THEN CASE WHEN split_part("
+    "substr(source_url, strpos(source_url, '://') + 3), '/', 1) = ''"
+    " THEN substr(source_url, strpos(source_url, '://') + 3)"
+    " ELSE substr(source_url, 1, strpos(source_url, '://') - 1) || chr(2)"
+    " || substr(source_url, strpos(source_url, '://') + 3) END"
+    " ELSE source_url END"
+)
+# Runs of '/' collapsed (twice covers runs of up to four) and the ends trimmed,
+# each only on the rows that need it: an untouched string costs a check, a
+# rewritten one a copy.
+_TREE_COLLAPSE_SQL = (
+    "(CASE WHEN contains(b, '//') THEN replace(replace(b, '//', '/'), '//', '/')"
+    " ELSE b END)"
+)
+_TREE_TRIMMED_SQL = (
+    f"(CASE WHEN starts_with({_TREE_COLLAPSE_SQL}, '/')"
+    f" OR ends_with({_TREE_COLLAPSE_SQL}, '/')"
+    f" THEN trim({_TREE_COLLAPSE_SQL}, '/') ELSE {_TREE_COLLAPSE_SQL} END)"
+)
+_TREE_PATH_SQL = f"replace({_TREE_TRIMMED_SQL}, '/', chr(1))"
+# A source shows unless it is resolved and holds nothing (the old client's
+# ``isEmptySource``). An unresolved one has an empty list because it is not read
+# yet, not because it is empty, and still needs its row to be resolved from.
+_TREE_VISIBLE_SQL = "(NOT is_resolved OR len(tensors) > 0)"
+_TREE_LIMIT = 2000
+_ENDPOINT_MARK = "\x02"
+_SEP = "\x01"
+
+
+def _enc(text: str) -> str:
+    return text.replace("://", _ENDPOINT_MARK)
+
+
+def _dec(text: str) -> str:
+    return text.replace(_ENDPOINT_MARK, "://").replace(_SEP, "/")
+
+
+def _segments(key: str) -> List[str]:
+    """The segments of folder *key* in SQL's spelling ("" is the top: none)."""
+    return _enc(key).split("/") if key else []
+
+
+def _seg_sql(seg: str) -> str:
+    """Folder segment *seg* as a SQL expression, with the endpoint mark spelled
+    as ``chr(2)`` rather than carried in the text."""
+    if _ENDPOINT_MARK in seg:
+        return f"replace({sql_literal(_dec(seg))}, '://', chr(2))"
+    return sql_literal(seg)
+
+
+def _tree_rows_sql(select: str, key: str, tail: str) -> str:
+    """``select`` over the visible sources under *key*, as ``p`` with each row's
+    path below the folder as ``rest``, then *tail*.
+
+    Every segment of *key* must appear in a row's url, so ``contains`` on each
+    drops most of a catalog before any path is built; the exact prefix test then
+    runs on what is left.
+    """
+    segs = _segments(key)
+    near = "".join(
+        f" AND contains(source_url, {sql_literal(_dec(seg))})"
+        for seg in dict.fromkeys(segs)
+    )
+    if segs:
+        prefix = " || chr(1) || ".join(_seg_sql(s) for s in segs) + " || chr(1)"
+        k = sum(len(s) + 1 for s in segs) + 1
+        below = (
+            f" p AS (SELECT * EXCLUDE (path), substr(path, {k}) AS rest FROM u"
+            f" WHERE starts_with(path, {prefix}))"
+        )
+    else:
+        below = " p AS (SELECT * EXCLUDE (path), path AS rest FROM u)"
+    return (
+        f"WITH t AS (SELECT {select}, {_TREE_BODY_SQL} AS b FROM sources"
+        f" WHERE {_TREE_VISIBLE_SQL}{near}),"
+        f" u AS (SELECT * EXCLUDE (b), {_TREE_PATH_SQL} AS path FROM t),"
+        f"{below} {tail}"
+    )
+
+
+def _chain(lo: str, hi: str) -> List[str]:
+    """The folder chain a group of rows shares, from its least and greatest path
+    (the common prefix of a set of strings is that of its min and max).
+
+    A path that is itself the whole common prefix is a source sitting in the
+    folder before it, so its own name is not part of the chain.
+    """
+    a, b = lo.split(_SEP), hi.split(_SEP)
+    chain = []
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        chain.append(x)
+    if len(chain) == len(a) or len(chain) == len(b):
+        chain.pop()
+    return chain
+
+
+def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, Any]:
+    """The direct children of folder *key* ("" is the top): its folders, and the
+    sources sitting in it with their listing descriptors.
+
+    Single-child folder chains are merged into one folder. Everything the routes
+    need from the catalog is here, so the query can move server-side without
+    touching them. Folders come first and share *limit* with the sources.
+    """
+    # One pass answers both halves: a row per first segment that holds a folder,
+    # and a grand-total row counting the sources sitting directly in this folder,
+    # so the second pass (the sources) runs only where there are any. The total
+    # sorts first so a limit cannot cut it off.
+    folder_table = client.query(
+        _tree_rows_sql(
+            "source_id",
+            key,
+            "SELECT seg, min(rest) FILTER (WHERE contains(rest, chr(1))) AS lo,"
+            " max(rest) FILTER (WHERE contains(rest, chr(1))) AS hi,"
+            " count(*) FILTER (WHERE NOT contains(rest, chr(1))) AS direct,"
+            " grouping(seg) AS total"
+            " FROM (SELECT split_part(rest, chr(1), 1) AS seg, rest FROM p)"
+            " GROUP BY GROUPING SETS ((seg), ())"
+            " HAVING grouping(seg) = 1"
+            " OR count(*) FILTER (WHERE contains(rest, chr(1))) > 0"
+            f" ORDER BY total DESC, seg LIMIT {limit + 2}",
+        )
+    )
+    rows_all = folder_table.to_pylist()
+    direct = sum(r["direct"] for r in rows_all if r["total"])
+    folder_rows = [r for r in rows_all if not r["total"]]
+    _, _, truncated = _truncation(folder_table, len(rows_all))
+    folders = []
+    for row in folder_rows[:limit]:
+        name = "/".join(_chain(row["lo"], row["hi"]))
+        folders.append(
+            {"name": _dec(name), "key": _dec(f"{_enc(key)}/{name}" if key else name)}
+        )
+    folders.sort(key=lambda f: f["name"].encode("utf-8"))
+    sources: List[Dict[str, Any]] = []
+    if len(folder_rows) > limit:
+        truncated = True
+    elif direct:
+        budget = limit - len(folders)
+        source_table = client.query(
+            _tree_rows_sql(
+                client.source_row_columns(),
+                key,
+                "SELECT * EXCLUDE (rest), CASE WHEN rest = '' THEN source_id"
+                " ELSE rest END AS name FROM p WHERE NOT contains(rest, chr(1))"
+                f" ORDER BY name, source_id LIMIT {budget + 1}",
+            )
+        )
+        rows = source_table.to_pylist()
+        truncated = truncated or _truncation(source_table, len(rows))[2]
+        if len(rows) > budget:
+            rows, truncated = rows[:budget], True
+        if rows:
+            ids = ", ".join(sql_literal(r["source_id"]) for r in rows)
+            _add_unresolved_reasons(client, rows, f"AND source_id IN ({ids})")
+        sources = [
+            {"name": _dec(row["name"]), "descriptor": _source_row_to_dict(row)}
+            for row in rows
+        ]
+    return {
+        "key": key,
+        "folders": folders,
+        "sources": sources,
+        "truncated": truncated,
+    }
+
+
+def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, Any]]:
+    """Every level from the top down to the one holding *source_id*, with its
+    descriptor; ``None`` when the catalog has no such (visible) source."""
+    found = client.query(
+        f"WITH t AS (SELECT {client.source_row_columns()}, {_TREE_BODY_SQL} AS b"
+        f" FROM sources WHERE source_id = {sql_literal(source_id)}"
+        f" AND {_TREE_VISIBLE_SQL}) SELECT * EXCLUDE (b), {_TREE_PATH_SQL} AS tp FROM t"
+    ).to_pylist()
+    if not found:
+        return None
+    _add_unresolved_reasons(client, found, f"AND source_id = {sql_literal(source_id)}")
+    tp = found[0]["tp"].replace(_SEP, "/")
+    levels = []
+    key = ""
+    while True:
+        level = _tree_level(client, key, limit)
+        levels.append(level)
+        if any(s["descriptor"]["source_id"] == source_id for s in level["sources"]):
+            break
+        below = next(
+            (f for f in level["folders"] if tp.startswith(_enc(f["key"]) + "/")),
+            None,
+        )
+        # A level cut by its limit may have lost the way down: stop there; the
+        # descriptor is still returned.
+        if below is None:
+            break
+        key = below["key"]
+    return {"levels": levels, "descriptor": _source_row_to_dict(found[0])}
+
+
+def _json_bytes(content: Any) -> bytes:
+    """Deterministic JSON: the same content is the same bytes, hence ETag."""
+    return json.dumps(
+        content, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _etag_response(request: Request, body: bytes) -> Response:
+    """*body* under a strong ETag of its bytes; 304 for a caller holding it."""
+    etag = '"' + hashlib.sha1(body).hexdigest() + '"'
+    held = [t.strip() for t in request.headers.get("if-none-match", "").split(",")]
+    if etag in held or "*" in held:
+        return Response(status_code=304, headers={"ETag": etag})
+    return Response(body, media_type="application/json", headers={"ETag": etag})
+
+
+@_router.get("/api/tree")
+async def get_tree(
+    request: Request,
+    key: str = Query(""),
+    limit: int = Query(_TREE_LIMIT, ge=1),
+) -> Response:
+    """One level of the source tree: the folders and sources directly under *key*.
+
+    ``{key, folders: [{name, key}], sources: [{name, descriptor}], truncated}``,
+    folders first, each byte-ordered by name. ``limit`` bounds folders and
+    sources together; ``truncated`` says that it or the server's own row cap cut
+    the level. The body is hashed into an ``ETag``, so a client revalidates a
+    level it holds with ``If-None-Match``.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    t0 = time.monotonic()
+    try:
+        client = ctx.get_client()
+
+        def build() -> bytes:
+            return _json_bytes(_tree_level(client, key, limit))
+
+        body = await run_in_threadpool(build)
+        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
+        return _etag_response(request, body)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("TREE_FAILED", str(exc))
+        logger.error(f"get_tree failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail=f"Flight error: {type(exc).__name__}"
+        )
+
+
+@_router.get("/api/tree/reveal")
+async def reveal_in_tree(
+    request: Request,
+    source_id: str = Query(...),
+    limit: int = Query(_TREE_LIMIT, ge=1),
+) -> Response:
+    """Every level from the top down to the one holding *source_id*, in one
+    request: ``{levels: [<level>...], descriptor}``."""
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    t0 = time.monotonic()
+    try:
+        client = ctx.get_client()
+        revealed = await run_in_threadpool(_tree_reveal, client, source_id, limit)
+        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
+        if revealed is None:
+            raise HTTPException(status_code=404, detail=f"No such source: {source_id}")
+        return _etag_response(request, _json_bytes(revealed))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("TREE_FAILED", str(exc))
+        logger.error(f"reveal_in_tree failed: {exc}")
         raise HTTPException(
             status_code=502, detail=f"Flight error: {type(exc).__name__}"
         )

@@ -62,6 +62,8 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
 | `GET` | `/api/sources` | ✓ | JSON array of the catalog's source rows (`source_id`, `source_url`, `source_type`, `is_resolved`, `tensors`, and `unresolved_reason` when the server has it), ordered by `source_id`. `?limit=N` caps the rows; `X-Truncated` says whether the listing is short of the catalog (by `limit` or by the server's own row cap) |
+| `GET` | `/api/tree` | ✓ | One level of the source tree: `?key=` (a folder's key, `""` is the top) and `?limit=` (default 2000, folders and sources together). `{key, folders: [{name, key}], sources: [{name, descriptor}], truncated}`; carries an `ETag` and honours `If-None-Match` |
+| `GET` | `/api/tree/reveal` | ✓ | `?source_id=`: `{levels: [<level>…], descriptor}`, every level from the top down to the one holding the source; 404 if it is unknown or hidden |
 | `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed source metadata |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
@@ -98,6 +100,20 @@ row cap — a source past that cap has no entry on `/api/sources` but is found
 there. The catalog is public: a token-protected source is listed too (the token
 gates its pixels), but a `cache:` upload has no catalog row at all — reach one
 through `/api/tile_info/{array_id}`.
+
+**The tree is built per level.** A source's place comes from its `source_url`
+alone: `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
+roots at the endpoint `scheme://host` (an empty host, as in `file:///`, is just
+the path), anything else is the string itself; empty segments are dropped. A
+source with no path sits at the top, named by its `source_id`. A level lists
+the folders directly under `key` and the sources directly in it, each by byte
+order of `name`; a chain of single-child folders is one folder
+(`chain/one/two`), which ends where a source sits or the chain forks. A
+folder's `key` is its full path and is what `?key=` takes. A resolved source
+with no tensor is hidden; an unresolved one is shown, since it is read when
+opened. `descriptor` is a row of
+`/api/sources`. `truncated` says that `limit` or the server's row cap cut the
+level. The query lives behind `_tree_level` and reads only the `sources` view.
 
 ### ROI annotations
 

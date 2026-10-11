@@ -447,13 +447,11 @@ export interface SliderGrid {
  */
 export function sliderGrid(
   tileInfo: TileInfo | null,
-  sources: DataSourceDescriptor[],
-  sourceId: string,
+  source: DataSourceDescriptor | undefined,
   tensorId: string,
 ): SliderGrid | null {
   if (tileInfo) return tileInfo;
-  const src = sources.find((s) => s.source_id === sourceId);
-  return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
+  return source?.tensors.find((t) => t.array_id === tensorId) ?? null;
 }
 
 

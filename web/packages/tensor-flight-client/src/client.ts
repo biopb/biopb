@@ -7,7 +7,7 @@
  *
  * Usage:
  *   const client = new TensorHttpClient("http://localhost:8816", token);
- *   const { sources } = await client.listSourcesPage(20000);
+ *   const { level } = await client.treeLevel("", 2000);
  *   const arr = await client.slice({ array_id: "my-source/tensor-0", ... });
  */
 
@@ -20,12 +20,14 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
-  SourceListing,
   SourceJobStatus,
   SliceRequest,
   TileInfo,
   TileRequest,
   TileResult,
+  TreeLevel,
+  TreeLevelResult,
+  TreeReveal,
   TypedNdArray,
 } from "./types.js";
 import type {
@@ -406,20 +408,37 @@ export class TensorHttpClient {
   // -------------------------------------------------------------------------
 
   /**
-   * List at most `limit` data sources, and whether that cut the catalog short.
-   * The server's own cap can cut a listing too, so `truncated` is the server's
-   * word, not a comparison against `limit`.
+   * One level of the catalog tree: the direct children of the folder `key` ("" is
+   * the top). `truncated` is the server's word that the folder holds more than
+   * `limit`.
+   *
+   * `cache: "no-cache"` has the browser revalidate with the last etag, so an
+   * unchanged level costs a 304 on the wire; callers compare `etag` to tell
+   * whether it changed.
    */
-  async listSourcesPage(limit: number, opts?: RequestOptions): Promise<SourceListing> {
+  async treeLevel(key: string, limit: number, opts?: RequestOptions): Promise<TreeLevelResult> {
     return this.send(
-      `/api/sources?limit=${limit}`,
-      { headers: this.headers() },
+      `/api/tree?key=${encodeURIComponent(key)}&limit=${limit}`,
+      { headers: this.headers(), cache: "no-cache" },
       this.metadataTimeoutMs,
       opts,
       async (res) => ({
-        sources: (await res.json()) as DataSourceDescriptor[],
-        truncated: res.headers.get("X-Truncated") === "true",
+        level: (await res.json()) as TreeLevel,
+        etag: res.headers.get("ETag"),
       }),
+    );
+  }
+
+  /**
+   * The levels from the top down to the one holding `sourceId`, in one request.
+   * Rejects with a 404 `TensorApiError` for a source the tree does not show.
+   */
+  async treeReveal(sourceId: string, opts?: RequestOptions): Promise<TreeReveal> {
+    return this.fetchJson<TreeReveal>(
+      `/api/tree/reveal?source_id=${encodeURIComponent(sourceId)}`,
+      undefined,
+      this.metadataTimeoutMs,
+      opts,
     );
   }
 
