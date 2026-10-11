@@ -229,7 +229,7 @@ write and every state transition are full access like every other mutation.
 ### The SPA
 
 The web viewer needs no dedicated route and no new wire field. A set is an
-ordinary tensor, listed by `/api/sources` and read through
+ordinary tensor, listed by `/api/tree` and read through
 `/api/tile_info` + `/api/tile` like any other; the browser adds three things.
 
 **The path is what says a tensor is a set.** There is no `role` column, and a

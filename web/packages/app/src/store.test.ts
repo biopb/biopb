@@ -2044,7 +2044,7 @@ describe("recent sources", () => {
 
   it("rebuilds an unlisted id from tile_info, which the catalog cannot answer", async () => {
     // The whole point: a cache:// upload is deliberately never in the catalog
-    // (biopb/biopb#265), so /api/sources 404s it and only the registry-backed
+    // (biopb/biopb#265), so /api/tree/reveal 404s it and only the registry-backed
     // tile_info can describe it.
     const client = recentClient(async () => UPLOAD_INFO);
     useAppStore.setState({ client, sourceIndex: {}, recentIds: ["upload_7f3"] });

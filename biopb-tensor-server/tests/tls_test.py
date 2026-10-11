@@ -366,9 +366,9 @@ def test_sidecar_reads_over_tls_without_pinning(
             tls_fingerprint=cert_fingerprint(cert_pem),
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
-            resp = tc.get("/api/sources")
+            resp = tc.get("/api/tree/reveal", params={"source_id": "img"})
             assert resp.status_code == 200
-            assert any(s["source_id"] == "img" for s in resp.json())
+            assert resp.json()["descriptor"]["source_id"] == "img"
 
         assert not tls_known_hosts().exists(), (
             "the sidecar holds the cert already -- it must not TOFU-pin it"
@@ -418,9 +418,9 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
             tls_fingerprint=cert_fingerprint(cert_pem),
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
-            resp = tc.get("/api/sources")
+            resp = tc.get("/api/tree/reveal", params={"source_id": "img"})
             assert resp.status_code == 200, resp.text
-            assert any(s["source_id"] == "img" for s in resp.json())
+            assert resp.json()["descriptor"]["source_id"] == "img"
 
         assert not tls_known_hosts().exists(), (
             "verified-first-use, not TOFU: nothing may be pinned"
@@ -468,7 +468,7 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
             tls_fingerprint=cert_fingerprint(other),
         )
         with TestClient(app, raise_server_exceptions=False) as tc:
-            assert tc.get("/api/sources").status_code >= 500
+            assert tc.get("/api/tree").status_code >= 500
     finally:
         clear_pin_cache()
         server.shutdown()
@@ -555,7 +555,7 @@ def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     try:
         app = create_app(flight_location=f"grpc://localhost:{server.port}", token=None)
         with TestClient(app, raise_server_exceptions=True) as tc:
-            assert tc.get("/api/sources").status_code == 502
+            assert tc.get("/api/tree").status_code == 502
     finally:
         server.shutdown()
 
