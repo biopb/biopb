@@ -66,7 +66,7 @@ def test_synthetic_source_reads_back_its_pixels(
         SourceConfig(url=path, type=source_type, source_id="synthetic")
     )
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == n_scenes
     assert list(descriptors[0].shape) == list(expected.shape)
     assert descriptors[0].dtype == expected.dtype.str
@@ -89,7 +89,7 @@ def test_synthetic_source_reads_an_interior_crop(
     source = adapter_cls.create_from_config(
         SourceConfig(url=path, type=source_type, source_id="synthetic")
     )
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     scene = source.get_tensor_adapter(descriptors[0].array_id)
 
     # Last plane of the last channel, cropped away from the origin in Y and X.

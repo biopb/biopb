@@ -155,7 +155,7 @@ class TestNiftiAdapterClose:
             adapter = NiftiAdapter(nib.load(str(nii_path)), "s")
             adapter.close()
             with pytest.raises(RuntimeError, match="closed"):
-                adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[8, 8, 4]))
+                adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
 
     def test_close_leaves_a_local_source_file_alone(self):
         import nibabel as nib
@@ -241,7 +241,7 @@ class TestNiftiAdapter:
             img = nib.load(str(nii_path))
             adapter = NiftiAdapter(img, "test_source")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
 
             assert metadata["format"] == "nifti"
             assert "spatial" in metadata
@@ -264,7 +264,7 @@ class TestNiftiAdapter:
             img = nib.load(str(nii_path))
             adapter = NiftiAdapter(img, "test_source")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
 
             assert metadata["spatial"]["voxel_size_mm"] == [1.5, 1.5, 2.0]
             assert metadata["spatial"]["units"] == "mm"
@@ -311,7 +311,7 @@ class TestNiftiAdapter:
             img = nib.load(str(nii_path))
             adapter = NiftiAdapter(img, "test_source")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
             assert metadata["header"]["intent"] == "label"
 
 
@@ -353,7 +353,7 @@ class TestNiftiAdapterIntegration:
             img = nib.load(str(nii_path))
             adapter = NiftiAdapter(img, "test_source")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
 
             assert "header" in metadata
             assert metadata["header"]["cal_min"] == 0.0

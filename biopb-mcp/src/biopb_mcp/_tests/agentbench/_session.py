@@ -1,6 +1,6 @@
 """A real biopb-mcp session, brought up and driven from synchronous test code.
 
-`_tests/bench/README.md`: a real shim-spawned session child, a
+`_tests/bench/README.md`: a real session child, a
 real IPython kernel, a real napari viewer, real dask — and the nine real tools
 reached over real MCP. Nothing here stands in for the runtime. That is the
 whole point: a hand-written tool surface would put `execute_code`'s return
@@ -46,9 +46,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -232,6 +236,67 @@ def staged_package() -> Path:
 #: How long bring-up may take. The kernel imports napari and spins dask, which
 #: is seconds on a warm machine and much worse on a cold one.
 SPAWN_TIMEOUT = 120.0
+
+
+def _spawn_session(scratch: Path, timeout: float):
+    """A session child on a dynamic port, started the way the control starts
+    one: it registers itself, and is recognised by a per-launch token.
+
+    Returns ``(process, mcp_url, session_id)``. Inherits this process's
+    environment, which is the point: the staged wheel, the tripwire and the
+    redirected config all reach the session and its kernel through it.
+    """
+    from biopb._config import locations as _locations
+    from biopb._lifecycle import sessions as _sessions
+
+    token = secrets.token_hex(8)
+    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: token}
+    log = open(scratch / "session.log", "wb")  # noqa: SIM115 - closed below
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "biopb_mcp.mcp",
+                "--transport",
+                "http",
+                "--port",
+                "0",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+    finally:
+        log.close()  # the child holds its own duplicate
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for rec in _sessions.list_sessions():
+            if rec.get(_locations.LAUNCH_TOKEN_FIELD) == token:
+                return proc, rec["mcp_url"], rec["session_id"]
+        if proc.poll() is not None:
+            raise SessionUnavailable(
+                f"the session exited ({proc.returncode}) before registering; "
+                f"see {scratch / 'session.log'}"
+            )
+        time.sleep(0.25)
+    proc.terminate()
+    raise SessionUnavailable(f"the session did not register within {timeout:.0f}s")
+
+
+def _stop_session(proc, session_id: str) -> None:
+    """End the session child and its kernel, and drop its record."""
+    from biopb._lifecycle import sessions as _sessions
+
+    proc.terminate()  # the session's own SIGTERM handler reaps its kernel
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    _sessions.unregister(session_id)
+
+
 KERNEL_TIMEOUT = 300.0
 CALL_TIMEOUT = 300.0
 
@@ -693,7 +758,7 @@ class _FakeControlAlgorithms:
         return server
 
     def publish(self) -> None:
-        """Write the control runtime record so ``biopb.algorithms()``
+        """Write the control runtime record so ``biopb._control.algorithms()``
         finds this fake control the same way it would a real one."""
         from biopb._control._endpoints import write_runtime_record
 
@@ -773,9 +838,6 @@ def live_session(
     if reason := why_unavailable():
         raise SessionUnavailable(reason)
 
-    from biopb_mcp._config import load_config
-    from biopb_mcp.mcp import _shim
-
     scratch = Path(tempfile.mkdtemp(prefix="biopb-skill-session-"))
     _write_config(scratch / "config", docs_enabled=docs_enabled)
 
@@ -839,9 +901,7 @@ def live_session(
             # to be discoverable from the first `GET /api/algorithms`.
             fake_control = _FakeControlAlgorithms(algorithms)
             fake_control.publish()
-        child, url, session_id = _shim.spawn_session(
-            load_config(), timeout=SPAWN_TIMEOUT
-        )
+        child, url, session_id = _spawn_session(scratch, SPAWN_TIMEOUT)
         loop = _LoopThread()
         session, init, tools, stop = _connect(loop, url)
         live = LiveSession(
@@ -879,7 +939,7 @@ def live_session(
             except Exception:  # noqa: BLE001 - teardown must not mask a failure
                 pass
         if child is not None:
-            _shim._reap_session(child, session_id)
+            _stop_session(child, session_id)
         if fake_control is not None:
             fake_control.close()
         for key, value in saved.items():

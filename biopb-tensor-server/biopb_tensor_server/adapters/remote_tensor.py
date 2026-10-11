@@ -16,7 +16,7 @@ OPAQUE: a served chunk_id is a **proxy envelope** (``chunk.encode_proxy_envelope
 wrapping the upstream chunk_id byte-for-byte, plus a local route and the upstream's
 content_version. A later ``do_get`` peels the envelope and forwards the inner
 VERBATIM -- no decode, no rewrite of the upstream id (biopb/biopb#178 W1). The
-upstream array_id is read once at flight-info time only to build the local route.
+local route is the tensor the plan is for.
 
 This module is the adapter and its data path, constructible directly (and via
 ``create_from_config`` for the single-source
@@ -29,17 +29,29 @@ the registered ``source_id`` and the collision check live in
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb._tls_material import (
+from biopb._security.tls_material import (
     TlsMaterialError,
     choose_anchor,
     expand_user_path,
@@ -52,27 +64,42 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     TensorReadPlan,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
-    array_id_from_chunk_id,
     cache_key_for_chunk_id,
     current_epoch,
     encode_chunk_id,
     encode_proxy_envelope,
+    encode_proxy_identity,
+    envelope_inner_is_ticket,
+    expand_identity,
     is_proxy_envelope,
     peel_proxy_envelope,
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
-from biopb_tensor_server.core.read_mask import LOCAL_ONLY, read_mask
+from biopb_tensor_server.core.labels import split_label_field
+from biopb_tensor_server.core.read_mask import (
+    LOCAL_ONLY,
+    PYRAMID,
+    TICKET_STUB,
+    read_mask,
+)
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -134,6 +161,37 @@ _CLIENT_POOL: Dict[Tuple[str, UpstreamCredentials], Any] = {}
 _CLIENT_POOL_LOCK = threading.Lock()
 
 
+def open_upstream_client(location: str, credentials: UpstreamCredentials):
+    """A new ``TensorFlightClient`` for *location* under *credentials*.
+
+    The one place the credential fields reach the client, so the pooled adapter
+    connections and the direct catalog fetches dial with the same token and
+    trust anchor.
+    """
+    from biopb.tensor import TensorFlightClient
+
+    return TensorFlightClient(
+        location,
+        cache_bytes=0,
+        token=credentials.token,
+        tls_ca_pem=credentials.tls_ca_pem,
+        tls_fingerprint=credentials.tls_fingerprint,
+    )
+
+
+def close_upstream_client(client) -> None:
+    """Close *client*, never raising.
+
+    An exception here would replace whatever is propagating out of the caller's
+    ``try`` body -- and a broken channel is exactly when both an upstream failure
+    and a failing ``close()`` happen together (biopb/biopb#529).
+    """
+    try:
+        client.close()
+    except Exception:
+        logger.debug("error closing upstream client", exc_info=True)
+
+
 def _pooled_upstream_client(location: str, credentials: UpstreamCredentials):
     """Return the shared ``TensorFlightClient`` for ``(location, credentials)``.
 
@@ -146,15 +204,7 @@ def _pooled_upstream_client(location: str, credentials: UpstreamCredentials):
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.get(key)
         if client is None:
-            from biopb.tensor import TensorFlightClient
-
-            client = TensorFlightClient(
-                location,
-                cache_bytes=0,
-                token=credentials.token,
-                tls_ca_pem=credentials.tls_ca_pem,
-                tls_fingerprint=credentials.tls_fingerprint,
-            )
+            client = open_upstream_client(location, credentials)
             _CLIENT_POOL[key] = client
         return client
 
@@ -173,10 +223,7 @@ def _evict_pooled_upstream_client(
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.pop(key, None)
     if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
+        close_upstream_client(client)
 
 
 def _clear_client_pool() -> None:
@@ -185,10 +232,7 @@ def _clear_client_pool() -> None:
         clients = list(_CLIENT_POOL.values())
         _CLIENT_POOL.clear()
     for client in clients:
-        try:
-            client.close()
-        except Exception:
-            pass
+        close_upstream_client(client)
 
 
 def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
@@ -205,12 +249,24 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
+def is_bare_host_upstream_url(url: str) -> bool:
+    """True for a bare-host ``grpc://host:port`` tensor-server URL (no ``/<id>``).
+
+    Only the bare-host "mirror everything" form has an upstream catalog to re-list;
+    ``grpc://host:port/<id>`` names exactly one source and is registered directly.
+    """
+    return (
+        url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+        and _split_grpc_url(url)[1] is None
+    )
+
+
 def mirrorable_upstream_id(source_id: str) -> bool:
     """Whether an upstream source is one this server mirrors.
 
     Everything but the upstream's **scratch** source, for either of two
     reasons. Its id is fixed, so a lone upstream with no alias -- which keeps
-    the verbatim id (``_namespaced_source_id``) -- registers it locally as
+    the verbatim id (``namespaced_source_id``) -- registers it locally as
     ``scratch``, the id this server's own scratch source holds, and
     ``SourceRegistry.register`` overwrites in silence. And everything on it
     carries a deadline set by *that* server's policy, so the mirror would be a
@@ -223,87 +279,242 @@ def mirrorable_upstream_id(source_id: str) -> bool:
     return source_id != SCRATCH_SOURCE_ID
 
 
+#: Rows asked for per catalog page. An upstream caps one query's rows
+#: (``max_query_results``); a page the cap cuts short is detected from the
+#: server's ``truncated`` flag and the next page resumes after its last row.
+CATALOG_PAGE_ROWS = 20000
+
+
+def _query_catalog_pages(
+    client,
+    select: str,
+    *,
+    where: Optional[str] = None,
+    page_rows: Optional[int] = None,
+) -> Iterator[List[dict]]:
+    """Rows of ``select ... FROM sources`` a page at a time, in ``source_id`` order.
+
+    The upstream's query cap truncates a long result silently, and a caller that
+    reconciles against the result would then treat the sources past the cut as
+    gone. So the read is keyset-paged instead: each page is ``LIMIT page_rows``
+    after the last ``source_id`` seen, and the loop ends on a page that is short
+    *and* not flagged ``truncated`` (a cap below ``page_rows`` flags it, and the
+    next page resumes after the rows that did arrive). ``select`` must include
+    ``source_id``.
+    """
+    page_rows = page_rows or CATALOG_PAGE_ROWS
+    last = None
+    while True:
+        conds = [where] if where else []
+        if last is not None:
+            conds.append(f"source_id > {sql_literal(last)}")
+        sql = (
+            f"{select} FROM sources"
+            + (f" WHERE {' AND '.join(conds)}" if conds else "")
+            + f" ORDER BY source_id LIMIT {page_rows}"
+        )
+        table = client.query(sql, format="arrow")
+        rows = table.to_pylist()
+        if rows:
+            yield rows
+        flagged = (table.schema.metadata or {}).get(b"truncated") == b"True"
+        if len(rows) < page_rows and not flagged:
+            return
+        last = rows[-1]["source_id"]
+
+
 def list_upstream_source_ids(client, location: str) -> List[str]:
     """Every source_id on an upstream tensor server that we mirror.
 
-    ``location`` is the upstream endpoint, named in the fallback warning. It is a
-    parameter rather than something read off the client because the callers
-    already computed it (``_split_grpc_url``) to build the client, and the SDK
-    exposes no public accessor -- reaching for ``client._location`` was borrowing
-    another package's private state to recover a value that was in scope
-    (biopb/biopb#529).
+    ``location`` is the upstream endpoint. It is a parameter rather than something
+    read off the client because the callers already computed it
+    (``_split_grpc_url``) to build the client, and the SDK exposes no public
+    accessor -- reaching for ``client._location`` was borrowing another package's
+    private state to recover a value that was in scope (biopb/biopb#529).
 
     Queries the ids alone (``query`` on one narrow column, the
-    canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
-    result is always complete and a caller (e.g. the monitor re-list) may
-    reconcile destructively against it.
+    canonical browse surface, biopb/biopb#225), paged past the upstream's row cap,
+    so the result is complete and a caller may reconcile destructively against it.
 
-    An upstream with no readable catalog raises rather than degrading: the only
-    fallback there ever was is ``list_sources()``, which in protocol v2 runs
-    this same query and so fails identically.
+    An upstream with no readable catalog raises rather than degrading.
     """
-    rows = client.query("SELECT source_id FROM sources", format="records")
     return [
-        row["source_id"] for row in rows if mirrorable_upstream_id(row["source_id"])
+        row["source_id"]
+        for rows in _query_catalog_pages(client, "SELECT source_id")
+        for row in rows
+        if mirrorable_upstream_id(row["source_id"])
     ]
 
 
-# Transport failures, as opposed to "this upstream has no SQL catalog". The
-# id-only fallback dials the same endpoint and fails identically, so these mean
-# the upstream is down -- which the re-list scheduler already reports, on a
-# window. Logging them here too only doubles an already-repeating traceback.
-_UNREACHABLE_ERRORS = (
-    flight.FlightUnavailableError,
-    flight.FlightTimedOutError,
-    flight.FlightUnauthenticatedError,
-    OSError,
-)
+def content_version_for(indexed_at: object) -> Optional[bytes]:
+    """The mirror's ``content_version`` for an upstream ``indexed_at``.
 
-
-def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
-    """Bulk-fetch an upstream's full catalog rows in ONE ``query``.
-
-    Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
-    ``source_url``, ``source_type``, ``metadata_json``, ``is_resolved``, the
-    per-tensor ``tensors`` STRUCT[] (biopb/biopb#224), and ``indexed_at`` (the
-    upstream's per-source register timestamp) -- everything needed to seed a
-    mirrored source's catalog entry without a per-source upstream RPC
-    (biopb/biopb#266). ``source_url`` carries the upstream's real path so the
-    mirror can be treed by filepath in the browser (biopb/biopb#297).
-    ``indexed_at`` becomes the mirror's content_version (biopb/biopb#178): it
-    changes when the upstream re-registers the source, so the proxy's chunk cache
-    re-namespaces instead of serving stale chunks.
-    ``is_resolved`` is carried so an unresolved upstream source
-    (``is_resolved=false``, empty ``tensors``) mirrors as unresolved rather than
-    being advertised as a readable source. ``complete`` is True because the
-    server-side DuckDB catalog is not truncated like ``list_sources()``.
-
-    The upstream's scratch source is left out, as it is from
-    :func:`list_upstream_source_ids`; see :func:`mirrorable_upstream_id`.
-
-    ``rows`` is ``None`` when the upstream has no SQL catalog (``query``
-    errors) -- the caller then falls back to id-only enumeration
-    (``list_upstream_source_ids``) and the per-source live sync path.
-
-    ``location`` names the upstream in the fallback warning; see
-    :func:`list_upstream_source_ids` for why it is a parameter.
+    ``None`` for an unversioned upstream, which therefore never compares equal to
+    anything and is re-read on every re-list.
     """
-    try:
-        rows = client.query(
+    return b"iat:" + str(indexed_at).encode() if indexed_at is not None else None
+
+
+class UpstreamVersion(NamedTuple):
+    """What the narrow pass learns about one upstream source."""
+
+    indexed_at: object
+    #: ``length(metadata_json)``: the bulk of a row, and wildly uneven (measured
+    #: on one lab catalog: median 0.7 KB, p99 128 KB, max 14 MB).
+    size: int
+
+
+def list_upstream_versions(client) -> Dict[str, UpstreamVersion]:
+    """``{source_id: UpstreamVersion}`` for every mirrorable source upstream.
+
+    One narrow query (no ``tensors`` or ``metadata_json`` payload), so it stays
+    cheap on a six-figure catalog and is what a re-list diffs against:
+    ``indexed_at`` is the upstream's register timestamp, which changes whenever
+    the source is re-registered (including unresolved -> resolved). Every write to
+    a catalog row is ``sync_source_added``, an upsert that re-stamps it -- an upload,
+    a detach or a reaped upload changes ``tensors`` only by re-syncing the parent --
+    so a changed row always carries a new ``indexed_at``. Paged past the
+    upstream's row cap, so the result is complete and a caller may reconcile
+    destructively against it.
+
+    Raises when the query fails. There is no degraded mode: every server owns a
+    catalog (protocol v2), so a failure is an upstream that is down, slow or
+    refusing us, and enumerating ids and syncing each source over its own RPC
+    would only multiply the load on exactly that upstream. The caller keeps the
+    catalog it has and retries on the next tick.
+    """
+    return {
+        r["source_id"]: UpstreamVersion(
+            r.get("indexed_at"), r.get("metadata_size") or 0
+        )
+        for rows in _query_catalog_pages(
+            client,
+            "SELECT source_id, indexed_at, length(metadata_json) AS metadata_size",
+        )
+        for r in rows
+        if mirrorable_upstream_id(r["source_id"])
+    }
+
+
+#: What one ``fetch_upstream_rows`` query may hold: a byte budget (a row's
+#: ``metadata_json`` plus ``FETCH_ROW_OVERHEAD`` for the rest) and an id cap that
+#: keeps the SQL short. A single row larger than the budget goes alone.
+FETCH_BYTES = 8 << 20
+FETCH_ROW_OVERHEAD = 2048
+FETCH_MAX_IDS = 500
+
+
+def _fetch_batches(
+    source_ids: Sequence[str], sizes: Mapping[str, int]
+) -> Iterator[List[str]]:
+    batch: List[str] = []
+    held = 0
+    for sid in source_ids:
+        cost = sizes.get(sid, 0) + FETCH_ROW_OVERHEAD
+        if batch and (held + cost > FETCH_BYTES or len(batch) >= FETCH_MAX_IDS):
+            yield batch
+            batch, held = [], 0
+        batch.append(sid)
+        held += cost
+    if batch:
+        yield batch
+
+
+def fetch_upstream_rows(
+    client, source_ids: Sequence[str], sizes: Mapping[str, int]
+) -> Iterator[List[dict]]:
+    """Full catalog rows for ``source_ids``, a bounded batch at a time.
+
+    Each row is a dict with ``source_id``, ``source_url``, ``source_type``,
+    ``metadata_json``, ``is_resolved``, the per-tensor ``tensors`` STRUCT[]
+    (biopb/biopb#224) and ``indexed_at`` -- everything needed to seed a mirrored
+    source's catalog entry without a per-source upstream RPC (biopb/biopb#266).
+    ``source_url`` carries the upstream's real path so the mirror can be treed by
+    filepath in the browser (biopb/biopb#297); ``is_resolved`` lets an unresolved
+    upstream source mirror as unresolved.
+
+    ``sizes`` is each id's ``metadata_json`` length from
+    :func:`list_upstream_versions`; batches are cut by it, so a first sync of a
+    large catalog holds a few MB however large the catalog or one row. A
+    generator: a source that disappeared since the ids were listed is simply
+    absent from its batch, and a failed query raises after the earlier batches
+    were consumed. A batch an upstream's row cap cuts short comes back as more
+    than one list.
+    """
+    for batch in _fetch_batches(source_ids, sizes):
+        ids = ", ".join(sql_literal(sid) for sid in batch)
+        yield from _query_catalog_pages(
+            client,
             "SELECT source_id, source_url, source_type, metadata_json, "
-            "is_resolved, tensors, indexed_at FROM sources",
-            format="records",
+            "is_resolved, tensors, indexed_at",
+            where=f"source_id IN ({ids})",
+            page_rows=len(batch) + 1,  # a complete batch never fills it
         )
-        return [r for r in rows if mirrorable_upstream_id(r["source_id"])], True
-    except Exception as exc:
-        logger.log(
-            logging.DEBUG if isinstance(exc, _UNREACHABLE_ERRORS) else logging.WARNING,
-            "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
-            "enumeration + per-source sync",
-            location,
-            exc,
-        )
-        return None, False
+
+
+def display_parts(upstream_location: str, alias: Optional[str]) -> Tuple[str, str]:
+    """The scheme and authority a mirror is shown under: whatever the upstream was
+    configured with (grpc://, grpcs://, grpc+tls://; hardcoding grpc:// advertised a
+    TLS upstream as plaintext, biopb/biopb#788), and the alias or else host:port."""
+    parts = urlsplit(upstream_location)
+    return parts.scheme or "grpc", alias or (parts.netloc or upstream_location)
+
+
+def mirror_display_url(
+    scheme: str,
+    authority: str,
+    upstream_source_id: str,
+    upstream_source_url: Optional[str],
+) -> str:
+    """The catalog ``source_url`` of a mirror, so a browser can tree it by path.
+
+    Embeds the upstream source's REAL location under the (aliased) endpoint --
+    ``<scheme>://<authority>/<remote-path>`` -- so a client nests mirrored sources
+    by their upstream filepath beneath an endpoint root, instead of collapsing
+    every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297). The
+    upstream url is a normalized catalog url (e.g. ``file:///labs/x/img.tif`` or
+    ``s3://bucket/key``); keep its authority + path, drop the scheme. Falls back to
+    the endpoint + upstream source_id when no usable path is available.
+    """
+    if upstream_source_url:
+        parts = urlsplit(upstream_source_url)
+        remote = (parts.netloc + parts.path).strip("/")
+        if remote:
+            return f"{scheme}://{authority}/{remote}"
+    return f"{scheme}://{authority}:{upstream_source_id}"
+
+
+def warn_noncanonical_tensors(source_id: str, tensor_rows: List[dict]) -> None:
+    """Log the tensors of a mirror that an upstream serves in a non-canonical axis
+    order, which reads of will refuse (biopb/biopb#596). Said when the mirror is
+    synced, not only when someone opens the tensor, so a reads-refused mirror is
+    discoverable from the log of the re-list that mirrored it."""
+    for t in tensor_rows:
+        why = noncanonical_order(t["dim_labels"], t["shape"])
+        if why is not None:
+            logger.warning(
+                "mirrored source %s: upstream tensor %s %s -- reads of it "
+                "will be refused until that upstream is upgraded",
+                source_id,
+                t["array_id"],
+                why,
+            )
+
+
+def localize_tensor_rows(
+    upstream_tensors: Optional[List[dict]], upstream_source_id: str, source_id: str
+) -> List[dict]:
+    """An upstream row's ``tensors`` as the mirror lists them: the same structure
+    with the source_id prefix of each ``array_id`` swapped."""
+    return [
+        {
+            "array_id": source_id + t["array_id"][len(upstream_source_id) :],
+            "dim_labels": list(t.get("dim_labels") or []),
+            "shape": [int(n) for n in t.get("shape") or []],
+            "dtype": t.get("dtype") or "",
+        }
+        for t in upstream_tensors or []
+    ]
 
 
 class RemoteTensorAdapter(TensorAdapter):
@@ -311,12 +522,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     # The upstream owns this source's axis order, so the server validates it
     # rather than permuting it (biopb/biopb#596) -- see
-    # ``_require_canonical_upstream`` and ``core.normalize``. Wrapping a proxy in
-    # a NormalizingAdapter would freeze a permutation derived from the labels the
-    # upstream advertised *at registration*, while ``seed_catalog`` keeps
-    # replacing those labels in place on every reconcile; an upstream that later
-    # upgraded to canonical order would then be re-permuted into the wrong one.
-    _normalizable_axes = False
+    # ``_require_canonical_upstream``.
 
     # A miss here is an upstream round trip plus load on someone else's server,
     # none of which the local hand-off contains. Measured, a LAN upstream clocks
@@ -362,15 +568,9 @@ class RemoteTensorAdapter(TensorAdapter):
         self._source_type = "tensor-server"
         self._tensor_name = tensor_name
         self._alias = alias
-        _parts = urlsplit(upstream_location)
-        # Display scheme: whatever the upstream was configured with (grpc://,
-        # grpcs://, grpc+tls://). Hardcoding grpc:// advertised a TLS upstream as
-        # plaintext (biopb/biopb#788).
-        self._scheme = _parts.scheme or "grpc"
-        # Display authority for the catalog source_url: the alias, or the
-        # host:port when there is none. (self._upstream_location keeps the real
-        # endpoint for dialing.)
-        self._authority = alias or (_parts.netloc or upstream_location)
+        # Display scheme and authority for the catalog source_url.
+        # (self._upstream_location keeps the real endpoint for dialing.)
+        self._scheme, self._authority = display_parts(upstream_location, alias)
         # Display-friendly catalog source_url. Until the upstream's real path is
         # seeded (seed_catalog, biopb/biopb#297), fall back to the endpoint + the
         # upstream source_id -- grpc://lab:experiment1 (aliased) or
@@ -388,16 +588,14 @@ class RemoteTensorAdapter(TensorAdapter):
 
         self._client = None  # lazy TensorFlightClient to the upstream
 
-        # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
-        # the whole upstream catalog in one query, it seeds these so
-        # registration (sync_source_added -> list_tensor_descriptors/get_metadata)
-        # needs no per-source upstream RPC. None = not seeded (fall back to a live
-        # per-source fetch). See seed_catalog().
+        # Bulk-seeded catalog surface (biopb/biopb#266). When a MirrorSet fetches
+        # the whole upstream catalog in one query, it seeds the tensors so
+        # registration (sync_source_added -> list_tensors) needs no per-source
+        # upstream RPC. None = not seeded (fall back to a live per-source
+        # fetch). See seed_catalog().
         self._descriptors_cache: Optional[List[TensorDescriptor]] = None
-        self._metadata_cache: Optional[dict] = None
-        # Whether the upstream *source* has resolved (carried from the bulk row),
-        # None until seeded. is_resolved() is its only reader (biopb/biopb#266).
-        self._upstream_resolved: Optional[bool] = None
+        # ((array_id, content_version), native) for has_native_pyramid().
+        self._native_pyramid_memo: Optional[tuple] = None
 
     # ------------------------------------------------------------------ upstream
 
@@ -433,7 +631,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         ``metadata_json`` and ``pyramid`` are cleared so the mirrored descriptor
         stays lean, exactly like a native adapter's: the LOCAL server fills both
-        itself on a ``GetFlightInfo`` (metadata from ``get_metadata()``; the
+        itself on a ``GetFlightInfo`` (metadata from ``registration_record``; the
         advertised pyramid from its own config). The upstream's ``get_descriptor``
         result carries them, so without clearing they would leak onto the proxy's
         catalog surface and the metadata would get double-wrapped on re-serialize.
@@ -464,6 +662,11 @@ class RemoteTensorAdapter(TensorAdapter):
         out.CopyFrom(desc)
         out.array_id = self._to_local_array_id(desc.array_id)
         out.metadata_json = ""
+        # The upstream's tickets are its own to seal. This server issues its own
+        # over the plan it serves (biopb/biopb#1112), and an upstream's stub
+        # would name a tensor and a key this server does not hold.
+        out.ClearField("ticket_stub")
+        out.ClearField("roi_ticket")
         return out
 
     def _mark_unreachable(self, exc: Exception) -> None:
@@ -511,51 +714,51 @@ class RemoteTensorAdapter(TensorAdapter):
             alias=source.alias,
         )
 
-    def _display_source_url(self, upstream_source_url: Optional[str]) -> str:
-        """Build the catalog ``source_url`` so a browser can tree a mirror by path.
+    def display_url(self, upstream_source_url: Optional[str]) -> str:
+        """:func:`mirror_display_url` for this mirror."""
+        return mirror_display_url(
+            self._scheme, self._authority, self._upstream_source_id, upstream_source_url
+        )
 
-        Embeds the upstream source's REAL location under the (aliased) endpoint --
-        ``<scheme>://<authority>/<remote-path>``, keeping the upstream's own
-        grpc/grpcs scheme -- so a client nests mirrored sources
-        by their upstream filepath beneath an endpoint root, instead of collapsing
-        every source of an upstream into a flat ``grpc:`` node (biopb/biopb#297).
-        The upstream url is a normalized catalog url (e.g.
-        ``file:///labs/x/img.tif`` or ``s3://bucket/key``); keep its authority +
-        path, drop the scheme. Falls back to the endpoint + upstream source_id when
-        no usable path is available (empty/opaque upstream url).
-        """
-        if upstream_source_url:
-            parts = urlsplit(upstream_source_url)
-            remote = (parts.netloc + parts.path).strip("/")
-            if remote:
-                return f"{self._scheme}://{self._authority}/{remote}"
-        return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
+    def local_tensor_rows(self, upstream_tensors: Optional[List[dict]]) -> List[dict]:
+        """:func:`localize_tensor_rows` for this mirror."""
+        return localize_tensor_rows(
+            upstream_tensors, self._upstream_source_id, self.source_id
+        )
+
+    def restore_catalog(
+        self, local_tensors: List[dict], source_url: str, indexed_at: object
+    ) -> None:
+        """Seed the catalog surface from what this mirror's own catalog row holds:
+        its tensors already local, its url already the display url, and the
+        upstream's ``indexed_at`` it was synced at."""
+        self._content_version = content_version_for(indexed_at)
+        self._descriptors_cache = [
+            TensorDescriptor(
+                array_id=t["array_id"],
+                dim_labels=t["dim_labels"],
+                shape=t["shape"],
+                dtype=t["dtype"],
+            )
+            for t in local_tensors
+        ]
+        self._source_url = source_url
 
     def seed_catalog(
         self,
         upstream_tensors: List[dict],
-        metadata: Optional[dict],
-        is_resolved: bool = True,
         source_url: Optional[str] = None,
         indexed_at: object = None,
     ) -> bool:
         """(Re)populate the catalog surface from a bulk upstream ``query``.
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
-        single upstream catalog fetch, so ``sync_source_added``
-        (``list_tensor_descriptors`` + ``get_metadata``) needs no per-source
-        upstream RPC. ``upstream_tensors`` is the row's ``tensors`` STRUCT[] (upstream
-        array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
+        single upstream catalog fetch, so ``sync_source_added`` (``list_tensors``)
+        needs no per-source upstream RPC. ``upstream_tensors`` is the row's
+        ``tensors`` STRUCT[] (upstream array_ids) as list-of-dicts; each is localized (source_id prefix swapped)
         exactly as the live path's ``_localize_descriptor`` would. Unlike the live
-        ``list_tensor_descriptors`` (default field only), this seeds **all** of the
+        ``list_tensors`` (default field only), this seeds **all** of the
         source's tensors, so a multi-field upstream mirrors completely.
-
-        ``is_resolved`` is the upstream *source*'s own flag (from its row): an
-        unresolved upstream source (``is_resolved=false``, empty tensors) must
-        mirror as unresolved, not be advertised as readable. Idempotent and
-        re-appliable: the reconcile re-seeds every mirrored source each re-list,
-        so an in-place upstream resolution (empty -> populated tensors,
-        false -> true) refreshes here rather than going stale.
 
         ``source_url`` is the upstream source's own catalog url; it is folded into
         the mirror's display url so the browser can tree it by the remote path
@@ -564,10 +767,12 @@ class RemoteTensorAdapter(TensorAdapter):
         ``indexed_at`` is the upstream source's register timestamp; it becomes this
         mirror's ``content_version`` (``b"iat:<ts>"``, biopb/biopb#178), folded into
         every minted proxy envelope so the chunk cache re-namespaces when the
-        upstream re-registers the source. It is set unconditionally (every reconcile
-        refreshes it) and deliberately NOT part of the ``changed`` result: a re-sync
-        re-stamps the LOCAL ``indexed_at``, so gating re-sync on it would churn; the
-        content_version only needs to ride the adapter for minting, not the catalog.
+        upstream re-registers the source. It is set unconditionally and
+        deliberately NOT part of the ``changed`` result: a re-sync re-stamps the
+        LOCAL ``indexed_at``, so gating re-sync on it would churn; the
+        content_version only needs to ride the adapter for minting, not the
+        catalog. Idempotent and re-appliable: the reconcile re-seeds a mirrored
+        source whenever its upstream ``indexed_at`` moves.
 
         We just queried the upstream, so mark it reachable. Returns whether the
         seeded catalog surface actually changed, so the caller can skip a
@@ -576,71 +781,44 @@ class RemoteTensorAdapter(TensorAdapter):
         # The upstream register timestamp is this mirror's content_version. An
         # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
         # envelope carries an empty cv, exactly as before this plumbing.
-        self._content_version = (
-            b"iat:" + str(indexed_at).encode() if indexed_at is not None else None
-        )
-        descs: List[TensorDescriptor] = []
-        for t in upstream_tensors or []:
-            descs.append(
-                TensorDescriptor(
-                    array_id=self._to_local_array_id(t["array_id"]),
-                    dim_labels=t.get("dim_labels") or [],
-                    shape=t.get("shape") or [],
-                    dtype=t.get("dtype") or "",
-                )
+        self._content_version = content_version_for(indexed_at)
+        rows = self.local_tensor_rows(upstream_tensors)
+        descs = [
+            TensorDescriptor(
+                array_id=t["array_id"],
+                dim_labels=t["dim_labels"],
+                shape=t["shape"],
+                dtype=t["dtype"],
             )
-        new_metadata = metadata or {}
-        new_resolved = bool(is_resolved)
+            for t in rows
+        ]
         # Mirror the upstream's real path into the display url (biopb/biopb#297).
-        new_url = self._display_source_url(source_url)
-        changed = (
-            descs != self._descriptors_cache
-            or new_metadata != self._metadata_cache
-            or new_resolved != self._upstream_resolved
-            or new_url != self._source_url
-        )
+        new_url = self.display_url(source_url)
+        changed = descs != self._descriptors_cache or new_url != self._source_url
         self._descriptors_cache = descs
-        self._metadata_cache = new_metadata
-        self._upstream_resolved = new_resolved
         self._source_url = new_url
         if changed:
-            # Say it at seed time, not only when someone opens the tensor: a
-            # reads-refused mirror should be discoverable from the log of the
-            # reconcile that mirrored it (biopb/biopb#596). Gated on `changed` so
-            # a steady re-list does not repeat it every tick.
-            for desc in descs:
-                why = noncanonical_order(desc.dim_labels, desc.shape)
-                if why is not None:
-                    logger.warning(
-                        "mirrored source %s: upstream tensor %s %s -- reads of it "
-                        "will be refused until that upstream is upgraded",
-                        self.source_id,
-                        desc.array_id,
-                        why,
-                    )
+            warn_noncanonical_tensors(self.source_id, rows)
         return changed
 
-    def get_metadata(self) -> dict:
-        """Mirror the upstream source's metadata dict (OME etc.), best-effort.
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        """The upstream source's metadata dict (OME etc.), read live, best-effort.
 
-        ``list_flights`` / ``list_sources`` is deliberately lean and leaves
-        ``metadata_json`` empty, and the only *live* RPC that fills it
-        (``GetFlightInfo(with_metadata=True)``) returns it *wrapped* in a
-        ``{"type","dim_label","metadata"}`` envelope. Instead read it from the
-        upstream's metadata catalog with a server-side SQL query: the DuckDB
-        ``sources.metadata_json`` column stores ``json.dumps(get_metadata())``
-        verbatim -- the **raw** dict, no envelope -- which is exactly this
-        method's contract (the LOCAL server adds the envelope when it serializes
-        the response on a ``GetFlightInfo(with_metadata=True)``). Best-effort: an
-        unreachable upstream, a metadata-DB-disabled upstream, or a not-yet-synced
-        source all degrade to ``{}`` (metadata is non-critical for serving).
+        Only a source configured on its own (``grpc://host:port/<id>``) registers
+        through here: a bare-host upstream's rows are written from the upstream's
+        rows (:class:`~biopb_tensor_server.sources.mirror.MirrorSet`), which
+        already carry the metadata.
+
+        ``list_flights`` is deliberately lean and leaves ``metadata_json`` empty, and
+        the only live RPC that fills it (``GetFlightInfo(with_metadata=True)``)
+        returns it *wrapped* in a ``{"type","dim_label","metadata"}`` envelope.
+        Read it from the upstream's metadata catalog instead: the DuckDB
+        ``sources.metadata_json`` column stores the **raw** dict, which is this
+        method's contract. An unreachable upstream, a DB-less one or a source not
+        yet synced all degrade to ``{}``: metadata is non-critical for serving.
         """
-        import json
-
-        # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
-        if self._metadata_cache is not None:
-            return self._metadata_cache
-
         sql = (
             "SELECT metadata_json FROM sources WHERE source_id = "
             f"{sql_literal(self._upstream_source_id)}"
@@ -651,23 +829,19 @@ class RemoteTensorAdapter(TensorAdapter):
             logger.debug(
                 "upstream metadata query failed for %s: %s", self.source_id, exc
             )
-            return {}
-        if not rows:
-            return {}
-        raw = rows[0].get("metadata_json")
-        if not raw:
-            return {}
+            return metadata_record({})
+        raw = rows[0].get("metadata_json") if rows else None
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(raw) if raw else {}
         except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+            return metadata_record({})
+        return metadata_record(parsed if isinstance(parsed, dict) else {})
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
         """Mirror this one upstream source's tensor descriptor(s).
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
-        by scanning the upstream's whole ``list_sources()`` catalog: that call is
+        by scanning the upstream's whole catalog: a ``query`` is
         *capped* (``max_query_results``), so for a large upstream this source
         could be truncated out of it -- and it would re-fetch the entire catalog
         on every listing, an O(N^2) cost. A single source's descriptor has no
@@ -688,7 +862,7 @@ class RemoteTensorAdapter(TensorAdapter):
         """
         # Bulk-seeded at registration -> no upstream RPC (biopb/biopb#266).
         if self._descriptors_cache is not None:
-            return self._descriptors_cache
+            return [catalog_entry(d) for d in self._descriptors_cache]
 
         try:
             # Structural mirror only -- metadata is served from this proxy's own
@@ -707,24 +881,14 @@ class RemoteTensorAdapter(TensorAdapter):
             return []  # unreachable / unresolved upstream -> placeholder row
         return [catalog_entry(self._localize_descriptor(desc))]
 
-    # No is_resident() override: a mirror's bytes are on another machine, so the
-    # base's "remote scheme -> non-resident" is the true answer, and `warm`
-    # refuses a remote url outright. Do not override it to report reachability
-    # -- that is is_resolved()'s job below (biopb/biopb#1035).
-
-    def is_resolved(self) -> bool:
-        """Whether the upstream has hydrated the source this mirrors.
-
-        The default (always True) would advertise a mirror of an unresolved
-        upstream source as readable-with-no-tensors, which is the conflation
-        biopb/biopb#1032 is about -- one layer further out. Unseeded (no bulk
-        catalog fetch, so nothing said otherwise) stays True.
-        """
-        return self._upstream_resolved is not False
+    @property
+    def categorical(self) -> bool:
+        """The upstream does not say, so read it off the id it minted."""
+        return split_label_field(self._tensor_name) is not None
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):
         """Return a tensor-layer view bound to the requested within-source field."""
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field == self._tensor_name:
             return self
         view = copy.copy(self)
@@ -732,7 +896,7 @@ class RemoteTensorAdapter(TensorAdapter):
         return view
 
     def plan_flight_info(self, read_opt, pyramid_config):
-        """Forward the upstream's authoritative GetFlightInfo, else plan locally.
+        """Forward the upstream's authoritative GetFlightInfo.
 
         A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
         pyramid, or physical scale of its own, so consult the upstream once
@@ -741,16 +905,11 @@ class RemoteTensorAdapter(TensorAdapter):
         server-advertised pyramid *when the request opted in* (``with_pyramid``,
         relayed to the upstream, biopb/biopb#563), and its physical scale (kept by
         ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
-        refilled locally from the mirror catalog). On an upstream failure the
-        forward returns ``None`` and we fall back to the base local planner --
-        never worse than a non-proxy adapter (biopb/biopb#295). On that fallback
-        the proxy advertises no physical scale of its own (inherited
-        ``_physical_scale`` default ``None``, exactly as before; tracked by
-        #266/#274).
+        refilled locally from the mirror catalog). An unreachable upstream fails
+        the call, as it does every other upstream read: a locally planned
+        answer would carry bare chunk_ids this proxy refuses to serve.
         """
         plan = self.forward_flight_info(read_opt)
-        if plan is None:
-            plan = super().plan_flight_info(read_opt, pyramid_config)
         self._require_canonical_upstream(plan.descriptor)
         return plan
 
@@ -761,9 +920,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """Plan a read, refusing a non-canonical upstream first (#596).
 
         The other read boundary besides ``plan_flight_info``: the precache warms
-        through it, and the local-planner fallback routes through it. Checking
-        the request descriptor is free -- it is derived from the mirrored one the
-        caller already holds.
+        through it. Checking the request descriptor is free -- it is derived from
+        the mirrored one the caller already holds.
         """
         self._require_canonical_upstream(request_desc)
         return super().get_read_plan(request_desc)
@@ -781,7 +939,7 @@ class RemoteTensorAdapter(TensorAdapter):
         descriptor it hands back *is* the artifact that would violate the
         guarantee -- a consumer that trusted it would mis-map its axes just as
         surely as one that read the pixels. The **catalog** surface is untouched:
-        ``list_flights`` / ``list_sources`` still enumerate the source, so an
+        ``list_flights`` still enumerates the source, so an
         operator sees the broken thing and a legible reason rather than a silent
         disappearance.
 
@@ -804,7 +962,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     # -------------------------------------------------------------- tensor layer
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Mirror the upstream tensor descriptor under the local array_id.
 
         Structure comes from the bulk-seeded cache when available
@@ -820,12 +978,8 @@ class RemoteTensorAdapter(TensorAdapter):
         need to. ``plan_flight_info`` forwards the whole upstream
         ``GetFlightInfo`` (``forward_flight_info``), whose descriptor carries the
         upstream's authoritative grid, and that path never routes through here.
-        What is left is the local-planner fallback, which runs only when the
-        upstream is unreachable -- so a probe for the grid at that moment would
-        fail too. A seeded descriptor therefore reports the structure it has and
-        an empty grid, and the planner falls back to the whole tensor split under
-        the Arrow ceiling, exactly as the catalog surface falls back to an empty
-        tensor list.
+        A seeded descriptor therefore reports the structure it has and an empty
+        grid.
 
         Falls back to a live fetch when this tensor was not seeded (a
         single-source static remote, or a field absent from the seed); that IS an
@@ -848,9 +1002,7 @@ class RemoteTensorAdapter(TensorAdapter):
         )
         return self._localize_descriptor(desc)
 
-    def forward_flight_info(
-        self, read_opt: TensorReadOption
-    ) -> Optional[TensorReadPlan]:
+    def forward_flight_info(self, read_opt: TensorReadOption) -> TensorReadPlan:
         """Forward a whole ``GetFlightInfo`` to the upstream and localize it.
 
         The server's ``get_flight_info`` calls this for a proxy tensor *instead*
@@ -872,68 +1024,121 @@ class RemoteTensorAdapter(TensorAdapter):
         ``do_get`` on one forwards straight back upstream via
         ``resolve_chunk_data`` (the same array_id swap).
 
-        Returns ``None`` in either failure mode, so the caller falls back to the
-        local planner -- never worse than a non-proxy adapter. The two modes are
-        caught separately: a **transport** failure of the upstream RPC (unreachable
-        / UNAVAILABLE / timeout / auth / upstream-side error) is an expected
-        operational condition, logged at DEBUG; a **logic** failure localizing a
-        response we *did* receive (a too-old / unexpected upstream, a corrupt
-        payload, or a proxy bug) is unexpected and logged at WARNING, so the
-        fallback never silently masks it.
+        An unreachable upstream raises the transport ``FlightError``; a response
+        that cannot be localized (a too-old upstream, a corrupt payload, a proxy
+        bug) raises ``FlightInternalError``.
         """
-        # Transport step -- the upstream GetFlightInfo RPC. flight.FlightError
-        # covers every upstream/gRPC failure (unavailable, timeout, auth, and an
-        # upstream-side internal error); OSError covers a socket-level fault.
-        try:
-            info = self._upstream_flight_info(read_opt)
-        except (flight.FlightError, OSError) as exc:
-            logger.debug(
-                "upstream flight-info RPC failed for %s (%r); falling back to the "
-                "local read planner",
-                self.array_id,
-                exc,
-            )
-            return None
-
-        # Logic step -- localize the response. A failure here is not a transport
-        # problem, so surface it (WARNING) rather than letting the fallback hide a
-        # protocol mismatch or a proxy bug.
+        info = self._upstream_flight_info(read_opt)
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
-            endpoints = []
             content_version = self.content_version  # loop-invariant
+            if up_desc.ticket_stub and info.endpoints:
+                return self._forward_stub_plan(info, up_desc, content_version)
+            # The local route is the tensor this plan is for. It only has to reach
+            # an adapter of this source: that adapter forwards the envelope's
+            # inner to the upstream verbatim, and the upstream routes by the ids
+            # inside it -- a native level's own adapter included. So the proxy
+            # never reads an upstream chunk_id; wrapping it in the envelope
+            # (route, epoch, content_version, then the bytes untouched) is the
+            # whole of it. The upstream's content_version rides the envelope, so
+            # the proxy cache namespaces by upstream content.
+            route = self._to_local_array_id(up_desc.array_id)
+            endpoints = []
             for ep in info.endpoints:
                 ticket = TensorTicket.FromString(ep.ticket.ticket)
-                bounds = ChunkBounds.FromString(ep.app_metadata)
-                # Wrap the upstream chunk_id in a proxy envelope: it is carried
-                # VERBATIM (never rewritten) and forwarded byte-for-byte on do_get,
-                # so bounds/scale/version bytes are untouched and the proxy stays
-                # blind to the upstream codec. We read the chunk's OWN upstream
-                # array_id (not self.array_id -- a sibling-field chunk keeps its own)
-                # only to build the LOCAL route, so the server dispatches a later
-                # do_get back to the right local tensor view. The upstream's
-                # The upstream's content_version rides the envelope, so the
-                # proxy cache namespaces by upstream content.
-                upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
-                    ticket.chunk_id,
-                    self._to_local_array_id(upstream_aid),
-                    content_version,
+                    ticket.chunk_id, route, content_version
                 )
-                endpoints.append(ChunkEndpoint(chunk_id=local_chunk_id, bounds=bounds))
+                endpoints.append(
+                    ChunkEndpoint(
+                        chunk_id=local_chunk_id,
+                        bounds=ChunkBounds.FromString(ep.app_metadata),
+                    )
+                )
             return TensorReadPlan(
                 descriptor=self._localize_forwarded_descriptor(up_desc),
                 chunk_endpoints=endpoints,
             )
         except Exception as exc:
-            logger.warning(
-                "upstream flight-info response for %s could not be localized (%r); "
-                "falling back to the local read planner",
-                self.array_id,
-                exc,
-                exc_info=True,
+            raise flight.FlightInternalError(
+                f"upstream flight-info response for {self.array_id} could not be "
+                f"localized: {exc!r}"
+            ) from exc
+
+    def _forward_stub_plan(
+        self, info, up_desc: TensorDescriptor, content_version: Optional[bytes]
+    ) -> TensorReadPlan:
+        """Localize an upstream plan that came as a stub plus indices.
+
+        The stub's identity is wrapped once, verbatim, in this proxy's own frame
+        -- route, epoch, content_version -- and the endpoints keep the upstream's
+        indices. So the proxy reads no upstream ticket per chunk and never learns
+        what the identity says; the local server seals what it serves, over the
+        upstream's window. The upstream's grant is dropped: it authorizes reading
+        the upstream, and this proxy does that with its own credentials.
+        """
+        stub = TensorTicket.FromString(up_desc.ticket_stub).chunk_ref.stub
+        identity = encode_proxy_identity(
+            stub.identity, self._to_local_array_id(up_desc.array_id), content_version
+        )
+        endpoints = []
+        for ep in info.endpoints:
+            index = tuple(TensorTicket.FromString(ep.ticket.ticket).chunk_ref.index)
+            endpoints.append(
+                ChunkEndpoint(
+                    chunk_id=expand_identity(identity, index),
+                    bounds=ChunkBounds.FromString(ep.app_metadata),
+                    index=index,
+                )
             )
-            return None
+        return TensorReadPlan(
+            descriptor=self._localize_forwarded_descriptor(up_desc),
+            chunk_endpoints=endpoints,
+            identity=identity,
+            window=(tuple(stub.grant.window_start), tuple(stub.grant.window_stop)),
+        )
+
+    def has_native_pyramid(self) -> bool:
+        """Whether the upstream serves this tensor from stored pyramid levels.
+
+        Asked of the upstream (one ``GetFlightInfo`` carrying only the pyramid
+        path, no read plan) and memoized until the mirror re-syncs. An upstream
+        advertises a pyramid even when computed, so only a ``native`` level
+        counts. An unreachable upstream answers False, unmemoized.
+
+        ``get_native_pyramid_levels`` stays ``None``: the proxy stores no
+        levels, and the levels it advertises come from the forwarded upstream
+        plan.
+        """
+        key = (self.array_id, self.content_version)
+        memo = self._native_pyramid_memo
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        try:
+            info = self._upstream_flight_info(
+                TensorReadOption(
+                    array_id=self.array_id, fields=FieldMask(paths=[PYRAMID])
+                )
+            )
+        except (flight.FlightError, OSError) as exc:
+            logger.debug(
+                "upstream pyramid probe failed for %s (%r)", self.array_id, exc
+            )
+            return False
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        native = any(level.native for level in desc.pyramid)
+        self._native_pyramid_memo = (key, native)
+        return native
+
+    def _upstream_issues_stubs(self, read_opt: TensorReadOption) -> bool:
+        """Should this request ask the upstream for a stub plan?
+
+        Only when the caller asked for one and the upstream offers it. Every
+        other case is planned as before, one ticket per chunk.
+        """
+        if TICKET_STUB not in read_mask(read_opt):
+            return False
+        return bool(self.client._state.ticket_stubs)
 
     def _upstream_flight_info(self, read_opt: TensorReadOption):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
@@ -953,6 +1158,8 @@ class RemoteTensorAdapter(TensorAdapter):
         # Forward the mask minus what this server answers itself -- LOCAL_ONLY
         # is the single definition of which paths those are (read_mask.py).
         forwarded = read_mask(read_opt) - LOCAL_ONLY
+        if not self._upstream_issues_stubs(read_opt):
+            forwarded = forwarded - {TICKET_STUB}
         up_read_opt.fields.paths.extend(sorted(forwarded))
         if read_opt.HasField("slice_hint"):
             up_read_opt.slice_hint.CopyFrom(read_opt.slice_hint)
@@ -1041,7 +1248,10 @@ class RemoteTensorAdapter(TensorAdapter):
         def compute_fn():
             # Forward the upstream chunk_id VERBATIM (the opaque inner); the upstream
             # does any downsampling and only the result crosses the network.
-            batch = self._upstream_record_batch(inner)
+            if envelope_inner_is_ticket(chunk_id):
+                batch = self._upstream_do_get(inner)
+            else:
+                batch = self._upstream_record_batch(inner)
             return batch, batch.nbytes
 
         if should_cache:
@@ -1057,9 +1267,18 @@ class RemoteTensorAdapter(TensorAdapter):
 
     def _upstream_record_batch(self, upstream_chunk_id: bytes) -> pa.RecordBatch:
         """do_get one chunk from the upstream, as a single unified RecordBatch."""
-        ticket = TensorTicket(chunk_id=upstream_chunk_id)
+        return self._upstream_do_get(
+            TensorTicket(chunk_id=upstream_chunk_id).SerializeToString()
+        )
+
+    def _upstream_do_get(self, ticket_bytes: bytes) -> pa.RecordBatch:
+        """do_get *ticket_bytes* from the upstream, as one unified RecordBatch.
+
+        The ticket is whatever names the chunk: a chunk_id arm, or an identity
+        and index the upstream completes itself.
+        """
         reader = self.client._client.do_get(
-            flight.Ticket(ticket.SerializeToString()),
+            flight.Ticket(ticket_bytes),
             options=self.client._call_options,
         )
         table = reader.read_all()

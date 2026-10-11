@@ -25,6 +25,7 @@ __all__ = [
     "METADATA_JSON",
     "PYRAMID",
     "READ_MASK_PATHS",
+    "TICKET_STUB",
     "UPLOAD_STATUS",
     "read_mask",
 ]
@@ -40,8 +41,13 @@ UPLOAD_STATUS = "upload_status"
 #: Whether the bytes are local right now -- a bounded stat walk.
 IS_RESIDENT = "is_resident"
 
+#: Issue the plan as one sealed stub plus an index per endpoint, and a sealed
+#: ROI ticket (biopb/biopb#1112). Free to compute, but it changes what the
+#: endpoints are, which is why a client asks for it.
+TICKET_STUB = "ticket_stub"
+
 READ_MASK_PATHS: FrozenSet[str] = frozenset(
-    {ENDPOINTS, METADATA_JSON, PYRAMID, UPLOAD_STATUS, IS_RESIDENT}
+    {ENDPOINTS, METADATA_JSON, PYRAMID, UPLOAD_STATUS, IS_RESIDENT, TICKET_STUB}
 )
 
 #: Paths that answer a question about *this* machine and so are never

@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.core.axes import canonical_permutation
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -177,6 +178,12 @@ def _expected_field(sizes, position, present):
     return out, field_labels
 
 
+def _canonical(expected, labels):
+    """``expected`` (file order) as the adapter serves it: Z, Y, X trailing."""
+    perm = canonical_permutation(labels, expected.shape)
+    return expected if perm is None else expected.transpose(perm)
+
+
 def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
     tmp_path, monkeypatch
 ):
@@ -191,15 +198,16 @@ def test_local_nd2_claims_natively_and_splits_positions_into_tensors(
     source = registry.get_adapter_for_type("nd2").create_from_config(_source(path))
     assert isinstance(source, Nd2Adapter)
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert [d.array_id for d in descriptors] == ["nd2/P:0", "nd2/P:1"]
     for desc in descriptors:
-        assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
+        assert list(desc.dim_labels) == ["T", "C", "Z", "Y", "X"]
         assert list(desc.shape) == [3, 2, 2, 4, 5]
         assert desc.dtype == np.dtype("<u2").str
 
     field = source.get_tensor_adapter(descriptors[1].array_id)
-    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
+    expected, labels = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
+    expected = _canonical(expected, labels)
     whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(descriptors[1].shape)))
     np.testing.assert_array_equal(whole, expected)
 
@@ -210,7 +218,8 @@ def test_interior_crop_reads_only_the_requested_window(tmp_path, monkeypatch):
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
     field = source.get_tensor_adapter("P:0")
-    expected, _ = _expected_field(_DEFAULT_SIZES, 0, ("P", "T", "Z"))
+    expected, labels = _expected_field(_DEFAULT_SIZES, 0, ("P", "T", "Z"))
+    expected = _canonical(expected, labels)
 
     bounds = ChunkBounds(start=[1, 0, 0, 1, 1], stop=[3, 2, 2, 3, 4])
     got = field.get_data(bounds)
@@ -223,7 +232,8 @@ def test_decimated_read_matches_a_strided_slice_of_the_full_read(tmp_path, monke
     _install_fake(monkeypatch)
     source = Nd2Adapter.create_from_config(_source(path))
     field = source.get_tensor_adapter("P:1")
-    expected, _ = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
+    expected, labels = _expected_field(_DEFAULT_SIZES, 1, ("P", "T", "Z"))
+    expected = _canonical(expected, labels)
 
     field_shape = field.get_tensor_descriptor().shape
     bounds = ChunkBounds(start=[0] * 5, stop=list(field_shape))
@@ -239,12 +249,12 @@ def test_single_position_file_has_one_field_with_no_p_axis(tmp_path, monkeypatch
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, sizes={"T": 3, "Z": 2, "C": 1, "Y": 4, "X": 5})
     source = Nd2Adapter.create_from_config(_source(path))
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     assert len(descriptors) == 1
     desc = descriptors[0]
     assert desc.array_id == "nd2/P:0"
     assert "P" not in desc.dim_labels
-    assert list(desc.dim_labels) == ["T", "Z", "C", "Y", "X"]
+    assert list(desc.dim_labels) == ["T", "C", "Z", "Y", "X"]
 
     field = source.get_tensor_adapter(desc.array_id)
     whole = field.get_data(ChunkBounds(start=[0] * 5, stop=list(desc.shape)))
@@ -314,7 +324,9 @@ def test_get_metadata_returns_the_ome_summary(tmp_path, monkeypatch):
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, ome_payload={"images": [{"id": "Image:0"}]})
     source = Nd2Adapter.create_from_config(_source(path))
-    assert source.get_metadata() == {"images": [{"id": "Image:0"}]}
+    assert source.registration_record([], import_rois=False).metadata == {
+        "images": [{"id": "Image:0"}]
+    }
 
 
 def test_component_axes_are_never_split_across_a_chunk(tmp_path, monkeypatch):

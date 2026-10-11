@@ -106,8 +106,8 @@ describe("descriptorFromTileInfo", () => {
     expect(tensor?.shape).toEqual([1024, 1024]);
     expect(tensor?.dtype).toBe("uint16");
     expect(tensor?.dim_labels).toEqual(["Y", "X"]);
-    // Empty for the reason a listing's entries are: the grid is answered per
-    // resolved tensor, by tile_info itself.
-    expect(tensor?.chunk_shape).toEqual([]);
+    // A listing entry has no grid: it is answered per resolved tensor, by
+    // tile_info itself.
+    expect(tensor).not.toHaveProperty("chunk_shape");
   });
 });

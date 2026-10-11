@@ -25,10 +25,9 @@ from biopb_tensor_server.adapters.fields import (
 )
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import CacheConfig
 
-from tests import catalog_server
+from tests import catalog_server, label_sets
 
 SHAPE = (4, 6)
 CHUNK = (2, 3)
@@ -74,9 +73,7 @@ class TestOneSourceManyTensors:
         client.upload_array(published, _arr())
         _add(client, source, "filling")  # still PENDING
 
-        listed = [
-            d.array_id for d in catalog_tensors(writable_server.sources.get(source))
-        ]
+        listed = [d.array_id for d in writable_server.sources.catalog_tensors(source)]
         assert listed == [published.array_id]
 
     def test_a_pending_tensor_is_writable_but_not_readable(self, client, source):
@@ -118,7 +115,12 @@ class TestOneSourceManyTensors:
         has one."""
         client.upload_array(_add(client, source, "img"), _arr())
 
-        assert writable_server.sources.get(source).get_metadata() == {}
+        assert (
+            writable_server.sources.get(source)
+            .registration_record([], import_rois=False)
+            .metadata
+            == {}
+        )
 
 
 class TestItSurvivesARestart:
@@ -131,7 +133,7 @@ class TestItSurvivesARestart:
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+            location="localhost:0", writable=True, write_dir=tmp_path / "w"
         )
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
@@ -175,14 +177,12 @@ class TestItSurvivesARestart:
         (tmp_path / "w").rename(moved)
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-        second = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=moved
-        )
+        second = catalog_server(location="localhost:0", writable=True, write_dir=moved)
         try:
             assert second.sources.get(source) is not None
-            assert [
-                d.array_id for d in catalog_tensors(second.sources.get(source))
-            ] == [f"{source}/@fields/img"]
+            assert [d.array_id for d in second.sources.catalog_tensors(source)] == [
+                f"{source}/@fields/img"
+            ]
         finally:
             second.shutdown()
             CacheManager.reset()
@@ -229,7 +229,7 @@ class TestWhatItRefuses:
         import zarr
 
         store = tmp_path / "theirs.zarr"
-        zarr.create(store=zarr.DirectoryStore(str(store)), shape=(4, 4), dtype="uint16")
+        zarr.create_array(str(store), shape=(4, 4), dtype="uint16", zarr_format=2)
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
         adapter = ZarrAdapter(zarr.open_array(str(store), mode="r"), "theirs")
@@ -258,7 +258,7 @@ class TestALabelSetOnAMember:
         client.upload_array(desc, labels)
 
         assert desc.array_id == f"{source}/@fields/img/@labels/nuclei"
-        assert client.get_label_sets(image.array_id) == [desc.array_id]
+        assert label_sets(client, image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
         )
@@ -311,5 +311,5 @@ class TestTheStoreFollowsThePlan:
 
         assert None not in tokens.values()
         assert tokens["a"] != tokens["b"]
-        assert tokens["a"] != parent.content_version
+        assert tokens["a"] != parent._content_version
         assert first.array_id != second.array_id

@@ -67,9 +67,9 @@ from typing import List, Optional, Tuple
 import pyarrow as pa
 from dask.utils import parse_bytes
 
-from biopb._fs_detect import unsafe_cache_dir_reason
-from biopb._locations import cache_dir
-from biopb.lifecycle.file_lock import ExclusiveFileLock
+from biopb._config.locations import cache_dir
+from biopb._lifecycle.file_lock import ExclusiveFileLock
+from biopb.tensor._fs_detect import unsafe_cache_dir_reason
 from biopb.tensor._location import canonical_location
 
 logger = logging.getLogger(__name__)

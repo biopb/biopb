@@ -132,7 +132,12 @@ class TestTiffSequenceClaim:
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.full_shape == [n, 8, 8]
             assert adapter.dim_labels == ["i", "y", "x"]
-            assert len(adapter.get_metadata()["files"]) == n
+            assert (
+                len(
+                    adapter.registration_record([], import_rois=False).metadata["files"]
+                )
+                == n
+            )
 
     def test_uppercase_tif_extension_claimed(self):
         """Case-insensitive extension match: a folder of `.TIF` is claimed."""
@@ -264,7 +269,7 @@ class TestTiffSequenceStackAll:
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.full_shape == [9, 8, 8]
             assert adapter.dim_labels == ["i", "y", "x"]
-            md = adapter.get_metadata()
+            md = adapter.registration_record([], import_rois=False).metadata
             assert len(md["files"]) == 9
             assert "unstacked_files" not in md
             # index-aligned: metadata order == stacked file order
@@ -291,7 +296,9 @@ class TestTiffSequenceStackAll:
             # 6 single-page files stacked, padded to the max plane, promoted dtype
             assert adapter.full_shape == [6, 16, 16]
             assert adapter._dtype == "uint16"
-            assert adapter.get_metadata()["unstacked_files"] == ["frame_zstack.tif"]
+            assert adapter.registration_record([], import_rois=False).metadata[
+                "unstacked_files"
+            ] == ["frame_zstack.tif"]
 
     def test_dtype_promotes_up_never_down(self):
         """The descriptor takes the widest dtype; a uint16 value survives a
@@ -409,7 +416,10 @@ class TestTiffSequenceStackAll:
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.full_shape[0] == n + 1
-            assert "readme.tif" in adapter.get_metadata()["files"]
+            assert (
+                "readme.tif"
+                in adapter.registration_record([], import_rois=False).metadata["files"]
+            )
 
     def test_unreadable_tiff_listed_as_unstacked(self):
         """A corrupt/unreadable TIFF is not stacked but is surfaced, not fatal."""
@@ -420,7 +430,12 @@ class TestTiffSequenceStackAll:
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
             assert adapter.full_shape[0] == 3
-            assert "truncated.tif" in adapter.get_metadata()["unstacked_files"]
+            assert (
+                "truncated.tif"
+                in adapter.registration_record([], import_rois=False).metadata[
+                    "unstacked_files"
+                ]
+            )
 
     def test_transport_error_propagates_not_demoted(self, monkeypatch):
         """An OSError while reading a member (e.g. a failed cloud recall) is
@@ -452,7 +467,9 @@ class TestTiffSequenceStackAll:
                 _write_tiff(Path(tmpdir) / f"img_{i}.tif", seed=i)
 
             adapter = TiffSequenceAdapter(str(tmpdir), "sid")
-            assert adapter.get_metadata()["files"] == [
+            assert adapter.registration_record([], import_rois=False).metadata[
+                "files"
+            ] == [
                 "img_1.tif",
                 "img_2.tif",
                 "img_10.tif",

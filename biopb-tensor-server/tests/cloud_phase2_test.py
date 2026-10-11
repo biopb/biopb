@@ -1,9 +1,9 @@
-"""Cloud-storage phase 2: unresolved adapter + lazy resolution + cloud opt-in.
+"""Cloud-storage phase 2: unresolved sources + lazy resolution + cloud opt-in.
 
 Covers the recall-free claim contract (each adapter avoids byte reads when its
-target is not resident), the UnresolvedSourceAdapter proxy and its resolve-on-
-serve hook, and the source-manager wiring that registers cloud sources unresolved
-and backfills the metadata DB once they resolve.
+target is not resident), and the source-manager wiring that catalogs a cloud
+source as ``needs_recall`` with no adapter and registers it, backfilling the
+metadata DB, when a client resolves it.
 
 Residency is simulated by patching ``_is_offline_placeholder`` -- the same
 stat-only signal the real code uses -- so a real on-disk store can stand in for a
@@ -14,12 +14,10 @@ import json
 import os
 import tempfile
 import threading
-import time
 
 import pytest
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.core import discovery
-from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -28,10 +26,11 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     should_skip_walk_entry,
 )
+from biopb_tensor_server.core.errors import SourceUnresolvedError
 from biopb_tensor_server.sources import reconciler as rec_mod
-from biopb_tensor_server.sources.tree_scanner import build_entry_signature
+from biopb_tensor_server.sources.entry_stat import build_entry_signature
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager
 
 
 def _zarr_available():
@@ -80,7 +79,7 @@ class TestCloudConfig:
 class TestClaimContextResidency:
     def test_directory_is_resident(self, tmp_path):
         # A directory legitimately reports st_blocks == 0 on some filesystems;
-        # never flag it (mirrors the phase-1 SourceAdapter.is_resident fix).
+        # never flag it (mirrors the phase-1 residency fix).
         assert ClaimContext(tmp_path).is_resident() is True
 
     def test_resident_file(self, tmp_path):
@@ -113,7 +112,7 @@ class TestShouldSkipAdmit:
     def test_admit_still_prunes_hidden_and_system(self, monkeypatch):
         from pathlib import Path
 
-        # Hidden entries and system/cloud dirs are pruned even under admit.
+        # Hidden entries and system dirs are pruned even under admit; OneDrive is not.
         assert (
             should_skip_walk_entry(
                 Path("/data/.hidden"), is_dir=False, admit_nonresident=True
@@ -123,6 +122,12 @@ class TestShouldSkipAdmit:
         assert (
             should_skip_walk_entry(
                 Path("/home/u/OneDrive"), is_dir=True, admit_nonresident=True
+            )
+            is False
+        )
+        assert (
+            should_skip_walk_entry(
+                Path("/data/.git"), is_dir=True, admit_nonresident=True
             )
             is True
         )
@@ -388,157 +393,37 @@ class TestReaderDeferBranches:
         assert claim.source_type == "tiff-sequence"
 
 
-# --------------------------------------------------------------------------- #
-# UnresolvedSourceAdapter proxy
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestUnresolvedProxy:
-    def _make_proxy(self, url, source_type="ome-zarr", on_resolved=None):
-        from biopb_tensor_server.adapters import get_default_registry
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-
-        cfg = SourceConfig(url=url, type=source_type, source_id="s1")
-        return UnresolvedSourceAdapter(
-            cfg, get_default_registry(), on_resolved=on_resolved
-        )
-
-    def test_catalog_surface_is_empty_and_not_resident(self):
-        proxy = self._make_proxy("/data/cloud/x.zarr")
-        # Empty tensor list is what keeps precache off an unresolved source: it
-        # loops list_tensor_descriptors and skips before any tensor-level call
-        # (pyramid checks are now tensor-scoped on the resolved adapter).
-        assert proxy.list_tensor_descriptors() == []
-        assert proxy.is_resident() is False
-        assert proxy.source_type == "ome-zarr"
-        assert proxy.is_resolved() is False
-
-    def test_close_forwards_to_the_resolved_adapter(self):
-        """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
-
-        ``close_adapter`` is duck-typed, so a proxy without ``close`` silently
-        skips cleanup for exactly the resolved cloud OME-TIFF / QPTIFF sources
-        whose ``close()`` is the one that matters.
-        """
-        proxy = self._make_proxy("/data/cloud/x.zarr")
-        closed = []
-
-        class _Inner:
-            def close(self):
-                closed.append(True)
-
-        proxy._resolved = _Inner()
-        proxy.close()
-        assert closed == [True]
-        assert proxy.is_resolved() is False
-        proxy.close()  # idempotent
-        assert closed == [True]
-
-    def test_close_on_unresolved_proxy_is_a_noop(self):
-        self._make_proxy("/data/cloud/x.zarr").close()  # does not raise
-
-    def test_get_level_adapter_forwards_to_the_resolved_adapter(self):
-        """The proxy forwards native-level lookup, like ``close`` (biopb/biopb#557).
-
-        A resolved cloud native-pyramid source serves its ``precompute`` chunks
-        through the level adapter; without this forward the server's chunk
-        dispatch would mis-route a level chunk to ``get_tensor_adapter``.
-        """
-        proxy = self._make_proxy("/data/cloud/x.zarr")
-        # Unresolved: no tensors yet, so no level -- None falls back to the
-        # tensor path (which raises the "resolve first" error).
-        assert proxy.get_level_adapter("1") is None
-
-        calls = []
-
-        class _Inner:
-            def get_level_adapter(self, path):
-                calls.append(path)
-                return "level-adapter"
-
-        proxy._resolved = _Inner()
-        assert proxy.get_level_adapter("1") == "level-adapter"
-        assert calls == ["1"]
-
-    def test_serve_surface_refuses_until_resolved(self):
-        # get_tensor_adapter (the GetFlightInfo / DoGet path) must NEVER resolve
-        # on its own -- it refuses with SourceUnresolvedError until resolve() has
-        # run, so the only thing that downloads is the explicit resolve action.
-        import zarr
-        from biopb_tensor_server.core.errors import SourceUnresolvedError
-
-        with tempfile.TemporaryDirectory() as d:
-            zpath = os.path.join(d, "img.zarr")
-            zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
-            proxy = self._make_proxy(zpath)
-            with pytest.raises(SourceUnresolvedError):
-                proxy.get_tensor_adapter("s1")
-            assert proxy.is_resolved() is False  # the refusal did not hydrate
-            # After an explicit resolve the serve surface delegates normally.
-            proxy.resolve()
-            ta = proxy.get_tensor_adapter("s1")
-            assert list(ta.get_tensor_descriptor().shape) == [8, 8]
-
-    def test_resolve_hydrates_and_delegates(self):
-        import zarr
-
-        with tempfile.TemporaryDirectory() as d:
-            zpath = os.path.join(d, "img.zarr")
-            zarr.open_array(
-                zpath, mode="w", shape=(64, 128), chunks=(32, 64), dtype="uint16"
-            )
-            fired = {}
-            proxy = self._make_proxy(
-                zpath,
-                source_type="ome-zarr",  # provisional guess; real type is "zarr"
-                on_resolved=lambda sid, ad: fired.update(sid=sid, type=ad._source_type),
-            )
-            proxy.resolve()
-            assert proxy.is_resolved() is True
-            # The authoritative type came from re-probing the hydrated content.
-            assert fired == {"sid": "s1", "type": "zarr"}
-            # Catalog surface now delegates to the resolved adapter.
-            assert [list(t.shape) for t in proxy.list_tensor_descriptors()] == [
-                [64, 128]
-            ]
-            assert proxy.is_resident() is True
-
-    def test_resolves_once_under_repeated_resolve(self):
-        import zarr
-
-        with tempfile.TemporaryDirectory() as d:
-            zpath = os.path.join(d, "img.zarr")
-            zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
-            calls = []
-            proxy = self._make_proxy(
-                zpath, on_resolved=lambda sid, ad: calls.append(sid)
-            )
-            proxy.resolve()
-            first = proxy._resolved
-            proxy.resolve()
-            assert proxy._resolved is first  # not rebuilt
-            assert calls == ["s1"]  # on_resolved fired exactly once
-
-    def test_resolution_failure_raises_source_unresolved(self):
-        from biopb_tensor_server.core.errors import SourceUnresolvedError
-
-        proxy = self._make_proxy("/nonexistent/path.zarr", source_type="ome-zarr")
-        with pytest.raises(SourceUnresolvedError):
-            proxy.resolve()
-
-
-# --------------------------------------------------------------------------- #
-# Source-manager registration decision
-# --------------------------------------------------------------------------- #
-
-
 class _FakeMetadataDb:
     def __init__(self):
         self.added = []
+        self.pending = []  # (source_id, recall) of each pending row written
 
-    def sync_source_added(self, source_id, adapter):
+    def restorable_rows(self):
+        return []
+
+    def ensure_root(self, root_id, root_url):
+        pass
+
+    def sync_roots(self, roots):
+        pass
+
+    def sweep_root(self, root_id, is_claimed):
+        return 0
+
+    def confirm_root(self, root_id):
+        pass
+
+    def sync_source_added(self, source_id, adapter, record=None):
         self.added.append((source_id, adapter))
+
+    def sync_pending_source(
+        self, claim, catalog_url=None, error=None, recall=False, record=None
+    ):
+        self.pending.append((claim.source_id, recall))
+
+    def sync_pending_sources(self, rows):
+        for row in rows:
+            self.sync_pending_source(row.claim, row.catalog_url, recall=row.recall)
 
     def sync_source_removed(self, source_id):
         pass
@@ -552,8 +437,13 @@ class _FakeServer:
         # registry; `registered` is this fake's own record of the same calls.
         self.sources = self.registered
 
-    def register_source(self, source_id, adapter):
+    def register_source(self, source_id, adapter, evictable=False):
         self.registered[source_id] = adapter
+
+    def swap_source(self, source_id, adapter, evictable=False):
+        displaced = self.registered.get(source_id)
+        self.registered[source_id] = adapter
+        return adapter, displaced
 
     def unregister_source(self, source_id):
         self.registered.pop(source_id, None)
@@ -567,9 +457,8 @@ class _FakeServer:
 
 def _make_manager(server, cloud_roots=None, monitored=None):
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
-    return SourceManager(
+    return make_manager(
         server=server,
         metadata_db=server._metadata_db,
         registry=get_default_registry(),
@@ -615,17 +504,14 @@ class TestUnresolvedDecision:
 
 
 class _ResidencyAdapter:
-    """Stand-in carrying the *real* ``is_resident()`` off the adapter base.
+    """Stand-in carrying only the ``source_url`` the gate asks about.
 
     Not a canned bool: the gate's failure mode is asking a weaker question than
-    the adapter would, so the test runs the adapter's own answer.
+    ``source_is_resident`` would, so the test runs the real answer on the url.
     """
 
     def __init__(self, source_url):
-        self._source_url = str(source_url)
-
-    def is_resident(self):
-        return SourceAdapter.is_resident(self)
+        self.source_url = str(source_url)
 
 
 class TestShouldWarm:
@@ -712,11 +598,10 @@ class TestShouldWarm:
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestCloudRegistrationEndToEnd:
-    def test_unresolved_registration_then_resolve_backfills_db(
+    def test_unresolved_claim_is_cataloged_unopened_then_resolve_registers_it(
         self, tmp_path, monkeypatch
     ):
         import zarr
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
         store = tmp_path / "img.zarr"
         zarr.open_array(
@@ -725,25 +610,56 @@ class TestCloudRegistrationEndToEnd:
 
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        reconciler = mgr._reconciler
 
-        # Register an ome-zarr claim flagged unresolved (as the defer branch would).
+        # An ome-zarr claim flagged unresolved (as the defer branch would).
         claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
-        assert mgr._reconciler._register_source_claim(claim) is True
+        assert reconciler._commit_add_claim(claim) is True
 
-        # Registered as the proxy; catalog row carries NULL shape (empty tensors).
+        # A catalog row that says needs_recall and a claim: no adapter, nothing
+        # opened, nothing queued for the background pool.
+        assert server.registered == {}
+        assert server._metadata_db.pending == [("cloud1", True)]
+        assert server._metadata_db.added == []
+        assert reconciler.is_pending("cloud1")
+        assert reconciler.unregistered_count() == 1
+        assert reconciler.pending_count() == 0  # waits for a client, not the pool
+        with pytest.raises(SourceUnresolvedError, match="download"):
+            reconciler.ensure_adapter("cloud1", consent=False)
+
+        # An explicit resolve builds the real adapter and writes the concrete row.
+        reconciler.ensure_adapter("cloud1", consent=True)
         adapter = server.registered["cloud1"]
-        assert isinstance(adapter, UnresolvedSourceAdapter)
-        assert adapter.list_tensor_descriptors() == []
-        assert server._metadata_db.added[-1][0] == "cloud1"
-        assert adapter.is_resident() is False
+        assert [list(t.shape) for t in adapter.list_tensors()] == [[32, 48]]
+        assert [sid for sid, _ in server._metadata_db.added] == ["cloud1"]
+        assert not reconciler.is_pending("cloud1")
+        assert reconciler.unregistered_count() == 0
 
-        # An explicit resolve -> backfills the DB with the concrete row.
-        adapter.resolve()
-        assert [list(t.shape) for t in adapter.list_tensor_descriptors()] == [[32, 48]]
-        # on_resolved fired a second sync_source_added (the upsert backfill).
-        assert [sid for sid, _ in server._metadata_db.added].count("cloud1") == 2
-        resolved_adapter = server._metadata_db.added[-1][1]
-        assert resolved_adapter.list_tensor_descriptors()[0].shape == [32, 48]
+    def test_a_refresh_sends_a_resolved_cloud_source_back_to_needs_recall(
+        self, tmp_path
+    ):
+        import zarr
+
+        store = tmp_path / "img.zarr"
+        zarr.open_array(
+            str(store), mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8"
+        )
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        reconciler = mgr._reconciler
+        claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
+        reconciler._commit_add_claim(claim)
+        reconciler.ensure_adapter("cloud1", consent=True)
+        assert "cloud1" in server.registered
+
+        # The bytes behind it changed: nothing is reopened, the adapter is
+        # dropped, and the row asks for a recall again.
+        assert reconciler._refresh_claim_locked(claim) is True
+
+        assert server.registered == {}
+        assert server._metadata_db.pending[-1] == ("cloud1", True)
+        assert "cloud1" in reconciler._recall
+        assert reconciler.is_pending("cloud1")
 
 
 # --------------------------------------------------------------------------- #
@@ -753,43 +669,32 @@ class TestCloudRegistrationEndToEnd:
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestPrecacheSkipsUnresolved:
-    def test_unresolved_source_never_reaches_descriptor_hook(self, monkeypatch):
-        from biopb_tensor_server.adapters import get_default_registry
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+    def test_unresolved_source_is_never_queued_for_registration(self, tmp_path):
+        # The background pool registers what it is told of. A cloud source is
+        # registered by downloading it, which only a client's resolve may do.
+        store = tmp_path / "img.zarr"
+        store.mkdir()
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        queued = []
+        mgr._reconciler.set_pending_hook(queued.append)
 
-        cfg = SourceConfig(url="/data/cloud/x.zarr", type="ome-zarr", source_id="s1")
-        proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
+        claim = SourceClaim("ome-zarr", str(store), source_id="cloud1", unresolved=True)
+        assert mgr._reconciler._commit_add_claim(claim) is True
 
-        # If precache (which loops list_tensor_descriptors) ever resolved the
-        # source, it would hydrate cloud data in the background. Guard: an empty
-        # tensor list means it skips before reaching the resolving get_tensor_adapter.
-        def _boom(*a, **k):
-            raise AssertionError("precache must not resolve an unresolved source")
+        assert queued == []
 
-        monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
-        assert proxy.list_tensor_descriptors() == []
-        assert proxy.is_resolved() is False
-
-    def test_real_precache_worker_does_not_resolve_unresolved(self, monkeypatch):
-        # Drives the actual PrecacheWorker._process_source: the empty tensor list
-        # makes it return before the resolving get_tensor_adapter, so the cloud
-        # source is never hydrated by background warming.
-        from biopb_tensor_server.adapters import get_default_registry
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+    def test_real_precache_worker_skips_a_source_with_no_adapter(self, monkeypatch):
+        # Drives the actual PrecacheWorker._process_source: a cloud source has no
+        # adapter until it resolves, so background warming finds nothing to read.
         from biopb_tensor_server.core.config import PrecacheConfig
         from biopb_tensor_server.serving.precache import PrecacheWorker
 
-        cfg = SourceConfig(url="/data/cloud/x.zarr", type="ome-zarr", source_id="s1")
-        proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
-
-        def _boom(*a, **k):
-            raise AssertionError("precache must not resolve an unresolved source")
-
-        monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
-
         class _Registry:
             def get(self, sid):
-                return proxy if sid == "s1" else None
+                return None
+
+            resolve = get
 
         class _Srv:
             sources = _Registry()
@@ -798,7 +703,6 @@ class TestPrecacheSkipsUnresolved:
         # Past the cache gate so the real source-processing logic runs.
         monkeypatch.setattr(worker, "_cache_active", lambda: True)
         assert worker._process_source("s1") is False
-        assert proxy.is_resolved() is False
 
 
 # --------------------------------------------------------------------------- #
@@ -836,19 +740,14 @@ class TestCloudRescanGating:
         # mtime is untrustworthy, so it could never age into eligibility. Set a
         # window no local entry could satisfy -- the cloud source must still register.
         mgr._stability_window = 10**9
-        mgr._scanner._stability_window = 10**9
 
         mgr._handle_rescan()
 
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-
-        assert len(server.registered) == 1
-        adapter = next(iter(server.registered.values()))
-        assert isinstance(adapter, UnresolvedSourceAdapter)
-        assert adapter.list_tensor_descriptors() == []
-        assert adapter.is_resident() is False
-        # Catalogued in the DB with an empty (NULL-shape) row.
-        assert server._metadata_db.added
+        # Cataloged as needs_recall without being opened: no adapter, no read.
+        assert server.registered == {}
+        assert len(mgr._reconciler._recall) == 1
+        assert [recall for _, recall in server._metadata_db.pending] == [True]
+        assert server._metadata_db.added == []
 
     def test_noncloud_root_defers_fresh_dataset_via_stability_window(
         self, tmp_path, force_nonresident
@@ -869,14 +768,28 @@ class TestCloudRescanGating:
         mgr._handle_rescan()
         assert server.registered == {}
 
+    @staticmethod
+    def _spy_walks(monkeypatch):
+        """Record every root the rescan hands to the walker."""
+        from biopb_tensor_server.sources import source_manager as sm
+
+        walked = []
+        real = sm.discover_sources
+
+        def spy(root, *args, **kwargs):
+            walked.append(str(root))
+            return real(root, *args, **kwargs)
+
+        monkeypatch.setattr(sm, "discover_sources", spy)
+        return walked
+
     def test_incremental_rescan_skips_cloud_force_full_rewalks(
         self, tmp_path, force_nonresident, monkeypatch
     ):
-        # A cloud subtree is scanned only on a force_full pass: the first rescan
+        # A cloud subtree is walked only on a force_full pass: the first rescan
         # (last-full == -inf) is force_full and registers it; a subsequent
-        # incremental rescan silently SKIPS the cloud root (recorded in
-        # _skipped_stable_dirs) and preserves the claim untouched; a later
-        # force_full rescan re-walks it.
+        # incremental rescan does not walk the cloud root and leaves the claim
+        # untouched; a later force_full rescan walks it again.
         root = tmp_path / "cloudroot"
         root.mkdir()
         store = root / "img.zarr"
@@ -887,24 +800,27 @@ class TestCloudRescanGating:
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
         root_key = str(root.resolve())
+        walked = self._spy_walks(monkeypatch)
 
         # First rescan: force_full -> cloud walked and registered.
         mgr._handle_rescan()
-        assert len(server.registered) == 1
-        sid = next(iter(server.registered))
-        assert root_key not in mgr._skipped_stable_dirs
+        assert len(mgr._reconciler._recall) == 1
+        sid = next(iter(mgr._reconciler._recall))
+        assert walked == [root_key]
 
-        # Incremental (non-force_full) rescan: cloud subtree skipped, claim kept.
+        # Incremental (non-force_full) rescan: cloud root not walked, claim kept.
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
         mgr._handle_rescan()
-        assert root_key in mgr._skipped_stable_dirs
-        assert set(server.registered) == {sid}  # preserved, not torn down/re-added
+        assert walked == [root_key]
+        assert set(mgr._reconciler._recall) == {
+            sid
+        }  # preserved, not torn down/re-added
 
-        # force_full rescan: cloud re-walked (no longer skipped), claim stable.
+        # force_full rescan: cloud walked again, claim stable.
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
         mgr._handle_rescan()
-        assert root_key not in mgr._skipped_stable_dirs
-        assert set(server.registered) == {sid}
+        assert walked == [root_key, root_key]
+        assert set(mgr._reconciler._recall) == {sid}
 
     @staticmethod
     def _make_cloud_store(root, name="img.zarr"):
@@ -914,42 +830,29 @@ class TestCloudRescanGating:
         (store / ".zattrs").write_text(json.dumps({"multiscales": [{"datasets": []}]}))
         return store
 
-    def test_incremental_does_no_cloud_entry_work(
+    def test_incremental_does_no_cloud_work(
         self, tmp_path, force_nonresident, monkeypatch
     ):
-        # After the startup force_full, cloud entries live in the cloud partition,
-        # NOT in _entry_states, and an incremental rescan touches none of them: the
-        # per-entry carry-forward must never run, and the partition is carried
-        # forward by reference (unchanged), while the cloud source stays registered.
+        # After the startup force_full, an incremental rescan neither walks the
+        # cloud root nor touches its source: it stays registered, and the
+        # reconcile scopes it out by id rather than diffing it.
         root = tmp_path / "cloudroot"
         root.mkdir()
         self._make_cloud_store(root)
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
-        root_key = str(root.resolve())
 
         mgr._handle_rescan()  # force_full
-        sid = next(iter(server.registered))
-        assert mgr._cloud_entry_states  # cloud entries partitioned out
-        assert root_key in mgr._cloud_entry_states
-        # Nothing under the cloud root lingers in _entry_states.
-        assert not any(
-            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_states
-        )
-        assert sid in mgr._reconciler._cloud_source_ids
+        sid = next(iter(mgr._reconciler._recall))
+        assert mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
 
-        # Incremental: the per-entry cloud carry-forward must never be invoked.
-        def _boom(*a, **k):
-            raise AssertionError("incremental must not iterate cloud entries")
-
-        monkeypatch.setattr(mgr._scanner, "_copy_cached_subtree_entries", _boom)
+        walked = self._spy_walks(monkeypatch)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
-        partition_before = dict(mgr._cloud_entry_states)
 
-        mgr._handle_rescan()  # must not raise
+        mgr._handle_rescan()
 
-        assert set(server.registered) == {sid}  # preserved
-        assert mgr._cloud_entry_states == partition_before  # carried, not rebuilt
+        assert walked == []  # the cloud root was not enumerated
+        assert set(mgr._reconciler._recall) == {sid}  # preserved
 
     def test_incremental_preserves_cloud_without_diff_or_churn(
         self, tmp_path, force_nonresident, monkeypatch
@@ -964,13 +867,13 @@ class TestCloudRescanGating:
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
 
         mgr._handle_rescan()  # force_full registers + partitions
-        sid = next(iter(server.registered))
-        added_before = len(server._metadata_db.added)
+        sid = next(iter(mgr._reconciler._recall))
+        added_before = len(server._metadata_db.pending)
 
         orig_sig = mgr._reconciler._build_claim_signatures
 
         def guard(claim):
-            assert claim.source_id not in mgr._reconciler._cloud_source_ids, (
+            assert not mgr._roots.is_cloud(claim.primary_path), (
                 "cloud source must not be signature-diffed on an incremental"
             )
             return orig_sig(claim)
@@ -980,8 +883,8 @@ class TestCloudRescanGating:
 
         mgr._handle_rescan()
 
-        assert set(server.registered) == {sid}
-        assert len(server._metadata_db.added) == added_before  # no re-add churn
+        assert set(mgr._reconciler._recall) == {sid}
+        assert len(server._metadata_db.pending) == added_before  # no re-add churn
 
     def test_new_cloud_dataset_surfaces_only_on_force_full(
         self, tmp_path, force_nonresident, monkeypatch
@@ -996,19 +899,20 @@ class TestCloudRescanGating:
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
 
         mgr._handle_rescan()  # force_full -> 1 source
-        assert len(server.registered) == 1
+        assert len(mgr._reconciler._recall) == 1
 
         self._make_cloud_store(root, "img2.zarr")  # new dataset under the cloud root
 
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
         mgr._handle_rescan()  # incremental: cloud skipped -> not discovered yet
-        assert len(server.registered) == 1
+        assert len(mgr._reconciler._recall) == 1
 
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
         mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
-        assert len(server.registered) == 2
+        assert len(mgr._reconciler._recall) == 2
         assert all(
-            sid in mgr._reconciler._cloud_source_ids for sid in server.registered
+            mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
+            for sid in mgr._reconciler._recall
         )
 
 
@@ -1024,14 +928,34 @@ class TestResolveAction:
     runs, then one terminal message carrying the source's now-concrete catalog
     row in its ``source_row`` arm."""
 
-    def _server(self, source_id, adapter):
-        """Registered AND catalogued -- what a SourceManager leaves behind, and
-        what the terminal row read at the end of the resolve stream needs. The
-        action refuses outright on a catalog-less server: the row IS its
-        terminal message."""
-        server = catalog_server("grpc://localhost:0")
-        register_and_catalog(server, source_id, adapter)
-        return server
+    def _server(self, zpath, source_id="cloud1"):
+        """A catalogued server whose reconciler holds an unresolved cloud claim,
+        which is what a SourceManager leaves behind for it: a ``needs_recall`` row
+        and a claim, with no adapter."""
+        from pathlib import Path
+
+        from biopb_tensor_server.adapters import get_default_registry
+
+        server = catalog_server("localhost:0")
+        mgr = make_manager(
+            server=server,
+            metadata_db=server.metadata_db,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            cloud_roots={Path(zpath).parent},
+        )
+        server.set_resolve_handler(mgr.resolve_source)
+        claim = SourceClaim("ome-zarr", zpath, source_id=source_id, unresolved=True)
+        assert mgr._reconciler._commit_add_claim(claim) is True
+        return server, mgr
+
+    @staticmethod
+    def _zarr(d):
+        import zarr
+
+        zpath = os.path.join(d, "img.zarr")
+        zarr.open_array(zpath, mode="w", shape=(16, 24), chunks=(8, 12), dtype="uint8")
+        return zpath
 
     @staticmethod
     def _parse(bodies):
@@ -1048,28 +972,20 @@ class TestResolveAction:
 
     def test_resolve_action_streams_the_backfilled_catalog_row(self):
         import pyarrow.flight as flight
-        import zarr
         from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
-        from biopb_tensor_server.adapters import get_default_registry
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as d:
-            zpath = os.path.join(d, "img.zarr")
-            zarr.open_array(
-                zpath, mode="w", shape=(16, 24), chunks=(8, 12), dtype="uint8"
-            )
-            cfg = SourceConfig(url=zpath, type="ome-zarr", source_id="cloud1")
-            # One catalog, wired into both halves the way cli.py does: the
-            # adapter's on_resolved backfills the row that registration wrote as
-            # a NULL-shape placeholder. Nothing else corrects it.
-            db = MetadataDatabase()
-            proxy = UnresolvedSourceAdapter(
-                cfg, get_default_registry(), on_resolved=db.sync_source_added
-            )
-            server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
-            db.sync_source_added("cloud1", server.register_source("cloud1", proxy))
+            server, _ = self._server(self._zarr(d))
+            db = server.metadata_db
+            (placeholder,) = db.query(
+                "SELECT is_resolved, unresolved_reason, tensors FROM sources"
+            ).to_pylist()
+            assert placeholder == {
+                "is_resolved": False,
+                "unresolved_reason": "needs_recall",
+                "tensors": [],
+            }
+            assert server.sources.get("cloud1") is None
 
             action = flight.Action("resolve", b"cloud1")
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
@@ -1085,84 +1001,67 @@ class TestResolveAction:
             assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
             assert row["is_resolved"] is True
             assert "data_resident" not in row  # never in a row
-            assert proxy.is_resolved() is True
+            assert server.sources.get("cloud1") is not None
 
-            # It IS the catalog row, not a second encoding built beside it. The
-            # backfill matters here: without on_resolved above, the placeholder
-            # row would still read empty.
+            # It IS the catalog row, not a second encoding built beside it.
             browsed = db.query(
                 f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = 'cloud1'"
             ).to_pylist()
             assert browsed == [row]
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
-        # The stream must carry progress keep-alives BEFORE the terminal descriptor
-        # -- this is what keeps a minutes-long recall under a proxy's idle read
+        # The stream must carry progress keep-alives BEFORE the terminal row --
+        # this is what keeps a minutes-long recall under a proxy's idle read
         # timeout, and the elapsed field lets a client show progress.
         #
-        # Deterministic drive (no wall-clock race, see issue #177): the fake
-        # resolve() blocks on an Event we only set AFTER pulling the first stream
-        # item. Because the worker thread is parked in resolve() until then, the
-        # server's heartbeat loop is guaranteed to time out its join at least once
-        # and emit a progress message first -- independent of runner load. The old
-        # form raced a 0.06s sleep against a 0.01s interval and flaked on slow CI.
-        import threading
-
+        # Deterministic drive (no wall-clock race, see issue #177): the recall
+        # blocks on an Event we only set AFTER pulling the first stream item.
+        # Because the worker thread is parked in it until then, the server's
+        # heartbeat loop is guaranteed to time out its join at least once and emit
+        # a progress message first -- independent of runner load.
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
         from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
 
         release = threading.Event()
 
-        class _SlowAdapter:
-            source_url = None
-            capability_token = None
-            catalog_url = "file:///slow"
-            source_type = "zarr"
+        with tempfile.TemporaryDirectory() as d:
+            server, mgr = self._server(self._zarr(d), "slow")
+            real = mgr._reconciler._build_recalled_adapter
 
-            def is_resident(self):
-                return True
-
-            def is_resolved(self):
-                return True
-
-            def list_tensor_descriptors(self):
-                return [TensorDescriptor(array_id="slow", shape=[2, 2], dtype="uint8")]
-
-            def get_metadata(self):
-                return {}
-
-            def resolve(self):
-                # Park until the test has observed the first heartbeat, then finish.
-                # Bounded wait so a broken test can never hang the drain below.
+            def slow_recall(claim, source_config):
+                # Park until the test has observed the first heartbeat, then
+                # finish. Bounded wait so a broken test can never hang the drain.
                 release.wait(timeout=5.0)
+                return real(claim, source_config)
 
-        server = self._server("slow", _SlowAdapter())
-        action = flight.Action("resolve", b"slow")
+            monkeypatch.setattr(mgr._reconciler, "_build_recalled_adapter", slow_recall)
+            action = flight.Action("resolve", b"slow")
 
-        stream = server.do_action(None, action)
-        try:
-            # Worker is parked in resolve() -> the first item is a heartbeat.
-            first = bytes(next(stream))
-        finally:
-            release.set()  # let resolve() complete, then drain the rest
-        bodies = [first] + [bytes(r) for r in stream]
-        msgs, kinds = self._parse(bodies)
+            stream = server.do_action(None, action)
+            try:
+                # Worker is parked in the recall -> the first item is a heartbeat.
+                first = bytes(next(stream))
+            finally:
+                release.set()  # let the recall complete, then drain the rest
+            bodies = [first] + [bytes(r) for r in stream]
+            msgs, kinds = self._parse(bodies)
 
-        assert kinds[0] == "progress"  # deterministically, a heartbeat leads
-        assert kinds.count("progress") >= 1  # at least one heartbeat
-        assert kinds[-1] == "source_row"  # terminal is the catalog row
-        assert self._rows(msgs[-1])[0]["source_id"] == "slow"
-        # progress heartbeats carry a monotonically non-decreasing elapsed clock
-        elapsed = [
-            m.progress.elapsed_seconds
-            for m, k in zip(msgs, kinds, strict=True)
-            if k == "progress"
-        ]
-        assert elapsed == sorted(elapsed)
-        assert elapsed[-1] >= 0.0
+            assert kinds[0] == "progress"  # deterministically, a heartbeat leads
+            assert kinds.count("progress") >= 1  # at least one heartbeat
+            assert kinds[-1] == "source_row"  # terminal is the catalog row
+            assert self._rows(msgs[-1])[0]["source_id"] == "slow"
+            # the heartbeat names what is being recalled
+            assert msgs[0].progress.target_name == "img.zarr"
+            # progress heartbeats carry a monotonically non-decreasing elapsed clock
+            elapsed = [
+                m.progress.elapsed_seconds
+                for m, k in zip(msgs, kinds, strict=True)
+                if k == "progress"
+            ]
+            assert elapsed == sorted(elapsed)
+            assert elapsed[-1] >= 0.0
 
     @pytest.mark.parametrize(
         "exc_type, flight_error",
@@ -1172,11 +1071,11 @@ class TestResolveAction:
         ],
     )
     def test_a_resolve_that_does_not_hydrate_raises_and_syncs_nothing(
-        self, exc_type, flight_error
+        self, exc_type, flight_error, monkeypatch
     ):
-        """The failure branch is what makes the backfill below it safe: a
-        resolve that did not hydrate never reaches the catalog sync or the row
-        read, so the placeholder row stays as registration wrote it."""
+        """A resolve that did not hydrate registers nothing: the row stays
+        ``needs_recall`` as the scan wrote it, and the source is not marked failed
+        (a retry may succeed once the bytes arrive)."""
         import pyarrow.flight as flight
         from biopb_tensor_server.core.errors import (
             SourceResolveRetriableError,
@@ -1189,402 +1088,54 @@ class TestResolveAction:
             else SourceUnresolvedError("unsupported type")
         )
 
-        class _WontHydrate:
-            capability_token = None
-            source_url = None
-            catalog_url = "file:///cloud1"
-            source_type = "ome-zarr"
-            synced = 0
+        def wont_hydrate(claim, source_config):
+            raise err
 
-            def is_resident(self):
-                return False
+        with tempfile.TemporaryDirectory() as d:
+            server, mgr = self._server(self._zarr(d))
+            monkeypatch.setattr(
+                mgr._reconciler, "_build_recalled_adapter", wont_hydrate
+            )
 
-            def is_resolved(self):
-                return False
+            action = flight.Action("resolve", b"cloud1")
+            with pytest.raises(getattr(flight, flight_error)):
+                list(server.do_action(None, action))
 
-            def list_tensor_descriptors(self):
-                # Empty before AND after: the source never hydrates.
-                return []
+            # Nothing registered, and the placeholder row is untouched.
+            assert server.sources.get("cloud1") is None
+            (row,) = server.metadata_db.query(
+                "SELECT tensors, unresolved_reason FROM sources "
+                "WHERE source_id = 'cloud1'"
+            ).to_pylist()
+            assert row == {"tensors": [], "unresolved_reason": "needs_recall"}
+            assert mgr._reconciler.is_pending("cloud1")
+            assert "cloud1" not in mgr._reconciler._pending_failed
 
-            def get_metadata(self):
-                type(self).synced += 1
-                return {}
+    def test_resolve_action_without_a_handler_is_not_enabled(self):
+        import pyarrow.flight as flight
 
-            def resolve(self):
-                raise err
-
-        adapter = _WontHydrate()
-        server = self._server("cloud1", adapter)
-        synced_at_registration = _WontHydrate.synced
-
+        server = catalog_server("localhost:0")  # nothing injected a resolver
         action = flight.Action("resolve", b"cloud1")
-        with pytest.raises(getattr(flight, flight_error)):
+        with pytest.raises(flight.FlightServerError, match="not enabled"):
             list(server.do_action(None, action))
-
-        # No second sync: the backfill is downstream of the raise.
-        assert _WontHydrate.synced == synced_at_registration
-        # ... and the placeholder row is untouched.
-        (row,) = server.metadata_db.query(
-            "SELECT tensors FROM sources WHERE source_id = 'cloud1'"
-        ).to_pylist()
-        assert row["tensors"] == []
 
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight
-        from biopb_tensor_server.serving.server import TensorFlightServer
 
-        # Registry only, no catalog row: the sentinel is never described, and
-        # the id under test is a *missing* one.
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("cloud1", _SlowSentinel())
+        # A server that resolves, asked for an id it has never heard of.
+        server = catalog_server("localhost:0")
+        server.set_resolve_handler(lambda source_id, on_target: False)
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(None, action))
 
 
-class _SlowSentinel:
-    """A registered placeholder so the server has a (different) source; the
-    `resolve` test above targets a *missing* id to exercise the not-found path."""
-
-    capability_token = None
-
-
-# --------------------------------------------------------------------------- #
-# Server `warm` action (streaming do_action): hydrate-ahead a resolved source
-# --------------------------------------------------------------------------- #
-
-
-class _DirAdapter:
-    """Minimal registered adapter exposing only ``_source_url`` -- all `warm`
-    needs (it walks that directory and reads files; format-agnostic)."""
-
-    capability_token = None
-
-    def __init__(self, url):
-        self._source_url = url
-
-    @property
-    def source_url(self):
-        return self._source_url
-
-
-class _Ctx:
-    """Fake ServerCallContext: counts ``is_cancelled`` polls; can flip True after
-    a fixed number so a test can exercise the cooperative-cancel break."""
-
-    def __init__(self, cancel_after=None):
-        self.calls = 0
-        self._cancel_after = cancel_after
-
-    def is_cancelled(self):
-        self.calls += 1
-        if self._cancel_after is None:
-            return False
-        return self.calls > self._cancel_after
-
-    def get_middleware(self, name):
-        return None  # no bearer presented; the servers here have no token
-
-
-class TestWarmAction:
-    """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
-    walks the resolved source directory and reads every file (forcing recall),
-    emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
-
-    def _server(self, source_id, adapter):
-        # Catalog-less and registry-only: warm walks the source directory, not
-        # the catalog, and _DirAdapter is a format-agnostic stub with no
-        # metadata to catalogue anyway. The residency test below wires a real
-        # catalog because that one IS about the row.
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source(source_id, adapter)
-        return server
-
-    @staticmethod
-    def _parse(bodies):
-        from biopb.tensor.descriptor_pb2 import WarmStreamMessage
-
-        msgs = [WarmStreamMessage.FromString(b) for b in bodies]
-        return msgs, [m.WhichOneof("payload") for m in msgs]
-
-    @staticmethod
-    def _no_throttle(monkeypatch):
-        # Force a progress message at every file/block boundary (the default
-        # 0.5s throttle would suppress them for tiny fast files).
-        from biopb_tensor_server.serving import server as server_mod
-
-        monkeypatch.setattr(server_mod, "_WARM_PROGRESS_MIN_INTERVAL", -1.0)
-
-    def _make_files(self, root, sizes):
-        paths = []
-        for name, size in sizes.items():
-            p = os.path.join(root, name)
-            with open(p, "wb") as fh:
-                fh.write(b"\xa5" * size)
-            paths.append(p)
-        return paths
-
-    def test_warm_writes_nothing_to_the_catalog(self, tmp_path):
-        """Warm touches no catalog at all: residency is not stored, so there is
-        nothing for it to correct, and the `directory_is_resident()` walk that
-        used to run here was pure cost (biopb/biopb#1035)."""
-        import pyarrow.flight as flight
-
-        class _Forbidden:
-            annotations_persisted = False
-            store_path = None
-
-            def __getattr__(self, name):
-                raise AssertionError(f"warm touched the catalog: {name}")
-
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        self._make_files(root, {"a.bin": 8})
-
-        server = self._server("s1", _DirAdapter(root))
-        server._metadata_db = _Forbidden()
-
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s1"))
-        ]
-        _msgs, kinds = self._parse(bodies)
-        assert kinds[-1] == "done"
-
-    def test_the_catalog_cannot_refresh_residency_at_all(self):
-        """It wrote `data_resident`, plus an `is_resolved` already true on the
-        one path that called it."""
-        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-
-        assert not hasattr(MetadataDatabase, "refresh_residency")
-
-    def test_warm_streams_progress_and_terminal_done(self, tmp_path, monkeypatch):
-        import pyarrow.flight as flight
-
-        self._no_throttle(monkeypatch)
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        sizes = {"a.bin": 50, "b.bin": 10, "c.bin": 30}
-        self._make_files(root, sizes)
-        total = sum(sizes.values())
-
-        server = self._server("s1", _DirAdapter(root))
-        action = flight.Action("warm", b"s1")
-        bodies = [bytes(r) for r in server.do_action(_Ctx(), action)]
-        msgs, kinds = self._parse(bodies)
-
-        assert kinds[-1] == "done"  # exactly one terminal, last
-        assert kinds.count("done") == 1
-        done = msgs[-1].done
-        assert done.files_total == 3
-        assert done.files_done == 3  # every file read
-        assert done.bytes_total == total
-        assert done.bytes_done == total  # every byte recalled
-        # progress arms report a monotonically non-decreasing files_done
-        prog_files = [
-            m.progress.files_done
-            for m, k in zip(msgs, kinds, strict=True)
-            if k == "progress"
-        ]
-        assert prog_files == sorted(prog_files)
-        # guard cleaned up
-        assert server.activity.warming == set()
-
-    def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
-        import pyarrow.flight as flight
-        from biopb_tensor_server.serving import server as server_mod
-
-        self._no_throttle(monkeypatch)
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        self._make_files(root, {"big": 90, "small": 10, "mid": 40})
-
-        submitted = []
-        original_submit = server_mod.ThreadPoolExecutor.submit
-
-        def record_submit(executor, fn, *args, **kwargs):
-            submitted.append(os.path.basename(args[0]))
-            return original_submit(executor, fn, *args, **kwargs)
-
-        monkeypatch.setattr(server_mod.ThreadPoolExecutor, "submit", record_submit)
-        server = self._server("s2", _DirAdapter(root))
-        list(server.do_action(_Ctx(), flight.Action("warm", b"s2")))
-
-        # Completion order is intentionally concurrent and may vary. The
-        # scheduler must still feed the pool in the coarsest-first order.
-        assert submitted == ["small", "mid", "big"]
-
-    def test_warm_reads_files_concurrently_with_bounded_workers(
-        self, tmp_path, monkeypatch
-    ):
-        import pyarrow.flight as flight
-        from biopb_tensor_server.serving import server as server_mod
-
-        self._no_throttle(monkeypatch)
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        worker_count = server_mod._WARM_MAX_WORKERS
-        sizes = {f"f{i}.bin": 8 for i in range(worker_count + 2)}
-        self._make_files(root, sizes)
-
-        active = [0]
-        max_active = [0]
-        active_lock = threading.Lock()
-        real_open = open
-
-        class TrackedFile:
-            def __init__(self, wrapped):
-                self._wrapped = wrapped
-
-            def __enter__(self):
-                self._wrapped.__enter__()
-                return self
-
-            def __exit__(self, *exc_info):
-                try:
-                    return self._wrapped.__exit__(*exc_info)
-                finally:
-                    with active_lock:
-                        active[0] -= 1
-
-            def readinto(self, buf):
-                # Hold each read briefly so all initially scheduled workers have
-                # an opportunity to overlap before the first one completes.
-                time.sleep(0.05)
-                return self._wrapped.readinto(buf)
-
-        def tracked_open(*args, **kwargs):
-            wrapped = real_open(*args, **kwargs)
-            with active_lock:
-                active[0] += 1
-                max_active[0] = max(max_active[0], active[0])
-            return TrackedFile(wrapped)
-
-        monkeypatch.setattr(server_mod, "open", tracked_open, raising=False)
-        server = self._server("s-concurrent", _DirAdapter(root))
-        bodies = [
-            bytes(r)
-            for r in server.do_action(_Ctx(), flight.Action("warm", b"s-concurrent"))
-        ]
-        msgs, _kinds = self._parse(bodies)
-
-        assert max_active[0] > 1
-        assert max_active[0] <= server_mod._WARM_MAX_WORKERS
-        assert msgs[-1].done.files_done == len(sizes)
-        assert msgs[-1].done.bytes_done == sum(sizes.values())
-
-    def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):
-        import pyarrow.flight as flight
-
-        self._no_throttle(monkeypatch)
-        root = str(tmp_path / "store")
-        nested = os.path.join(root, "0", "0")
-        os.makedirs(nested)
-        self._make_files(root, {".zattrs": 20})
-        self._make_files(nested, {"chunk": 64})  # interior chunk file
-
-        server = self._server("s3", _DirAdapter(root))
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s3"))
-        ]
-        msgs, kinds = self._parse(bodies)
-        done = msgs[-1].done
-        assert done.files_total == 2  # nested file counted
-        assert done.bytes_total == 84
-        assert done.bytes_done == 84
-
-    def test_warm_single_file_source_is_noop(self, tmp_path):
-        import pyarrow.flight as flight
-
-        f = tmp_path / "one.tif"
-        f.write_bytes(b"x" * 100)
-        server = self._server("s4", _DirAdapter(str(f)))  # _source_url is a FILE
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s4"))
-        ]
-        msgs, kinds = self._parse(bodies)
-        assert kinds == ["done"]
-        assert msgs[-1].done.files_total == 0  # nothing to warm
-
-    def test_warm_refuses_a_remote_source(self):
-        """A remote url has no local tree to recall into, so warm fails loudly
-        rather than answering `files_total == 0` -- which a local single-file
-        source already uses to mean "nothing left to warm" (biopb/biopb#1035).
-        """
-        import pyarrow.flight as flight
-
-        server = self._server("s9", _DirAdapter("grpc://lab/img.zarr"))
-        with pytest.raises(flight.FlightServerError, match="remote"):
-            list(server.do_action(_Ctx(), flight.Action("warm", b"s9")))
-
-    def test_warm_names_the_scheme_and_where_to_go(self):
-        # Actionable: which source, why not here, and where to warm it.
-        import pyarrow.flight as flight
-
-        server = self._server("s10", _DirAdapter("s3://bucket/img.zarr"))
-        with pytest.raises(flight.FlightServerError) as caught:
-            list(server.do_action(_Ctx(), flight.Action("warm", b"s10")))
-        message = str(caught.value)
-        assert "s10" in message
-        assert "s3" in message
-        assert "server that holds the data" in message
-
-    def test_warm_still_no_ops_on_a_local_single_file_source(self, tmp_path):
-        # The refusal must not swallow this: `files_total == 0` is how a client
-        # (the web SPA) learns a source is single-file.
-        import pyarrow.flight as flight
-
-        f = tmp_path / "scan.nii"
-        f.write_bytes(b"payload")
-        server = self._server("s11", _DirAdapter(str(f)))
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s11"))
-        ]
-        msgs, kinds = self._parse(bodies)
-        assert kinds == ["done"]
-        assert msgs[-1].done.files_total == 0
-
-    def test_warm_cancel_stops_early_with_partial_done(self, tmp_path, monkeypatch):
-        import pyarrow.flight as flight
-
-        self._no_throttle(monkeypatch)
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        self._make_files(root, {f"f{i}.bin": 8 for i in range(12)})
-
-        server = self._server("s5", _DirAdapter(root))
-        # Flip cancelled True after a couple of polls -> break mid-recall.
-        ctx = _Ctx(cancel_after=2)
-        bodies = [bytes(r) for r in server.do_action(ctx, flight.Action("warm", b"s5"))]
-        msgs, kinds = self._parse(bodies)
-        assert kinds[-1] == "done"  # still emits a terminal snapshot
-        done = msgs[-1].done
-        assert done.files_done < done.files_total  # did not finish all 12
-        assert server.activity.warming == set()  # guard released even on cancel
-
-    def test_warm_rejects_concurrent_warm_of_same_source(self, tmp_path):
-        import pyarrow.flight as flight
-
-        root = str(tmp_path / "src")
-        os.makedirs(root)
-        self._make_files(root, {"a.bin": 8})
-        server = self._server("s6", _DirAdapter(root))
-        server.activity.begin_warm("s6")  # simulate an in-flight warm
-        with pytest.raises(flight.FlightServerError, match="already in progress"):
-            list(server.do_action(_Ctx(), flight.Action("warm", b"s6")))
-
-    def test_warm_unknown_source_errors(self):
-        import pyarrow.flight as flight
-
-        server = self._server("s7", _DirAdapter("/nonexistent"))
-        with pytest.raises(flight.FlightServerError, match="Source not found"):
-            list(server.do_action(_Ctx(), flight.Action("warm", b"missing")))
-
-
-# --------------------------------------------------------------------------- #
-# Change A: cloud-root flag plumbing (ClaimContext -> claim() -> resolve)
-# --------------------------------------------------------------------------- #
+def test_the_catalog_cannot_refresh_residency_at_all():
+    """It wrote `data_resident`, plus an `is_resolved` already true on the
+    one path that called it."""
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    assert not hasattr(MetadataDatabase, "refresh_residency")
 
 
 class TestCloudRootFlag:
@@ -1592,14 +1143,10 @@ class TestCloudRootFlag:
         assert ClaimContext(tmp_path, cloud_root=True).cloud_root is True
         assert ClaimContext(tmp_path).cloud_root is False
 
-    def test_discover_from_entries_sets_cloud_root_per_entry(self, tmp_path):
-        # cloud_by_path carries the per-path cloud flag the walk computed once; it
-        # must reach the adapter's claim() via its ClaimContext. A path absent from
-        # the map defaults to False.
-        from biopb_tensor_server.core.discovery import (
-            AdapterRegistry,
-            discover_sources_from_entries,
-        )
+    def test_discover_sources_sets_cloud_root_on_every_probe(self, tmp_path):
+        # The walk's ``cloud_root`` must reach each adapter's claim() through its
+        # ClaimContext -- for the root and for every entry found under it.
+        from biopb_tensor_server.core.discovery import AdapterRegistry, discover_sources
 
         seen = {}
 
@@ -1611,17 +1158,155 @@ class TestCloudRootFlag:
 
         registry = AdapterRegistry()
         registry.register(_Recorder, "recorder")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.bin").write_text("x")
 
-        cloud_dir = str(tmp_path / "cloud")
-        plain_dir = str(tmp_path / "plain")
-        entries = [(cloud_dir, True, None), (plain_dir, True, None)]
-        discover_sources_from_entries(
-            entries,
-            registry,
-            cloud_by_path={cloud_dir: True},  # plain_dir absent -> defaults False
-        )
-        assert seen[cloud_dir] is True
-        assert seen[plain_dir] is False
+        discover_sources(tmp_path, registry, cloud_root=True, admit_nonresident=True)
+
+        assert seen and all(seen.values())
+        discover_sources(tmp_path, registry)
+        assert not any(seen.values())
+
+
+# --------------------------------------------------------------------------- #
+# Drag-drop of a cloud folder (biopb/biopb#310)
+# --------------------------------------------------------------------------- #
+
+
+def _drop(mgr, path, **kwargs):
+    mgr.complete_initial_scan()  # drops wait for the first scan
+    result = None
+    for event in mgr.add_local_source(str(path), **kwargs):
+        if event[0] == "result":
+            result = event[1]
+    return result
+
+
+class TestDropCloudFolder:
+    """A drop is a root like any other: ``cloud`` is a property of it."""
+
+    @staticmethod
+    def _folder(tmp_path):
+        folder = tmp_path / "synced"
+        folder.mkdir()
+        (folder / "scan.nii").write_bytes(b"payload")
+        return folder
+
+    def test_without_cloud_placeholders_are_skipped_and_counted(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        server = _FakeServer()
+        mgr = _make_manager(server)
+
+        result = _drop(mgr, folder)
+
+        assert result.added == []
+        assert result.skipped_offline == 1
+        assert server.registered == {}
+
+    def test_consented_drop_catalogs_placeholders_as_needs_recall(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        server = _FakeServer()
+        mgr = _make_manager(server)
+
+        result = _drop(mgr, folder, cloud=True)
+
+        assert len(result.added) == 1
+        assert result.skipped_offline == 0
+        (sid,) = result.added
+        assert sid not in server.registered  # a row and a claim, no adapter
+        assert server._metadata_db.pending == [(sid, True)]
+
+    def test_without_cloud_onedrive_directories_are_counted(self, tmp_path):
+        folder = tmp_path / "parent"
+        (folder / "OneDrive").mkdir(parents=True)
+        (folder / "OneDrive - Lab").mkdir()
+        (folder / "OneDrive" / "scan.nii").write_bytes(b"payload")
+        (folder / "other").mkdir()
+
+        result = _drop(_make_manager(_FakeServer()), folder)
+
+        assert result.added == []
+        assert result.skipped_cloud_dirs == 2
+
+    def test_with_cloud_onedrive_directories_are_entered(
+        self, tmp_path, force_nonresident
+    ):
+        folder = tmp_path / "parent"
+        (folder / "OneDrive").mkdir(parents=True)
+        (folder / "OneDrive" / "scan.nii").write_bytes(b"payload")
+
+        result = _drop(_make_manager(_FakeServer()), folder, cloud=True)
+
+        assert len(result.added) == 1
+        assert result.skipped_cloud_dirs == 0
+
+    def test_the_root_stays_cloud_for_the_later_checks(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+
+        _drop(mgr, folder, cloud=True)
+
+        assert mgr._roots.is_cloud(str(folder / "scan.nii"))
+        assert mgr._reconciler._roots.is_cloud(str(folder / "scan.nii"))
+
+    def test_deregistering_the_drop_takes_the_cloud_root_with_it(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+        _drop(mgr, folder, cloud=True)
+        assert mgr._roots.is_cloud(str(folder / "scan.nii"))
+
+        mgr.remove_dropped_root("dnd://synced")
+
+        assert not mgr._roots.is_cloud(str(folder / "scan.nii"))
+        assert not mgr._reconciler._roots.is_cloud(str(folder / "scan.nii"))
+
+    def test_a_configured_cloud_root_survives_a_drop_being_deregistered(
+        self, tmp_path, force_nonresident
+    ):
+        root = tmp_path / "configured"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "scan.nii").write_bytes(b"payload")
+        mgr = _make_manager(_FakeServer(), cloud_roots={root.resolve()})
+        _drop(mgr, sub)
+
+        mgr.remove_dropped_root("dnd://sub")
+
+        assert mgr._roots.is_cloud(str(sub / "scan.nii"))
+
+    def test_a_drop_under_a_configured_cloud_root_needs_no_flag(
+        self, tmp_path, force_nonresident
+    ):
+        root = tmp_path / "configured"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "scan.nii").write_bytes(b"payload")
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()})
+
+        result = _drop(mgr, sub)  # no cloud flag
+
+        assert len(result.added) == 1
+        assert server._metadata_db.pending == [(result.added[0], True)]
+
+    def test_a_resident_folder_reports_nothing_skipped_and_is_not_cloud(self, tmp_path):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+
+        result = _drop(mgr, folder)
+
+        # (The payload is not a real NIfTI, so registration may fail; what is
+        # pinned is that the walk skipped nothing and the root was not made cloud.)
+        assert result.skipped_offline == 0
+        assert not mgr._roots.is_cloud(str(folder))
 
 
 # --------------------------------------------------------------------------- #
@@ -1830,26 +1515,30 @@ class TestCloudSignatureInvariance:
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 class TestResolveErrorSurfacing:
-    def _make_proxy(self, url, source_type="ome-zarr"):
-        from biopb_tensor_server.adapters import get_default_registry
-        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-
-        cfg = SourceConfig(url=url, type=source_type, source_id="s1")
-        return UnresolvedSourceAdapter(cfg, get_default_registry())
+    def _recall(self, path, source_type="ome-zarr"):
+        """A manager holding one unresolved cloud claim, and its reconciler."""
+        server = _FakeServer()
+        mgr = _make_manager(server)
+        reconciler = mgr._reconciler
+        claim = SourceClaim(source_type, path, source_id="s1", unresolved=True)
+        assert reconciler._commit_add_claim(claim) is True
+        return server, reconciler
 
     def test_reclaim_oserror_surfaces_retriable(self, monkeypatch):
         # An OSError while re-claiming (recall/IO) must surface as retriable,
         # NOT silently degrade to the claim-time guessed type.
         from biopb_tensor_server.core.errors import SourceResolveRetriableError
 
-        proxy = self._make_proxy("/data/cloud/x.zarr")
+        server, reconciler = self._recall("/data/cloud/x.zarr")
 
         def _boom(ctx, state):
             raise OSError("recall failed")
 
-        monkeypatch.setattr(proxy._registry, "get_claims_for_path", _boom)
+        monkeypatch.setattr(reconciler._registry, "get_claims_for_path", _boom)
         with pytest.raises(SourceResolveRetriableError):
-            proxy.resolve()
+            reconciler.ensure_adapter("s1", consent=True)
+        assert server.registered == {}
+        assert "s1" in reconciler._recall  # still waiting for a retry
 
     def test_create_from_config_oserror_is_retriable(self, monkeypatch, tmp_path):
         import zarr
@@ -1857,7 +1546,7 @@ class TestResolveErrorSurfacing:
 
         zpath = str(tmp_path / "img.zarr")
         zarr.open_array(zpath, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
-        proxy = self._make_proxy(zpath, source_type="ome-zarr")
+        server, reconciler = self._recall(zpath)
 
         # Force the open/hydrate step (create_from_config of the resolved adapter
         # class) to raise an OSError -> retriable, not permanent. A bare zarr array
@@ -1871,7 +1560,8 @@ class TestResolveErrorSurfacing:
 
         monkeypatch.setattr(ZarrAdapter, "create_from_config", classmethod(_boom))
         with pytest.raises(SourceResolveRetriableError):
-            proxy.resolve()
+            reconciler.ensure_adapter("s1", consent=True)
+        assert "s1" in reconciler._recall
 
     def test_permanent_failure_is_plain_unresolved(self):
         # A nonexistent path: re-claim yields nothing and create_from_config
@@ -1882,10 +1572,11 @@ class TestResolveErrorSurfacing:
             SourceUnresolvedError,
         )
 
-        proxy = self._make_proxy("/nonexistent/path.zarr", source_type="zarr")
+        server, reconciler = self._recall("/nonexistent/path.zarr", "zarr")
         with pytest.raises(SourceUnresolvedError) as exc_info:
-            proxy.resolve()
+            reconciler.ensure_adapter("s1", consent=True)
         assert not isinstance(exc_info.value, SourceResolveRetriableError)
+        assert "s1" not in reconciler._pending_failed
 
 
 # --------------------------------------------------------------------------- #
@@ -1916,9 +1607,9 @@ class TestZarrOmeZarrPriority:
         import zarr
 
         store = tmp_path / "img.zarr"
-        g = zarr.open_group(str(store), mode="w")
+        g = zarr.open_group(str(store), mode="w", zarr_format=2)
         g.attrs["multiscales"] = [{"datasets": [{"path": "0"}]}]
-        g.create_dataset("0", shape=(4, 4), chunks=(4, 4), dtype="uint8")
+        g.create_array("0", shape=(4, 4), chunks=(4, 4), dtype="uint8")
 
         claims = self._registry().get_claims_for_path(
             ClaimContext(store), DiscoveryState()

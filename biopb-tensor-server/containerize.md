@@ -356,7 +356,7 @@ docker run -d -p 8814:8814 -p 8815:8815 \
 
 - Docker installed
 - buf CLI installed (for local wheel build)
-- Python 3.11+ with pip
+- Python 3.12 with pip
 
 ### Step 1: Build Wheels Locally
 

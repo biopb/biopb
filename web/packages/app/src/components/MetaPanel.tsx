@@ -1,7 +1,6 @@
 "use client";
 
-import { memo, useEffect, useState } from "react";
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import { memo, useEffect, useMemo, useState } from "react";
 import { selectTileInfo, useAppStore } from "../store";
 import {
   MAX_ROWS,
@@ -150,33 +149,19 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
   // catalog scan's. See `sliderGrid` for why those can differ.
   const tileInfo = useAppStore(selectTileInfo);
   const [metadata, setMetadata] = useState<Record<string, unknown> | null>(null);
-  const [source, setSource] = useState<DataSourceDescriptor | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Addressed by id rather than found in `sources`: the catalog listing is
-  // capped and may still be scanning, and this panel describes one source that
-  // is already open -- there is no reason for it to depend on the whole list.
-  useEffect(() => {
-    let cancelled = false;
-    if (!client || !sourceId) {
-      setSource(null);
-      return;
-    }
-    client.http
-      .getSource(sourceId)
-      .then((d) => {
-        if (!cancelled) setSource(d);
-      })
-      .catch(() => {
-        // The metadata request below reports for both; a missing descriptor
-        // just leaves the key-info block out.
-        if (!cancelled) setSource(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [client, sourceId]);
+  // A listed source carries its url (the tree names its entry from it). One the
+  // catalog does not list -- past the listing's limit, or opened from a shared
+  // link before the listing lands -- has none to show, and the row is left out
+  // rather than filled with something that only looks like one. An upload has
+  // an empty url, so its id stands in.
+  const sources = useAppStore((s) => s.sources);
+  const sourceUrl = useMemo(() => {
+    const listed = sources.find((s) => s.source_id === sourceId);
+    return listed ? listed.source_url || sourceId : null;
+  }, [sources, sourceId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -208,17 +193,21 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
   return (
     <section className="meta-panel">
       {/* Key info section */}
-      {source && (
+      {sourceId && (
         <div style={{ marginBottom: 12, padding: 8, background: "#1e2435", borderRadius: 4 }}>
           <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>Array</div>
           <div style={{ fontSize: 12, wordBreak: "break-all" }}>
             {/* `array_id` is the whole address already -- prefixing the
                 source_id again produced "src/src/field" on a multi-tensor
                 source. */}
-            {activeTensorId ?? source.source_id}
+            {activeTensorId ?? sourceId}
           </div>
-          <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
-          <div style={{ fontSize: 12, wordBreak: "break-all" }}>{source.source_url || source.source_id}</div>
+          {sourceUrl && (
+            <>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 8, marginBottom: 4 }}>Source URL</div>
+              <div style={{ fontSize: 12, wordBreak: "break-all" }}>{sourceUrl}</div>
+            </>
+          )}
 
           {tileInfo && (
             <>

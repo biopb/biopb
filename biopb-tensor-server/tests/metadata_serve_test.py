@@ -15,6 +15,10 @@ import threading
 import time
 
 import pytest
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 from tests import catalog_server, register_and_catalog
 
@@ -40,9 +44,11 @@ def _meta_zarr_cls():
             self._meta = meta
             self.get_metadata_calls = 0
 
-        def get_metadata(self):
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
             self.get_metadata_calls += 1
-            return self._meta
+            return metadata_record(self._meta)
 
     return _MetaZarr
 
@@ -59,7 +65,7 @@ def test_serve_reads_metadata_from_catalog_without_recompute(simple_zarr_array):
     _MetaZarr = _meta_zarr_cls()
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "DAPI"}})
     server.register_source("img", adapter)
     db.sync_source_added("img", adapter)  # stores the metadata in the catalog
@@ -94,7 +100,7 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
     _MetaZarr = _meta_zarr_cls()
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={})  # empty -> NULL row
     server.register_source("img", adapter)
     db.sync_source_added("img", adapter)
@@ -123,7 +129,7 @@ def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = catalog_server("grpc://localhost:0")
+    server = catalog_server("localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     register_and_catalog(server, "img", adapter)
     _serve(server)
@@ -138,10 +144,10 @@ def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array):
-    """With no catalog there is no metadata cache -- and nothing released the
-    adapter's registration copy either, since ``sync_source_added`` is what does
-    that. So the adapter answers, and a descriptor still carries its metadata.
+def test_a_catalog_less_server_serves_no_metadata(simple_zarr_array):
+    """Source-level metadata is a catalog concern: with no catalog there is no
+    row to read it from, and the adapter is never asked, so a descriptor carries
+    none.
 
     ``get_source_metadata`` is a catalog query, so that one refuses: the
     embedded in-process cache serves a result it was asked for by id, it does
@@ -156,14 +162,14 @@ def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array)
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     server.register_source("img", adapter)
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
         desc = client.get_descriptor("img", with_metadata=True)
-        assert json.loads(desc.metadata_json)["metadata"] == {"ome": {"channel": "GFP"}}
+        assert not desc.metadata_json
         with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
             client.get_source_metadata("img")
         client.close()
@@ -200,14 +206,18 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
             super().__init__(*a, **k)
             self._field_meta = field_meta
 
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}  # source-level (cached in catalog)
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record(
+                {"plate": {"rows": ["A"]}}
+            )  # source-level (cached in catalog)
 
         def get_tensor_metadata(self):
             return self._field_meta  # per-tensor delta, merged over the row
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _PerTensorZarr(arr, "plate", ["y", "x"], field_meta={"ome": "field"})
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)  # catalog holds the plate metadata
@@ -240,14 +250,16 @@ def test_source_metadata_excludes_the_per_tensor_delta(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
 
     class _PerTensorZarr(ZarrAdapter):
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({"plate": {"rows": ["A"]}})
 
         def get_tensor_metadata(self):
             return {"ome": "field"}
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _PerTensorZarr(arr, "plate", ["y", "x"])
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)
@@ -274,13 +286,15 @@ def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
 
     class _RowOnlyZarr(ZarrAdapter):
-        def get_metadata(self):
-            return {"plate": {"rows": ["A"]}}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({"plate": {"rows": ["A"]}})
 
         # get_tensor_metadata inherits the None default -> no delta
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _RowOnlyZarr(arr, "plate", ["y", "x"])
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)

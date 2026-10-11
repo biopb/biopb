@@ -23,7 +23,7 @@ Client (Python or TypeScript)
                                               ┌──────────────────────────┐
                                               │  TensorAdapter           │
                                               │  (Zarr / OME-Zarr /      │
-                                              │   OME-TIFF / HDF5 / CZI) │
+                                              │   OME-TIFF / EMD / CZI)  │
                                               └──────────────────────────┘
 ```
 
@@ -48,22 +48,21 @@ The `biopb_tensor_server` package is organized into layered subpackages:
 
 - **`core/`** — foundational primitives and contracts: adapter ABCs, the
   `claim()` discovery protocol, `config` (the schema and its file I/O, nothing
-  that reads a disk or a network), the `axes` vocabulary + its `normalize` seam,
-  and the live `source_registry`.
+  that reads a disk or a network), the `axes` vocabulary + its `normalize` permutation helpers.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`, plus what those servers
   own directly: `metadata_db` (the DuckDB store whose `sources` / `rois` /
   `decode_rates` tables back the surfaces they expose), `tls` (the listener's
   self-signed leaf) and `activity` (in-flight read tracking). Builds on `core`.
 - **`sources/`** — source lifecycle: `resolve` (config entries -> concrete
-  sources), `source_manager` + `tree_scanner` + `watcher` (scan orchestration)
-  and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
+  sources), `source_manager` (scan orchestration),
+  `source_registry` (the live id -> adapter map) and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
   `adapters`; it names `serving`'s server and `metadata_db` only in type
   annotations, never importing them at runtime.
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
   cache. A bare module name here is an adapter; an underscored one is shared
   machinery: `_scale` and `_ome_rois` (format metadata in, common representation
-  out), `_handle_reaper`, and `_writable` — the mixin two of the adapters
+  out), `_handle_reaper`, `_handle_pool`, and `_writable` — the mixin two of the adapters
   inherit for progress, completion and disposal. `cache/segment_index` and
   `cache/segment_store` are the Arrow segment format itself, so an uploaded
   `cache://` member writes what the chunk cache writes: the codec and the boot
@@ -101,8 +100,8 @@ id or a byte-prefix sniff -- and the arm names the flight:
 
 | Flight | Data | GetFlightInfo | DoGet ticket | DoPut command |
 |---|---|---|---|---|
-| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
-| `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted) | `PutCommand.chunk` (writable servers) |
+| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`, `rois`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
+| `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted), or `chunk_ref` (a plan's stub + a grid index) | `PutCommand.chunk` (writable servers) |
 | `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.tensor._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
 
 `ListFlights` advertises the catalog only: one flight per table by path, with
@@ -118,6 +117,33 @@ capability token when it carries one, else the server-wide token. A grant sits
 on one tensor, never on the source it hangs off -- one source is shared by
 uploads with different producers. A private tensor may still be catalogued --
 the token gates reading, not knowing.
+
+**Sealed plans** (`ticket_stub` in the field mask). A plan is issued as one
+*stub* on the descriptor plus an index per endpoint, rather than a ticket per
+chunk. The stub splits into an `identity` (tensor, version, scale, method, grid:
+stable, and what a cache keys on) and a `grant`: a MAC over the identity, the
+plan's window of chunks and an expiry. A client reads a chunk by concatenating
+the stub and the endpoint's ticket, which protobuf merges; the server expands
+`(identity, index)` back into the chunk_id it always minted, so nothing below the
+ticket changed. A valid seal opens `do_get` and `chunk_locate` for its chunks in
+place of a bearer token, so a reference can leave the machine without the
+connection's token (`auth_token` empty). It never opens planning or an action. The
+tensor's ROI sets get the same treatment (`roi_ticket`), with the content version
+in the MAC so a reused name inherits nothing. Seals last `server.seal_ttl`
+seconds (a day by default, 0 never expires; on the admin page like any other
+server key). The key lives in the state tree (`ticket-seal.key`); deleting it
+revokes every seal outstanding. A mirror wraps
+its upstream's identity once and keeps the upstream's indices, and seals what it
+serves with its own key.
+
+**What a plan records of its request.** From Flight protocol v3 a plan's
+`FlightInfo.app_metadata` is the whole `TensorReadOption` it answers, and its
+descriptor carries only what the server decided (realized `slice_hint`, logical
+`shape`/`chunk_shape`), not an echo of the scale and method. A consumer crops
+back to the request, or replays it to plan a handle that has no endpoints, from
+there. Which protocol wrote a plan is stamped on its schema (`flight_protocol`),
+so a plan handed between processes is self-describing. The SDK reads v2 and v3
+servers; a v2 SDK refuses a v3 server by its health check and has to upgrade.
 
 `health` is outside both tiers and answers anyone, the way an HTTP server
 answers `/healthz`: it is the liveness probe, so a caller that cannot yet
@@ -158,33 +184,35 @@ where they are declared — `adapter_base.py` asserts that at import time
 never be written onto `SourceAdapter`.
 
 Every concrete format adapter subclasses `TensorAdapter` and fills both roles in
-one object. The lone source-only adapter is `UnresolvedSourceAdapter`, which has
-no tensors until it resolves.
+one object. A source that is not resolved yet (a cloud source, or one whose
+registration is pending) has no adapter at all: a catalog row and a claim, until
+`resolve` builds its adapter.
 
-A source can also answer for **label sets** it did not produce (biopb/biopb#1059):
-`SourceAdapter.label_sets` merges what the format reads from its own file
-(`get_embedded_labels`, an OME-Zarr's NGFF `labels/` group) with what was
+A source answers for **label sets** (biopb/biopb#1059) under the marked field
+`.../@labels/<name>`. The ones its own file carries (an OME-Zarr's NGFF `labels/`
+group, an OME-TIFF's masks) are the format's tensors: `list_tensors` lists them
+after the images and `get_tensor_adapter` resolves them, unchecked. The ones
 attached to it (finished sidecars under `write_dir/labels/<source_id>/`, by a
-registration hook), each checked to span the image it binds to. The serve path resolves tensors through `resolve_tensor` /
-`resolve_chunk_adapter`, which try a `.../@labels/<name>` field against the sets
-before delegating to the format; `catalog_tensors` lists sets after the image
-tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
+registration hook) are checked to span the image they bind to. The serve path
+resolves tensors through `resolve_tensor`, which matches a marked field against
+the attached tensors by longest prefix before delegating to the format;
+`catalog_tensors` lists attached sets after the image tensors. See **[docs/label-tensors.md](docs/label-tensors.md)**.
 
 | Method | Returns |
 |--------|---------|
-| `list_tensor_descriptors()` | `list[TensorDescriptor]` — the source's tensors, as structural catalog entries |
+| `list_tensors()` | `list[TensorEntry]` — the source's tensors (`array_id`, `dim_labels`, `shape`, `dtype`) |
 | `get_tensor_descriptor()` | `TensorDescriptor` proto — the full serving descriptor of one *bound* tensor |
 | `get_data(bounds)` | `np.ndarray` — decodes only the requested sub-region |
 | `get_native_pyramid_levels()` | `list[PyramidLevel]` or `None` — native pyramid levels |
 
 ### Catalog entry vs serving descriptor (biopb/biopb#812)
 
-The two descriptor methods answer different questions, and the split runs all the
+The source and tensor roles answer different questions, and the split runs all the
 way to the wire:
 
 - **Structural** — `array_id`, `dim_labels`, `shape`, `dtype`. Stable per tensor
   and derivable from the container's index without opening one, so a *source*
-  answers for all its tensors at once. This is what `list_tensor_descriptors()`
+  answers for all its tensors at once. This is what `list_tensors()`
   returns and what the DuckDB `sources.tensors` STRUCT stores — the row is the
   only representation of a source that crosses the wire.
 - **Serving** — above all the transfer `chunk_shape`, plus `pyramid` and
@@ -193,15 +221,16 @@ way to the wire:
   scale. Only the adapter `get_tensor_adapter(array_id)` returns can answer them,
   and `GetFlightInfo` — which binds first — is where they reach a client.
 
-`adapter_base.catalog_entry()` is the projection, and `catalog_tensors()`
-re-applies it as the row is written, so no adapter can publish a read plan into
-the catalog. A client that needs a grid describes the tensor; an empty
-`chunk_shape` is not a fallback to plan on.
+A source lists `TensorEntry` records, a plain dataclass with no field for a
+serving fact, so no source can publish a read plan into the catalog.
+`catalog_tensors()` is the one path into the row. The only `TensorDescriptor`
+that reaches a client is `get_tensor_descriptor()`'s. A client that needs a grid
+describes the tensor.
 
 ### Canonical axis order (biopb/biopb#596)
 
-Adapters read whatever axis order their upstream reader emits. The server
-normalizes that at the adapter seam, so the wire carries a guarantee instead of
+Adapters read whatever axis order their upstream reader emits. The adapter base
+normalizes that, so the wire carries a guarantee instead of
 each consumer re-deriving "which axis is Y/X/Z/S" with its own vocabulary:
 
 > **Z, Y, X and S appear last, in that relative order**; every other axis — T, C,
@@ -212,21 +241,24 @@ Relative order, not index: `[z, dimq, y, x]` normalizes to `[dimq, z, y, x]` —
 it. And only Z/Y/X/S count as trailing; T and C classify through the same
 vocabulary but have no canonical place, so they ride with the unlabeled.
 
-The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` is the
-seam that applies it, and `SourceRegistry.register` — the single registration
-chokepoint — is where it attaches. An already-canonical adapter is returned
-**unchanged** (same object, same cost), which is nearly all of them: `bioio`
-fixes `TCZYXS` upstream, and OME-TIFF / QPTIFF / TIFF-sequence / ndtiff / DICOM
-are compliant by construction. `nifti` (which emits X before Y) is the one
-family whose behavior actually changes.
+The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` holds the
+permutation helpers and the `@canonical_axes` class decorator. A leaf adapter is
+written in its reader's order — `_native_descriptor` plus its own `get_data`,
+`get_decimated_data`, `read_block_shape`, `get_native_pyramid_levels` and
+`list_tensors` — and carries the decorator, which wraps those methods to present
+them canonical (the base permutes `get_tensor_descriptor` to match). The planner,
+scaled and streamed reads and the pyramid therefore work in canonical order with
+no translation of their own. A leaf reads its own geometry through
+`_native_descriptor()`. Adapters that already emit canonical order pay one `None`
+check per call.
 
 | | |
 |---|---|
-| **Not in scope** | Unlabeled stores (`zarr`, `hdf5`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting a positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Axis semantics come from the format; registration cannot relabel them. |
+| **Not in scope** | Unlabeled stores (`zarr`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting a positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Axis semantics come from the format; registration cannot relabel them. |
 | **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture the render path took toward adapter-supplied labels. |
-| **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
+| **chunk_ids** | Minted from the canonical geometry, like the rest of the plan. |
 | **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |
-| **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the native-pyramid `precompute` routing working underneath. |
+| **Plans** | The base planner runs on the canonical descriptor; only the native-pyramid `precompute` routing translates a scale hint and level factors, because it matches on-disk levels. |
 
 An order this server does not own is **refused, not permuted** — permuting works
 only where the server owns the whole read path, and two seams don't. Both report
@@ -235,7 +267,7 @@ through the shared `core/axes.py::noncanonical_order`:
 | | |
 |---|---|
 | **Writes** | `add_tensor` rejects a non-canonical declared order up front, so a writable source never disagrees with what `put_chunk` wrote — `physical_scale` and `chunk_shape` arrive aligned to the uploader's labels. |
-| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy opts out of wrapping (`_normalizable_axes = False`) and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
+| **Remote proxy** | Its upstream owns the order in the same sense: that server mints the chunk_ids, plans the reads (#295) and sizes the grid. So the proxy does not carry `@canonical_axes` and refuses a non-canonical upstream at `plan_flight_info` / `get_read_plan`. The source stays catalogued and listed; only reads fail, with an error naming the order. Costs upstream-first upgrade ordering across a federation, and buys a check that holds nothing stateful — a re-seed or an upstream upgrade is picked up on the next open, where a frozen permutation would have silently mis-served it. |
 
 ### Adapter file-handle policy (biopb/biopb#71)
 
@@ -246,8 +278,8 @@ justified by open cost.
 
 | Open cost | Policy | Adapters |
 |---|---|---|
-| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `hdf5`, `mrc`, TIFF sequences, `bioio`, `dicom`, local `zarr` |
-| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `ndtiff` |
+| O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `mrc`, TIFF sequences, `bioio`, `dicom`, local `zarr` |
+| O(N) and/or unbounded | pooled handle keyed by file identity (`_handle_pool`; TTL `handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `czi`, `ndtiff` |
 
 ---
 
@@ -283,15 +315,20 @@ holds the `source_id <-> path` maps and the `on_source_added` /
 **Progressive discovery (biopb/biopb#212).** The CLI launcher reaches `SERVING`
 ASAP and runs the monitored bootstrap scan in the background; the catalog grows
 *within* that scan as each source is claimed (see Directory Monitoring below).
-See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
+See **[docs/catalog-persistence.md](docs/catalog-persistence.md)**.
 
-### Directory monitoring (`sources.watcher`, `sources.source_manager`)
+### Directory scanning (`core.discovery`, `sources.source_manager`)
 
-`PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
-`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a fs
-walker gated on the stability window, returning an immutable `ScanSnapshot`), runs
-discovery on the snapshot's paths, and diffs the result against the confirmed
-catalog.
+There is one walker, `discover_sources`, which claims as it goes and stops at a
+claimed directory. A drag-dropped folder, a `monitor = false` directory and each
+rescan of a monitored root all call it. It keeps nothing between calls, so a
+rescan stats every entry under each monitored root every tick (cloud roots only on
+the hourly full pass): monitor directories of a sane size, not a whole archive.
+The result is diffed against the confirmed catalog under the root: add what is
+new, refresh what is known, remove what is gone -- guarded by the stability
+window, by the directories the walk declined, and (for a monitored source) by
+having been missed on two consecutive scans. Only an entry with nothing to
+discover (a typed source, a file, one remote source) is registered without a walk.
 
 **Moves** within a monitored dir preserve `source_id`; a move out is a delete,
 a move in a create.
@@ -319,7 +356,8 @@ User-drawn 2-D ROIs live in a `rois` table in the same DuckDB catalog as
 sibling table, not a field inside a source row: `sources.metadata_json` is
 adapter-produced and rewritten on every re-registration. The table is private
 data -- read over DoGet and written over DoPut, authorized per source like
-pixels -- and is deliberately not on the SQL surface (biopb/biopb#1010).
+pixels. It is also a table on the SQL surface, which only full access reaches
+(a narrow grant or a seal cannot query).
 Orphans (annotations whose source is gone) are reported and pruned by the
 `roi_prune` action.
 
@@ -332,10 +370,10 @@ See **[docs/roi-annotations.md](docs/roi-annotations.md)**.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--host 127.0.0.1] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--host 127.0.0.1] [--port 8815] [--no-writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
 # for grpc only (no web server) — same flight options + token handling as launch
-biopb-tensor-server serve --config biopb.json [--host 127.0.0.1] [--port 8815] [--writable] [--tls] [--san NAME]
+biopb-tensor-server serve --config biopb.json [--host 127.0.0.1] [--port 8815] [--no-writable] [--tls] [--san NAME]
 
 # generate / rotate the self-signed TLS cert and print its fingerprint
 biopb-tensor-server cert init [--force] [--san NAME]
@@ -367,7 +405,7 @@ and *where to expose it* is the launch command.
 4. Initialize the chunk cache. The server refuses to start when the cache dir
    cannot be mmapped safely (network mount, cloud-synced folder) or isn't
    writable — the on-disk cache is required infrastructure, not optional.
-5. Resolve config sources into *static* and *monitored* sets, and build the
+5. Partition config sources into *static*, *monitored* and *scan-once* sets, and build the
    metadata DB (mandatory — it backs `query`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
    monitored dir that fills later. The cache's measured per-tensor decode
@@ -442,7 +480,7 @@ supervisor: see
 | `BIOPB_UPSTREAM_TENSOR_TOKEN` | Bearer token for **one** upstream tensor server (`tensor-server` sources) — a single-upstream convenience. A source's credentials profile overrides it, and is the only way to give several upstreams different tokens or any TLS trust. |
 | `BIOPB_LOG_LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`; anything else is ignored and the CLI/default level wins. |
 | `BIOPB_DATA_PLANE_SUPERVISED` | Set **by the control** on the child it spawns. The sidecar reports it and refuses self-restart, so a supervised restart is control-routed instead of racing the supervisor. |
-| `BIOPB_OMETIFF_PARALLEL_READ` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**. |
+| `BIOPB_OMETIFF_PARALLEL_READ` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing on the pooled handle's lock (biopb/biopb#473). **Default off**. |
 | `BIOPB_CLAIM_GENERIC_IMAGES` | Seeds the initial default for claiming generic raster/video during discovery (**off**, biopb/biopb#40). Only matters on discovery paths that never load a `ServerConfig`; a loaded config's `claim_generic_images` overrides it at startup. |
 | `BIOPB_DISCOVERY_SKIP_OFFLINE` | `0` disables skipping suspected cloud placeholders during discovery (**on** by default) — an escape hatch for a filesystem that reports zero allocated blocks spuriously. |
 

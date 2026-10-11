@@ -90,6 +90,12 @@ message TensorDescriptor {
   // Per-dimension integer downsampling factors for virtual/scaled reads.
   // Example: [1, 8, 8] means full resolution on first axis, 8x reduced on remaining.
   // These do not change tensor identity, only how a specific read request is planned.
+  //
+  // A GetFlightInfo *response* leaves this and `reduction_method` unset from
+  // Flight protocol v3 on: the request is recorded whole in
+  // `FlightInfo.app_metadata` (a TensorReadOption), and the descriptor carries
+  // what the server decided -- the realized `slice_hint`, the logical `shape`
+  // and `chunk_shape`. A v2 server echoed them here.
   repeated int64 scale_hint = 7;
 
   // Dynamic reduction/downsampling method for scaled reads: "nearest", "area",
@@ -214,6 +220,24 @@ message TensorDescriptor {
   // forms an opaque chunk key, which must also change when chunking or
   // normalization changes, is internal to the server and not visible here.
   optional bytes content_version = 14;
+
+  // A serving field, filled only when the request's field mask names
+  // "ticket_stub". The plan's stub: a serialized TensorTicket whose
+  // `chunk_ref.stub` carries what every chunk of the plan shares, and whose
+  // endpoints then carry only their `chunk_ref.index`. A client reads a chunk
+  // by sending `ticket_stub + endpoint.ticket` -- the two concatenated, which
+  // protobuf merges into one ChunkRef.
+  //
+  // The stub's grant is a read credential for exactly the chunks the plan
+  // names, so a reference can leave the machine without the connection's own
+  // token. Empty means the server issued full tickets and the endpoints stand
+  // alone.
+  bytes ticket_stub = 18;
+
+  // A serving field, filled with `ticket_stub`. A serialized TensorTicket whose
+  // `roi_read` names this tensor with a grant: send it as the ticket for every
+  // set, or merge a `RoiRead{set_name}` onto it for one.
+  bytes roi_ticket = 19;
 }
 
 // One resolution level of a tensor's server-advertised pyramid.
@@ -336,6 +360,10 @@ message TensorReadOption {
   //                     The one cheap path: an in-memory record read.
   //   "is_resident"   - whether the bytes are local right now. A bounded stat
   //                     walk of the source (biopb/biopb#1035).
+  //   "ticket_stub"   - issue the plan as one sealed stub plus an index per
+  //                     endpoint (see ChunkRef) instead of a full ticket per
+  //                     endpoint, and fill `roi_ticket`. Refused by a server
+  //                     whose `health` does not report `ticket_stubs`.
   //
   // Opt-in throughout, and that is the point of replacing the three `with_*`
   // bools this supersedes: they defaulted the *most* expensive part, the read
@@ -447,49 +475,6 @@ message ResolveStreamMessage {
   }
 }
 
-// Progress for an in-flight "warm" (hydrate-ahead) Flight action. After a
-// source is resolved, a multi-file cloud source's member data files are still
-// dehydrated and recall one-at-a-time onto the lazy read path. "warm" opts into
-// pulling them all resident on the server up front: it walks the source
-// directory and reads each file to force the sync engine's recall, streaming
-// these so a client can show progress (files / bytes) and cancel. The recall
-// happens server-side -- no pixels cross the wire, only this progress.
-// Informational only.
-message WarmProgress {
-  // Total regular files discovered under the source (the recall-free stat
-  // pass). 0 while still enumerating.
-  int32 files_total = 1;
-
-  // Files fully read (made resident) so far.
-  int32 files_done = 2;
-
-  // Sum of file sizes in bytes (stat is recall-free), or 0 while enumerating.
-  int64 bytes_total = 3;
-
-  // Bytes read (recalled) so far.
-  int64 bytes_done = 4;
-
-  // Basename of the file currently being recalled, or empty.
-  string current_name = 5;
-
-  // Seconds elapsed since warming began on the server.
-  double elapsed_seconds = 6;
-}
-
-// One message in the "warm" action's result stream. The server emits zero or
-// more `progress` updates followed by exactly one terminal `done` snapshot. On
-// normal completion `done.files_done == done.files_total`; on cancellation (the
-// client closing the stream) the `done` reflects partial progress. A
-// single-file source yields one `done` with files_total == 0. A remote-url
-// source (an object store, or a `grpc://` mirror) fails instead: nothing on the
-// serving machine can be made resident, and a zero count would read as "done".
-message WarmStreamMessage {
-  oneof payload {
-    WarmProgress progress = 1;
-    WarmProgress done = 2;
-  }
-}
-
 // Request body for the "add_source" Flight action: register an existing path
 // (or remote URL) on the SERVER's filesystem as a served source at runtime and
 // start serving it. This is the wire entrypoint into the same claim -> adapter
@@ -514,6 +499,15 @@ message AddSourceRequest {
   // the tag is not reused.
   reserved 4;
   reserved "monitor";
+
+  // Treat `url` as a cloud / synced folder (OneDrive, Dropbox, iCloud "Files On
+  // Demand"): offline placeholders are admitted and registered as unresolved
+  // sources whose content is read on first access, instead of being skipped. Set
+  // only with the user's consent -- a dropped path cannot be assumed to be
+  // cloud-backed, and a wrong guess turns off multi-file grouping (OME-TIFF and
+  // DICOM series come in as single files). A path already under a configured
+  // `cloud` root is treated as cloud whatever this says.
+  bool cloud = 5;
 }
 
 // Progress heartbeat for an in-flight "add_source" action: one emitted per
@@ -568,6 +562,17 @@ message AddSourceResult {
   // source_ids deregistered because their files are gone from under the
   // dropped path.
   repeated string removed = 5;
+
+  // Offline placeholder files skipped because the request was not for a cloud
+  // folder. Non-zero means the import is incomplete: resend with `cloud` set to
+  // include them (their content is not read until first access).
+  int32 skipped_offline = 7;
+
+  // OneDrive directories (`OneDrive`, `OneDrive - <Org>`) skipped because the
+  // request was not for a cloud folder. Everything inside them is missing from
+  // the import and uncounted by `skipped_offline`; resend with `cloud` set to
+  // include them.
+  int32 skipped_cloud_dirs = 8;
 }
 
 // One message in the "add_source" action's result stream: zero or more

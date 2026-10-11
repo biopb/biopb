@@ -14,6 +14,7 @@ import pytest
 
 from biopb_mcp._tests.conftest import rpc_reply
 from biopb_mcp.mcp import _app, _chat, _kernel_rpc, _server, _writers
+from biopb_mcp.mcp._kernel_env import ViewerMode
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
@@ -102,7 +103,7 @@ def chat_host():
         "watchdog_running": True,
     }
     host._running = None
-    host.no_viewer_reason = None
+    host.viewer = ViewerMode.real()
     host._states = [("ok", "")]
     host.interrupts = []
     # What another writer has run and the loop has not been told about, and the
@@ -600,9 +601,14 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        assert chat_host.digest_origins == ["chat"]
+        assert chat_host.digest_origins
+        assert set(chat_host.digest_origins) == {"chat"}
 
-    def test_the_notice_is_not_discharged_until_the_result_is_recorded(self, chat_host):
+    def test_the_notice_is_not_discharged_until_the_result_is_recorded(
+        self, chat_host, monkeypatch
+    ):
+        # Pins the tool-result seam; the turn-start note would take the digest first.
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
         # The ack promises the agent *has been told*, and it has been told when
         # the result carrying the note is in the thread -- not when the note was
         # rendered. Acked at entry, a turn cancelled three minutes into a job
@@ -616,7 +622,11 @@ class TestExecuteCode:
         asyncio.run(_chat.run_turn("set x", model))
         assert chat_host.events == ["submit", "ack"]
 
-    def test_the_notice_is_discharged_only_once_it_has_been_delivered(self, chat_host):
+    def test_the_notice_is_discharged_only_once_it_has_been_delivered(
+        self, chat_host, monkeypatch
+    ):
+        # Pins the tool-result seam; the turn-start note would take the digest first.
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
         chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
         model = _scripted(
             {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
@@ -733,6 +743,108 @@ class TestExecuteCode:
         # Refused, not claimed: the holder keeps the kernel.
         assert _writers._claimed_by == "sess-A"
         chat_host.run_cell.assert_not_called()
+
+
+class TestQueuedMessages:
+    """#856: a message sent mid-turn enters the thread at a round boundary."""
+
+    def test_it_lands_after_the_round_results_and_before_the_next_ask(self, chat_host):
+        replies = [
+            {"content": "", "tool_calls": [_call("execute_code", python_code="1")]},
+            {"content": "done"},
+        ]
+        seen = []
+
+        async def model(messages, tools):
+            seen.append(messages)
+            if len(seen) == 1:
+                # Sent while the first provider call is in flight.
+                _chat.queue_user("actually, use layer B")
+            return replies[len(seen) - 1]
+
+        asyncio.run(_chat.run_turn("go", model))
+        roles = [m["role"] for m in _chat.history()]
+        assert roles == ["user", "assistant", "tool", "user", "assistant"]
+        assert _chat.history()[3]["content"] == "actually, use layer B"
+        # The second ask saw it, after the tool result.
+        assert seen[1][-1] == {"role": "user", "content": "actually, use layer B"}
+        assert _chat.queued() == []
+
+    def test_a_message_queued_during_the_final_answer_starts_another_round(
+        self, chat_host
+    ):
+        replies = [{"content": "first"}, {"content": "second"}]
+        calls = []
+
+        async def model(messages, tools):
+            calls.append(1)
+            if len(calls) == 1:
+                _chat.queue_user("wait, also this")
+            return replies[len(calls) - 1]
+
+        asyncio.run(_chat.run_turn("go", model))
+        assert [m["content"] for m in _chat.history()] == [
+            "go",
+            "first",
+            "wait, also this",
+            "second",
+        ]
+
+    def test_a_cancelled_turn_still_records_what_was_queued(self, chat_host):
+        started = asyncio.Event()
+
+        async def hang(messages, tools):
+            started.set()
+            await asyncio.sleep(3600)
+
+        async def scenario():
+            task = asyncio.create_task(_chat.run_turn("go", hang))
+            await started.wait()
+            _chat.queue_user("never delivered?")
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        tail = [m["content"] for m in _chat.history()][-2:]
+        assert tail[0].startswith("Turn cancelled")
+        assert tail[1] == "never delivered?"
+
+
+class TestActivityNote:
+    """#861: the user's console cells reach the thread without a turn."""
+
+    def test_finished_cells_are_noted_once_and_acked(self, chat_host):
+        chat_host._digest = [
+            {"job_id": "job-7", "status": "ok", "origin": "user"},
+            {"job_id": "job-8", "status": "running", "origin": "user"},
+        ]
+        _chat.sync_activity()
+        _chat.sync_activity()
+        notes = [m for m in _chat.history() if m.get("note")]
+        assert len(notes) == 1
+        assert "job-7 (ok)" in notes[0]["content"]
+        assert "job-8" not in notes[0]["content"]  # still running: not final
+        assert chat_host.acked == [["job-7"]]
+
+    def test_the_note_is_not_a_turn_and_is_projected_folded(self, chat_host):
+        _chat._append("user", "hello")
+        _chat._append("assistant", "hi")
+        _chat._append("user", "ran job-1", note=True)
+        _chat._append("user", "ran job-2", note=True)
+        assert _chat._last_user_text() == "hello"
+        projected = _chat._llm_messages()
+        tail = projected[-1]
+        assert tail["role"] == "user"
+        assert tail["content"] == "ran job-1\nran job-2"
+
+    def test_a_turn_sees_the_note_before_the_question(self, chat_host):
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        model = _scripted({"content": "ok"})
+        asyncio.run(_chat.run_turn("what changed?", model))
+        sent = model.seen[0]["messages"]
+        assert "job-7 (ok)" in sent[-2]["content"]
+        assert sent[-1]["content"] == "what changed?"
 
 
 class TestConcurrency:
@@ -923,6 +1035,8 @@ class TestCancel:
     def test_a_cancelled_turn_leaves_the_activity_notice_pending(
         self, chat_host, monkeypatch
     ):
+        # Pins the tool-result seam; the turn-start note would take the digest first.
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
         # It was written into a result that never reached the thread. Left
         # un-acked, the digest offers those cells again on the next call: a
         # repeat, which the note's own wording covers, rather than a cell the

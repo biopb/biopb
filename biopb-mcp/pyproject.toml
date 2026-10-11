@@ -17,16 +17,15 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-# Upper bound mirrors biopb / biopb-tensor-server (both >=3.10,<3.13): biopb-mcp
-# depends on biopb[tensor], so without it a 3.13 install fails with a confusing
-# transitive resolution error instead of a clean requires-python message. Also
-# matches the classifiers above (3.10-3.12 only).
-requires-python = ">=3.10,<3.13"
+# Bounds mirror biopb-tensor-server and biopb-control: biopb-mcp depends on
+# biopb[tensor], so a mismatch fails with a confusing transitive resolution
+# error instead of a clean requires-python message.
+requires-python = ">=3.12,<3.15"
 dependencies = [
     # mcp <2: 2.x deleted `mcp.server.fastmcp`, which `mcp/_server.py` is built
     # on, and imports cryptography at module scope, which our pyjwt override
@@ -57,10 +56,6 @@ dependencies = [
     # It also happens to be what upstream tracking libraries pin against, which
     # is what lets a `pkg:` skill declare one without the resolver moving scipy
     # backwards under a live kernel.
-    #
-    # Costs nothing on 3.11+, which already resolve past 1.15 to 1.16+. On 3.10
-    # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
-    # 1.14.1. Retire this with the 3.10 floor, not before.
     "scipy != 1.15.*",
     # distributed: for a cell that builds a dask Client (the kernel guide's cluster
     # recipe); the kernel itself never imports it.
@@ -73,7 +68,7 @@ dependencies = [
     "matplotlib",
     "scikit-learn",
     # biopb.control, biopb.tensor.Connection and the Ops protocol (.dev0: a pre-tag dev build).
-    "biopb[tensor] >= 0.11.1",
+    "biopb[tensor,shim] >= 0.12.0",
 ]
 
 [project.optional-dependencies]
@@ -87,17 +82,16 @@ dependencies = [
 # the installer all resolve the identical napari, so the graph-walk
 # thread-safety test certifies the same object graph that actually ships (see
 # _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari -- its
-# default Qt binding is version-dependent, so the exact pin freezes that too
-# (>=0.7 was also needed to stay off the 0.6.x line, which pins vispy<0.16 and
-# can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
-# version as a `versions.json` release attribute that install.sh reads to pin
-# `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
+# default Qt binding is version-dependent, so the exact pin freezes that too.
+# The release pipeline surfaces this version as a `versions.json` release
+# attribute that install.sh reads to pin `napari[all]==` at deploy time
+# (release.yaml + install/install.sh). Bump here.
 napari = [
-    "napari[all]==0.7.0",
+    "napari[all]==0.9.2",
     "pyqt6",
     "qtpy",
     # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
-    "biopb-napari-widget >= 0.1.0",
+    "biopb-napari-widget >= 0.2.0",
 ]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
@@ -154,7 +148,7 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
-# Light console entry (stdlib + biopb._locations only, no kernel/napari
+# Light console entry (stdlib + biopb._config.locations only, no kernel/napari
 # import) the installer calls to seed the bundled correctness-critical
 # algorithm-plane ops (biopb_mcp/algorithms/) into ~/.config/biopb/algorithms/.
 biopb-mcp-seed-algorithms = "biopb_mcp.algorithms._seed:_cli"

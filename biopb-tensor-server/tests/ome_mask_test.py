@@ -157,10 +157,10 @@ class TestRasterizedMaskAdapter:
         assert (out2 == 0).all()  # bbox ends exactly at 3, this chunk starts there
 
     def test_y_x_are_found_by_label_not_position(self):
-        """An interleaved RGB(A) source keeps its trailing samples axis (``S``)
-        here -- ``label_extent`` drops only the channel axis -- so Y/X are NOT
-        reliably the last two axes, and locating them positionally paints the
-        wrong plane entirely."""
+        """The adapter paints whatever axes it is given, a trailing samples axis
+        included (``label_extent`` leaves it out of a set now, but a set under
+        the earlier rule had one), so Y/X are NOT reliably the last two axes,
+        and locating them positionally paints the wrong plane entirely."""
         bmp = np.zeros((4, 4))
         bmp[1:3, 1:3] = 1
         meta = _meta({"Image:0": [_mask(0, 0, 4, 4, bmp)]})
@@ -174,6 +174,20 @@ class TestRasterizedMaskAdapter:
         assert out[0, 2, 2, 0] == 1
         assert out[0, 0, 0, 0] == 0
         assert (out[0, 2, 2, :] == 1).all()  # broadcasts across the samples axis
+
+    def test_a_singleton_channel_axis_is_painted_across(self):
+        """The set has the image's rank, its channel axis a singleton."""
+        bmp = np.zeros((4, 4))
+        bmp[1:3, 1:3] = 1
+        meta = _meta({"Image:0": [_mask(0, 0, 4, 4, bmp)]})
+        dims = ("T", "C", "Y", "X")
+        adapter = self._adapter(
+            self._shapes(meta, dims=dims), dim_labels=dims, shape=(2, 1, 4, 4)
+        )
+        out = adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=[2, 1, 4, 4]))
+        assert out.shape == (2, 1, 4, 4)
+        assert (out[:, 0, 1:3, 1:3] == 1).all()
+        assert out[:, 0, 0, 0].sum() == 0
 
     def test_z_pin_applies_only_to_its_own_plane(self):
         bmp = np.ones((3, 3))
@@ -329,14 +343,15 @@ class TestFastMetadataRealBitmap:
         raw = bytes([0xFF, 0x00, 0xFE, 0x80, 0x01, 0x00])  # not valid UTF-8
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
-        metadata = adapter.get_metadata()
+        metadata = adapter._ome_metadata()
         assert metadata  # used to come back {} entirely
         assert metadata["images"][0]["id"] == "Image:0"
         mask = metadata["rois"][0]["union"]["masks"][0]
         assert base64.b64decode(mask["bin_data"]["value"]) == raw
 
-    def test_get_embedded_labels_end_to_end(self, tmp_path):
+    def test_the_mask_set_is_a_tensor_of_the_source(self, tmp_path):
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         raw_bitmap = np.zeros((4, 4), dtype=np.uint8)
         raw_bitmap[1:3, 1:3] = 1
@@ -344,7 +359,7 @@ class TestFastMetadataRealBitmap:
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
 
-        sets = adapter.get_embedded_labels()
+        sets = adapter._embedded_sets()
         assert list(sets.keys()) == ["Image:0/@labels/@ome"]
         label_set = sets["Image:0/@labels/@ome"]
         assert label_set.array_id == "src1/Image:0/@labels/@ome"
@@ -355,10 +370,16 @@ class TestFastMetadataRealBitmap:
         assert out[tuple([0] * (out.ndim - 2) + [2, 2])] == 1
         assert out[tuple([0] * (out.ndim - 2) + [0, 0])] == 0
 
-        # And through the base SourceAdapter machinery: extent must match.
-        assert "Image:0/@labels/@ome" in adapter.label_sets
+        # And as the source's own tensor: listed after the image, routed by id.
+        reg = SourceRegistry()
+        adapter = reg.register("src1", adapter)
+        assert [t.array_id for t in adapter.list_tensors()] == [
+            "src1/Image:0",
+            "src1/Image:0/@labels/@ome",
+        ]
+        assert reg.resolve_tensor("src1", "Image:0/@labels/@ome") is label_set
 
-        adapter.release_registration_cache()
+        adapter._drop_registration_state()
 
         # The label adapter keeps the decoded bitmap, while the source retains
         # neither the base64 payload nor its parsed duplicate.
@@ -367,21 +388,21 @@ class TestFastMetadataRealBitmap:
         assert adapter._parsed_metadata_probed is False
         for scene in adapter._tensor_adapters.values():
             assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
-        cached_label_set = adapter.label_sets["Image:0/@labels/@ome"]
+        cached_label_set = adapter.get_tensor_adapter("src1/Image:0/@labels/@ome")
         assert (
             cached_label_set.get_data(
                 ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))
             )[tuple([0] * (out.ndim - 2) + [2, 2])]
             == 1
         )
-        metadata_after_release = adapter.get_metadata()
+        metadata_after_release = adapter._ome_metadata()
         mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
         assert mask_after_release["bin_data"]["value"] == ""
 
     def test_release_survives_a_reduced_xml_the_stripper_cannot_parse(
         self, tmp_path, monkeypatch
     ):
-        """release_registration_cache() is documented to never raise. A reduced
+        """Dropping the registration state must never raise. A reduced
         XML the mask stripper's ET.fromstring rejects must not abort the raw-XML
         drop or the cascade to scene adapters below it -- it is left un-redacted
         instead (biopb/biopb#1081)."""
@@ -395,7 +416,7 @@ class TestFastMetadataRealBitmap:
         raw = np.packbits(raw_bitmap.flatten(), bitorder="big").tobytes()
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
-        adapter.get_embedded_labels()  # sets _mask_payloads_transferred
+        adapter._embedded_sets()  # sets _mask_payloads_transferred
 
         def _broken_strip(ome_xml):
             raise ET.ParseError("boom")
@@ -404,7 +425,7 @@ class TestFastMetadataRealBitmap:
             ome_tiff_module, "_strip_mask_bindata_payloads", _broken_strip
         )
 
-        adapter.release_registration_cache()  # must not raise
+        adapter._drop_registration_state()  # must not raise
 
         assert adapter._raw_ome_xml is None
         assert adapter._raw_ome_xml_released is True
@@ -412,7 +433,7 @@ class TestFastMetadataRealBitmap:
         assert base64.b64encode(raw).decode("ascii") in adapter._reduced_ome_xml
 
     def test_get_metadata_parses_the_ome_xml_only_once(self, tmp_path, monkeypatch):
-        """get_embedded_labels() calls get_metadata() internally, and so does
+        """building the label sets calls get_metadata() internally, and so does
         the registration path (metadata_db.py) -- the parsed dict is cached so
         that doesn't cost a second ome-types parse."""
         import biopb_tensor_server.adapters.ome_tiff as ome_tiff_module
@@ -430,8 +451,8 @@ class TestFastMetadataRealBitmap:
 
         monkeypatch.setattr(ome_tiff_module, "_fast_ome_metadata", counting)
 
-        adapter.get_metadata()
-        adapter.get_embedded_labels()  # calls self.get_metadata() again internally
-        adapter.get_metadata()
+        adapter._ome_metadata()
+        adapter._embedded_sets()  # calls self._ome_metadata() again internally
+        adapter._ome_metadata()
 
         assert len(calls) == 1

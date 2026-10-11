@@ -127,7 +127,7 @@ def _start_server(zarr_path: str):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=str(cache_dir)))
 
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=MetadataDatabase())
+    server = TensorFlightServer("localhost:0", metadata_db=MetadataDatabase())
     registered = server.register_source(
         "stack", ZarrAdapter(zarr.open_array(zarr_path, mode="r"), "stack", LABELS)
     )

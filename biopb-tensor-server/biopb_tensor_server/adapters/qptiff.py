@@ -27,38 +27,44 @@ is a **native-pyramid** adapter -- only the second after ``OmeZarrAdapter``:
 - ``get_read_plan()`` routes a ``precompute`` + ``scale_hint`` request to the
   matching level's ``aszarr`` store; each level's chunks are encoded with
   ``array_id = source_id/{level}`` so ``DoGet`` dispatches back through
-  ``get_level_adapter`` (the same mechanism OME-Zarr uses).
+  ``get_tensor_adapter`` (the same mechanism OME-Zarr uses).
 
 v1 exposes only the baseline pyramidal multichannel image as one tensor
 (``c,y,x``); the auxiliary Thumbnail/Overview/Label series are surfaced in
-``get_metadata()`` but not as separate tensors (biopb/biopb#135 open question).
+``registration_record`` but not as separate tensors (biopb/biopb#135 open question).
 """
 
 import logging
 import threading
-import time
 import xml.etree.ElementTree as ET
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._handle_reaper import (
-    DEFAULT_HANDLE_REAPER_TTL,
-    IdleHandleReaper,
-)
+from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
+from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +76,7 @@ QPTIFF_EXTENSIONS = (".qptiff",)
 
 # The vendor XML block in a QPTIFF's ImageDescription is rooted at
 # <PerkinElmer-QPI-ImageDescription>; this substring gates channel/marker-name
-# extraction in get_metadata() (the file is already open there, so this is a
+# extraction in registration_record (the file is already open there, so this is a
 # read of in-hand bytes -- not a claim-time recall).
 _QPI_XML_MARKER = "PerkinElmer-QPI"
 
@@ -94,36 +100,68 @@ def _default_dim_labels(ndim: int) -> List[str]:
     return [f"dim{i}" for i in range(ndim - 2)] + ["y", "x"]
 
 
-# One pool for QPTIFF handles. Its open is the expensive kind -- a pyramidal
-# whole-slide BigTIFF's IFD table -- so it keeps the long TTL, like the OME-TIFF
-# store pool it most resembles. The cap is tighter because one warm handle here
-# is more than a parsed directory: the ``TiffFile`` plus one live ``aszarr`` store
-# for every pyramid level that has been read.
-#
-# Until this pool existed the handle was simply never released: ``close()`` has no
-# caller anywhere in the package, so a QPTIFF held its ``TiffFile`` and stores from
-# registration until the process exited or the adapter was garbage collected --
-# the pin biopb/biopb#71 removed from hdf5/mrc, and that OME-TIFF bounded with a
-# reaper, which this adapter got neither of.
-_handle_reaper = IdleHandleReaper(
-    DEFAULT_HANDLE_REAPER_TTL, "qptiff-handle-reaper", max_handles=16
-)
+# One pool for QPTIFF handles, keyed by file identity so a rebuilt adapter finds
+# its predecessor's. Its open is the expensive kind -- a pyramidal whole-slide
+# BigTIFF's IFD table -- so it keeps the long TTL. The cap is tighter than
+# OME-TIFF's because one warm handle is more than a parsed directory: the
+# ``TiffFile`` plus one live ``aszarr`` store for every pyramid level read.
+_handle_pool = HandlePool(DEFAULT_HANDLE_REAPER_TTL, 16, "qptiff-handle-pool")
 
 
+class _QptiffFile:
+    """One open ``TiffFile``, its baseline series and its per-level stores: what
+    the pool keeps open for a file."""
+
+    def __init__(self, path: str):
+        import tifffile
+
+        self.lock = threading.RLock()
+        self.tiff = tifffile.TiffFile(path)
+        self.series = self.tiff.series[0]
+        self._level_stores: dict = {}  # level -> (zarr_array, store)
+
+    def level_store(self, level: int):
+        """Open (and cache) the ``aszarr`` store for one pyramid level as an array.
+
+        Default chunkmode, so the zarr chunks are the QPTIFF's native tile grid --
+        the access granularity we advertise as ``chunk_shape``.
+        """
+        cached = self._level_stores.get(level)
+        if cached is not None:
+            return cached
+        with self.lock:
+            cached = self._level_stores.get(level)
+            if cached is not None:
+                return cached
+            import zarr
+
+            store = self.series.aszarr(level=level)
+            opened = (zarr.open(store, mode="r"), store)
+            self._level_stores[level] = opened
+            return opened
+
+    def close(self) -> None:
+        for _za, store in list(self._level_stores.values()):
+            try:
+                store.close()
+            except Exception:
+                logger.debug("error closing qptiff level store", exc_info=True)
+        self._level_stores = {}
+        try:
+            self.tiff.close()
+        except Exception:
+            logger.debug("error closing qptiff handle", exc_info=True)
+
+
+@canonical_axes
 class _QptiffLevelAdapter(ZarrAdapter):
-    """A native pyramid level's backend, counted against its parent's handle.
+    """A native pyramid level's backend, reading under a lease on its parent's
+    pooled handle.
 
     The zarr array this reads through is a view onto the parent's one ``TiffFile``,
-    which the reaper may now close. ``DoGet`` resolves a level adapter and reads
-    through it as two separate steps (serving/server.py), so a sweep landing
-    between them would otherwise read a closed store -- and the parent's own
-    ``_active_reads`` count would not see it, because the read never goes through
-    the parent.
-
-    So the array is re-resolved from the parent on every read rather than captured
-    once: a reap since the last read replaced it, and this adapter may well have
-    outlived that (the parent's cache is cleared on release, but a caller already
-    holding one has not noticed).
+    which the pool may close. The array is re-resolved from a lease on every read
+    rather than captured once, so a close since the last read replaced it, and
+    this adapter may well have outlived that.
     """
 
     def __init__(self, parent: "QptiffAdapter", level: int, *args, **kwargs):
@@ -132,13 +170,13 @@ class _QptiffLevelAdapter(ZarrAdapter):
         self._level = level
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        self.zarr_array = self._parent._begin_level_read(self._level)
-        try:
-            return super().get_data(bounds)
-        finally:
-            self._parent._end_read()
+        super(ZarrAdapter, self).get_data(bounds)  # validate against the level
+        slices = bounds_to_slices(bounds)
+        with self._parent._file() as handle:
+            return np.asarray(handle.level_store(self._level)[0][slices])
 
 
+@canonical_axes
 class QptiffAdapter(TensorAdapter):
     """Adapter for Akoya PhenoImager QPTIFF (pyramidal multiplex BigTIFF).
 
@@ -187,11 +225,62 @@ class QptiffAdapter(TensorAdapter):
         """Create a source-level adapter (the tifffile handle opens lazily)."""
         return cls(str(source.url), source.source_id)
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "QptiffAdapter":
+        """Rebuild from the row: descriptor, pyramid shapes, scale and metadata are
+        answered from it, and the TIFF handle opens on the first read."""
+        adapter = cls(str(source.url), source.source_id)
+        shape = tuple(int(s) for s in payload["shape"])
+        labels = _default_dim_labels(len(shape))
+        adapter.dim_labels = labels
+        adapter._stored = {
+            "payload": payload,
+            "level_shapes": [tuple(int(s) for s in lv) for lv in payload["levels"]],
+            "scale": payload["scale"],
+            "metadata": metadata,
+            "descriptor": TensorDescriptor(
+                array_id=adapter.array_id,
+                dim_labels=labels,
+                shape=list(shape),
+                chunk_shape=default_transfer_chunk_shape(
+                    shape,
+                    payload["dtype"],
+                    labels,
+                    native=tuple(int(c) for c in payload["chunks"]),
+                ),
+                dtype=payload["dtype"],
+            ),
+        }
+        return adapter
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The baseline image's shape, dtype and tile grid, every pyramid level's
+        shape and the physical scale: what the descriptor, the native pyramid and
+        the scale hint are made of."""
+        if self._stored is not None:
+            return self._stored["payload"]
+        za, _ = self._level_store(0)
+        scale = self._physical_scale()
+        return {
+            "shape": [int(s) for s in self._level_shape(0)],
+            "dtype": za.dtype.str,
+            "chunks": [int(c) for c in za.chunks],
+            "levels": [
+                [int(s) for s in self._level_shape(i)] for i in range(self._n_levels())
+            ],
+            "scale": None if scale is None else [list(scale[0]), list(scale[1])],
+        }
+
     def __init__(
         self,
         url: str,
         source_id: str,
-        io_lock: Optional[threading.RLock] = None,
     ):
         self.source_id = source_id
         self._url = url or ""
@@ -201,24 +290,13 @@ class QptiffAdapter(TensorAdapter):
         # namespace. None (unresolved / non-file url) leaves the source unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
-        # One lock serialises the open/cache and metadata paths over the single
-        # tifffile handle; reads run lock-free (see _read_level). RLock keeps it
-        # safe should any of those paths ever acquire it while already held.
-        self._io_lock = io_lock if io_lock is not None else threading.RLock()
-
         self.dim_labels: Optional[List[str]] = None
 
-        self._tiff = None
-        self._series = None
-        self._level_stores: dict = {}  # level -> (zarr_array, store)
         self._level_adapters: dict = {}  # level -> ZarrAdapter (native-level backend)
         self._cached_descriptor: Optional[TensorDescriptor] = None
-
-        # ReapableHandle state. Reads decode WITHOUT ``_io_lock`` (see
-        # _read_level), so ``_active_reads`` -- not the lock -- is what stops a
-        # sweep closing the store under a decode in flight.
-        self._persistent_last_access = 0.0
-        self._active_reads = 0
+        # What a source rebuilt from its row answers without the file (descriptor,
+        # level shapes, scale, metadata); None for one parsed from the file.
+        self._stored: Optional[Dict[str, Any]] = None
 
     # ---- tifffile handle / level stores ------------------------------------
 
@@ -226,145 +304,59 @@ class QptiffAdapter(TensorAdapter):
         url = self._url
         return url[len("file://") :] if url.startswith("file://") else url
 
-    def _open(self):
-        """Open the tifffile handle + baseline series once (caller holds the lock)."""
-        if self._series is None:
-            import tifffile
+    def _pool_key(self):
+        return (self._url, self._content_version)
 
-            self._tiff = tifffile.TiffFile(self._local_path())
-            self._series = self._tiff.series[0]
-            # Stamped before register so this adapter sorts newest and a cap
-            # eviction triggered by its own register never picks it.
-            self._persistent_last_access = time.monotonic()
-            _handle_reaper.register(self)
-        return self._series
+    @contextmanager
+    def _file(self):
+        """Lease this file's pooled handle for the duration of a block. A leased
+        handle is never closed, so reads decode under it without a lock."""
+        with _handle_pool.checkout(self._pool_key(), self._open_file) as handle:
+            yield handle.value
+
+    def _open_file(self) -> PooledHandle:
+        opened = _QptiffFile(self._local_path())
+        return PooledHandle(self._pool_key(), opened, opened.close)
 
     def _level_store(self, level: int):
-        """Open (and cache) the ``aszarr`` store for one pyramid level as an array.
-
-        Default chunkmode, so the zarr chunks are the QPTIFF's native tile grid --
-        the access granularity we advertise as ``chunk_shape``.
-        """
-        with self._io_lock:
-            cached = self._level_stores.get(level)
-            if cached is not None:
-                return cached
-            import zarr
-
-            series = self._open()
-            store = series.aszarr(level=level)
-            za = zarr.open(store, mode="r")
-            self._level_stores[level] = (za, store)
-            return za, store
+        with self._file() as handle:
+            return handle.level_store(level)
 
     def _n_levels(self) -> int:
-        with self._io_lock:
-            return len(self._open().levels)
+        if self._stored is not None:
+            return len(self._stored["level_shapes"])
+        with self._file() as handle:
+            return len(handle.series.levels)
 
     def _level_shape(self, level: int) -> Tuple[int, ...]:
-        with self._io_lock:
-            return tuple(int(x) for x in self._open().levels[level].shape)
+        if self._stored is not None:
+            return self._stored["level_shapes"][level]
+        with self._file() as handle:
+            return tuple(int(x) for x in handle.series.levels[level].shape)
 
     def _read_level(self, level: int, bounds: ChunkBounds) -> np.ndarray:
-        slices = self._bounds_to_slices(bounds)
-        # _level_store takes the lock only for the lazy open + cache; the read
-        # itself runs WITHOUT our lock so parallel do_get chunk reads decode
-        # concurrently. tifffile already makes this safe: its aszarr store
+        slices = bounds_to_slices(bounds)
+        # The read runs under a lease and no lock, so parallel do_get chunk reads
+        # decode concurrently. tifffile already makes this safe: its aszarr store
         # serializes the raw seek+read on one shared handle lock (fh.lock, the
         # same RLock across all our per-level stores), and the tile decode
         # (imagecodecs: LZW for Akoya component data, JPEG for RGB overviews, ...)
         # is per-tile into a fresh buffer, so concurrent reads cannot race. Copy
         # out so the result is independent of the store.
-        za = self._begin_level_read(level)
-        try:
-            return np.asarray(za[slices])
-        finally:
-            self._end_read()
-
-    def _begin_level_read(self, level: int):
-        """Open (or reuse) a level's store and mark a read in flight.
-
-        Holds ``_io_lock`` only for the open/cache and the count, never across
-        the decode -- that is the property ``_read_level`` documents and this
-        keeps. Incrementing under the lock is what makes the count sound: the
-        reaper tests it under the same lock, so a read already handed a store is
-        visible before a sweep can decide to close it.
-        """
-        with self._io_lock:
-            za, _ = self._level_store(level)
-            self._persistent_last_access = time.monotonic()
-            self._active_reads += 1
-            return za
-
-    def _end_read(self) -> None:
-        with self._io_lock:
-            self._active_reads -= 1
-            self._persistent_last_access = time.monotonic()
-
-    def _release_persistent_handle(self) -> None:
-        """Close the handle and permit a later reopen.
-
-        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
-        hook. Caller holds ``_io_lock`` and has established ``_active_reads == 0``.
-        """
-        _handle_reaper.discard(self)
-        self._close_handles()
+        with self._file() as handle:
+            return np.asarray(handle.level_store(level)[0][slices])
 
     def close(self) -> None:
-        """Release the handle now rather than waiting for the reaper.
-
-        Defers to a decode in flight for the same reason a sweep does: the store
-        it is reading through would go out from under it.
-        """
-        with self._io_lock:
-            if self._active_reads == 0:
-                self._release_persistent_handle()
-
-    def _close_handles(self) -> None:
-        """Close the tifffile handle + per-level stores; allow a later reopen.
-
-        Caller holds ``self._io_lock`` (the explicit ``close()``) or is the GC
-        finalizer (no references left, so no read can be in flight -- no lock
-        needed). Nulls the instance refs *before* closing so a concurrent reopen,
-        were one possible, sees a clean slate; reads them via ``getattr`` so a
-        finalizer running after a half-finished ``__init__`` can't raise. Safe to
-        call repeatedly.
-        """
-        _handle_reaper.discard(self)
-        stores = getattr(self, "_level_stores", None) or {}
-        tiff = getattr(self, "_tiff", None)
-        self._level_stores = {}
+        """Release the pooled handle now (at its last lease) rather than waiting
+        for the pool's TTL."""
+        _handle_pool.drop(self._pool_key())
         self._level_adapters = {}
-        self._tiff = None
-        self._series = None
-        self._cached_descriptor = None
-        for _za, store in list(stores.values()):
-            try:
-                store.close()
-            except Exception:
-                logger.debug("error closing qptiff level store", exc_info=True)
-        if tiff is not None:
-            try:
-                tiff.close()
-            except Exception:
-                logger.debug("error closing qptiff handle", exc_info=True)
-
-    def __del__(self):
-        # GC backstop: release the handle even without an explicit close(), but
-        # WITHOUT taking _io_lock -- acquiring a lock in a finalizer can deadlock
-        # against a thread that holds it, or touch torn-down globals at interpreter
-        # shutdown. By the time GC collects this adapter no references remain, so
-        # no read can be in flight and the lock is unnecessary (the OmeTiffAdapter
-        # pattern). The registry's unregister/shutdown path calls close() for the
-        # locked, in-flight-safe release.
-        try:
-            self._close_handles()
-        except Exception:
-            pass
 
     # ---- descriptors --------------------------------------------------------
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
+        if self._stored is not None:
+            return self._stored["descriptor"]
         if self._cached_descriptor is not None:
             return self._cached_descriptor
         za, _ = self._level_store(0)
@@ -383,8 +375,8 @@ class QptiffAdapter(TensorAdapter):
         )
         return self._cached_descriptor
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     # ---- reads --------------------------------------------------------------
 
@@ -450,25 +442,25 @@ class QptiffAdapter(TensorAdapter):
         """
         return self._scale_for(self._level_shape(0), self._level_shape(level))
 
-    def get_level_adapter(self, path: str) -> ZarrAdapter:
-        """Full backend adapter for a native level, keyed by its integer index.
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """A native level for ``<source>/<level>``, else the base behavior."""
+        field = strip_source_prefix(self.source_id, tensor_id)
+        if field and field.isdigit() and int(field) < self._n_levels():
+            return self._level_adapter(int(field))
+        return super().get_tensor_adapter(tensor_id)
 
-        Reached by ``DoGet`` for ``precompute`` chunks (``array_id`` suffix
-        ``/{level}``) via the ``get_level_adapter`` contract on ``TensorAdapter``
-        (biopb/biopb#557).
+    def _level_adapter(self, level: int) -> ZarrAdapter:
+        """Full backend adapter for a native level, keyed by its integer index.
 
         Each level's ``aszarr`` store is already a real ``zarr`` array, so -- like
         ``OmeZarrAdapter`` -- the level adapter is a bare ``ZarrAdapter`` over it
         with ``source_id`` inherited and ``_tensor_name = str(level)``. The base
         ``array_id`` property then yields ``source_id/{level}``; nothing hardcodes
-        the identifier. This keeps the level adapter a genuine ``TensorAdapter``
-        -- which is itself a ``SourceAdapter`` -- so any caller that treats it as a full
-        source -- metadata-DB sync, source-level ops -- finds the attributes it
-        expects. All levels share the parent's one open ``tifffile`` handle (the
-        ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle of its
-        own, so the parent's ``close()`` remains the single owner of teardown.
+        the identifier. All levels share the parent's one open ``tifffile`` handle
+        (the ``aszarr`` stores reference it), and ``ZarrAdapter`` holds no handle
+        of its own, so the parent's ``close()`` remains the single owner of
+        teardown.
         """
-        level = int(path)
         cached = self._level_adapters.get(level)
         if cached is not None:
             return cached
@@ -478,7 +470,7 @@ class QptiffAdapter(TensorAdapter):
             level,
             za,
             source_id=self.source_id,
-            dim_labels=list(self.get_tensor_descriptor().dim_labels),
+            dim_labels=list(self._native_descriptor().dim_labels),
         )
         level_adapter._tensor_name = str(level)
         # Point provenance at the real file + this format, not ZarrAdapter's
@@ -498,10 +490,12 @@ class QptiffAdapter(TensorAdapter):
         pixel size = unit / density, converted to micrometres. Returns ``None``
         when no usable resolution is present (e.g. ResolutionUnit "none").
         """
+        if self._stored is not None:
+            scale = self._stored["scale"]
+            return None if scale is None else (list(scale[0]), list(scale[1]))
         try:
-            with self._io_lock:
-                self._open()
-                page = self._tiff.pages[0]
+            with self._file() as handle:
+                page = handle.tiff.pages[0]
 
             def _density(tag_name):
                 tag = page.tags.get(tag_name)
@@ -520,7 +514,7 @@ class QptiffAdapter(TensorAdapter):
             if um_per_unit is None:
                 return None
 
-            labels = self.get_tensor_descriptor().dim_labels
+            labels = self._native_descriptor().dim_labels
             sizes = {
                 axis: d * um_per_unit
                 for axis, d in (
@@ -534,18 +528,21 @@ class QptiffAdapter(TensorAdapter):
             logger.debug("qptiff: physical scale unavailable", exc_info=True)
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Marker/channel names + the raw vendor XML, best-effort and JSON-safe.
 
         Channel markers are read from the per-channel level-0 pages' vendor XML.
         Auxiliary series (thumbnail/overview/label) are listed by name only -- v1
         does not expose them as tensors (biopb/biopb#135).
         """
+        if self._stored is not None:
+            return metadata_record(dict(self._stored["metadata"]))
         meta: dict = {"format": "qptiff"}
         try:
-            with self._io_lock:
-                self._open()
-                base = self.get_tensor_descriptor()
+            with self._file() as handle:
+                base = self._native_descriptor()
                 labels = list(base.dim_labels)
                 n_channels = int(base.shape[labels.index("c")]) if "c" in labels else 1
                 # One entry per channel, positionally (None where a page has no
@@ -554,26 +551,26 @@ class QptiffAdapter(TensorAdapter):
                 # attribute names to the wrong channels.
                 names = [
                     self._marker_name(pg.description or "")
-                    for pg in self._tiff.pages[:n_channels]
+                    for pg in handle.tiff.pages[:n_channels]
                 ]
                 if any(names):
                     meta["channels"] = names
                 # Full page-0 vendor XML -- not truncated. It is fetched only on a
                 # metadata request (never in list_flights) and a hard byte cap
                 # could sever a multi-KB Akoya block mid-element.
-                d0 = self._tiff.pages[0].description or ""
+                d0 = handle.tiff.pages[0].description or ""
                 if d0:
                     meta["image_description"] = d0
                 aux = [
                     str(s.name)
-                    for s in self._tiff.series[1:]
+                    for s in handle.tiff.series[1:]
                     if getattr(s, "name", None)
                 ]
                 if aux:
                     meta["auxiliary_series"] = aux
         except Exception:
             logger.debug("qptiff: metadata parse failed", exc_info=True)
-        return meta
+        return metadata_record(meta)
 
     @staticmethod
     def _marker_name(desc: str) -> Optional[str]:

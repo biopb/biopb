@@ -71,6 +71,7 @@ export default function ChatPane({
   const [model, setModelState] = useState(status.model);
   useEffect(() => setModelState(status.model), [status.model]);
   const [busy, setBusy] = useState(false);
+  const [queued, setQueued] = useState<string[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [text, setText] = useState("");
   // What has already been asked, for the arrow keys to walk back through.
@@ -111,6 +112,12 @@ export default function ChatPane({
     }
     if (!page) return; // unreachable; keep what is on screen
     setBusy(page.busy);
+    // Kept when unchanged: a fresh array every poll would re-render the pane.
+    setQueued((prev) =>
+      prev.length === page.queued.length && prev.every((t, i) => t === page.queued[i])
+        ? prev
+        : page.queued,
+    );
     setLive(page.live);
     // Empty only from a child too old to send it; keeping what we have beats
     // blanking the header.
@@ -141,7 +148,7 @@ export default function ChatPane({
 
   const submit = useCallback(async () => {
     const body = text.trim();
-    if (!body || busy || sending) return;
+    if (!body || sending) return;
     setSending(true);
     setError(null);
     const err = await sendTurn(base, body);
@@ -155,7 +162,7 @@ export default function ChatPane({
     setNotice(null); // a context report describes the thread as it was
     setBusy(true); // poll faster immediately rather than after one slow tick
     poll();
-  }, [base, text, busy, sending, poll]);
+  }, [base, text, sending, poll]);
 
   // The wire thread, projected onto what the pane renders. Everything below
   // this line renders one shape and knows nothing about where it came from.
@@ -313,10 +320,7 @@ export default function ChatPane({
     });
   }, []);
 
-  // Both read the typed text the same way, so the button is enabled exactly
-  // when Enter would do something.
   const matches = matchCommands(text);
-  const isCommand = parseCommand(text).kind === "command";
 
   // One step back or forward through the prompt buffer. Returns whether the
   // keystroke was used, because an unused one has to go back to the textarea as
@@ -397,7 +401,8 @@ export default function ChatPane({
                 "msg " +
                 g.item.role +
                 (g.item.error ? " err" : "") +
-                (g.item.cancelled ? " cancelled" : "")
+                (g.item.cancelled ? " cancelled" : "") +
+                (g.item.note ? " note" : "")
               }
             >
               {g.item.blocks.map((b, i) =>
@@ -419,6 +424,15 @@ export default function ChatPane({
             />
           ),
         )}
+
+        {/* Sent mid-turn and held: it enters the thread after the step now
+            running, not during it, so it must not read as delivered. */}
+        {queued.map((q, i) => (
+          <div key={"q" + i} className="msg user queued">
+            <span>{q}</span>
+            <span className="queued-tag"> · will send after this step</span>
+          </div>
+        ))}
 
         {notice ? <div className="chat-report">{notice}</div> : null}
       </div>
@@ -489,7 +503,7 @@ export default function ChatPane({
             className="chat-send"
             aria-label="Send message"
             title="Send (Enter)"
-            disabled={!status.ready || sending || (busy && !isCommand) || !text.trim()}
+            disabled={!status.ready || sending || !text.trim()}
             onClick={onEnter}
           >
             ↩
@@ -502,7 +516,7 @@ export default function ChatPane({
             // during a turn. A button that replaces Send mid-turn changes what
             // the control under the cursor means while you are looking at it.
             <span className="chat-busy">
-              working… · <kbd>esc</kbd> to cancel
+              working… · <kbd>Enter</kbd> queues a message · <kbd>esc</kbd> to cancel
             </span>
           ) : (
             <span className="chat-hint">
@@ -675,6 +689,9 @@ const CHAT_CSS = `
                         color: #666; }
   .chat-bar { display: flex; align-items: baseline; gap: 10px; margin-top: 6px;
               min-height: 15px; }
+  .msg.note { opacity: 0.6; font-size: 12px; font-style: italic; }
+  .msg.queued { opacity: 0.6; }
+  .queued-tag { font-size: 11px; }
   .chat-busy { color: #7e7; font-size: 12px; }
   .chat-hint { color: #666; font-size: 12px; }
   .chat-bar kbd { font-family: ui-monospace, Menlo, monospace; font-size: 11px;

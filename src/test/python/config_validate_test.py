@@ -1,4 +1,4 @@
-"""The shared config-validation scheme (``biopb._config_validate``).
+"""The shared config-validation scheme (``biopb._config.validate``).
 
 One checker, one policy, three consumers (biopb-tensor-server's load path,
 biopb-mcp's load path, the control's admin endpoints). These tests pin the parts
@@ -12,8 +12,8 @@ import logging
 from dataclasses import dataclass
 
 import pytest
-from biopb._config_constraints import Enum, Range
-from biopb._config_validate import (
+from biopb._config.constraints import Enum, Range
+from biopb._config.validate import (
     MISSING,
     Problem,
     check_sections,

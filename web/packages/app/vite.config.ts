@@ -69,6 +69,13 @@ const control = { target: "http://localhost:8813", changeOrigin: true };
 
 export default defineConfig({
   base: urlPrefix ? `${urlPrefix}/` : "/",
+  experimental: {
+    // Lazy-chunk preloads resolve against the chunk's URL: root-absolute ones
+    // escape `--url-prefix`, since the control only rewrites the HTML shell.
+    renderBuiltUrl(_filename, { hostType }) {
+      return hostType === "js" ? { relative: true } : undefined;
+    },
+  },
   plugins: [react(), injectBaseGlobal(urlPrefix)],
   resolve: {
     dedupe: ["react", "react-dom"],

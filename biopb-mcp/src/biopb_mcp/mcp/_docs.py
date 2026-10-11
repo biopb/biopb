@@ -39,7 +39,7 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
-from biopb._config_io import atomic_write_json, atomic_write_text
+from biopb._config.io import atomic_write_json, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ def local_dir() -> Path | None:
     if configured:
         return Path(configured).expanduser()
     try:
-        from biopb import _locations
+        from biopb._config import locations as _locations
 
         if hasattr(_locations, "mcp_docs_dir"):
             return _locations.mcp_docs_dir()
@@ -424,8 +424,64 @@ def changed_shipped_ids(current_ids: list[str] | None = None) -> list[str]:
         changed = sorted(i for i, h in current.items() if old_hashes.get(i) != h)
     else:
         changed = []  # no trustworthy "before" to diff against
-    _save_manifest({"version": version, "hashes": current, "changed": changed})
+    _save_manifest(
+        {**manifest, "version": version, "hashes": current, "changed": changed}
+    )
     return changed
+
+
+# A local copy's *base*: the hash of the shipped text it was copied from, kept
+# in the manifest's ``bases`` mapping. Whether a copy is behind is a question
+# about that copy, not about the last version bump: a copy made from this
+# release's text is current however much the release changed it, and one made
+# two releases ago is still behind after a release that left the doc alone. So
+# :func:`stale_shadowed_ids` compares the shipped text against the copy's base,
+# and the version-keyed change set is only the fallback for a copy written
+# before bases were recorded.
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _bases(manifest: dict) -> dict:
+    bases = manifest.get("bases")
+    return bases if isinstance(bases, dict) else {}
+
+
+def _is_behind(doc_id: str, bases: dict, changed: set[str]) -> bool:
+    """Whether the local copy of shipped *doc_id* predates its shipped text."""
+    shipped = _shipped_text(doc_id)
+    if shipped is None:
+        return False
+    base = bases.get(doc_id)
+    if isinstance(base, str):
+        return base != _text_hash(shipped)
+    return doc_id in changed  # no base recorded: the copy predates bases
+
+
+def stale_shadowed_ids(shadowed: set[str], current_ids: list[str]) -> list[str]:
+    """The shadowed shipped ids whose shipped text moved past the copy's base."""
+    changed = set(changed_shipped_ids(current_ids))  # also seeds the manifest
+    bases = _bases(_load_manifest())
+    return [i for i in current_ids if i in shadowed and _is_behind(i, bases, changed)]
+
+
+def _rebase(doc_id: str) -> bool:
+    """Record the current shipped text as *doc_id*'s copy's base.
+
+    Called on every write to a copy of a shipped doc: the write is made against
+    this release's text (the ``@diff`` read is how a release's changes are
+    carried over), so afterwards the copy is not behind it. Returns whether the
+    copy *was* behind, so the write can say it cleared the flag.
+    """
+    shipped = _shipped_text(doc_id)
+    if shipped is None:
+        return False
+    manifest = _load_manifest()
+    bases = _bases(manifest)
+    was_behind = _is_behind(doc_id, bases, set(changed_shipped_ids()))
+    manifest = _load_manifest()  # changed_shipped_ids may have just reseeded it
+    _save_manifest({**manifest, "bases": {**bases, doc_id: _text_hash(shipped)}})
+    return was_behind
 
 
 # --------------------------------------------------------------------------- #
@@ -553,9 +609,9 @@ def render_index(text: str | None = None) -> str:
     copy)`` where a local doc shadows a shipped one; a trailing *New shipped
     docs* list names the shipped docs this index neither lists nor ignores,
     and a *Shipped docs your local copy may be behind on* list names shadowed
-    ids whose shipped text changed since this install last looked (§ shipped-
-    doc change manifest) -- the only shadowed-doc case with anything to act
-    on, since an unshadowed one is simply read fresh. Each item carries the
+    ids whose shipped text is no longer the text the copy was based on
+    (:func:`stale_shadowed_ids`) -- the only shadowed-doc case with anything to
+    act on, since an unshadowed one is simply read fresh. Each item carries the
     shipped doc's description, and each stale item the ``<id>@diff`` read that
     shows what changed. Neither tail is truncated -- both are bounded by what
     one release adds, and truncating would hide the upgrade they exist to
@@ -590,7 +646,7 @@ def render_index(text: str | None = None) -> str:
     new = [i for i in ids if i not in named]
     _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
 
-    stale = [i for i in changed_shipped_ids(ids) if i in shadowed]
+    stale = stale_shadowed_ids(shadowed, ids)
     _append_tail(
         out,
         _STALE_TAIL,
@@ -811,6 +867,12 @@ def write_doc(
         return f"Could not write '{doc_id}': {exc}"
 
     result = _diff(base or "", after, doc_id)
+    if doc_id != INDEX_ID and _rebase(doc_id) and before_local is not None:
+        result += (
+            f"\n\nThis copy was behind the shipped text, and this write marks it "
+            f"current. If you have not carried over the release's changes, "
+            f'read_doc("{doc_id}{DIFF_SUFFIX}") still shows them.'
+        )
     if doc_id != INDEX_ID and before_local is None:
         result += _file_index_entry(doc_id)
     return result

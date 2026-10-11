@@ -20,23 +20,25 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
-    ClaimContext,
     DiscoveryState,
     SourceClaim,
+    WalkReport,
     discover_sources,
-    discover_sources_from_entries,
     generate_source_id,
     local_path_is_rooted,
     resolve_local_path,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.errors import CatalogRestoreError, UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
-from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
-from biopb_tensor_server.sources.resolve import _reroot_catalog_url
-from biopb_tensor_server.sources.tree_scanner import (
-    EntryState,
-    TreeScanner,
-    entry_is_quiet,
+from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
+from biopb_tensor_server.sources.reconciler import Reconciler
+from biopb_tensor_server.sources.registration_worker import RegistrationWorker
+from biopb_tensor_server.sources.resolve import partition_sources
+from biopb_tensor_server.sources.roots import (
+    DND_URL_PREFIX,
+    Root,
+    RootKind,
+    Roots,
 )
 
 if TYPE_CHECKING:
@@ -66,51 +68,6 @@ _UPSTREAM_FAILURE_LOG_INTERVAL = 300.0
 _ADD_SOURCE_ACQUIRE_HEARTBEAT = 5.0
 
 
-# Virtual scheme stamped on the catalog ``source_url`` of a drag-dropped source.
-# It marks the source's *origin* (a runtime drop, not config/discovery) and is the
-# key a future "remove dropped source" feature authorizes on: the drop re-root
-# guard below only stamps it when the drop is entirely new AND outside every
-# monitored root, so its presence means "user-added and nothing will re-add it."
-# It is a display-only scheme (like ``cache://``) — never touches ``source_id`` or
-# the raw ``_source_url`` used for I/O. Keep in sync with the client tree builders
-# that strip it: ``_get_path_parts`` (biopb-mcp ``tensor_browser/_widget.py``) and
-# ``getPathParts`` (web ``SourceTree.tsx``).
-DND_URL_PREFIX = "dnd://"
-
-
-def _drop_catalog_url(
-    dropped_root: str, primary_path: str, *, mark_dnd: bool = True
-) -> str:
-    """Catalog ``source_url`` that re-roots a drag-dropped source under the
-    dropped item's basename, optionally prefixed with the ``dnd://`` origin scheme.
-
-    A dropped file's real path (``/home/u/data/exp/a.tif``) would otherwise nest
-    it deep inside the shared absolute-path tree; re-rooting it at the dropped
-    item's basename makes each drop its own root instead (via the shared
-    ``_reroot_catalog_url``). When ``mark_dnd`` is set, the ``dnd://`` prefix also
-    marks it as removable drop-origin:
-
-        drop /home/u/data/exp.zarr           -> "dnd://exp.zarr"        (own root)
-        drop /home/u/data/exp/ (a folder) with
-             .../exp/a.tif, .../exp/sub/b.tif -> "dnd://exp/a.tif",
-                                                 "dnd://exp/sub/b.tif"
-
-    ``mark_dnd`` is False for a drop that lands under a monitored root: it still
-    gets a tidy display root, but no marker, because the periodic rescan will
-    re-discover it (with its native url) — so it is not safely removable. The
-    marker therefore means exactly "user-added and nothing will re-add it."
-
-    Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
-    uses); the client tree builders strip the scheme for display. The
-    configured-``alias`` re-root shares ``_reroot_catalog_url`` but is always
-    scheme-less, so the two re-root paths stay distinguishable.
-    """
-    dropped_root = str(dropped_root).rstrip("/\\")
-    base = os.path.basename(dropped_root) or dropped_root
-    rerooted = _reroot_catalog_url(base, dropped_root, primary_path)
-    return DND_URL_PREFIX + rerooted if mark_dnd else rerooted
-
-
 @dataclass
 class AddSourceTally:
     """The terminal outcome of one ``add_local_source`` drop.
@@ -124,13 +81,19 @@ class AddSourceTally:
     refreshed: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
     failed: List[Tuple[str, str]] = field(default_factory=list)
+    # Offline placeholder files the walk passed over because the drop was not a
+    # cloud root; non-zero means the import is incomplete.
+    skipped_offline: int = 0
+    # OneDrive directories pruned because the drop was not a cloud root; their
+    # files are not counted.
+    skipped_cloud_dirs: int = 0
 
 
 class SourceManager:
     """Drives the periodic rescan and owns the filesystem-scan machinery.
 
     The confirmed-catalog write path (registration, the discovered/upstream diff,
-    add/remove lifecycle, failure-retry state) lives in :class:`Reconciler`, which
+    add/remove lifecycle) lives in :class:`Reconciler`, which
     this manager constructs and delegates every catalog mutation to; see that
     class's module docstring for the seam between the two.
     """
@@ -140,16 +103,16 @@ class SourceManager:
         server: TensorFlightServer,
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
-        monitored_dirs: Set[Path],
-        rescan_interval: float = 30.0,
+        roots: Optional[Roots] = None,
+        rescan_interval: float = 120.0,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
         full_rescan_interval: float = 3600.0,
-        aggressive_dir_pruning: bool = False,
-        cloud_roots: Optional[Set[Path]] = None,
-        monitored_upstreams: Optional[List[SourceConfig]] = None,
         prune_unseen_days: int = 0,
+        registration_workers: int = 0,
+        walk_threads: int = 1,
+        adapter_idle_seconds: float = 0.0,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -157,38 +120,36 @@ class SourceManager:
         self._server = server
         self._registry = registry
         self._metadata_db = metadata_db
+        # How long a source's adapter is kept after its last read; 0 keeps it for
+        # as long as the source is registered. A rebuild costs a row read and a
+        # payload rebuild, and the first read reopens the file.
+        self._adapter_idle_seconds = adapter_idle_seconds
 
-        # What is watched. Under a cloud root (config ``cloud=true``) dehydrated
-        # entries are admitted and registered as unresolved sources that resolve
-        # on first access. Upstreams are bare-host ``grpc://`` tensor servers
-        # whose catalog is re-listed and reconciled like a directory walk; a
-        # single-source ``grpc://host/<id>`` entry is not here, having nothing to
-        # re-list.
-        self._monitored_dirs = monitored_dirs
-        self._cloud_roots: Set[Path] = cloud_roots or set()
-        self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
+        # Every root, and what is true of each (alias, cloud, kind). Under a cloud
+        # root (config ``cloud=true``) dehydrated entries are admitted and
+        # registered as unresolved sources that resolve on first access. Upstreams
+        # are bare-host ``grpc://`` tensor servers whose catalog is re-listed and
+        # reconciled like a directory walk; a single-source ``grpc://host/<id>``
+        # entry is not a root, having nothing to re-list. Shared with the
+        # Reconciler.
+        self._roots = roots if roots is not None else Roots()
+        # The catalog shows a persisted row only against its root, so the roots go
+        # in before the first source does.
+        if metadata_db is not None:
+            metadata_db.sync_roots(
+                [(root.root_id, root.root_url) for root in self._roots.persisted()]
+            )
+        # Monitored roots that could not be listed on the last walk, so a change
+        # of state is logged once, not every tick.
+        self._unavailable_roots: Set[Path] = set()
 
-        # Scan tuning, and the filesystem signature walk it configures. The
-        # scanner is a pure producer: given the previous caches it returns a
-        # fresh ScanSnapshot, and this manager publishes, rolls back and
-        # partitions that snapshot.
+        # Scan tuning. Nothing is kept between scans: every rescan walks the
+        # monitored roots afresh (the one walker, ``discover_sources``), so a root
+        # costs a stat per entry per tick -- the price of having no snapshot to
+        # prune against, and why a very large directory should not be monitored.
+        # Cloud roots are the exception: walked only on the periodic full pass.
         self._stability_window = stability_window
         self._full_rescan_interval = full_rescan_interval
-        self._aggressive_dir_pruning = aggressive_dir_pruning
-        self._scanner = TreeScanner(
-            stability_window=stability_window,
-            aggressive_dir_pruning=aggressive_dir_pruning,
-        )
-
-        # Scan caches: path -> EntryState (signature + pending-scan flag).
-        # Cloud entries sit in their own partition because
-        # cloud subtrees are walked only on the force_full pass -- keeping them
-        # out of ``_entry_states`` is what holds every per-entry rescan loop to
-        # O(non-cloud). That partition is rebuilt only at the end of a successful
-        # force_full, so a failed one leaves the last good snapshot intact.
-        self._entry_states: Dict[str, EntryState] = {}
-        self._cloud_entry_states: Dict[str, EntryState] = {}
-        self._skipped_stable_dirs: Set[str] = set()
         self._last_full_rescan_at: float = float("-inf")
 
         # Per-upstream re-list cadence, keyed by url and counted in rescan ticks
@@ -200,7 +161,6 @@ class SourceManager:
         # window instead of on every tick.
         self._upstream_relist: Dict[str, Dict[str, int]] = {}
         self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
-        self._failed_upstreams: Set[str] = set()
         self._upstream_config_errors: Dict[str, str] = {}
         self._upstream_failures: Dict[str, Tuple[float, str]] = {}
 
@@ -215,30 +175,24 @@ class SourceManager:
         # the loop's wait condition and its wake signal (the ``precache``
         # worker's idiom), so :meth:`stop` returns at once instead of running
         # out the current interval, and no separate running flag has to be kept
-        # in step with it. A ``rescan_interval`` of 0 or less means no loop at
-        # all (config ``monitor_mode = "off"``); the launcher then drives a
-        # single scan itself. A positive one is floored at 0.1s -- a config
-        # value below that is almost certainly a mistake, and without a floor
-        # it would drive back-to-back full tree walks.
-        self._rescan_interval = (
-            rescan_interval if rescan_interval <= 0 else max(0.1, rescan_interval)
-        )
+        # in step with it. The loop always runs: the first scan, and the startup
+        # protocol it completes, happen on its first tick. The interval is floored
+        # at 0.1s -- a config value below that is almost certainly a mistake, and
+        # without a floor it would drive back-to-back full tree walks.
+        self._rescan_interval = max(0.1, rescan_interval)
         self._next_rescan_at: float = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         # Startup protocol, and the precache routing gate it drives.
-        # ``_initial_scan_done`` flips at the end of the first successful full
-        # rescan -- which under progressive discovery runs in the event loop
-        # *after* start(), so it, not "are we past start()", is the
-        # startup/runtime boundary. Sources committed before it route to the slow
-        # precache backlog; after it, ``_on_source_committed`` prompt-enqueues
-        # them. ``_suppress_live_precache`` holds that backlog routing across the
-        # boot tick's upstream re-list, which the local walk in the same tick has
-        # already flipped the boundary for. Event-loop thread only, so plain
-        # flags are safe.
+        # ``_initial_scan_done`` flips at the end of the first tick -- after every
+        # configured source (one-shot directories, monitored walk, upstream
+        # mirror) has had its first pass -- which runs in the event loop *after*
+        # start(), so it, not "are we past start()", is the startup/runtime
+        # boundary. Sources committed before it route to the slow precache
+        # backlog; after it, ``_on_source_committed`` prompt-enqueues them.
+        # Event-loop thread only, so a plain flag is safe.
         self._initial_scan_done = False
-        self._suppress_live_precache = False
         self._on_source_committed: Optional[Callable[[str], None]] = None
         self._on_initial_scan_complete: Optional[Callable[[], None]] = None
 
@@ -252,45 +206,101 @@ class SourceManager:
 
         # The confirmed-catalog writer: owns the live claim set, registration and
         # the discovered/upstream diff. This manager feeds it scan results and
-        # delegates every catalog mutation to it. Its injected seams read back
-        # into here -- ``entry_for`` for the scan caches above,
-        # ``notify_source_committed`` for the precache gate.
+        # delegates every catalog mutation to it. Its injected seam reads back
+        # into here: ``notify_source_committed`` for the precache gate.
         self._reconciler = Reconciler(
             server=server,
             registry=registry,
             discovery_state=discovery_state,
             metadata_db=metadata_db,
             credentials_config=credentials_config,
-            monitored_dirs=monitored_dirs,
-            cloud_roots=self._cloud_roots,
-            entry_for=self._entry_for,
+            roots=self._roots,
             notify_source_committed=self._notify_source_committed,
+            catalog_url_for=self._display_url_for,
             stability_window=stability_window,
         )
 
+        self._walk_threads = walk_threads
+        # Background registration of what the first scan claims
+        # (``registration_workers`` threads; 0 registers inline, as it always
+        # did). A client that resolves a source before its turn registers it itself.
+        self._registration_worker: Optional[RegistrationWorker] = None
+        if registration_workers > 0:
+            self._registration_worker = RegistrationWorker(
+                self._register_pending, registration_workers
+            )
+        self._reconciler.set_pending_hook(self._enqueue_pending)
+        self._on_startup_source: Optional[Callable[[str, float], None]] = None
+        # Sources committed pending -> their mtime, until their registration
+        # completes. They were found by the first scan, so they are startup set
+        # whenever that registration happens to finish (see
+        # ``_notify_source_committed``).
+        self._deferred: Dict[str, float] = {}
+        set_pending_check = getattr(server.sources, "set_pending_check", None)
+        if set_pending_check is not None:
+            set_pending_check(
+                lambda source_id: self._reconciler.ensure_adapter(
+                    source_id, consent=False
+                )
+            )
+
+    def resolve_source(self, source_id: str, on_target: Callable[[str], None]) -> bool:
+        """Register a source that has no adapter yet, for the ``resolve`` action.
+
+        A cloud source is downloaded and a pending local one is registered ahead
+        of the pool; a source that is registered already is left alone. Calls
+        ``on_target`` with the path about to be opened. Returns False for an
+        unknown source, and raises why a source cannot be opened (retriable or
+        not): see ``Reconciler.ensure_adapter``.
+        """
+        adapter = self._server.sources.get(source_id)
+        path = (
+            adapter.source_url
+            if adapter is not None
+            else self._reconciler.claim_primary_path(source_id)
+        )
+        if path is None and self._reconciler.is_mirror(source_id):
+            path = source_id  # a mirror has no adapter until it is read
+        if path is None:
+            return False
+        on_target(path or source_id)
+        self._reconciler.ensure_adapter(source_id, consent=True)
+        return True
+
+    @property
+    def roots(self) -> Roots:
+        """Every root this manager scans, re-lists or was dropped into."""
+        return self._roots
+
+    @property
+    def _monitored_upstreams(self) -> List[Root]:
+        return self._roots.of_kind(RootKind.UPSTREAM)
+
     def start(self) -> None:
-        """Start the periodic rescan loop, if there is anything for it to do.
+        """Start the rescan loop.
 
-        A no-op when rescanning is disabled (``rescan_interval <= 0``), or
-        neither a monitored directory nor a monitored upstream is configured;
-        callers check :meth:`is_running` afterward to tell.
-
-        The bootstrap scan runs in this loop, whose first tick fires
-        immediately. Until it completes, ``_initial_scan_done`` stays False so
-        its sources route to the precache backlog rather than the prompt
+        The first scan runs in this loop, whose first tick fires immediately --
+        even for a config with nothing to scan, where that tick just completes
+        the startup protocol. Until it does, ``_initial_scan_done`` stays False
+        so its sources route to the precache backlog rather than the prompt
         enqueue.
         """
-        if self._rescan_interval <= 0:
-            return
-        if not self._monitored_dirs and not self._monitored_upstreams:
-            return
-
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
             return
 
         self._next_rescan_at = time.monotonic()
         self._stop.clear()
+        self._restore_catalog()
+        if self._registration_worker is not None:
+            # After the static sources, which were committed inline before this.
+            self._reconciler.set_defer_registration(True)
+            if not self._initial_scan_done:
+                # Held until the walk is over (``complete_initial_scan``): the
+                # two contend, and a held pool lets every claim be committed
+                # first. A later rescan does not hold it again.
+                self._registration_worker.pause()
+            self._registration_worker.start()
         self._thread = threading.Thread(
             target=self._event_loop,
             daemon=True,
@@ -301,20 +311,41 @@ class SourceManager:
             "SourceManager started; rescanning every %.1fs", self._rescan_interval
         )
 
-    def run_bootstrap_fallback(self) -> None:
-        """Run the startup scan the caller must drive itself, when :meth:`start`
-        didn't (call only after checking :meth:`is_running` is False).
+    def _restore_catalog(self) -> None:
+        """Put the last run's sources back as claims, before the first scan.
 
-        Centralizes the branch a launcher would otherwise have to re-derive from
-        ``monitored_dirs`` -- this manager already knows which case it is: a
-        monitored tree with rescanning off still needs one synchronous walk
-        (:meth:`run_initial_scan`); a static-only config has nothing to walk, so
-        the startup protocol is advanced directly (:meth:`complete_initial_scan`).
+        Nothing on a first run, when there are no rows. The first scan then
+        verifies each claim like any rescan.
         """
-        if self._monitored_dirs:
-            self.run_initial_scan()
-        else:
-            self.complete_initial_scan()
+        db = self._metadata_db
+        rows = db.restorable_rows() if db is not None else []
+        if not rows:
+            return
+        started = time.monotonic()
+        try:
+            summary = self._reconciler.restore(rows)
+        except Exception as exc:
+            logger.exception("Catalog restore failed")
+            raise CatalogRestoreError(
+                f"The last run's catalog could not be restored ({exc}). Stop the "
+                "server and run `biopb-tensor-server reset-catalog <config>` to "
+                "empty the catalog tables; annotations are kept."
+            ) from exc
+        worker = self._registration_worker
+        for source_id in summary["queue"]:
+            # Newest-first needs a stat each, which is the walk's to pay: restored
+            # sources are queued as they were found.
+            self._deferred[source_id] = 0.0
+            if worker is not None:
+                worker.enqueue(source_id, 0.0)
+        logger.info(
+            "Restored %d sources from the catalog in %.1f s (%d dropped, %d "
+            "re-attributed)",
+            summary["restored"],
+            time.monotonic() - started,
+            summary["dropped"],
+            summary["rewritten"],
+        )
 
     # --- Startup-protocol seam ------------------------------------------------
     # The launcher drives startup through these public methods rather than the
@@ -328,42 +359,38 @@ class SourceManager:
         committed *after* the initial scan (a live addition).
 
         The launcher wires this to the precache worker's prompt-enqueue. Startup
-        sources are gated out of it (they route to the slow backlog) until the
-        first full scan flips the startup boundary -- see ``_commit_add_claim``.
+        sources are gated out of it (see :meth:`set_startup_source_hook`) until the
+        first full scan flips the startup boundary.
         """
         self._on_source_committed = callback
+
+    def set_startup_source_hook(
+        self, callback: Optional[Callable[[str, float], None]]
+    ) -> None:
+        """Register the hook called with ``(source_id, mtime)`` when a *local*
+        source from the first scan has been registered.
+
+        The launcher wires this to the precache worker's backlog. It fires when
+        the registration completes, not when the scan claims the source: a source
+        whose registration is deferred has nothing to warm until then.
+        """
+        self._on_startup_source = callback
 
     def set_initial_scan_complete_hook(
         self, callback: Optional[Callable[[], None]]
     ) -> None:
         """Register the hook fired once when the first full scan completes.
 
-        The launcher uses it to seed the precache backlog from the established
-        startup catalog. Fired from the event-loop thread (or from
-        :meth:`complete_initial_scan` on a static-only config).
+        Fired from the event-loop thread.
         """
         self._on_initial_scan_complete = callback
-
-    def run_initial_scan(self) -> None:
-        """Run the bootstrap scan synchronously (public seam for the launcher).
-
-        Under progressive discovery the bootstrap scan normally runs in the
-        rescan loop after :meth:`start`. When no loop will drive it -- rescanning
-        is off but monitored dirs exist -- the launcher calls this to run one
-        full rescan inline. Being the first pass, it force-fulls,
-        stamps freshness, flips the startup gate, and fires the completion hook,
-        exactly as the background path would.
-        """
-        self._handle_rescan()
 
     def _mark_catalog_complete(self) -> None:
         """Publish that a full scan just finished, and run the orphan clock.
 
-        The three paths that can complete one -- a forced full rescan, an
-        upstream re-list pass, and a static-only config with nothing to walk --
-        all end here, which is what lets the clock be driven by the event rather
-        than by a timer that would have to re-derive it. "Complete" is not
-        checked here; at this point it is held.
+        The paths that can complete one -- the first tick, a later forced full
+        rescan, and a later upstream re-list pass -- all end here, so the clock is
+        driven by the event, not by a timer.
 
         Auto-prune is armed only once this process has been up longer than the
         threshold it would delete on. Until then it cannot have watched anything
@@ -409,37 +436,78 @@ class SourceManager:
         return time.monotonic() - self._started_at >= self._prune_unseen_days * 86400
 
     def complete_initial_scan(self) -> None:
-        """Advance the startup protocol when there is nothing to walk.
+        """Advance the startup protocol: stamp catalog freshness, clear
+        ``full_scan_in_progress``, flip the precache startup gate, and fire the
+        first-scan-complete hook.
 
-        A static-only config (no monitored dirs) has no bootstrap scan, but the
-        startup protocol must still complete: stamp catalog freshness, flip the
-        precache startup gate, and fire the first-scan-complete hook. Idempotent:
-        the hook fires only on the transition to done.
+        Called at the end of the first tick, whatever it scanned (nothing, for a
+        config of static sources only). Idempotent: the hook fires only on the
+        transition to done.
         """
         self._mark_catalog_complete()
+        self._server.set_full_scan_in_progress(False)
         if not self._initial_scan_done:
             self._initial_scan_done = True
+            # Sources found from here on are the few a rescan turns up, and are
+            # registered when they are claimed, as a drop is.
+            self._reconciler.set_defer_registration(False)
+            if self._registration_worker is not None:
+                self._registration_worker.resume()
+            logger.info(
+                "Initial scan complete: %d sources, %.0f s after start, "
+                "%d awaiting registration",
+                len(self._server.sources) + self._reconciler.unregistered_count(),
+                time.monotonic() - self._started_at,
+                self._reconciler.pending_count(),
+            )
             self._fire_initial_scan_complete()
 
-    def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
-        """Return ``(source_id, mtime)`` for every currently-registered *local*
-        source, for seeding the precache backlog (newest first).
+    def pending_registrations(self) -> int:
+        """How many claimed sources are still waiting to be registered."""
+        return self._reconciler.pending_count()
 
-        Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
-        can't be stat-ed (e.g. removed between commit and this call).
+    def unregistered_sources(self) -> int:
+        """How many catalogued sources have no adapter yet, failed ones included."""
+        return self._reconciler.unregistered_count()
+
+    def registration_idle(self) -> bool:
+        """Whether the first scan is over and every source it claimed is registered.
+
+        What the precache backlog waits for: registration is the critical path of
+        a start and reads the same files, so warming them is for after it.
         """
-        # The Reconciler snapshots claims under its state lock (the rescan
-        # thread adds/removes claims concurrently); we stat() outside
-        # that lock (I/O).
-        snapshot = self._reconciler.local_claim_paths()
-        out: List[Tuple[str, float]] = []
-        for source_id, primary_path in snapshot:
-            try:
-                mtime = os.stat(primary_path).st_mtime
-            except OSError:
-                continue
-            out.append((source_id, mtime))
-        return out
+        return self._initial_scan_done and self._reconciler.pending_count() == 0
+
+    def _register_pending(self, source_id: str) -> bool:
+        """What a registration worker runs for a queued source.
+
+        A source that was removed while it waited is no longer pending after this,
+        and would otherwise stay in ``_deferred`` for good.
+        """
+        try:
+            return self._reconciler.ensure_registered(source_id)
+        finally:
+            if not self._reconciler.is_pending(source_id):
+                self._deferred.pop(source_id, None)
+
+    def _enqueue_pending(self, source_id: str) -> None:
+        """Queue a source the reconciler committed pending, newest file first."""
+        mtime = self._claim_mtime(source_id) or 0.0
+        self._deferred[source_id] = mtime
+        worker = self._registration_worker
+        if worker is not None:
+            worker.enqueue(source_id, mtime)
+
+    def _claim_mtime(self, source_id: str) -> Optional[float]:
+        """The modification time of a claimed local source's primary path (0.0 if
+        it cannot be stat-ed), or None when it has no claim or is remote."""
+        primary_path = self._reconciler.claim_primary_path(source_id)
+        if primary_path is None or is_remote_url(primary_path):
+            return None
+        try:
+            return os.stat(primary_path).st_mtime
+        except OSError:
+            return 0.0
 
     def stop(self, join_timeout: float = 5) -> None:
         """Stop the event processing loop.
@@ -453,6 +521,8 @@ class SourceManager:
         only burns the shutdown budget. That in-flight RPC is not cancelled.
         """
         self._stop.set()
+        if self._registration_worker is not None:
+            self._registration_worker.stop(join_timeout)
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
             self._thread = None
@@ -475,159 +545,175 @@ class SourceManager:
                 self._handle_rescan()
             except Exception:
                 logger.exception("Rescan failed")
+            self._release_idle_adapters()
             self._next_rescan_at = time.monotonic() + self._rescan_interval
 
+    def _release_idle_adapters(self) -> None:
+        """Let go of the adapters nothing has read for ``adapter_idle_seconds``.
+
+        Once per tick, so an adapter is kept for that long rounded up to the next
+        one; a failed rescan does not skip it.
+        """
+        if self._adapter_idle_seconds > 0:
+            self._server.sources.release_idle(self._adapter_idle_seconds)
+
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
+        """Run one tick: the one-shot directories, the monitored walk, then the
+        due upstream re-lists.
 
-        Local directory sources are discovered *before* the tensor-server upstream
-        re-list so a slow/large upstream (hundreds of mirrored sources, each a
-        network round-trip) cannot delay the local catalog from appearing: the
-        local walk streams its sources first and the upstream mirror fills in
-        behind it on the same tick.
-
-        Precache routing subtlety: on the boot tick the local walk flips
-        ``_initial_scan_done`` True *before* the upstream re-list runs, which
-        would otherwise make ``_commit_add_claim`` prompt-enqueue the entire
-        startup upstream mirror at the precache worker's un-idle-gated live tier
-        (hundreds of upstream chunk fetches competing with serving -- the very
-        thing this reorder protects the local catalog from). The whole tick is a
-        startup tick if the scan had not completed when it began, so the upstream
-        mirror it registers is startup set and must route to the slow backlog. We
-        suppress the live enqueue across just that re-list.
+        The first tick is the first scan. It leaves ``full_scan_in_progress`` set
+        (the launcher raised it before :meth:`start`) and ends by completing the
+        startup protocol, so the flag clears, the precache gate opens and the
+        freshness stamp advances only once every source has had its first pass --
+        an unreachable upstream delays that by one failed attempt, not
+        indefinitely. Everything registered before then, the upstream mirror
+        included, is startup set and routes to the precache backlog.
         """
         # Serialize the whole pass against a concurrent runtime add_local_source
         # (Flight thread) so the two never mutate the confirmed catalog at once.
         with self._catalog_lock:
-            startup_tick = not self._initial_scan_done
-            self._rescan_monitored_dirs()
-            # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
-            # cadence -- fast (every tick) while changing/failing, backing off toward
-            # full_rescan_interval while a source set stays stable. Runs AFTER the
-            # local walk (see docstring).
-            if startup_tick:
-                self._suppress_live_precache = True
-                try:
-                    self._reconcile_due_upstreams()
-                finally:
-                    self._suppress_live_precache = False
-            else:
+            try:
+                self._scan_pending_roots()
+                self._rescan_monitored_dirs()
+                # tensor-server upstream re-list (biopb/biopb#178): adaptive
+                # per-upstream cadence -- fast (every tick) while changing/failing,
+                # backing off toward full_rescan_interval while a source set stays
+                # stable.
                 self._reconcile_due_upstreams()
+            except BaseException:
+                if not self._initial_scan_done:
+                    # The next tick retries the first scan; until it completes
+                    # nothing is scanning, so do not leave the flag claiming so.
+                    self._server.set_full_scan_in_progress(False)
+                raise
+            if not self._initial_scan_done:
+                self.complete_initial_scan()
+
+    def _scan_pending_roots(self) -> None:
+        """Scan the configured ``monitor = false`` directories, each once.
+
+        Runs ahead of the monitored walk on the first tick, so what it registers
+        is startup set (precache backlog, not the live enqueue) and the catalog
+        grows behind SERVING exactly as a monitored directory's does. A claim
+        registered here sits outside every monitored root, so the rescan never
+        sees it; a later drop of the directory picks up changes, as it does for
+        any root.
+
+        Caller holds ``_catalog_lock``.
+        """
+        for root in self._roots.take_unscanned():
+            try:
+                if os.path.exists(root.url):
+                    self._scan_root(root, recurring=False)
+                else:
+                    logger.warning("Configured path does not exist: %s", root.url)
+            except Exception:
+                # One bad root must not cost the others.
+                logger.exception("Could not scan configured directory %s", root.url)
+
+    def _scan_root(self, root: Root, recurring: bool) -> None:
+        """Walk one root, commit what is new as it is found, then compare the walk
+        with the root's claims: refresh what changed, remove what is gone.
+
+        *recurring* is a monitored root, walked again every tick, so it gates on
+        stability and removes a claim only after two misses; a scan-once root is
+        walked once, so it does neither (see ``Reconciler._reconcile_root``).
+
+        A claim is committed the moment the walk finds it, rather than batched into
+        the comparison after, so the catalog grows within the walk. A claim already
+        known is left to the comparison, which checks its signature, and removal is
+        only decided once the walk is over. The stability gate runs inside the walk,
+        so an unstable entry is never claimed or streamed; the next tick picks it
+        up. The root is walked as stored, not resolved again: it is canonical from
+        config, so its claims are spelled under it however the path has changed
+        since (a migration may have left a link).
+        """
+        # An alias on a configured root re-roots everything found under it
+        # (``Roots.display_url``); persistent for a scan-once root, which nothing
+        # rescans to merge it back into the shared path tree.
+        discovered = DiscoveryState(
+            on_source_added=self._reconciler._stream_claim_add,
+            source_type=root.source.type if root.source is not None else None,
+        )
+        report = WalkReport()
+        # Before the walk, so what the walk streams is not in it.
+        snapshot = self._reconciler.claims_under(root.path)
+        self._reconciler.begin_pending_batch()
+        try:
+            discover_sources(
+                root.path,
+                self._registry,
+                discovered,
+                path_filter=self._should_claim if recurring else None,
+                admit_nonresident=root.cloud,
+                cloud_root=root.cloud,
+                report=report,
+                monitored=recurring,
+                walk_threads=self._walk_threads,
+            )
+            self._reconciler._preserve_skipped_claims(
+                snapshot, discovered, report.declined_dirs
+            )
+            self._reconciler._reconcile_root(snapshot, discovered, recurring)
+        finally:
+            # Before the startup protocol resumes the registration pool, so every
+            # claim has its row by then.
+            self._reconciler.end_pending_batch()
+        if self._metadata_db is not None:
+            self._confirm_root(root)
+
+    def _confirm_root(self, root: Root) -> None:
+        """Record that a root's walk finished, and sweep the rows no claim holds.
+
+        Only a walk that ran to the end: a root that could not be listed, or whose
+        walk raised, leaves its restored rows unconfirmed.
+        """
+        try:
+            self._metadata_db.sweep_root(root.root_id, self._reconciler.has_claim)
+            self._metadata_db.confirm_root(root.root_id)
+        except Exception:
+            logger.exception("could not confirm root %s", root.url)
 
     def _rescan_monitored_dirs(self) -> None:
-        """Walk the monitored directories and reconcile the discovered catalog.
+        """Scan the monitored directories, each against its own claims.
 
-        No-op for an upstream-only config (no monitored dirs); that case's
-        freshness signals + first-scan gate are driven by _reconcile_due_upstreams.
+        No-op for an upstream-only config (no monitored dirs). On the first tick
+        the progress flag and freshness stamp are left to
+        :meth:`complete_initial_scan`, which runs after the upstream pass.
         """
-        if not self._monitored_dirs:
-            return
-
-        self._cleanup_deleted_monitored_dirs()
-        if not self._monitored_dirs:
+        monitored = self._roots.of_kind(RootKind.MONITORED)
+        if not monitored:
             return
 
         force_full_rescan = self._should_force_full_rescan()
         # Progressive-discovery freshness signals: while a *full* reconcile runs,
         # the health action reports full_scan_in_progress=True; on success it
         # advances last_full_scan_finished_at. Incremental rescans leave both
-        # untouched (they deliberately skip stable/cloud subtrees, so they are
-        # not a whole-tree reconcile). Guaranteed reset in the outer finally.
+        # untouched (they skip cloud roots, so they are not a whole-catalog
+        # reconcile). The first tick's pass is only part of the first scan, so it
+        # leaves both to complete_initial_scan; a later one resets them in the
+        # outer finally.
+        startup = not self._initial_scan_done
+        completes_here = force_full_rescan and not startup
         if force_full_rescan:
             self._server.set_full_scan_in_progress(True)
         try:
-            snapshot = self._scanner.scan(
-                monitored_dirs=self._monitored_dirs,
-                cloud_roots=self._cloud_roots,
-                force_full=force_full_rescan,
-                prev_entry_states=self._entry_states,
-                prev_cloud_entry_states=self._cloud_entry_states,
-            )
-            next_state = snapshot.entry_states
-            skipped_dirs = snapshot.skipped_dirs
-            next_cloud = snapshot.cloud_by_path
-            previous_state = self._entry_states
-            previous_skipped_dirs = self._skipped_stable_dirs
+            for root in sorted(monitored, key=lambda r: r.url):
+                # A cloud root is enumerated only on the full pass: listing one is
+                # expensive and its mtimes are unreliable, so an incremental tick
+                # leaves its sources as they are.
+                if root.cloud and not force_full_rescan:
+                    continue
+                # A root that cannot be listed says nothing about what is
+                # registered under it: it is not scanned, so nothing is removed.
+                if not self._root_is_listable(root.path):
+                    continue
+                self._scan_root(root, recurring=True)
 
-            self._entry_states = next_state
-            self._skipped_stable_dirs = skipped_dirs
-
-            rescan_succeeded = False
-            try:
-                # Progressive population: on the *first* full scan, register each
-                # source the moment the walk claims it rather than batching every
-                # add into the end-of-walk reconcile, so the catalog grows within
-                # the walk. Safe only for the first scan -- it starts empty and
-                # force-full, so there are no removals to diff and every claim is
-                # a pure add. The claim phase already applies the stability gate
-                # (path_filter), so deferred/unstable entries are never claimed
-                # and therefore never streamed; the next steady-state rescan
-                # picks them up. The end-of-walk reconcile below still runs and
-                # is idempotent for streamed adds.
-                stream_first_scan = force_full_rescan and not self._initial_scan_done
-                discovered_state = DiscoveryState()
-                if stream_first_scan:
-                    discovered_state.on_source_added = (
-                        self._reconciler._stream_first_scan_add
-                    )
-
-                # Single traversal: the state walk above already visited every
-                # entry and recorded its (resolved path, is_directory) into
-                # next_state in DFS parent-first order, so the claim phase is
-                # driven straight off that snapshot rather than re-walking the
-                # filesystem. skipped_dirs prunes the stable subtrees the state
-                # walk carried forward; their claims are preserved below.
-                discovered_state = discover_sources_from_entries(
-                    (
-                        (path_str, entry.is_directory, entry.signature)
-                        for path_str, entry in next_state.items()
-                    ),
-                    self._registry,
-                    state=discovered_state,
-                    path_filter=self._should_scan_resolved,
-                    skipped_dirs=skipped_dirs,
-                    cloud_by_path=next_cloud,
-                )
-
-                self._reconciler._preserve_skipped_claims(
-                    discovered_state, skipped_dirs
-                )
-
-                self._reconciler._reconcile_discovered_state(
-                    discovered_state, force_full=force_full_rescan
-                )
-                rescan_succeeded = True
-            finally:
-                if not rescan_succeeded:
-                    self._entry_states = previous_state
-                    self._skipped_stable_dirs = previous_skipped_dirs
-
-            if force_full_rescan and rescan_succeeded:
+            if completes_here:
                 self._mark_catalog_complete()
-                # Partition the just-walked cloud entries out of _entry_states.
-                # Runs only after the force_full claim + reconcile have seen the
-                # full _entry_states (cloud included), so cloud sources reconcile
-                # normally here; afterwards _entry_states holds non-cloud only and
-                # the frequent incremental rescans never iterate cloud entries.
-                # next_state is self._entry_states (set above), so popping trims
-                # it in place. Only on success -- a failed force_full leaves the
-                # previous _cloud_entry_states intact.
-                cloud_state: Dict[str, EntryState] = {}
-                for path_str, is_cloud in next_cloud.items():
-                    if not is_cloud:
-                        continue
-                    entry = next_state.pop(path_str, None)
-                    if entry is not None:
-                        cloud_state[path_str] = entry
-                self._cloud_entry_states = cloud_state
-                # First full scan done: flip the precache gate (live additions
-                # now prompt-enqueue) and let the launcher seed the backlog with
-                # the established catalog. Fired once, best-effort.
-                if not self._initial_scan_done:
-                    self._initial_scan_done = True
-                    self._fire_initial_scan_complete()
         finally:
-            if force_full_rescan:
+            if completes_here:
                 self._server.set_full_scan_in_progress(False)
 
     def _fire_initial_scan_complete(self) -> None:
@@ -644,158 +730,84 @@ class SourceManager:
         except Exception:
             logger.exception("on_initial_scan_complete callback failed")
 
-    def _cleanup_deleted_monitored_dirs(self) -> None:
-        """Remove claims for monitored roots that no longer exist."""
-        deleted_dirs = []
-        for monitored_dir in sorted(self._monitored_dirs):
-            try:
-                exists = monitored_dir.exists()
-            except OSError:
-                exists = False
-            if not exists:
-                deleted_dirs.append(monitored_dir)
+    def _root_is_listable(self, root: Path) -> bool:
+        """Whether a monitored root can be walked now; logs each change of state.
 
-        for deleted_dir in deleted_dirs:
-            self._cleanup_deleted_monitored_dir(deleted_dir)
-
-    def _cleanup_deleted_monitored_dir(self, deleted_dir: Path) -> None:
-        """Remove sources and cache state for a monitored root that disappeared."""
-        removed_source_ids = []
-        deleted_root = deleted_dir.resolve(strict=False)
-
-        for source_id, claim in self._reconciler.claim_items():
-            if is_remote_url(claim.primary_path):
-                continue
-            try:
-                claim_path = Path(claim.primary_path).resolve(strict=False)
-            except OSError:
-                continue
-            if (
-                claim_path == deleted_root or claim_path.is_relative_to(deleted_root)
-            ) and self._reconciler._commit_remove_source(source_id):
-                removed_source_ids.append(source_id)
-
-        deleted_root_str = str(deleted_root)
-        self._monitored_dirs.discard(deleted_dir)
-        self._skipped_stable_dirs.discard(deleted_root_str)
-
-        entry_paths_to_remove = [
-            path_str
-            for path_str in self._entry_states
-            if path_str == deleted_root_str
-            or Path(path_str).is_relative_to(deleted_root)
-        ]
-        for path_str in entry_paths_to_remove:
-            self._entry_states.pop(path_str, None)
-
-        # Cloud entries live in the partition, not _entry_states; prune them too.
-        cloud_paths_to_remove = [
-            path_str
-            for path_str in self._cloud_entry_states
-            if path_str == deleted_root_str
-            or Path(path_str).is_relative_to(deleted_root)
-        ]
-        for path_str in cloud_paths_to_remove:
-            self._cloud_entry_states.pop(path_str, None)
-
-        if removed_source_ids:
+        An unmounted drive, a share that is down and a deleted directory look the
+        same from here, so a root that cannot be listed is not evidence that what
+        is registered under it is gone: the caller records it as declined, its
+        sources stay, and it is walked again as soon as it is back.
+        """
+        if root.is_dir():
+            if root in self._unavailable_roots:
+                self._unavailable_roots.discard(root)
+                logger.info("Monitored directory is available again: %s", root)
+            return True
+        if root not in self._unavailable_roots:
+            self._unavailable_roots.add(root)
             logger.warning(
-                "Removed %d sources after monitored directory disappeared: %s",
-                len(removed_source_ids),
-                deleted_dir,
+                "Monitored directory is not available; keeping its sources until it "
+                "is back: %s",
+                root,
             )
-        else:
-            logger.warning(
-                "Stopped monitoring deleted directory with no active sources: %s",
-                deleted_dir,
-            )
+        return False
 
     def _should_force_full_rescan(self) -> bool:
-        """Return True when a full tree walk should bypass subtree pruning."""
+        """Whether a full pass (the only one that walks cloud roots) is due."""
         if self._full_rescan_interval <= 0:
             return False
         return time.time() - self._last_full_rescan_at >= self._full_rescan_interval
 
-    def _entry_for(self, path_str: str) -> Optional[EntryState]:
-        """Cached signature entry for a path, from either partition.
+    def _should_claim(self, path: Path) -> bool:
+        """Stability gate: may this entry be claimed -- and, for a directory,
+        entered -- on this pass?
 
-        Cloud entries live in ``_cloud_entry_states`` (walked only on force_full),
-        non-cloud in ``_entry_states``. Readers that may receive a cloud member path
-        outside the force_full walk (signature diff, stability gate) use this so a
-        cloud member is found in the partition instead of falling through to a live
-        ``Path(member).stat()`` -- a cloud network round-trip.
+        Claiming a half-written file registers a wrong descriptor, and for a
+        format whose type marker is written last (OME-TIFF) a wrong
+        ``source_type``, hence a different ``source_id``. So an entry is eligible
+        only once it has been unchanged for the stability window, judged by a stat
+        taken now (nothing is cached between scans). A pure read of the
+        filesystem; the removal shield asks the same ``entry_is_quiet`` question.
+
+        Cloud/synced-folder entries bypass the window entirely (cloud-storage
+        phase 2): mtime/ctime age is unreliable there (doc S1.2), so a placeholder
+        could never stabilize, and archived dehydrated data is never mid-write.
         """
-        entry = self._entry_states.get(path_str)
-        if entry is None:
-            entry = self._cloud_entry_states.get(path_str)
-        return entry
-
-    def _should_scan_resolved(self, resolved_str: str) -> bool:
-        """Stability gate: may this path be claimed on this pass?
-
-        Discovery iterates ``next_state`` keys, which ``TreeScanner`` already
-        stored as resolved path strings, so a per-entry ``Path.resolve()`` would
-        be pure waste. A pure read -- the walk derives ``pending_scan`` from the
-        same ``entry_is_quiet`` predicate this applies, so nothing here reaches
-        back into the cached record.
-        """
-        if os.path.basename(resolved_str).startswith("."):
-            return False
-
-        if resolved_str in self._skipped_stable_dirs:
-            return False
-
-        entry = self._entry_for(resolved_str)
-        if entry is None:
-            return False
-
-        # Cloud/synced-folder entries bypass the stability machinery entirely
-        # (cloud-storage phase 2): the mtime/ctime age is unreliable on cloud
-        # filesystems (doc S1.2), so a placeholder could never stabilize.
-        # Archived dehydrated data is inherently stable (never mid-write), so
-        # admit it immediately.
-        #
-        # Load-bearing for TreeScanner's cloud inode-backfill skip: under cloud
-        # the entry signature degrades to a constant (0, 0), so `last_changed`
-        # never advances -- safe only because this early return means it is
-        # never read for a cloud path.
-        if self._is_under_cloud_root(resolved_str):
+        if self._roots.is_cloud(str(path)):
             return True
-
-        return entry_is_quiet(entry.last_changed, time.time(), self._stability_window)
-
-    def _is_under_cloud_root(self, path: str) -> bool:
-        """True when *path* is a cloud-opted root or lives under one.
-
-        Consulted by the stability gate (:meth:`_should_scan_resolved`); shares
-        the cloud-membership rule with the Reconciler via the module free
-        function so neither object depends on the other.
-        """
-        return is_under_cloud_root(self._cloud_roots, path)
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            return False
+        now = time.time()
+        return entry_is_quiet(
+            entry_change_time(stat_result, now), now, self._stability_window
+        )
 
     def _notify_source_committed(self, source_id: str) -> None:
-        """Precache routing gate for a freshly committed source (injected into
+        """Route a source that has just been registered to precache (injected into
         the Reconciler as ``notify_source_committed``).
 
-        Only live additions -- those committed after the initial scan completes,
-        and outside the boot-tick upstream re-list guarded by
-        ``_suppress_live_precache`` -- are prompt-enqueued; the startup set routes
-        to the slow backlog instead. This manager owns the startup/suppress state
-        that decides that, so the gate lives here rather than in the Reconciler.
-        Best-effort: a hook failure must never abort a source commit.
+        A startup source -- one the first scan found, whether it registered as it
+        was claimed or afterwards (``_deferred``) -- goes to the slow backlog, with
+        its mtime; a later addition is prompt-enqueued. This manager owns the
+        startup state that decides that, so the routing lives here rather than in
+        the Reconciler. A remote source is not enqueued as startup: precache does
+        not warm those. Best-effort: a hook failure must never abort a commit.
         """
-        if (
-            self._initial_scan_done
-            and not self._suppress_live_precache
-            and self._on_source_committed is not None
-        ):
-            try:
+        startup = source_id in self._deferred or not self._initial_scan_done
+        mtime = self._deferred.pop(source_id, None)
+        try:
+            if startup:
+                if self._on_startup_source is not None:
+                    if mtime is None:
+                        mtime = self._claim_mtime(source_id)
+                    if mtime is not None:
+                        self._on_startup_source(source_id, mtime)
+            elif self._on_source_committed is not None:
                 self._on_source_committed(source_id)
-            except Exception:
-                logger.exception(
-                    "precache on_source_committed hook failed for %s",
-                    source_id,
-                )
+        except Exception:
+            logger.exception("precache routing hook failed for %s", source_id)
 
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.
@@ -857,6 +869,11 @@ class SourceManager:
                     removed.append(source_id)
                 else:
                     failed.append((source_id, "not present (already removed?)"))
+            # Taking the drop away takes its label and its cloud consent too; a
+            # later plain drop of the same folder must not inherit either.
+            dropped = self._roots.by_label(root_url[len(DND_URL_PREFIX) :].strip("/\\"))
+            if dropped is not None:
+                self._roots.remove(dropped)
         return removed, failed
 
     def _reconcile_due_upstreams(self) -> None:
@@ -866,13 +883,10 @@ class SourceManager:
         failing, and backs off (period doubles per unchanged re-list, capped at
         full_rescan_interval) while it is stable -- so a stable lab store is not
         queried every 30s forever, yet a new source / a recovered upstream is
-        mirrored within ~one tick. When there are no monitored *dirs* this is the
-        sole reconcile, so the first pass also drives the progressive-discovery
-        freshness signals + first-scan gate the dir path would otherwise own.
+        mirrored within ~one tick. When there are no monitored *dirs* each pass
+        is the whole reconcile, so a later one advances catalog freshness itself.
         """
-        if not self._monitored_upstreams:
-            return
-        due: List[SourceConfig] = []
+        due: List[Root] = []
         for upstream in self._monitored_upstreams:
             state = self._upstream_relist.setdefault(
                 upstream.url, {"period": 1, "countdown": 0}
@@ -883,22 +897,14 @@ class SourceManager:
         if not due:
             return
 
-        upstream_only = not self._monitored_dirs
-        first_pass = upstream_only and not self._initial_scan_done
-        if first_pass:
-            self._server.set_full_scan_in_progress(True)
         try:
             for upstream in due:
                 self._reconcile_and_reschedule(upstream)
         finally:
-            if upstream_only:
+            if not self._roots.of_kind(RootKind.MONITORED) and self._initial_scan_done:
                 # Each completed pass re-verifies the (remote) catalog -> advance
-                # freshness. in_progress / the first-scan gate fire once, on boot.
+                # freshness. The first tick leaves that to complete_initial_scan.
                 self._mark_catalog_complete()
-                if first_pass:
-                    self._server.set_full_scan_in_progress(False)
-                    self._initial_scan_done = True
-                    self._fire_initial_scan_complete()
 
     def _log_upstream_config_error(self, url: str, exc: Exception) -> None:
         """Report a broken upstream config once, until it changes or clears.
@@ -984,7 +990,7 @@ class SourceManager:
             return
         logger.info("Upstream %s is reachable again; catalog re-listed.", url)
 
-    def _reconcile_and_reschedule(self, upstream: SourceConfig) -> None:
+    def _reconcile_and_reschedule(self, upstream: Root) -> None:
         """Re-list one upstream and set its next-due period from the outcome."""
         state = self._upstream_relist[upstream.url]
         try:
@@ -995,7 +1001,6 @@ class SourceManager:
             # trust anchor recovers on its own. Back all the way off instead of
             # re-reading the same broken file every tick (biopb/biopb#608); a
             # fixed config is still picked up, one slow tick later.
-            self._failed_upstreams.add(upstream.url)
             state["period"] = self._upstream_max_period
             state["countdown"] = state["period"]
             # We never dialed, so any pending unreachable report is stale -- drop
@@ -1006,12 +1011,10 @@ class SourceManager:
             return
         except Exception as exc:
             # Failure (unreachable): retry on the fast cadence next tick.
-            self._failed_upstreams.add(upstream.url)
             state["period"] = 1
             state["countdown"] = state["period"]
             self._log_upstream_unreachable(upstream.url, exc)
             return
-        self._failed_upstreams.discard(upstream.url)
         self._clear_upstream_failure(upstream.url)
         recovered = self._clear_upstream_config_error(upstream.url)
         if changed or recovered:
@@ -1024,40 +1027,37 @@ class SourceManager:
             state["period"] = min(state["period"] * 2, self._upstream_max_period)
         state["countdown"] = state["period"]
 
-    def _reconcile_upstreams(
-        self, upstreams: Optional[List[SourceConfig]] = None
-    ) -> None:
-        """Re-list each given tensor-server upstream now (ignoring the backoff
-        schedule); used by tests and any caller that wants an immediate pass.
+    def register_static_source(self, source: SourceConfig) -> bool:
+        """Register one remote single source as it is: nothing to walk.
 
-        Best-effort per upstream: an unreachable upstream leaves its currently
-        mirrored sources in place (no spurious removals) and is marked failed.
+        Returns whether it was committed.
         """
-        if upstreams is None:
-            upstreams = self._monitored_upstreams
-        for upstream in upstreams:
-            try:
-                self._reconciler._reconcile_one_upstream(upstream)
-            except UpstreamConfigError as exc:
-                self._failed_upstreams.add(upstream.url)
-                self._log_upstream_config_error(upstream.url, exc)
-            except Exception:
-                self._failed_upstreams.add(upstream.url)
-                logger.warning(
-                    "Upstream re-list failed for %s; keeping its current catalog "
-                    "(will retry on the next rescan)",
-                    upstream.url,
-                    exc_info=True,
-                )
-            else:
-                self._failed_upstreams.discard(upstream.url)
-                self._clear_upstream_config_error(upstream.url)
+        # claim->SourceConfig drops most configs, so we carry some through to call
+        # create_from_config.
+        extra_config = {}
+        if source.credentials_profile:
+            extra_config["credentials_profile"] = source.credentials_profile
+        if source.alias:  # display-only
+            extra_config["alias"] = source.alias
+        # The URL is left verbatim: aliasing is intentional because the server may
+        # use a different address/port for the same data.
+        claim = SourceClaim(
+            source_type=source.type,
+            primary_path=source.url,
+            source_id=source.source_id,
+            extra_config=extra_config,
+            unresolved=bool(source.cloud),
+        )
+        return self._reconciler._commit_add_claim(
+            claim, catalog_url=source._catalog_url
+        )
 
     def add_local_source(
         self,
         url: str,
         source_type: str = "",
         should_cancel: Optional[Callable[[], bool]] = None,
+        cloud: bool = False,
     ):
         """Register ``url`` (a path on the server) as source(s) at runtime.
 
@@ -1069,6 +1069,11 @@ class SourceManager:
           advances only the path),
         - ``("result", tally)`` -- exactly one terminal
           :class:`AddSourceTally`.
+
+        ``cloud`` treats ``url`` as a cloud / synced folder: offline placeholders
+        are admitted and registered unresolved (content read on first access)
+        instead of skipped, and multi-file grouping is off. Without it the walk
+        skips placeholders and the tally's ``skipped_offline`` says how many.
 
         A claim that is already registered is **rebuilt**, not skipped: its
         adapter is reconstructed against the file as it is now, which is the
@@ -1095,11 +1100,30 @@ class SourceManager:
         ``should_cancel()`` is polled between sources: a cancel stops discovery
         but KEEPS everything already committed (registration is not rolled back).
 
+        Where the drop lands decides what it may do. **Inside a known root** -- a
+        monitored directory, a configured ``monitor = false`` directory, or an
+        earlier drop's root, the root itself included -- it registers and refreshes
+        as a rescan of that root would, in that root's display tree (its alias if
+        it has one). A monitored or ``monitor = false`` root gets no ``dnd://`` mark
+        (its rescan owns the sources); an earlier drop's root keeps its own, so a
+        source a re-drop adds is removed with the drop. **Outside every known root** it becomes a root of its own, with
+        a unique ``dnd://`` label, but only if it overlaps nothing already
+        registered; otherwise it is refused. Drops are refused until the first scan
+        has finished, since both checks need the whole catalog.
+
         Whole-request problems raise before the first yield:
         ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
-        ``ValueError`` (a remote URL -- runtime add is local-only for now -- or a
-        relative path, which has no anchor on this side of the wire).
+        ``ValueError`` (a remote URL -- runtime add is local-only for now -- a
+        relative path, which has no anchor on this side of the wire, or a first scan
+        still running). Cloud mode asked for inside a known root is refused the same
+        way, but only once the catalog lock is held, since where the drop lands is
+        read under it; a wait that heart-beat first yields progress before it.
         """
+        if not self._initial_scan_done:
+            raise ValueError(
+                "The catalog is still being indexed; try again when the first scan "
+                "has finished"
+            )
         if is_remote_url(url):
             raise ValueError(
                 "Runtime source add supports local filesystem paths only; "
@@ -1128,217 +1152,267 @@ class SourceManager:
         if not os.access(real, os.R_OK):
             raise PermissionError(f"Path not readable by the server: {url}")
         url = real
-        is_dir = os.path.isdir(url)
 
-        tally = AddSourceTally()
+        root_path = Path(url)
 
         # Acquire the catalog lock, heart-beating while a rescan holds it so a
         # long wait does not sit silent long enough to trip a proxy timeout.
         while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
             yield ("progress", 0, "waiting for catalog scan to finish")
+        new_root: Optional[Root] = None
         try:
-            # Containment check (case 4): if a STRICT ancestor of the drop is
-            # already owned by a source, the drop is *inside* that source. The
-            # exact-path member dedup in DiscoveryState.add_claim does not catch
-            # this (dir sources record only the dir as a member), so reject here.
-            owner = self._reconciler._find_containing_source(url)
-            if owner is not None:
-                tally.failed.append((url, f"already part of source '{owner}'"))
-                yield ("result", tally)
-                return
-
-            # Is the dropped path itself a dataset (single claim), or a plain
-            # folder to recurse into? Probe the root once against a scratch state.
-            scratch = DiscoveryState()
-            root_claims = self._registry.get_claims_for_path(
-                ClaimContext(Path(url)), scratch
-            )
-            if root_claims:
-                claims: List[SourceClaim] = [root_claims[0]]
-            elif is_dir:
-                # A plain folder is walked recursively (case 5). The large-drop
-                # footgun guard lives client-side (the tensor browser confirms
-                # before sending an oversized folder): drag-drop is localhost-only,
-                # so the client shares this filesystem and can size the tree before
-                # any scan is sent. A direct SDK caller passing a path is explicit
-                # intent, so the walk is not gated here.
-                discover_sources(
-                    Path(url),
-                    self._registry,
-                    scratch,
+            # Where the drop lands is read under the lock: a drop or a removal that
+            # held it first may have added or taken away the root this lands in.
+            known = self._roots.containing(root_path)
+            if known is not None and cloud and not self._roots.is_cloud(url):
+                # Cloud is a property of a root, set where the root is first added;
+                # a subfolder cannot turn it on afterwards, and there would be no
+                # drop to deregister to take it back.
+                raise ValueError(
+                    f"Cannot switch cloud mode on inside {known.url}: it is set "
+                    "where the folder is first added, or in the config"
                 )
-                claims = list(scratch.claims.values())
-            else:
-                claims = []
-
-            # Assign identity to every claim up front so the overlap check below
-            # can see the whole drop before any of it is committed.
-            for claim in claims:
-                if source_type:
-                    claim.source_type = source_type
-                if not claim.source_id:
-                    claim.source_id = generate_source_id(
-                        str(claim.primary_path), claim.source_type
-                    )
-
-            already_ids = {
-                claim.source_id
-                for claim in claims
-                if self._reconciler.has_claim(claim.source_id)
-            }
-
-            # Removal half, before the empty-drop bail-out below: dropping a
-            # folder whose contents were deleted is exactly how a stale entry
-            # gets noticed, and there is nothing to add in that case. A dropped
-            # *file* skips the O(catalog) scan -- its own existence was checked
-            # above, and it has no descendants that could have vanished.
-            tally.removed = (
-                self._deregister_vanished_under(
-                    url, {claim.source_id for claim in claims}
+            if known is None:
+                # Outside every known root, so a root of its own. Cloud-ness belongs
+                # to the root, not to this call: once a root is cloud, the stability
+                # gate, the deferred registration, the precache residency check and
+                # the reconcile's cloud scoping all ask the same question of every
+                # path under it. So a consented drop is a cloud root until that drop
+                # is deregistered. Added by ``_register_root`` at the first
+                # source it commits, so a drop that commits nothing leaves no root.
+                new_root = Root(
+                    RootKind.DROPPED,
+                    url,
+                    cloud=cloud,
+                    label=self._roots.unique_label(root_path),
                 )
-                if is_dir
-                else []
+            yield from self._register_root(
+                url,
+                source_type=source_type,
+                should_cancel=should_cancel,
+                new_root=new_root,
             )
-
-            if not claims:
-                if not tally.removed:
-                    reason = (
-                        "no supported datasets found under directory"
-                        if is_dir
-                        else "not a recognized image format"
-                    )
-                    tally.failed.append((url, reason))
-                yield ("result", tally)
-                return
-
-            # Re-root the drop into its own browser tree root only when it is
-            # ENTIRELY NEW. If any claim is already registered, this drop is a
-            # rescan of a location already represented in the tree -- e.g. a
-            # monitor=false config dir dropped to pick up new files -- so keep the
-            # native source_url on the new siblings. Re-rooting them instead would
-            # split that one dir's old and new contents across two roots with
-            # nothing to reconcile them (a monitor=false dir never rescans).
-            reroot = not already_ids
-
-            for claim in claims:
-                if claim.source_id in already_ids:
-                    tally.already_present.append(claim.source_id)
-                    # fresh_signatures: this drop is not the periodic pass, so
-                    # the scan cache holds what that pass last saw, not what is
-                    # on disk now.
-                    if self._reconciler._refresh_claim(claim, fresh_signatures=True):
-                        tally.refreshed.append(claim.source_id)
-                        yield ("progress", len(tally.added), str(claim.primary_path))
-                    else:
-                        tally.failed.append(
-                            (
-                                str(claim.primary_path),
-                                "could not rebuild (see server log); the "
-                                "previously registered source is still served",
-                            )
-                        )
-                else:
-                    # Re-rooting (own display root) and the ``dnd://`` origin
-                    # marker are decoupled: a drop under a monitored root still
-                    # gets a tidy display root, but NOT the marker -- the periodic
-                    # rescan re-discovers it, so it is not safely removable. Only a
-                    # drop outside every monitored root is stamped ``dnd://``, so
-                    # the marker stays equivalent to "user-added and nothing will
-                    # re-add it" (what Phase 2 removal authorizes on).
-                    catalog_url = (
-                        _drop_catalog_url(
-                            url,
-                            claim.primary_path,
-                            mark_dnd=not self._reconciler._is_monitored_claim(claim),
-                        )
-                        if reroot
-                        else None
-                    )
-                    if self._reconciler._commit_add_claim(
-                        claim, catalog_url=catalog_url
-                    ):
-                        tally.added.append(claim.source_id)
-                        yield ("progress", len(tally.added), str(claim.primary_path))
-                    else:
-                        tally.failed.append(
-                            (
-                                str(claim.primary_path),
-                                "could not open or register (see server log)",
-                            )
-                        )
-
-                if should_cancel is not None and should_cancel():
-                    break
-
-            yield ("result", tally)
         finally:
             self._catalog_lock.release()
 
-    def _deregister_vanished_under(
-        self, root: str, discovered_ids: Set[str]
-    ) -> List[str]:
-        """Deregister sources under ``root`` whose files are no longer there.
+    def _register_root(
+        self,
+        url: str,
+        *,
+        source_type: str = "",
+        should_cancel: Optional[Callable[[], bool]] = None,
+        new_root: Optional[Root] = None,
+    ):
+        """Claim everything at or under ``url`` and bring the catalog in line.
 
-        Scoped to the drop, deliberately: the periodic reconcile's diff is
-        whole-catalog (``current_ids - discovered_ids``), so running it against a
-        subtree walk would deregister every source outside the drop.
+        A drop's scan: containment guard, ``discover_sources`` into a scratch
+        state, remove what is gone under the path, then per claim refresh-if-known
+        else add. The caller holds ``_catalog_lock`` and has checked that ``url``
+        is a rooted, readable local path. Yields the events
+        :meth:`add_local_source` documents.
 
-        Absence from the walk is not on its own evidence of deletion -- an
-        adapter can decline a claim it once made (a sequence directory worn down
-        to a single file), and a drop has none of the stability gating the
-        periodic path removes under. So a source goes only when its primary path
-        is gone from the filesystem, which is the case #944 reports.
+        ``new_root`` is the root a drop is making for itself: it is refused whole,
+        before anything is removed or committed, when :meth:`Roots.check_overlap`
+        finds it shares sources with another root, and it joins the roots just
+        before its first new source is committed, so that source sees it. The
+        walk is a cloud one when that root, or the one ``url`` lies in, is.
         """
-        # `root` is what resolve_local_path returned in add_local_source; a
-        # second, differently-spelled canonicalization here is what drifts (#947).
-        root_path = Path(root)
+        cloud = new_root.cloud if new_root else self._roots.is_cloud(url)
+        is_dir = os.path.isdir(url)
+        tally = AddSourceTally()
 
-        removed: List[str] = []
-        for source_id, claim in self._reconciler.claim_items():
-            if source_id in discovered_ids or is_remote_url(claim.primary_path):
-                continue
-            # Existence first: it is one stat and rejects nearly every source in
-            # the catalog, where resolve() is an lstat per path component.
-            if os.path.exists(claim.primary_path):
-                continue
-            try:
-                primary = Path(claim.primary_path).resolve(strict=False)
-            except OSError:
-                continue
-            if not primary.is_relative_to(root_path):
-                continue
-            if self._reconciler._commit_remove_source(source_id):
-                removed.append(source_id)
-                logger.info("Deregistered source %s: %s is gone", source_id, primary)
-        return removed
+        # Containment check (case 4): if a STRICT ancestor of the drop is
+        # already owned by a source, the drop is *inside* that source. The
+        # exact-path member dedup in DiscoveryState.add_claim does not catch
+        # this (dir sources record only the dir as a member), so reject here.
+        owner = self._reconciler._find_containing_source(url)
+        if owner is not None:
+            tally.failed.append((url, f"already part of source '{owner}'"))
+            yield ("result", tally)
+            return
+
+        # A dataset is claimed in place; a plain folder is walked recursively
+        # (case 5). The large-drop footgun guard lives client-side (the tensor
+        # browser confirms before sending an oversized folder): drag-drop is
+        # localhost-only, so the client shares this filesystem and can size the
+        # tree before any scan is sent. A direct SDK caller passing a path is
+        # explicit intent, so the walk is not gated here. Discovery runs into a
+        # scratch state, so it never mutates the confirmed catalog until a claim
+        # is committed.
+        report = WalkReport()
+        scratch = discover_sources(
+            Path(url),
+            self._registry,
+            DiscoveryState(),
+            admit_nonresident=cloud,
+            cloud_root=cloud,
+            report=report,
+        )
+        claims: List[SourceClaim] = list(scratch.claims.values())
+        tally.skipped_offline = report.offline_files
+        tally.skipped_cloud_dirs = report.cloud_dirs
+
+        # Assign identity to every claim up front so the overlap check below
+        # can see the whole drop before any of it is committed.
+        for claim in claims:
+            if source_type:
+                claim.source_type = source_type
+            if not claim.source_id:
+                claim.source_id = generate_source_id(
+                    str(claim.primary_path), claim.source_type
+                )
+
+        already_ids = {
+            claim.source_id
+            for claim in claims
+            if self._reconciler.has_claim(claim.source_id)
+        }
+
+        if new_root is not None:
+            overlap = self._roots.check_overlap(
+                Path(url),
+                (path for _, path in self._reconciler.local_claim_paths()),
+                already_registered=bool(already_ids),
+            )
+            if overlap:
+                tally.failed.append((url, overlap))
+                yield ("result", tally)
+                return
+
+        # Removal half, before the empty-drop bail-out below: dropping a
+        # folder whose contents were deleted is exactly how a stale entry
+        # gets noticed, and there is nothing to add in that case. A dropped
+        # *file* skips the O(catalog) scan -- its own existence was checked
+        # above, and it has no descendants that could have vanished.
+        tally.removed = (
+            self._remove_unclaimed_under(
+                url, {claim.source_id for claim in claims}, report.declined_dirs
+            )
+            if is_dir
+            else []
+        )
+
+        if not claims:
+            if not tally.removed:
+                reason = (
+                    "no supported datasets found under directory"
+                    if is_dir
+                    else "not a recognized image format"
+                )
+                tally.failed.append((url, reason))
+            yield ("result", tally)
+            return
+
+        for claim in claims:
+            if claim.source_id in already_ids:
+                tally.already_present.append(claim.source_id)
+                if self._reconciler.is_held_under_another_path(claim):
+                    continue
+                if self._reconciler._refresh_claim(claim):
+                    tally.refreshed.append(claim.source_id)
+                    yield ("progress", len(tally.added), str(claim.primary_path))
+                else:
+                    tally.failed.append(
+                        (
+                            str(claim.primary_path),
+                            "could not rebuild (see server log); the "
+                            "previously registered source is still served",
+                        )
+                    )
+            else:
+                if new_root is not None:
+                    self._roots.add(new_root)
+                catalog_url = self._display_url_for(claim)
+                added = False
+                try:
+                    added = self._reconciler._commit_add_claim(
+                        claim, catalog_url=catalog_url
+                    )
+                finally:
+                    if new_root is not None:
+                        if added:
+                            new_root = None
+                        else:
+                            self._roots.remove(new_root)
+                if added:
+                    tally.added.append(claim.source_id)
+                    yield ("progress", len(tally.added), str(claim.primary_path))
+                else:
+                    tally.failed.append(
+                        (
+                            str(claim.primary_path),
+                            "could not open or register (see server log)",
+                        )
+                    )
+
+            if should_cancel is not None and should_cancel():
+                break
+
+        yield ("result", tally)
+
+    def _remove_unclaimed_under(
+        self, root: str, discovered_ids: Set[str], declined_dirs: Set[str]
+    ) -> List[str]:
+        """Remove the sources under ``root`` that this walk did not find again.
+
+        Scoped to the root, deliberately: a subtree walk says nothing about the
+        sources outside it. The claims it may remove are those under ``root`` that
+
+        * are not under a monitored root -- the rescan does that, whose two-miss
+          rule suits a source that is only briefly unclaimable; a drop outside
+          every monitored root has no later pass, so waiting would mean never; and
+        * do not live in a directory the walk declined (the skip policy never
+          entered it, so absence says nothing).
+
+        Those are removed by the same rule every scan uses (``_remove_absent``): at
+        once, quiet or not (a recently written file is read, and only a monitored
+        root has a next tick to wait for), and only if no adapter claims them on a
+        second look.
+        """
+        declined = [Path(d) for d in declined_dirs]
+        snapshot = {
+            source_id: claim
+            for source_id, claim in self._reconciler.claims_under(Path(root)).items()
+            if not self._roots.is_monitored(claim.primary_path)
+            and not self._reconciler._claim_overlaps_skipped_subtree(claim, declined)
+        }
+        return self._reconciler._remove_absent(
+            snapshot, discovered_ids, recurring=False
+        )
+
+    def _display_url_for(self, claim: SourceClaim) -> Optional[str]:
+        """The display ``source_url`` the roots give a claim (None leaves it plain)."""
+        return self._roots.display_url(claim.primary_path)
 
     def _catalog_url_for(self, source_id: str) -> Optional[str]:
-        """The registered source's catalog ``source_url`` (None if missing)."""
-        adapter = self._server.sources.get(source_id)
-        return adapter.catalog_url if adapter is not None else None
+        """The source's catalog ``source_url``, registered or pending (None if
+        it is neither)."""
+        return self._reconciler.catalog_url_of(source_id)
 
 
 def create_source_manager(
     server: TensorFlightServer,
     registry: AdapterRegistry,
-    monitored_sources: Optional[List[SourceConfig]] = None,
-    static_sources: Optional[List[SourceConfig]] = None,
+    sources: Optional[List[SourceConfig]] = None,
+    write_dir: Optional[Path] = None,
     metadata_db: Optional[MetadataDatabase] = None,
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
     full_rescan_interval: float = 3600.0,
-    aggressive_dir_pruning: bool = False,
     prune_unseen_days: int = 0,
-    rescan_interval: float = 30.0,
+    rescan_interval: float = 120.0,
+    registration_workers: int = 0,
+    walk_threads: int = 1,
+    adapter_idle_seconds: float = 0.0,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
-    Handles both static sources (explicit config, registered once) and monitored
-    sources (filesystem-discovered, kept live by the rescan loop). Both paths use
-    the same DiscoveryState/callback machinery. Remote sources are never
-    filesystem-watched: a bare-host ``grpc://`` upstream is monitored through the
-    background catalog re-list, and any other remote source is registered
-    statically during initial discovery.
+    Sorts ``sources`` once (:func:`partition_sources`) into roots -- monitored
+    directories (kept live by the rescan loop), scan-once paths (registered by the
+    first tick, then left alone) and bare-host ``grpc://`` upstreams (re-listed in
+    the background) -- and single remote sources, registered as they are. All use
+    the same DiscoveryState/callback machinery. The roots are left on the manager
+    as ``manager.roots``.
 
     Always returns a manager. An empty catalog is a valid runtime state --
     sources arrive later through runtime add_source (napari drag-drop), DoPut
@@ -1349,114 +1423,60 @@ def create_source_manager(
     Args:
         server: TensorFlightServer the sources are registered into.
         registry: AdapterRegistry used for claim detection and adapter creation.
-        monitored_sources: SourceConfig entries with monitor=True.
-        static_sources: Explicit SourceConfig entries (monitor=False).
+        sources: The configured ``[[sources]]`` entries, as written.
+        write_dir: The upload directory; warned about when it lies inside a
+            scanned source directory.
         metadata_db: the catalog this manager writes as sources are added and
             removed. It is the only writer: the server registers, the reconciler
             catalogues. None leaves registered sources absent from every browse.
         credentials_config: CredentialsConfig for remote storage authentication.
         stability_window: Seconds an entry's signature must be unchanged before
             it is eligible to be claimed.
-        full_rescan_interval: Seconds between full tree walks; the rescans in
-            between prune stable and cloud subtrees. <= 0 disables force-full.
-        aggressive_dir_pruning: Whether the scanner may skip a directory whose
-            own signature is unchanged without descending into it.
+        full_rescan_interval: Seconds between full passes, the only ones that
+            walk a cloud root. <= 0 disables force-full.
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
-        rescan_interval: Seconds between rescans. <= 0 leaves the manager with
-            no rescan loop, so :meth:`SourceManager.start` no-ops and the caller
-            drives any scan itself (config ``monitor_mode = "off"``).
+        rescan_interval: Seconds between rescans (floored at 0.1s).
+        adapter_idle_seconds: Seconds a registered source's adapter is kept after
+            its last read, for a source that can be rebuilt from its row; 0 keeps
+            every adapter.
+        registration_workers: Threads that register, in the background, the
+            sources the first scan claims. 0 registers each as it is claimed.
 
     Returns:
         A SourceManager, empty if no source is usable.
     """
-    monitored_sources = monitored_sources or []
-    static_sources = static_sources or []
-
-    # A bare-host tensor-server upstream ("mirror everything") IS monitored -- its
-    # catalog is re-listed/reconciled in the background (biopb/biopb#178) -- it just
-    # is not *filesystem*-watched. Distinguished here so the log line below is not
-    # misleading, and reused for the monitored_upstreams filter.
-    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
-
-    def _is_bare_host_upstream_url(url: str) -> bool:
-        return (
-            url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
-            and _split_grpc_url(url)[1] is None
+    static_sources, roots = partition_sources(
+        sources or [],
+        registry,
+        credentials_config=credentials_config,
+        write_dir=write_dir,
+    )
+    for root in roots.of_kind(RootKind.UPSTREAM):
+        logger.info(
+            "Tensor-server upstream %s: catalog re-listed in the background, "
+            "not filesystem-watched",
+            root.url,
         )
 
-    # Extract monitored directories. Remote sources are never filesystem-watched;
-    # a bare-host upstream is still monitored via the background re-list, whereas
-    # any other remote source (a single-source grpc://host/<id>, or an s3://...
-    # entry) is registered statically.
-    monitored_dirs: Set[Path] = set()
-    for source in monitored_sources:
-        if source.is_remote:
-            if _is_bare_host_upstream_url(source.url):
-                logger.info(
-                    "Tensor-server upstream %s: catalog re-listed in the background, "
-                    "not filesystem-watched",
-                    source.url,
-                )
-            else:
-                logger.info(
-                    "Remote source %s is registered statically, not monitored",
-                    source.url,
-                )
-            continue
+    if not static_sources and not roots:
+        logger.info("No sources configured yet; serving an empty catalog")
 
-        local_path = source.local_path
-        if local_path is None or not local_path.exists():
-            logger.warning(f"Cannot monitor non-existent path: {source.url}")
-            continue
-
-        if local_path.is_file():
-            logger.warning(f"Cannot monitor single file: {source.url}")
-            continue
-
-        monitored_dirs.add(local_path)
-
-    # Tensor-server upstreams (bare-host grpc://) whose catalog is re-listed and
-    # reconciled in the background (biopb/biopb#178). Every bare-host upstream
-    # qualifies regardless of `monitor`: cli._resolve_serve_sources routes them all
-    # here (never to inline static expansion) so a large upstream neither blocks
-    # SERVING nor pays a per-source get_descriptor RPC -- `monitor=false` only makes
-    # the adaptive cadence back off after the boot-tick reconcile. A single-source
-    # grpc://host/<id> entry has nothing to re-list, so it is excluded -- only the
-    # bare-host "mirror everything" form qualifies.
-    monitored_upstreams = [
-        ms
-        for ms in monitored_sources
-        if ms.is_remote and _is_bare_host_upstream_url(ms.url)
-    ]
-
-    # An unreachable monitored upstream contributes no static sources at startup
-    # (its bare-host expansion was skipped), but the re-list populates it once it
-    # is reachable -- so it counts as "something to serve" and the catalog is not
-    # reported as empty on its account.
-    if not monitored_dirs and not static_sources and not monitored_upstreams:
-        logger.warning("No sources configured yet; serving an empty catalog")
-
-    # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
-    # across both monitored and static sources. Under a monitored cloud root the
-    # walk admits dehydrated entries; for any cloud source the registration path
-    # defers a non-resident dataset to lazy resolution (cloud-storage phase 2).
-    cloud_roots: Set[Path] = set()
-    for source in (*monitored_sources, *static_sources):
+    # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
+    # and catalog non-resident sources as ``needs_recall``, registered when a
+    # client resolves them.
+    for source in (
+        *(r.source for r in roots),
+        *static_sources,
+    ):
         if source.cloud:
-            # EXPERIMENTAL: cloud/synced-folder mode (offline placeholders resolved
-            # lazily on first access) is not yet stable. Warned once per configured
-            # cloud source at startup.
+            # Warned once per configured cloud source at startup.
             logger.warning(
                 "Source %r uses the EXPERIMENTAL 'cloud' mode (offline/synced-folder "
                 "placeholders resolved lazily on first access): its behavior and "
                 "config surface may change without notice in a future release.",
                 source.url,
             )
-        if source.cloud and not source.is_remote:
-            local_path = source.local_path
-            if local_path is not None:
-                cloud_roots.add(local_path)
 
     # Create discovery state (empty - will be populated after SourceManager is created)
     discovery_state = DiscoveryState()
@@ -1466,68 +1486,22 @@ def create_source_manager(
         server=server,
         registry=registry,
         discovery_state=discovery_state,
-        monitored_dirs=monitored_dirs,
+        roots=roots,
         rescan_interval=rescan_interval,
         metadata_db=metadata_db,
         credentials_config=credentials_config,
         stability_window=stability_window,
         full_rescan_interval=full_rescan_interval,
-        aggressive_dir_pruning=aggressive_dir_pruning,
-        cloud_roots=cloud_roots,
-        monitored_upstreams=monitored_upstreams,
         prune_unseen_days=prune_unseen_days,
+        registration_workers=registration_workers,
+        adapter_idle_seconds=adapter_idle_seconds,
+        walk_threads=walk_threads,
     )
 
-    # Seed static sources as direct claims (explicit config, no filesystem walk)
-    # These are added first so monitored discovery skips paths already claimed.
+    # Added first so monitored discovery skips paths already claimed.
     for source in static_sources:
-        extra_config = {}
-        if source.dataset:
-            extra_config["dataset"] = source.dataset
-        # credentials_profile is dropped by the claim->SourceConfig rebuild in
-        # _register_source_claim; carry it here so a tensor-server proxy's
-        # per-upstream token (and any remote source's profile) reaches
-        # create_from_config.
-        if source.credentials_profile:
-            extra_config["credentials_profile"] = source.credentials_profile
-        # Same rebuild drops `alias`, which a tensor-server proxy needs as the
-        # display authority of its catalog source_url (biopb/biopb#788). The
-        # source_id is already namespaced by then, so this is display-only.
-        if source.alias:
-            extra_config["alias"] = source.alias
-        # Store the canonical resolved form of a local config path (the same
-        # resolve_local_path the source_id hash, the containment guard, and the
-        # drop path all use) so its claim key compares equal to a drop that lands
-        # inside it. Otherwise a source configured through a symlink/junction
-        # (e.g. /data/current -> /data/2026-07, or a Windows junction / mapped
-        # drive) keeps its raw path, so a drop *inside* it -- whose resolved form
-        # differs -- evades the "already part of <source>" guard and double-
-        # registers. Monitored sources reach the same form via the walk's
-        # Path.resolve. A remote URL is left verbatim -- is_remote_url is
-        # prefix-based, so a Windows drive letter (C:\...) stays a local path.
-        primary_path = source.url
-        if not is_remote_url(source.url):
-            primary_path = resolve_local_path(source.url)
-        claim = SourceClaim(
-            source_type=source.type,
-            primary_path=primary_path,  # resolved local path; remote URL verbatim
-            source_id=source.source_id,
-            extra_config=extra_config,
-            # A static source explicitly flagged cloud is always deferred: the
-            # user said "don't open it eagerly". If it is in fact resident, the
-            # first access still resolves it cheaply.
-            unresolved=bool(source.cloud),
-        )
-        # source._catalog_url is the alias-derived display tree-root for a local
-        # source (resolve.resolve_all_sources), or None. Threaded as the descriptor's
-        # source_url override, exactly like the drag-drop re-rooting path.
-        manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
+        manager.register_static_source(source)
+    if static_sources:
+        logger.info("Loaded %d remote data source(s)", len(static_sources))
 
-    # Monitored discovery is NOT run synchronously here: under progressive
-    # discovery the launcher starts the manager's rescan loop, whose first tick
-    # fires immediately, so the (possibly slow) bootstrap scan
-    # happens in the background while the server already reports SERVING. A
-    # static-only config (no monitored_dirs) has nothing to scan -- the launcher
-    # drives the first-scan-complete path directly so it still reports a
-    # freshness timestamp and seeds the backlog.
     return manager

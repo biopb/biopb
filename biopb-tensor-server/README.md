@@ -36,7 +36,6 @@ The Arrow data are then served to the user via an Arrow Flight server, which bri
 | NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
 | MRC | `.mrc` | Native (`rosettasciio`) |
 | EMD | `.emd` | Native (`rosettasciio`) both Berkeley and Velox flavors |
-| HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
 
 ## Client
 
@@ -153,7 +152,7 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
 
 ### Requirements
 
-- Python >= 3.10, < 3.13
+- Python >= 3.12, < 3.13
 - pyarrow >= 14.0.0
 
 ### Setup

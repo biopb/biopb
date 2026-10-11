@@ -46,6 +46,10 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.errors import StaleChunkError
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 CV = b"1700000000000000000:4096"
 
@@ -525,7 +529,7 @@ class _VersionedStubAdapter(TensorAdapter):
         self._shape = list(shape)
         self._content_version = content_version
 
-    def get_tensor_descriptor(self):
+    def _native_descriptor(self):
         return TensorDescriptor(
             array_id=self.array_id,
             shape=self._shape,
@@ -543,11 +547,13 @@ class _VersionedStubAdapter(TensorAdapter):
     def create_from_config(cls, source, credentials_config=None):
         raise NotImplementedError
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class TestResolveChunkDataRejectsStaleVersion:

@@ -1,5 +1,15 @@
 # No `__version__` here: one distribution, one version, published as
 # `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
+from biopb.image._arg import (
+    NDIM_LABELS,
+    decode_arg,
+    encode_arg,
+    json_arg,
+    json_value,
+    jsonable,
+)
+from biopb.image._client import OpsClient, connect, make_channel, op_error
+
 # Utility functions for image data serialization/deserialization
 from biopb.image._utils import (
     deserialize_image_data,
@@ -55,9 +65,11 @@ __all__ = [
     "ImageData",
     "Mask",
     "Mesh",
+    "NDIM_LABELS",
     "OpInfo",
     "OpList",
     "Ops",
+    "OpsClient",
     "OpsServicer",
     "OpsStub",
     "Pixels",
@@ -78,11 +90,19 @@ __all__ = [
     "Tensor",
     "TensorArg",
     "add_OpsServicer_to_server",
+    "connect",
+    "decode_arg",
     "deserialize_image_data",
+    "encode_arg",
     "get_image_data_dim_labels",
     "get_image_data_shape",
+    "json_arg",
+    "json_value",
+    "jsonable",
+    "make_channel",
     "mask_to_roi",
     "normalize_array_dims",
+    "op_error",
     "roi_to_mask",
     "serialize_from_numpy_to_image_data",
 ]

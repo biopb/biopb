@@ -1,7 +1,6 @@
 package biopb.tensor;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 import org.apache.arrow.flight.FlightEndpoint;
@@ -10,6 +9,8 @@ import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.vector.FieldVector;
+
+import com.google.protobuf.ByteString;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.RandomAccessibleInterval;
@@ -91,15 +92,8 @@ final class Imglib2TensorFactory {
      * from inside a cell load.
      */
     private static void checkWireProtocol(FlightInfo plan) {
-        String stamped = null;
-        java.util.Optional<org.apache.arrow.vector.types.pojo.Schema> schema = plan.getSchemaOptional();
-        if (schema.isPresent()) {
-            java.util.Map<String, String> metadata = schema.get().getCustomMetadata();
-            if (metadata != null) {
-                stamped = metadata.get(WireVersions.WIRE_PROTOCOL_METADATA_KEY);
-            }
-        }
-        int serverVersion = WireVersions.stampedVersion(stamped);
+        int serverVersion = WireVersions.stampedVersion(
+                WireVersions.stamp(plan, WireVersions.WIRE_PROTOCOL_METADATA_KEY));
         if (serverVersion != WireVersions.TENSOR_WIRE_PROTOCOL_VERSION) {
             throw new UnsupportedOperationException(WireVersions.mismatch(
                     "tensor wire protocol", serverVersion, WireVersions.TENSOR_WIRE_PROTOCOL_VERSION,
@@ -129,11 +123,31 @@ final class Imglib2TensorFactory {
     }
 
     private static List<ChunkRef> chunkRefs(FlightInfo plan) {
+        byte[] stub = descriptorOf(plan).getTicketStub().toByteArray();
         List<ChunkRef> chunks = new ArrayList<>(plan.getEndpoints().size());
         for (FlightEndpoint endpoint : plan.getEndpoints()) {
-            chunks.add(new ChunkRef(endpoint.getTicket(), parseChunkBounds(endpoint.getAppMetadata())));
+            chunks.add(new ChunkRef(
+                    ticketOf(stub, endpoint.getTicket()), parseChunkBounds(endpoint.getAppMetadata())));
         }
         return chunks;
+    }
+
+    /**
+     * The ticket that reads one endpoint.
+     *
+     * <p>A plan issued as a stub ({@code descriptor.ticket_stub},
+     * biopb/biopb#1112) has endpoints that carry only a grid index; the ticket
+     * is the stub and the endpoint's, concatenated, which protobuf merges into
+     * one {@code ChunkRef} carrying both -- no codec. Without a stub the
+     * endpoint's ticket is whole and is returned as the server minted it.
+     */
+    static Ticket ticketOf(byte[] stub, Ticket endpointTicket) {
+        if (stub.length == 0) {
+            return endpointTicket;
+        }
+        return new Ticket(ByteString.copyFrom(stub)
+                .concat(ByteString.copyFrom(endpointTicket.getBytes()))
+                .toByteArray());
     }
 
     @SuppressWarnings("unchecked")
@@ -143,7 +157,7 @@ final class Imglib2TensorFactory {
         RandomAccess<T> access = image.randomAccess();
 
         for (ChunkRef chunk : chunks) {
-            writeChunk(access, chunk.bounds, fetchChunkValues(chunk.ticket));
+            fetchChunkValues(chunk.ticket).writeTo(access, chunk.bounds);
         }
         return image;
     }
@@ -155,12 +169,13 @@ final class Imglib2TensorFactory {
         if (chunk == null) {
             throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
         }
-        writeChunk(cell.randomAccess(), chunk.bounds, fetchChunkValues(chunk.ticket));
+        fetchChunkValues(chunk.ticket).writeTo(cell.randomAccess(), chunk.bounds);
     }
 
-    private double[] fetchChunkValues(Ticket ticket) {
+    private ChunkValues fetchChunkValues(Ticket ticket) {
         try (FlightStream stream = session.getStream(ticket)) {
-            double[] values = new double[0];
+            List<byte[]> rows = new ArrayList<>();
+            List<String> dtypes = new ArrayList<>();
             while (stream.next()) {
                 FieldVector dataVector = stream.getRoot().getVector("data");
                 FieldVector dtypeVector = stream.getRoot().getVector("dtype");
@@ -175,14 +190,11 @@ final class Imglib2TensorFactory {
                                 + (rowObj == null ? "null" : rowObj.getClass()));
                     }
                     Object dtypeObj = dtypeVector.getObject(row);
-                    double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
-                            dtypeObj == null ? "" : dtypeObj.toString());
-                    int offset = values.length;
-                    values = Arrays.copyOf(values, offset + decoded.length);
-                    System.arraycopy(decoded, 0, values, offset, decoded.length);
+                    rows.add((byte[]) rowObj);
+                    dtypes.add(dtypeObj == null ? "" : dtypeObj.toString());
                 }
             }
-            return values;
+            return ChunkValues.decode(rows, dtypes);
         } catch (FlightRuntimeException error) {
             throw TensorErrorMapper.map(error);
         } catch (RuntimeException error) {

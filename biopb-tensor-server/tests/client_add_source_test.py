@@ -34,7 +34,7 @@ def _result_body(added=(), already=(), failed=()):
 def _bare_client():
     from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
-    # register_local_path / resolve_source / warm_source now live on CatalogClient (#278 item C); build
+    # register_local_path / resolve_source now live on CatalogClient (#278 item C); build
     # the shared state + collaborators (no connection) and inject the fake flight
     # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
@@ -132,15 +132,6 @@ class TestAddSource:
         with pytest.raises(RuntimeError, match="too old"):
             client.register_local_path("/drop")
 
-    def test_add_source_is_a_deprecated_alias_for_register_local_path(self):
-        client = _bare_client()
-        client._state.client = _FakeFlight([_FakeResult(_result_body(added=["s1"]))])
-
-        with pytest.warns(DeprecationWarning, match="add_source"):
-            out = client.add_source("/drop")
-
-        assert list(out.added) == ["s1"]
-
     def test_no_terminal_result_raises(self):
         client = _bare_client()
         client._state.client = _FakeFlight(
@@ -182,3 +173,37 @@ class TestAddSource:
         out = client.register_local_path("/drop", should_cancel=_flip_after(1))
 
         assert list(out.added) == [] and list(out.already_present) == []
+
+
+class TestCloudFlag:
+    """``cloud`` rides on the request; ``skipped_offline`` rides on the result."""
+
+    def test_the_flag_is_sent_and_the_count_is_returned(self):
+        from biopb.tensor.descriptor_pb2 import AddSourceRequest
+
+        body = AddSourceStreamMessage(
+            result=AddSourceResult(skipped_offline=3)
+        ).SerializeToString()
+        client = _bare_client()
+        fake = _FakeFlight(results=[_FakeResult(body)])
+        client._state.client = fake
+
+        result = client.register_local_path("/data/synced", cloud=True)
+
+        sent = AddSourceRequest()
+        sent.ParseFromString(fake.action.body.to_pybytes())
+        assert sent.url == "/data/synced" and sent.cloud is True
+        assert result.skipped_offline == 3
+
+    def test_cloud_defaults_to_off(self):
+        from biopb.tensor.descriptor_pb2 import AddSourceRequest
+
+        client = _bare_client()
+        fake = _FakeFlight(results=[_FakeResult(_result_body())])
+        client._state.client = fake
+
+        client.register_local_path("/data/x")
+
+        sent = AddSourceRequest()
+        sent.ParseFromString(fake.action.body.to_pybytes())
+        assert sent.cloud is False

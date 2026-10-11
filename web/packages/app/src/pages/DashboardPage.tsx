@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
+import { catalogIsFilling } from "../utils/catalogHealth";
 import { sessionFetch } from "../utils/sessionFetch";
 import {
   authRequired,
@@ -38,13 +39,13 @@ interface SessionRec {
   // error|unknown); decorative, may be absent on an older control.
   kernel?: string;
   // Whether that page leads with the chat client rather than the job list --
-  // true for an agentless `biopb mcp view` session whose chat this control will
+  // true for a session whose mode serves chat (not a shim's child) and whose
+  // chat this control will
   // proxy. Absent on an older control, which reads as an observe link.
   chat?: boolean;
-  // Whether the session serves a stop verb -- true only where it owns its own
-  // reap (a viewer, not a child some MCP client's shim will reap). Absent on an
-  // older control, which reads as no stop button rather than one that 404s.
-  can_stop?: boolean;
+  // Who the session answers to -- an attached agent, the chat pane, or nobody.
+  // Said in the stop confirmation, since stopping takes the kernel from them.
+  holder?: string | null;
 }
 interface AgentRec {
   id: string;
@@ -86,6 +87,7 @@ export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
   const [agents, setAgents] = useState<AgentRec[] | null>(null);
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
+  const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -109,6 +111,13 @@ export default function DashboardPage() {
   // empty (biopb/biopb#1028), so the badge is downgraded to "starting" until
   // this independently confirms the backend's own readyz.
   const [backendReady, setBackendReady] = useState<boolean | null>(null);
+  // The catalog's own state, from the same readyz: a monitored directory can
+  // keep indexing for hours after the plane answers SERVING.
+  const [catalog, setCatalog] = useState<{
+    scanning: boolean;
+    count: number;
+    finishedAt: number | null;
+  } | null>(null);
 
   const pollStatus = useCallback(async () => {
     try {
@@ -133,6 +142,16 @@ export default function DashboardPage() {
       const r = await fetch(withBase("/data_plane/readyz"));
       const j = await r.json().catch(() => null);
       setBackendReady(!!j && j.ready === true);
+      const h = j?.backend_health;
+      setCatalog(
+        h
+          ? {
+              scanning: catalogIsFilling(h),
+              count: j.source_count ?? 0,
+              finishedAt: h.last_full_scan_finished_at ?? null,
+            }
+          : null,
+      );
     } catch {
       setBackendReady(false);
     }
@@ -164,6 +183,54 @@ export default function DashboardPage() {
       /* keep last */
     }
   }, []);
+
+  // Add or remove a registry entry, then re-list. The control reports a
+  // refusal (bad url, taken name) as {error}.
+  const algoEdit = useCallback(
+    async (path: string, body?: object) => {
+      setAlgosBusy(true);
+      try {
+        const r = await sessionFetch(withBase(path), {
+          method: "POST",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const res = await r.json().catch(() => ({}));
+        if (res && res.error) alert("Failed: " + res.error);
+      } catch (e) {
+        alert("Failed: " + String(e));
+      }
+      await pollAlgos();
+      setAlgosBusy(false);
+    },
+    [pollAlgos],
+  );
+
+  const registerRemote = () => {
+    const url = prompt("URL of the algorithm server (grpc://host:port or grpcs://host:port)");
+    if (!url?.trim()) return;
+    // The server's own default (host and port, made filename-safe), offered for
+    // editing. Cancelling this second dialog cancels the registration; blank
+    // leaves the choice to the server.
+    let host = url.trim();
+    try {
+      host = new URL(url.trim().replace(/^grpcs?:/i, "http:")).host || host;
+    } catch {
+      // not a URL; the server refuses it with its own message
+    }
+    const suggested = host.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    const name = prompt("Name for this server", suggested || "server");
+    if (name === null) return;
+    algoEdit("/api/algorithms/register", { url: url.trim(), name: name.trim() || undefined });
+  };
+  // A script entry is a file on the control's machine: the control starts and
+  // stops it, and the entry itself is managed on disk.
+  const algoVerb = (s: AlgoRec, verb: "ensure" | "stop") =>
+    algoEdit("/api/algorithms/" + verb + "?name=" + encodeURIComponent(s.name));
+  const deregister = (s: AlgoRec) => {
+    if (confirm("Deregister " + s.name + "?"))
+      algoEdit("/api/algorithms/deregister?name=" + encodeURIComponent(s.name));
+  };
 
   // Token-driven unlock gate. Capture a ?token= handed over by the one-time
   // access URL, then — only where the control's /health advertises auth_required
@@ -253,12 +320,13 @@ export default function DashboardPage() {
   // for a session started here and one started with `biopb mcp view` in a
   // terminal, and the confirm says so: that terminal is about to come back.
   const stopSession = useCallback(
-    async (id: string) => {
+    async (id: string, holder?: string | null) => {
+      const heldBy = holder ? `\n\nIts ${holder} is attached and loses it.` : "";
       if (
         !confirm(
           `Stop session ${id}?\n\nIts kernel (and napari window) closes and any running ` +
             `work is lost. If it was started with \`biopb mcp view\` in a ` +
-            `terminal, that terminal returns.`,
+            `terminal, that terminal returns.${heldBy}`,
         )
       )
         return;
@@ -368,6 +436,22 @@ export default function DashboardPage() {
             >
               {displayState}
             </span>
+            {catalog &&
+              dpState === "serving" &&
+              (catalog.scanning ? (
+                <span style={{ opacity: 0.7, fontSize: 12 }} title="The catalog is still being indexed.">
+                  {" "}
+                  indexing… {catalog.count.toLocaleString()} sources so far
+                </span>
+              ) : (
+                catalog.finishedAt && (
+                  <span style={{ opacity: 0.7, fontSize: 12 }}>
+                    {" "}
+                    {catalog.count.toLocaleString()} sources, indexed{" "}
+                    {new Date(catalog.finishedAt * 1000).toLocaleString()}
+                  </span>
+                )
+              ))}
           </div>
           <dl>
             <dt>gRPC</dt>
@@ -444,6 +528,9 @@ export default function DashboardPage() {
             <button className="mini" onClick={pollAlgos}>
               ↻
             </button>
+            <button className="mini" disabled={algosBusy} onClick={registerRemote}>
+              Register remote
+            </button>
           </h2>
           <ul>
             {algos == null ? (
@@ -451,7 +538,15 @@ export default function DashboardPage() {
             ) : algos.length === 0 ? (
               <li className="empty">no algorithm servers configured</li>
             ) : (
-              algos.map((s, i) => <AlgoRow key={i} s={s} />)
+              algos.map((s) => (
+                <AlgoRow
+                  key={s.name}
+                  s={s}
+                  busy={algosBusy}
+                  onDeregister={deregister}
+                  onVerb={algoVerb}
+                />
+              ))
             )}
           </ul>
           <p className="note">
@@ -553,17 +648,15 @@ export default function DashboardPage() {
                     >
                       {s.chat ? "chat →" : "observe →"}
                     </a>
-                    {s.can_stop ? (
-                      <button
-                        className="mini stop"
-                        onClick={() => stopSession(s.session_id)}
-                        disabled={stoppingId === s.session_id}
-                        title="Stop this session"
-                        aria-label={`Stop session ${s.session_id}`}
-                      >
-                        {stoppingId === s.session_id ? "…" : "✕"}
-                      </button>
-                    ) : null}
+                    <button
+                      className="mini stop"
+                      onClick={() => stopSession(s.session_id, s.holder)}
+                      disabled={stoppingId === s.session_id}
+                      title="Stop this session"
+                      aria-label={`Stop session ${s.session_id}`}
+                    >
+                      {stoppingId === s.session_id ? "…" : "✕"}
+                    </button>
                   </li>
                 );
               })
@@ -584,7 +677,17 @@ export default function DashboardPage() {
 // One algorithm-plane row: a status dot, host:port (TLS tag for grpcs), the
 // state + op count, and an ops preview (full list in the hover title). A
 // non-serving server shows its error message in the preview slot instead.
-function AlgoRow({ s }: { s: AlgoRec }) {
+function AlgoRow({
+  s,
+  busy,
+  onDeregister,
+  onVerb,
+}: {
+  s: AlgoRec;
+  busy: boolean;
+  onDeregister: (s: AlgoRec) => void;
+  onVerb: (s: AlgoRec, verb: "ensure" | "stop") => void;
+}) {
   const serving = s.state === "up";
   // A script entry that is installed but not running is healthy: it starts
   // on its first call.
@@ -612,6 +715,21 @@ function AlgoRow({ s }: { s: AlgoRec }) {
           {s.error}
         </span>
       ) : null}
+      <span className="agent-btns">
+        {s.kind === "url" ? (
+          <button className="danger" disabled={busy} onClick={() => onDeregister(s)}>
+            Deregister
+          </button>
+        ) : ["new", "stopped", "failed"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "ensure")}>
+            Start
+          </button>
+        ) : ["up", "starting"].includes(s.state) ? (
+          <button disabled={busy} onClick={() => onVerb(s, "stop")}>
+            Stop
+          </button>
+        ) : null}
+      </span>
     </li>
   );
 }

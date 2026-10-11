@@ -73,11 +73,20 @@ jobs:
           server-password: MAVEN_PASSWORD
           gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
           gpg-passphrase: GPG_PASSPHRASE
+      - name: Pin Maven 3.9
+        # The runner's Maven 3.10.0 writes maven-metadata-local.xml into the
+        # staged bundle's artifact directory, and Central rejects the bundle
+        # ("content that does NOT have a .pom file"). Build with 3.9 instead.
+        run: mvn -B wrapper:wrapper -Dmaven=3.9.16
       - name: Publish to Maven Central
         # Tests already passed in the build job for this commit; skip re-running
         # them here so deploy just builds, signs, and publishes the artifacts.
-        run: mvn -B deploy -DskipTests -Drevision=${{ steps.version.outputs.VERSION }} -P release --file pom.xml
+        run: ./mvnw -B deploy -DskipTests -Drevision=${{ steps.version.outputs.VERSION }} -P release --file pom.xml
         env:
           MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
           MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      - name: List the Central bundle
+        # What Central saw, when it rejects the bundle.
+        if: failure()
+        run: unzip -l target/central-publishing/central-bundle.zip

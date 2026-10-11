@@ -54,6 +54,7 @@ from pathlib import Path
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.config import CacheConfig
 
@@ -92,7 +93,7 @@ def _open_adapter(path: Path):
     else:
         sys.exit(f"no adapter wired for {suffix} in this benchmark")
 
-    descriptors = source.list_tensor_descriptors()
+    descriptors = source.list_tensors()
     descriptor = descriptors[0]
     adapter = source.get_tensor_adapter(descriptor.array_id)
     return adapter, descriptor
@@ -234,7 +235,7 @@ def main() -> None:
     print(
         f"{args.file.name}  {shape} {descriptor.dtype} "
         f"labels={list(descriptor.dim_labels)}  "
-        f"grid={list(adapter.get_transfer_chunk_size())}"
+        f"grid={list(transfer_chunk_size(adapter.get_tensor_descriptor()))}"
     )
     print(
         f"{'state':6} {'method':8} {'scale':>5} {'latency':>10} {'chunks':>7} "

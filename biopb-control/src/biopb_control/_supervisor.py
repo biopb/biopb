@@ -18,16 +18,16 @@ or logged-out control must not orphan the tensor server: an orphan keeps holding
 the gRPC port, which the next control start then reads as a *conflict* it refuses
 — so the installer's stop→start (and every restart) would wedge behind a plane
 nobody owns. The bind closes that: on POSIX the child inherits a parent-death
-pipe (:mod:`biopb.lifecycle.deathwatch`) and runs in its own session, so an
+pipe (:mod:`biopb._lifecycle.deathwatch`) and runs in its own session, so an
 *uncatchable* control death (SIGKILL/OOM/crash) EOFs the pipe and the plane
 group-kills itself; on Windows it is assigned to a kill-on-close Job Object
-(:mod:`biopb.lifecycle.winjob`) the control holds, so the OS reaps it when the
+(:mod:`biopb._lifecycle.winjob`) the control holds, so the OS reaps it when the
 control's last handle closes. This is orthogonal to the *graceful* stop path
 below (SIGTERM / the Windows sentinel), which still runs the plane's orderly
 shutdown when the control is alive to ask for it; the bind is only the backstop
 for when it is not.
 
-Readiness beyond "port bound" (the progressive-discovery ``SERVING`` scan) is
+Readiness beyond "port bound" (the discovery ``SERVING`` scan) is
 left to the *client*: ``biopb.tensor.Connection`` connects and waits the
 server through its data-folder scan itself. The supervisor's job ends at "the
 process is up and listening".
@@ -46,8 +46,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-from biopb import _locations
-from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb._config import locations as _locations
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+
+from biopb_control._rotating_log import RotatingLog, pump
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +124,8 @@ class ServiceProcess:
 
     def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
-        self._log_fh = None
+        self._log_sink: Optional[RotatingLog] = None
+        self._pump: Optional[threading.Thread] = None
         # Death-binding handles (see the module docstring). POSIX: the write end
         # of the child's parent-death pipe, re-armed per spawn and closed once the
         # child is gone. Windows: a kill-on-close Job Object created once and
@@ -156,34 +159,26 @@ class ServiceProcess:
         except OSError:
             return False
 
-    def _open_log(self):
-        """Open (once) the append-binary file the child's stdout/stderr go to.
+    def _open_log(self) -> Optional[RotatingLog]:
+        """Open (once) the rotating file the child's output is written to, or
+        ``None`` when it goes to the control's own stderr.
 
-        Binary + unbuffered for the same reason the CLI's server log is: the
-        child and its native libraries (gRPC, Arrow) emit arbitrary bytes. Falls
-        back to the control's own stderr if the file can't be opened, so a bad log
-        path never blocks the plane from starting.
-
-        Rotated once here, before the first open of this supervisor's lifetime, so
-        the plane's stdout log (which has no in-process RotatingFileHandler) does
-        not grow unbounded across control restarts — mirroring what ``control
-        start`` does for ``control.log``. Rotating here (not per child respawn)
-        keeps the appended fd stable while the control lives.
+        The child's stdout and stderr are a pipe the control copies into the
+        file (:func:`_rotating_log.pump`), so the file rotates while the plane
+        runs and bounds everything the child writes, native libraries included.
+        Falls back to the control's stderr if the file can't be opened, so a bad
+        log path never blocks the plane from starting.
         """
-        if self._log_fh is not None:
-            return self._log_fh
+        if self._log_sink is not None:
+            return self._log_sink
         path = self.log_path
         if path is None:
-            self._log_fh = getattr(sys.stderr, "buffer", sys.stderr)
-            return self._log_fh
+            return None
         try:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            _locations.rotate_log(Path(path))
-            self._log_fh = open(path, "ab", buffering=0)  # noqa: SIM115 - long-lived handle stored on self._log_fh for the spawned subprocess's lifetime
+            self._log_sink = RotatingLog(path)
         except OSError:
             logger.warning("Cannot open log %s; using stderr", path)
-            self._log_fh = getattr(sys.stderr, "buffer", sys.stderr)
-        return self._log_fh
+        return self._log_sink
 
     def _start_process(self) -> None:
         """Spawn the child, bound to the control's lifetime. Raises ``OSError``
@@ -196,13 +191,19 @@ class ServiceProcess:
         """
         spec = self._service_spec()
         log = self._open_log()
-        try:
-            log.write(
-                f"\n--- control: starting {spec.label} at "
-                f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode()
-            )
-        except (OSError, ValueError):
-            pass
+        banner = (
+            f"\n--- control: starting {spec.label} at "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode()
+        )
+        if log is not None:
+            log.write(banner)
+            out, err = subprocess.PIPE, subprocess.STDOUT
+        else:
+            out = err = getattr(sys.stderr, "buffer", sys.stderr)
+            try:
+                out.write(banner)
+            except (OSError, ValueError):
+                pass
         logger.info("Spawning %s: %s", spec.label, " ".join(spec.argv))
         # A tracked child bound to the control's lifetime (module docstring):
         # while the control lives it owns and reaps this child directly; if the
@@ -220,8 +221,8 @@ class ServiceProcess:
             self._proc = subprocess.Popen(
                 spec.argv,
                 stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
+                stdout=out,
+                stderr=err,
                 env=env,
                 close_fds=True,
                 **popen_kwargs,
@@ -238,6 +239,14 @@ class ServiceProcess:
                 except OSError:
                     pass
         self._assign_to_job()
+        if log is not None and self._proc.stdout is not None:
+            self._pump = threading.Thread(
+                target=pump,
+                args=(self._proc.stdout, log),
+                name=f"{spec.label}-log",
+                daemon=True,
+            )
+            self._pump.start()
 
     def _arm_parent_death(self, env: dict, popen_kwargs: dict) -> Optional[int]:
         """POSIX: arm the child's parent-death pipe; return the read fd to close
@@ -245,7 +254,7 @@ class ServiceProcess:
 
         Creates a pipe, passes the read end to the child (fd inherited via
         ``pass_fds``, its number in ``BIOPB_PARENT_DEATH_FD``), and keeps the
-        write end on ``self._death_w``. The child's :func:`biopb.lifecycle.
+        write end on ``self._death_w``. The child's :func:`biopb._lifecycle.
         deathwatch.install` blocks on the read end and self-terminates on EOF, so
         an uncatchable control death takes the plane down. The child is put in its
         **own session** so the deathwatch's group-kill reaps only the plane and
@@ -340,6 +349,14 @@ class ServiceProcess:
             except subprocess.TimeoutExpired:
                 pass
         self._stopped()
+        self._drain_log()
+
+    def _drain_log(self, timeout: float = 2.0) -> None:
+        """Let the pump copy what the child wrote before it died: the last lines
+        are the ones a crash is diagnosed from."""
+        pump_thread, self._pump = self._pump, None
+        if pump_thread is not None:
+            pump_thread.join(timeout)
 
     def _ask_to_stop(self, proc: subprocess.Popen) -> None:
         """A graceful stop: SIGTERM, which is TerminateProcess on Windows."""
@@ -349,13 +366,10 @@ class ServiceProcess:
         """After the child has exited, however it was stopped."""
 
     def _close_log(self) -> None:
-        fh = self._log_fh
-        self._log_fh = None
-        if fh is not None and fh is not getattr(sys.stderr, "buffer", sys.stderr):
-            try:
-                fh.close()
-            except OSError:
-                pass
+        self._drain_log()
+        log, self._log_sink = self._log_sink, None
+        if log is not None:
+            log.close()
 
 
 @dataclass
@@ -697,7 +711,7 @@ class DataPlaneSupervisor(ServiceProcess):
     @staticmethod
     def _win_stop_sentinel() -> Path:
         # The one definition the tensor server's shutdown listener also binds to
-        # (biopb._locations.tensor_stop_sentinel), so writer and watcher
+        # (biopb._config.locations.tensor_stop_sentinel), so writer and watcher
         # cannot disagree — a single fixed name under the biopb state dir, not
         # keyed by PID.
         return _locations.tensor_stop_sentinel()

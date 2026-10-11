@@ -16,22 +16,21 @@ Remote storage support via RemoteNdTiffFileIO wrapper.
 
 from __future__ import annotations
 
-import threading
-import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._handle_reaper import (
-    DEFAULT_HANDLE_REAPER_TTL,
-    IdleHandleReaper,
-)
+from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
+from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
 from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -39,6 +38,12 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
+from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
     from ndtiff import NDTiffDataset
@@ -48,27 +53,17 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.remote import RemoteStore
 
 
-# =============================================================================
-# Persistent dataset pool (steady-state fd hygiene, biopb/biopb#71)
-# =============================================================================
-#
-# ``NDTiffDataset.__init__`` eagerly opens *every* ``NDTiffStack_*.tif`` in the
-# acquisition, so a catalogued source pins one fd per file -- routinely hundreds,
-# which on Windows makes the whole acquisition folder undeletable and on POSIX
-# holds disk after an unlink. The handle is kept warm between reads (a
-# reopen-per-read would reopen the *entire* acquisition to serve one plane, since
-# the reopen unit is decoupled from the read unit), and a shared idle reaper
-# closes it once no one has read the source for the TTL -- bounding the pin rather
-# than pinning for the catalog's whole lifetime. The next read after a lull pays
-# one reopen. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at startup;
-# see :mod:`biopb_tensor_server.adapters._handle_reaper`.
-# The reopen unit is the whole acquisition, so the TTL is the long default --
-# but so is the *pin*: NDTiffDataset eagerly opens every NDTiffStack_*.tif, so
-# one warm handle here can hold thousands of file descriptors where every other
-# pool holds one. That asymmetry, not the reopen cost, sets the cap.
-_dataset_reaper = IdleHandleReaper(
-    DEFAULT_HANDLE_REAPER_TTL, "ndtiff-dataset-reaper", max_handles=4
-)
+# The acquisition's open dataset is the handle, kept warm between reads in a pool
+# keyed by file identity: a per-read reopen would reopen the *entire* acquisition
+# to serve one plane, since the reopen unit is decoupled from the read unit. A
+# rebuilt adapter finds the dataset its predecessor opened, and the pool closes it
+# once no one has read the source for the TTL (``ServerConfig.handle_reaper_ttl``
+# is its ceiling). The reopen unit is the whole acquisition, so the TTL is the
+# long default -- but so is the *pin*: NDTiffDataset eagerly opens every
+# NDTiffStack_*.tif, so one warm handle here can hold thousands of file
+# descriptors where every other pool holds one. That asymmetry, not the reopen
+# cost, sets the cap.
+_dataset_pool = HandlePool(DEFAULT_HANDLE_REAPER_TTL, 4, "ndtiff-dataset-pool")
 
 
 # =============================================================================
@@ -162,8 +157,8 @@ def _extract_summary(dataset) -> dict:
 
     ``summary_metadata`` is parsed from ``NDTiff.index`` at construction and does
     not depend on the per-file readers, but snapshotting it at registration means
-    ``get_metadata`` / ``_physical_scale`` never touch ``self._dataset`` -- which
-    the reaper may have closed and set to ``None`` between reads.
+    ``registration_record`` / ``_physical_scale`` never touch the dataset -- which
+    the pool may have closed between reads.
     """
     meta = getattr(dataset, "summary_metadata", None)
     if meta is None:
@@ -182,6 +177,7 @@ def _extract_summary(dataset) -> dict:
 # =============================================================================
 
 
+@canonical_axes
 class NdTiffAdapter(TensorAdapter):
     """Adapter for Micro-Manager NDTiff storage format.
 
@@ -240,7 +236,7 @@ class NdTiffAdapter(TensorAdapter):
     ) -> NdTiffAdapter:
         """Create adapter instance from SourceConfig.
 
-        Builds a ``reopen`` thunk capturing the url + credentials so the reaper
+        Builds a ``reopen`` thunk capturing the url + credentials so the pool
         can close the acquisition when idle and a later read can reopen it (see
         the module docstring), opens it once for the initial handle, and hands
         both to the adapter.
@@ -275,7 +271,7 @@ class NdTiffAdapter(TensorAdapter):
         """Return a zero-arg thunk that (re)opens the ``NDTiffDataset``.
 
         The same construction ``create_from_config`` used, replayable by the read
-        path after the reaper closes the dataset. Imports are deferred to call
+        path after the pool closes the dataset. Imports are deferred to call
         time so an env without ndtiff (or fsspec) still imports this module.
         """
 
@@ -302,8 +298,10 @@ class NdTiffAdapter(TensorAdapter):
         dataset: NDTiffDataset,
         source_id: str,
         source_url: str,
-        io_lock: Optional[threading.Lock] = None,
         reopen: Optional[Callable[[], NDTiffDataset]] = None,
+        *,
+        structure: Optional[Dict[str, Any]] = None,
+        summary: Optional[dict] = None,
     ):
         """Initialize NDTiff adapter.
 
@@ -311,14 +309,17 @@ class NdTiffAdapter(TensorAdapter):
             dataset: NDTiffDataset instance (the initial open handle)
             source_id: Unique identifier for this data source
             source_url: URL or path to the data source
-            io_lock: Optional thread lock for IO serialization
             reopen: Optional zero-arg thunk that reopens the dataset. When set (the
-                ``create_from_config`` path), the reaper may close the acquisition
-                between reads and the read path reopens on demand. When None (a
-                caller that handed in a bare dataset, e.g. a test), the handle is
-                never reaped and a read after ``close()`` fails loudly.
+                ``create_from_config`` path), the dataset is pooled: the pool may
+                close it between reads and the read path reopens on demand. When
+                None (a caller that handed in a bare dataset, e.g. a test), the
+                handle is this adapter's own, never pooled, and a read after
+                ``close()`` fails loudly.
+            structure / summary: a restored source's axes, shape and dtype and its
+                summary metadata (``catalog_payload`` and the row), given with no
+                *dataset* (``None``) and a *reopen*: nothing is opened until a read
+                needs the acquisition, as after the pool closes an idle one.
         """
-        self._dataset = dataset
         self._reopen = reopen
         self.source_id = source_id
         self._source_url = source_url
@@ -327,24 +328,24 @@ class NdTiffAdapter(TensorAdapter):
         # for an NDTiff dataset dir. None (unresolved url) leaves it unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
-        self._io_lock = io_lock or threading.Lock()
-        # Reaper bookkeeping (see the module docstring). Reads stay entirely under
-        # _io_lock, so no lock-free read is ever in flight -- _active_reads is a
-        # constant 0 and the reaper's non-blocking _io_lock acquire alone fences a
-        # close against a read.
-        self._persistent_last_access = time.monotonic()
-        self._active_reads = 0
+        if dataset is not None:
+            dask_arr = dataset.as_array()
 
-        # Get dask array from dataset
-        self._dask_arr = dataset.as_array()
+            # Summary metadata snapshot -- so registration_record/_physical_scale never
+            # reach through the dataset, which the pool may have closed (see the
+            # helper).
+            self._summary_metadata = _extract_summary(dataset)
 
-        # Summary metadata snapshot -- so get_metadata/_physical_scale never reach
-        # through self._dataset, which the reaper may have closed (see the helper).
-        self._summary_metadata = _extract_summary(dataset)
-
-        # Get axes from dataset
-        # ndtiff uses axis names: position, time, channel, z, row, column
-        self._axes = list(dataset.axes.keys()) if hasattr(dataset, "axes") else []
+            # Get axes from dataset
+            # ndtiff uses axis names: position, time, channel, z, row, column
+            self._axes = list(dataset.axes.keys()) if hasattr(dataset, "axes") else []
+            self._shape = list(dask_arr.shape)
+            self._dtype = str(dask_arr.dtype)
+        else:
+            self._summary_metadata = summary or {}
+            self._axes = list(structure["axes"])
+            self._shape = [int(s) for s in structure["shape"]]
+            self._dtype = structure["dtype"]
 
         # Map axis names to short labels
         axis_alias = {
@@ -363,10 +364,6 @@ class NdTiffAdapter(TensorAdapter):
             self.dim_labels.append(label)
         self.dim_labels.extend(["y", "x"])
 
-        # Get shape and dtype from dask array
-        self._shape = list(self._dask_arr.shape)
-        self._dtype = str(self._dask_arr.dtype)
-
         # One 2D plane matches ndtiff's tile-based storage; it seeds the
         # transfer grid rather than being it (biopb/biopb#809), so a small plane
         # ships several planes per chunk instead of one endpoint each.
@@ -380,13 +377,55 @@ class NdTiffAdapter(TensorAdapter):
             native=[1] * n_non_spatial + spatial_shape,
         )
 
-        # Only a reopen-capable adapter is worth reaping -- one handed a bare
-        # dataset it cannot rebuild must keep it. Registering also lazily starts
-        # the reaper thread, so a bare-dataset caller (a test) spawns nothing.
-        if self._reopen is not None:
-            _dataset_reaper.register(self)
+        # The handle the constructor was given: pooled when the adapter can reopen
+        # (a restored source holds none yet; its first read opens one), else this
+        # adapter's own for life.
+        self._own: Optional[PooledHandle] = None
+        if dataset is not None:
+            handle = self._handle_for(dataset, dask_arr)
+            if self._reopen is not None:
+                _dataset_pool.put(handle)
+            else:
+                self._own = handle
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The acquisition's axes, shape and dtype: what opening it (every stack
+        file, and a dask graph over them) is done for before a descriptor can be
+        made. The summary metadata is the row's. ``None`` for a remote store."""
+        if is_remote_url(self._source_url):
+            return None
+        return {
+            "axes": list(self._axes),
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype,
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: SourceConfig,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> NdTiffAdapter:
+        """Rebuild with no dataset open: the acquisition is opened by the first read
+        (``_open``), as it is after the pool has closed an idle one."""
+        reopen = cls._dataset_opener(
+            url=source.url,
+            is_remote=source.is_remote,
+            credentials_config=credentials_config,
+            credentials_profile=source.credentials_profile,
+        )
+        return cls(
+            dataset=None,
+            source_id=source.source_id or "",
+            source_url=str(source.url),
+            reopen=reopen,
+            structure=payload,
+            summary=metadata,
+        )
+
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter."""
         return TensorDescriptor(
             array_id=self.array_id,
@@ -396,9 +435,9 @@ class NdTiffAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
         """List all tensors - single tensor source."""
-        return [catalog_entry(self.get_tensor_descriptor())]
+        return [catalog_entry(self._native_descriptor())]
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -419,91 +458,70 @@ class NdTiffAdapter(TensorAdapter):
             Numpy array with data within the requested bounds
         """
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
-        with self._io_lock:
-            dask_arr = self._ensure_dask_arr()
-            self._persistent_last_access = time.monotonic()
-            return dask_arr[slices].compute()
+        with self._leased() as handle, handle.lock:
+            return handle.value[1][slices].compute()
 
-    def _ensure_dask_arr(self):
-        """Return the dask array, reopening the acquisition if the reaper closed it.
+    def _pool_key(self):
+        return (self._source_url, self._content_version)
 
-        Caller holds ``self._io_lock``. A reopen-capable adapter (created via
-        ``create_from_config``) rebuilds the whole ``NDTiffDataset`` and re-arms
-        the reaper; one handed a bare dataset has nothing to rebuild, so a read
-        after ``close()`` fails loudly instead.
-        """
-        if self._dask_arr is not None:
-            return self._dask_arr
-        if self._reopen is None:
-            raise RuntimeError(f"NDTiff source {self.source_id!r} is closed")
+    def _handle_for(self, dataset, dask_arr) -> PooledHandle:
+        return PooledHandle(
+            self._pool_key(), (dataset, dask_arr), lambda: _close_dataset(dataset)
+        )
+
+    def _open(self) -> PooledHandle:
+        """Reopen the whole acquisition as a handle the pool closes."""
         dataset = self._reopen()
-        self._dataset = dataset
-        self._dask_arr = dataset.as_array()
-        self._persistent_last_access = time.monotonic()
-        _dataset_reaper.register(self)
-        return self._dask_arr
+        return self._handle_for(dataset, dataset.as_array())
+
+    @contextmanager
+    def _leased(self):
+        """Lease the open acquisition, reopening it if the pool closed it. An
+        adapter handed a bare dataset has nothing to rebuild, so a read after
+        ``close()`` fails loudly instead."""
+        if self._reopen is None:
+            if self._own is None:
+                raise RuntimeError(f"NDTiff source {self.source_id!r} is closed")
+            yield self._own
+            return
+        with _dataset_pool.checkout(self._pool_key(), self._open) as handle:
+            yield handle
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the MicroManager summary metadata.
 
         ``PixelSize_um`` (isotropic X/Y) and the z-step, projected onto the
         ``x`` / ``y`` / ``z`` axes; position / time / channel axes get
-        ``0.0`` / ``""``. Reads the same summary dict :meth:`get_metadata`
-        returns.
+        ``0.0`` / ``""``. Reads the summary snapshot taken at construction.
         """
-        return mm_summary_scale(self.get_metadata(), self.dim_labels)
+        return mm_summary_scale(self._summary_metadata, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return dataset summary metadata (MicroManager acquisition settings).
 
         Served from the snapshot taken at registration, so it stands even after
-        the reaper has closed the underlying dataset.
+        the pool has closed the underlying dataset.
         """
-        return self._summary_metadata
+        return metadata_record(self._summary_metadata)
 
     # ---- lifecycle ----------------------------------------------------------
 
-    def _release_persistent_handle(self) -> None:
-        """Close the acquisition's per-file readers; permit a later reopen.
-
-        ``NDTiffDataset.__init__`` eagerly opens *every* ``NDTiffStack_*.tif`` in
-        the acquisition, so one registered source pins as many fds as the
-        acquisition has files -- routinely hundreds, which on Windows makes the
-        whole folder undeletable. Upstream's ``close()`` closes every reader; the
-        dask array must go first because its graph holds the dataset.
-
-        This is the shared reaper's release hook (called under ``_io_lock`` once
-        the source has been idle past the TTL) and also backs the explicit
-        ``close()``. It leaves ``self._reopen`` intact, so a reaper close is
-        transparent to a later read; ``close()`` is the same drop with teardown
-        intent. Caller holds ``_io_lock`` (reaper/close) or is the GC finalizer.
-        """
-        self._dask_arr = None
-        dataset = self._dataset
-        self._dataset = None
-        _dataset_reaper.discard(self)
-        _close_dataset(dataset)
-
     def close(self) -> None:
-        """Release the dataset's per-file readers on teardown (biopb/biopb#71).
+        """Release the acquisition's per-file readers on teardown (biopb/biopb#71).
 
-        The handles stay persistent between reads rather than being reopened per
-        read (unlike hdf5/mrc): the reopen unit here is the *whole* acquisition,
-        so a per-read reopen would open thousands of files to serve one plane. The
-        idle reaper bounds the steady-state pin; this releases it deterministically
-        on unregister/shutdown.
+        ``NDTiffDataset.__init__`` eagerly opens *every* ``NDTiffStack_*.tif``, so
+        one registered source pins as many fds as the acquisition has files --
+        routinely hundreds, which on Windows makes the whole folder undeletable.
+        The pooled dataset is closed at its last lease; the pool's TTL bounds the
+        steady-state pin and this releases it deterministically on
+        unregister/shutdown.
         """
-        with self._io_lock:
-            self._release_persistent_handle()
-
-    def __del__(self):
-        # GC backstop: release the fds even without an explicit close(). Fires
-        # only when the adapter is unreferenced -- so no read is in flight, and
-        # the release hook's brief reaper-lock take (discard) can't re-enter a
-        # lock this thread already holds.
-        try:
-            self._release_persistent_handle()
-        except Exception:
-            pass
+        if self._reopen is not None:
+            _dataset_pool.drop(self._pool_key())
+        elif self._own is not None:
+            own, self._own = self._own, None
+            own.close()

@@ -11,12 +11,11 @@ import sys
 import pytest
 
 from biopb_mcp._config import McpConfig
-from biopb_mcp.mcp import __main__ as launcher
+from biopb_mcp.mcp import __main__ as launcher, _session_mode
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _decide_viewer,
     _has_display,
-    _is_agentless,
     _parse_args,
     _register_session,
     _setup_chat,
@@ -107,19 +106,28 @@ class TestMainDispatch:
         monkeypatch.setattr(cfg, "load_config", dict)
 
     def test_stdio_runs_the_shim(self, monkeypatch):
-        from biopb_mcp.mcp import _shim
+        from biopb import _shim
 
         calls = []
-        monkeypatch.setattr(
-            _shim, "serve", lambda config, port: calls.append((config, port))
-        )
+        monkeypatch.delenv("BIOPB_SESSION", raising=False)
+        monkeypatch.setattr(_shim, "serve", lambda session=None: calls.append(session))
         assert main(["--transport", "stdio", "--port", "9123"]) == 0
-        assert calls == [({}, 9123)]
+        assert calls == [None]
+
+    def test_stdio_session_comes_from_the_flag_or_the_environment(self, monkeypatch):
+        from biopb import _shim
+
+        calls = []
+        monkeypatch.setattr(_shim, "serve", lambda session=None: calls.append(session))
+        monkeypatch.setenv("BIOPB_SESSION", "from-env")
+        main(["--transport", "stdio"])
+        main(["--transport", "stdio", "--session", "new"])
+        assert calls == ["from-env", "new"]
 
     def test_stdio_bridge_failure_exits_nonzero(self, monkeypatch):
-        from biopb_mcp.mcp import _shim
+        from biopb import _shim
 
-        def _boom(config, port):
+        def _boom(session=None):
             raise TimeoutError("daemon never came up")
 
         monkeypatch.setattr(_shim, "serve", _boom)
@@ -163,6 +171,32 @@ class TestMainDispatch:
         )
         assert main(["--view"]) == 0
         assert calls == [True]
+
+
+class TestWithdrawUnusableTools:
+    class _Mcp:
+        def __init__(self):
+            self.removed = []
+
+        def remove_tool(self, name):
+            self.removed.append(name)
+
+    def test_a_session_without_a_viewer_loses_take_screenshot(self):
+        from biopb_mcp.mcp.__main__ import _withdraw_unusable_tools
+        from biopb_mcp.mcp._kernel_env import ViewerMode
+
+        mcp = self._Mcp()
+        _withdraw_unusable_tools(mcp, ViewerMode.none("no display"))
+        assert mcp.removed == ["take_screenshot"]
+
+    def test_a_session_with_a_window_keeps_every_tool(self):
+        from biopb_mcp.mcp.__main__ import _withdraw_unusable_tools
+        from biopb_mcp.mcp._kernel_env import ViewerMode
+
+        mcp = self._Mcp()
+        _withdraw_unusable_tools(mcp, ViewerMode.real())
+        _withdraw_unusable_tools(mcp, ViewerMode.virtual(":99"))
+        assert mcp.removed == []
 
 
 class TestHasDisplay:
@@ -216,28 +250,27 @@ class TestDecideViewer:
         return {"viewer": viewer}
 
     def test_a_viewer_by_default(self, host):
-        assert _decide_viewer(self._config()) == (None, False)
+        assert _decide_viewer(self._config()).kind == "real"
 
     def test_config_turns_it_off(self, host):
-        reason, virtual = _decide_viewer(self._config(enabled=False))
-        assert "viewer.enabled" in reason and virtual is False
+        mode = _decide_viewer(self._config(enabled=False))
+        assert mode.kind == "none" and "viewer.enabled" in mode.reason
 
     def test_none_without_napari(self, host):
         host["napari"] = False
-        reason, _ = _decide_viewer(self._config())
-        assert "biopb-mcp[napari]" in reason
+        assert "biopb-mcp[napari]" in _decide_viewer(self._config()).reason
 
     def test_no_display_means_no_viewer_not_xvfb(self, host):
         host["display"] = False
-        reason, virtual = _decide_viewer(self._config())
-        assert "no display" in reason and virtual is False
+        mode = _decide_viewer(self._config())
+        assert mode.kind == "none" and "no display" in mode.reason
 
     def test_xvfb_only_when_the_config_opts_in(self, host):
         host["display"] = False
-        assert _decide_viewer(self._config(virtual_display=True)) == (None, True)
+        assert _decide_viewer(self._config(virtual_display=True)).kind == "virtual"
 
     def test_view_overrides_the_config(self, host):
-        assert _decide_viewer(self._config(enabled=False), view=True) == (None, False)
+        assert _decide_viewer(self._config(enabled=False), view=True).kind == "real"
 
     @pytest.mark.parametrize("missing", ["napari", "display"])
     def test_view_fails_where_it_cannot_have_a_window(self, host, missing):
@@ -327,37 +360,35 @@ class TestSetupChat:
         ids=["partial", "full"],
     )
     def test_it_mounts_for_a_viewer(self, cfg, mounted):
-        assert _setup_chat(cfg, agentless=True) is True
+        assert _setup_chat(cfg, mode="durable") is True
         assert mounted == [1]
 
     def test_it_mounts_nothing_for_a_harness_session(self, mounted):
         cfg = {"observe": {"enabled": True, "chat_enabled": True}}
-        assert _setup_chat(cfg, agentless=False) is False
+        assert _setup_chat(cfg, mode="direct") is False
         assert mounted == []
 
     def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
         cfg = {"observe": {"enabled": True, "chat_enabled": False}}
-        assert _setup_chat(cfg, agentless=True) is False
+        assert _setup_chat(cfg, mode="durable") is False
         assert mounted == []
 
     @pytest.mark.parametrize(
-        "cfg, agentless, expected",
+        "cfg, mode, expected",
         [
-            ({"observe": {"enabled": True, "chat_enabled": True}}, True, True),
-            ({"observe": {"enabled": True, "chat_enabled": True}}, False, False),
-            ({"observe": {"enabled": True, "chat_enabled": False}}, True, False),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, "durable", True),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, "direct", False),
+            ({"observe": {"enabled": True, "chat_enabled": False}}, "durable", False),
         ],
     )
-    def test_it_publishes_the_verdict_on_api_status(
-        self, mounted, cfg, agentless, expected
-    ):
+    def test_it_publishes_the_verdict_on_api_status(self, mounted, cfg, mode, expected):
         # The control's dashboard labels a session's link by what it serves, and
         # reads that off /api/status. Set on every path, so a session that never
         # mounted chat -- or failed to -- reads as off rather than stale.
         from biopb_mcp.mcp import _observe
 
         _observe.set_chat_enabled(not expected)  # a value that must be overwritten
-        assert _setup_chat(cfg, agentless=agentless) is expected
+        assert _setup_chat(cfg, mode=mode) is expected
         assert _observe._chat_enabled is expected
 
     def test_setup_observe_hands_over_the_session_teardown(self, monkeypatch):
@@ -369,26 +400,25 @@ class TestSetupChat:
         calls = []
         _setup_observe(
             {"observe": {"enabled": True}},
-            agentless=True,
+            mode="durable",
             on_shutdown=lambda: calls.append(1),
         )
-        assert _observe._agentless is True
+        assert _observe._mode == "durable"
         _observe._shutdown_hook()
         assert calls == [1]
-        _observe.set_session_owns_its_reap(False)
+        _observe.set_session_mode("direct")
 
-    def test_setup_observe_gives_a_shim_child_no_teardown(self, monkeypatch):
-        # A shim-owned child is its shim's to reap; handing it a teardown here
-        # would let the web end a session an MCP client is still bridging to.
+    def test_setup_observe_wires_the_teardown_for_every_mode(self, monkeypatch):
+        # Every session can be stopped from the dashboard. A shim whose session
+        # is stopped sees it stop answering and unbinds.
         from biopb_mcp.mcp import _observe
 
-        _setup_observe(
-            {"observe": {"enabled": True}},
-            agentless=False,
-            on_shutdown=lambda: None,
-        )
-        assert _observe._agentless is False
-        assert _observe._shutdown_hook is None
+        for mode in ("durable", "direct"):
+            _setup_observe(
+                {"observe": {"enabled": True}}, mode=mode, on_shutdown=lambda: None
+            )
+            assert _observe._mode == mode
+            assert _observe._shutdown_hook is not None
 
     def test_a_failed_mount_reads_as_off(self, monkeypatch):
         from biopb_mcp.mcp import _chat_api, _observe
@@ -398,36 +428,44 @@ class TestSetupChat:
         )
         _observe.set_chat_enabled(True)
         cfg = {"observe": {"enabled": True, "chat_enabled": True}}
-        assert _setup_chat(cfg, agentless=True) is False
+        assert _setup_chat(cfg, mode="durable") is False
         assert _observe._chat_enabled is False
 
 
-class TestAgentless:
-    """Which sessions count as one a human opened.
+class TestSessionMode:
+    """How a launch is named, and what hangs off the name.
 
-    Two things hang off this and must not drift apart: such a session owns its
-    reap (the stop route), and it is the only kind served the built-in chat
-    loop. Pinned as a truth table rather than trusted to two inline expressions.
+    Pinned as a truth table rather than trusted to inline expressions: whether a
+    session mounts chat and publishes itself follows from its mode and must not
+    drift apart.
     """
 
     @pytest.mark.parametrize(
-        "view,shim_owned,port,expected",
+        "view,port,expected",
         [
             # `biopb mcp view`, on a dynamic or a chosen port.
-            (True, False, 0, True),
-            (True, False, 9000, True),
-            # The dashboard's new session: a plain http session on port 0.
-            (False, False, 0, True),
-            # A shim-owned child is serving an MCP client, whatever its port.
-            (False, True, 0, False),
-            (True, True, 0, False),
+            (True, 0, "durable"),
+            (True, 9000, "durable"),
+            # A session the control launched: a plain http session on port 0.
+            (False, 0, "durable"),
             # A direct `--transport http` launch on a fixed port: wired to
             # something by its operator, and publishes no session.
-            (False, False, 8765, False),
+            (False, 8765, "direct"),
         ],
     )
-    def test_truth_table(self, view, shim_owned, port, expected):
-        assert _is_agentless(view, shim_owned, port) is expected
+    def test_truth_table(self, view, port, expected):
+        assert _session_mode.of(view, port) == expected
+
+    @pytest.mark.parametrize(
+        "mode,chat,publishes",
+        [
+            ("durable", True, True),
+            ("direct", False, False),
+        ],
+    )
+    def test_what_follows_from_the_mode(self, mode, chat, publishes):
+        assert _session_mode.serves_chat(mode) is chat
+        assert _session_mode.publishes(mode) is publishes
 
 
 _URL = "http://127.0.0.1:45678/mcp"
@@ -435,7 +473,7 @@ _URL = "http://127.0.0.1:45678/mcp"
 
 class TestSessionRegistration:
     """Every session on a dynamic port publishes itself into the shared registry
-    the control reads (`biopb._sessions`). Without this a session is invisible:
+    the control reads (`biopb._lifecycle.sessions`). Without this a session is invisible:
     no dashboard entry, no observe page, no `/session/<id>/*` proxying."""
 
     @pytest.fixture(autouse=True)
@@ -443,7 +481,7 @@ class TestSessionRegistration:
         monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
 
     def test_registers_a_routable_record(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         assert session_id is not None
@@ -456,28 +494,26 @@ class TestSessionRegistration:
         # Nobody launched us, so there is no launch to attribute this to.
         assert "launch_token" not in rec
 
-    def test_a_shim_minted_id_is_used(self):
-        # The shim names the session's logfile with it, so the record must match.
-        from biopb import _sessions
-
-        assert (
-            _register_session(45678, _URL, "20260101-000000-7") == "20260101-000000-7"
-        )
-        assert _sessions.read_session("20260101-000000-7")["port"] == 45678
-
     def test_a_launchers_token_is_echoed_onto_the_record(self, monkeypatch):
         # How the control recognises the viewer it just spawned. It cannot use
         # the pid it holds: behind a Windows trampoline (uv / pip console-script
         # launchers) that is the stub's, not ours (biopb#1084).
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         rec = _sessions.read_session(
             _register_session(45678, _URL, launched_by="tok-abc123")
         )
         assert rec["launch_token"] == "tok-abc123"
 
+    def test_the_mode_is_recorded_on_the_record(self):
+        from biopb._lifecycle import sessions as _sessions
+
+        rec = _sessions.read_session(_register_session(45678, _URL, mode="durable"))
+        assert rec["mode"] == "durable"
+        assert "mode" not in _sessions.read_session(_register_session(45678, _URL))
+
     def test_registered_session_is_listed_as_live(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         # Our own pid owns the record, so the liveness prune must keep it --
@@ -485,7 +521,7 @@ class TestSessionRegistration:
         assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
 
     def test_unregister_removes_the_record(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         _unregister_session(session_id)
@@ -497,7 +533,7 @@ class TestSessionRegistration:
         _unregister_session(None)
 
     def test_publish_failure_costs_only_discoverability(self, monkeypatch):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         def _boom(*a, **k):
             raise OSError("read-only state dir")
@@ -507,7 +543,7 @@ class TestSessionRegistration:
         assert _register_session(45678, _URL) is None
 
     def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         def _boom(*a, **k):
             raise OSError("gone")

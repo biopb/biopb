@@ -18,12 +18,12 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import ZarrAdapter
 from biopb_tensor_server.core import (
+    adapter_base,
     adapter_base as _ab,
     cache_source as _cs,
     downsample as _ds,
 )
 from biopb_tensor_server.core.chunk import cache_key_for_chunk_id
-from biopb_tensor_server.core.normalize import NormalizingAdapter, normalize_adapter
 
 from tests.scaled_data_seam_test import _set_grid
 
@@ -99,29 +99,22 @@ class TestTheProbeKeysAreThePlansKeys:
         assert len(_probe_keys(adapter, (32, 32), (64, 64))) == 4
 
 
-class TestADelegatingWrapper:
-    """``NormalizingAdapter`` inherits ``get_scaled_data`` and delegates the
-    reads under it, so the extraction has to leave it on the same path it was on.
-    """
+class TestAPermutedAdapter:
+    """A non-canonical adapter plans, keys and reads in canonical order, so the
+    cache-sourced probe mints the same chunk_ids the plan did."""
 
     @pytest.fixture
-    def wrapped(self):
-        """A permuting wrapper: ``normalize_adapter`` hands back anything
-        already canonical unchanged, so a wrapper is always a permuting one."""
+    def permuted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            inner = _zarr(tmp, (32, 64), ("x", "y"))
-            wrapper = normalize_adapter(inner)
-            assert isinstance(wrapper, NormalizingAdapter)
-            yield wrapper, inner
+            adapter = _zarr(tmp, (32, 64), ("x", "y"))
+            assert adapter._axis_perm() is not None
+            yield adapter
 
-    def test_the_probe_runs_on_the_wrapper_and_the_delegates_version(
-        self, wrapped, cache, monkeypatch
+    def test_the_probe_runs_on_the_canonical_descriptor_and_the_adapters_version(
+        self, permuted, cache, monkeypatch
     ):
-        """What the mixin used to read off ``self`` now travels as arguments:
-        the wrapper's own (canonical) descriptor, and the version its delegate
-        owns."""
-        wrapper, inner = wrapped
-        monkeypatch.setattr(inner, "_content_version", b"v2")
+        adapter = permuted
+        monkeypatch.setattr(adapter, "_content_version", b"v2")
         seen = []
         sourced = _cs.cache_sourced_units
 
@@ -133,41 +126,32 @@ class TestADelegatingWrapper:
         monkeypatch.setattr(_ab, "cache_sourced_units", spy)
         bounds = ChunkBounds(start=[0, 0], stop=[64, 32])
 
-        wrapper.get_scaled_data(bounds, (4, 4), "area", cache)
+        adapter.get_scaled_data(bounds, (4, 4), "area", cache)
 
         assert len(seen) == 1
         descriptor, content_version = seen[0]
-        assert list(descriptor.dim_labels) == ["y", "x"], "the wrapper's own order"
-        assert content_version == inner.content_version == b"v2"
+        assert list(descriptor.dim_labels) == ["y", "x"]
+        assert content_version == adapter.content_version == b"v2"
 
-    def test_a_permuted_wrapper_declines_and_reads_the_source(
-        self, wrapped, cache, monkeypatch
-    ):
-        """Today's behaviour, pinned rather than endorsed (biopb/biopb#986).
-
-        The plan carries the *delegate's* chunk_ids verbatim, so a warm cache
-        holds native-order bounds; the probe mints canonical ones off the
-        wrapper's descriptor. The two never meet, the read falls back to the
-        source, and the pixels are right anyway -- which is why nothing has
-        noticed. Fixing it belongs with whoever reconciles the two orders.
-        """
-        wrapper, inner = wrapped
-        monkeypatch.setattr(inner, "get_transfer_chunk_size", lambda: (16, 32))
-        monkeypatch.setattr(wrapper, "get_transfer_chunk_size", lambda: (32, 16))
+    def test_a_warm_cache_serves_a_scaled_read(self, permuted, cache, monkeypatch):
+        adapter = permuted
+        monkeypatch.setattr(adapter_base, "transfer_chunk_size", lambda _d: (32, 16))
         monkeypatch.setattr(
-            type(inner), "read_block_shape", property(lambda self: None)
+            type(adapter), "read_block_shape", property(lambda self: None)
         )
-        for endpoint in wrapper.get_read_plan(TensorDescriptor()).chunk_endpoints:
-            wrapper.resolve_chunk_data(endpoint.chunk_id, cache)
+        for endpoint in adapter.get_read_plan(TensorDescriptor()).chunk_endpoints:
+            adapter.resolve_chunk_data(endpoint.chunk_id, cache)
         bounds = ChunkBounds(start=[0, 0], stop=[64, 32])
-        expected = _ds.downsample_block(wrapper.get_data(bounds), (4, 4), "area")
+        expected = _ds.downsample_block(adapter.get_data(bounds), (4, 4), "area")
         reads = []
-        native = inner.get_data
+        native = adapter.get_data
         monkeypatch.setattr(
-            inner, "get_data", lambda b: (reads.append(tuple(b.start)), native(b))[1]
+            adapter,
+            "get_data",
+            lambda b: (reads.append(tuple(b.start)), native(b))[1],
         )
 
-        out = wrapper.get_scaled_data(bounds, (4, 4), "area", cache)
+        out = adapter.get_scaled_data(bounds, (4, 4), "area", cache)
 
-        assert reads, "the probe misses, so the source is read"
+        assert not reads, "the probe hits the warm chunks"
         assert np.array_equal(out, expected)

@@ -45,9 +45,10 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from biopb import _algorithms, _locations
-from biopb.lifecycle import winjob as _winjob
+from biopb._config import locations as _locations
+from biopb._lifecycle import winjob as _winjob
 
+from . import _registry
 from ._supervisor import (
     _BACKOFF_SCHEDULE,
     _HEALTHY_RESET_SECONDS,
@@ -142,7 +143,6 @@ class ScriptEntry(ServiceProcess):
         self._failures = 0
         self._restarts = 0
         self._next_attempt_at = 0.0
-        self._log_rotated = False
 
     # --- ServiceProcess -------------------------------------------------- #
 
@@ -167,10 +167,6 @@ class ScriptEntry(ServiceProcess):
 
     def _probe_target(self) -> tuple[str, int]:
         return "127.0.0.1", self._port
-
-    def _open_log(self):
-        self._log_rotated = True
-        return super()._open_log()
 
     # The server is uv's child, not the process spawned, so a stop takes the
     # whole tree: the process group on POSIX (the child leads its own
@@ -205,12 +201,10 @@ class ScriptEntry(ServiceProcess):
             return None
         return data if isinstance(data, dict) and "hash" in data else None
 
-    def _append_log(self, text: str) -> None:
-        if not self._log_rotated:
-            _locations.rotate_log(self._log)
-            self._log_rotated = True
-        with open(self._log, "a", encoding="utf-8") as fh:
-            fh.write(text)
+    def _append_log(self, data: str | bytes) -> None:
+        sink = self._open_log()
+        if sink is not None:
+            sink.write(data.encode() if isinstance(data, str) else data)
 
     def _fail(self, what: str, file_hash: Optional[str]) -> None:
         lines, _truncated = tail_file(self._log, ERROR_TAIL_LINES, _LOG_TAIL_MAX_BYTES)
@@ -220,18 +214,25 @@ class ScriptEntry(ServiceProcess):
         logger.warning("algorithm %s: %s", self.name, what)
 
     def _run_step(
-        self, argv: list[str], timeout: float, *, stdout=None
+        self, argv: list[str], timeout: float, *, capture: bool = False
     ) -> subprocess.CompletedProcess:
+        """Run one install step, its output going to the log. ``capture`` keeps
+        stdout for the caller and logs only stderr."""
         self._append_log(f"\n--- control: {' '.join(argv)} ---\n")
-        with open(self._log, "ab") as log:
-            return subprocess.run(
+        try:
+            done = subprocess.run(
                 argv,
                 stdin=subprocess.DEVNULL,
-                stdout=stdout if stdout is not None else log,
-                stderr=log,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE if capture else subprocess.STDOUT,
                 timeout=timeout,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            self._append_log((exc.stderr if capture else exc.stdout) or b"")
+            raise
+        self._append_log((done.stderr if capture else done.stdout) or b"")
+        return done
 
     def _install(self) -> None:
         """Lock, sync and describe the file as it is now. Runs off the lock."""
@@ -251,7 +252,7 @@ class ScriptEntry(ServiceProcess):
             done = self._run_step(
                 [*self._uv, "run", *script, "--describe"],
                 DESCRIBE_TIMEOUT,
-                stdout=subprocess.PIPE,
+                capture=True,
             )
             if done.returncode != 0:
                 self._fail(f"--describe failed (exit {done.returncode})", file_hash)
@@ -434,7 +435,7 @@ class ScriptEntry(ServiceProcess):
             )
             oplist = cached["oplist"] if current else {}
             running = state in ("up", "starting") and self._proc is not None
-            return _algorithms.row(
+            return _registry.row(
                 {"name": self.name, "kind": "script", "url": None},
                 url=f"grpc://127.0.0.1:{self._port}" if running else None,
                 state=state,
@@ -476,7 +477,7 @@ class AlgorithmPlane:
     def _entries(self) -> list[dict]:
         """The registry now, with the script entries' supervisors kept in step:
         a new file gets one, and a removed file's server is stopped."""
-        listed = _algorithms.entries(self._directory)
+        listed = _registry.entries(self._directory)
         state_dir = self._state_dir or _locations.algorithms_state_dir()
         gone = []
         with self._lock:
@@ -507,18 +508,16 @@ class AlgorithmPlane:
 
     def _row(self, entry: dict, *, probe: bool, timeout: float) -> dict:
         if entry["error"]:
-            return _algorithms.row(entry, state="invalid")
+            return _registry.row(entry, state="invalid")
         if entry["kind"] == "script":
             with self._lock:
                 script = self._scripts.get(entry["name"])
             if script is not None:
                 return script.row()
-            return _algorithms.row(entry, state="new")
+            return _registry.row(entry, state="new")
         if not probe:
-            return _algorithms.row(entry)
-        return _algorithms.row(
-            entry, **_algorithms.probe(entry["url"], timeout=timeout)
-        )
+            return _registry.row(entry)
+        return _registry.row(entry, **_registry.probe(entry["url"], timeout=timeout))
 
     def rows(
         self,
@@ -534,7 +533,7 @@ class AlgorithmPlane:
         """
         if entries is None:
             entries = self._entries()
-        return _algorithms.sweep(
+        return _registry.sweep(
             entries, lambda e: self._row(e, probe=probe, timeout=timeout)
         )
 
@@ -547,6 +546,15 @@ class AlgorithmPlane:
         for script in scripts:
             script.start_install(retry_failed=False)
         return self.rows(entries=listed)
+
+    def register_url(self, url: str, name: Optional[str] = None) -> str:
+        """Add a url entry; answer its name. ValueError for a bad URL or name."""
+        return _registry.register_url(url, name, self._directory)
+
+    def deregister(self, name: str) -> None:
+        """Remove a url entry. KeyError if unknown, ValueError for a script entry."""
+        _registry.deregister(name, self._directory)
+        self._entries()
 
     def _find(self, name: str) -> tuple[Optional[dict], Optional[ScriptEntry]]:
         entry = next((e for e in self._entries() if e["name"] == name), None)

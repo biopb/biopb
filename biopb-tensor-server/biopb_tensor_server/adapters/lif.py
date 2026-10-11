@@ -23,6 +23,7 @@ BioIO and has no fallback path of its own.
 """
 
 import logging
+from collections import namedtuple
 from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -34,7 +35,9 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
@@ -42,6 +45,11 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -73,6 +81,63 @@ class _LifLayout:
     filename: str
     image_list: Tuple[Dict[str, Any], ...]
     offsets: Tuple[Tuple[int, int], ...]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """The layout as JSON: every image's ``image_list`` entry and byte offsets.
+
+        Raises ``TypeError`` for a value JSON cannot carry faithfully (the caller
+        then stores no payload and the file is parsed on a restart).
+        """
+        return {
+            "image_list": [_encode(info) for info in self.image_list],
+            "offsets": [[int(a), int(b)] for a, b in self.offsets],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any], filename: str) -> "_LifLayout":
+        """Rebuild a layout from :meth:`to_payload`; *filename* is where the file is now."""
+        return cls(
+            filename=filename,
+            image_list=tuple(_decode(info) for info in payload["image_list"]),
+            offsets=tuple((int(a), int(b)) for a, b in payload["offsets"]),
+        )
+
+
+def _encode(value: Any) -> Any:
+    """*value* as JSON-safe data that :func:`_decode` turns back into the same value.
+
+    ``readlif`` fills an ``image_list`` entry with namedtuples (``dims``), tuples,
+    and dicts keyed by int, none of which survive ``json`` as themselves.
+    """
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return {
+            "__namedtuple__": [type(value).__name__, list(value._fields)],
+            "values": [_encode(v) for v in value],
+        }
+    if isinstance(value, tuple):
+        return {"__tuple__": [_encode(v) for v in value]}
+    if isinstance(value, list):
+        return [_encode(v) for v in value]
+    if isinstance(value, dict):
+        return {"__dict__": [[_encode(k), _encode(v)] for k, v in value.items()]}
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"cannot store a {type(value).__name__} in a payload")
+
+
+def _decode(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_decode(v) for v in value]
+    if isinstance(value, dict):
+        if "__namedtuple__" in value:
+            name, fields = value["__namedtuple__"]
+            return namedtuple(name, fields)(*[_decode(v) for v in value["values"]])
+        if "__tuple__" in value:
+            return tuple(_decode(v) for v in value["__tuple__"])
+        return {_decode(k): _decode(v) for k, v in value["__dict__"]}
+    return value
 
 
 def read_layout(path: str) -> _LifLayout:
@@ -124,6 +189,7 @@ def _dtype_for(info: Dict[str, Any]) -> np.dtype:
     return np.dtype(np.uint8 if depth == 8 else np.uint16)
 
 
+@canonical_axes
 class LifAdapter(TensorAdapter):
     """Reads Leica LIF images through readlif, one tensor per image."""
 
@@ -167,6 +233,34 @@ class LifAdapter(TensorAdapter):
             source.source_id,
             layout=read_layout(path),
         )
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "LifAdapter":
+        """Rebuild from the row's parsed image list: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        return cls(
+            path,
+            source.source_id,
+            layout=_LifLayout.from_payload(payload["layout"], path),
+        )
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The parsed image list and offsets. Source-level only; ``None`` when the
+        list holds something JSON cannot carry back faithfully."""
+        if self.image_position is not None:
+            return None
+        try:
+            return {"layout": self._layout.to_payload()}
+        except TypeError:
+            logger.debug("LIF layout is not storable as a payload", exc_info=True)
+            return None
 
     def __init__(
         self,
@@ -215,25 +309,28 @@ class LifAdapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
+        return self._native_entries()
+
+    def _native_entries(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(len(self._layout.image_list))
         ]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         if self.image_position is not None:
             return self._descriptor_for(self.image_position)
-        entries = self.list_tensor_descriptors()
+        entries = self._native_entries()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no images",
                 reason="unknown_source",
             )
-        return self.get_tensor_adapter(entries[0].array_id).get_tensor_descriptor()
+        return self.get_tensor_adapter(entries[0].array_id)._native_descriptor()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> "LifAdapter":
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         position = self._position_for_field(field)
         cached = self._tensor_adapters.get(field)
         if cached is not None:
@@ -340,18 +437,24 @@ class LifAdapter(TensorAdapter):
         }
         return scale_by_label(self.dim_labels, values, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """This image's readlif-parsed acquisition summary."""
         if self.image_position is None:
-            return {"format": "lif", "images": len(self._layout.image_list)}
+            return metadata_record(
+                {"format": "lif", "images": len(self._layout.image_list)}
+            )
         info = self._layout.image_list[self.image_position]
-        return {
-            "format": "lif",
-            "name": info.get("name"),
-            "channels": info.get("channels"),
-            "bit_depth": list(info.get("bit_depth") or ()),
-            "settings": dict(info.get("settings") or {}),
-        }
+        return metadata_record(
+            {
+                "format": "lif",
+                "name": info.get("name"),
+                "channels": info.get("channels"),
+                "bit_depth": list(info.get("bit_depth") or ()),
+                "settings": dict(info.get("settings") or {}),
+            }
+        )
 
 
 __all__ = ["LifAdapter"]

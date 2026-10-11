@@ -17,7 +17,7 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer, ZarrAdapter
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 
 def _zarr_available() -> bool:
@@ -57,7 +57,7 @@ class TestTensorFlightClientRoundTrip:
             zarr_arr = zarr.open_array(zarr_path, mode="r")
             adapter = ZarrAdapter(zarr_arr, "test-tensor", ["y", "x"])
 
-            server = catalog_server("grpc://localhost:8890")
+            server = catalog_server("localhost:8890")
             register_and_catalog(server, "test-tensor", adapter)
 
             # Start server in background
@@ -77,38 +77,48 @@ class TestTensorFlightClientRoundTrip:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_list_sources(self, server_client):
         """Test listing sources."""
-        sources = server_client.list_sources()
-        assert "test-tensor" in sources
+        assert "test-tensor" in source_ids(server_client)
 
-        # DataSourceDescriptor contains tensor metadata
-        source_desc = sources["test-tensor"]
-        assert len(source_desc.tensors) == 1
-        assert source_desc.tensors[0].array_id == "test-tensor"
-        assert list(source_desc.tensors[0].shape) == [128, 128]
-
-    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_source_answers_one_id(self, server_client):
-        """The addressed counterpart of list_sources: same descriptor, one row."""
-        desc = server_client.get_source("test-tensor")
-        assert desc is not None
-        assert desc.source_id == "test-tensor"
-        assert [t.array_id for t in desc.tensors] == ["test-tensor"]
-        assert list(desc.tensors[0].shape) == [128, 128]
+        # The sources row carries tensor metadata
+        (row,) = server_client.query(
+            "SELECT tensors FROM sources WHERE source_id = 'test-tensor'",
+            format="records",
+        )
+        assert len(row["tensors"]) == 1
+        assert row["tensors"][0]["array_id"] == "test-tensor"
+        assert list(row["tensors"][0]["shape"]) == [128, 128]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_source_is_none_for_an_unknown_id(self, server_client):
-        assert server_client.get_source("no-such-source") is None
+    def test_query_answers_one_id(self, server_client):
+        """The addressed query: one row for one id."""
+        (row,) = server_client.query(
+            "SELECT source_id, tensors FROM sources WHERE source_id = 'test-tensor'",
+            format="records",
+        )
+        assert row["source_id"] == "test-tensor"
+        assert [t["array_id"] for t in row["tensors"]] == ["test-tensor"]
+        assert list(row["tensors"][0]["shape"]) == [128, 128]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_query_is_empty_for_an_unknown_id(self, server_client):
+        assert (
+            server_client.query(
+                "SELECT source_id FROM sources WHERE source_id = 'no-such-source'",
+                format="records",
+            )
+            == []
+        )
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_the_catalog_is_never_snapshotted_client_side(self, server_client):
-        """Neither call caches anything, source-keyed or otherwise.
+        """Neither query caches anything, source-keyed or otherwise.
 
         "What does this server hold?" is a question only the server can answer;
         a local copy goes stale the moment anything registers.
         """
         client = server_client
-        client.list_sources()
-        client.get_source("test-tensor")
+        source_ids(client)
+        client.query("SELECT * FROM sources WHERE source_id = 'test-tensor'")
 
         assert not hasattr(client._catalog._state, "sources")
         assert not hasattr(client._catalog._state, "descriptors")
@@ -266,7 +276,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "mean-preserve", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8893")
+            server = TensorFlightServer("localhost:8893")
             server.register_source("mean-preserve", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -314,7 +324,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "linear", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8894")
+            server = TensorFlightServer("localhost:8894")
             server.register_source("linear", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -354,7 +364,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "nearest-edge", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8892")
+            server = TensorFlightServer("localhost:8892")
             server.register_source("nearest-edge", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -477,11 +487,11 @@ class TestTensorFlightClientRoundTrip:
         )
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import SliceHint
+        from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        # The requested slice rides the plan's app_metadata.
+        # The whole request rides the plan's app_metadata.
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        requested = SliceHint.FromString(info.app_metadata)
+        requested = TensorReadOption.FromString(info.app_metadata).slice_hint
         assert list(requested.start) == [0, 0]
         assert list(requested.stop) == [64, 64]
 
@@ -501,13 +511,17 @@ class TestTensorFlightClientRoundTrip:
         )
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 
-        # Verify scale_hint in the plan's descriptor
+        # The scale and method are in the request the plan records, and the
+        # descriptor does not echo them back.
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        assert list(
-            TensorDescriptor.FromString(info.descriptor.command).scale_hint
-        ) == [2, 2]
+        request = TensorReadOption.FromString(info.app_metadata)
+        assert list(request.scale_hint) == [2, 2]
+        assert request.reduction_method == "nearest"
+        descriptor = TensorDescriptor.FromString(info.descriptor.command)
+        assert not descriptor.scale_hint
+        assert not descriptor.reduction_method
 
         # Reconstruct and verify downscaled shape
         darr = TensorFlightClient.tensor_from_pb(pb)
@@ -518,10 +532,9 @@ class TestTensorFlightClientRoundTrip:
         assert darr[32:, 32:].compute().mean() == 40.0
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_get_tensor_pb_is_a_deprecated_alias(self, server_client):
+    def test_get_tensor_output_pb(self, server_client):
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
-        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
-            pb = server_client.get_tensor_pb("test-tensor")
+        pb = server_client.get_tensor("test-tensor", output="pb")
 
         assert isinstance(pb, SerializedTensor)

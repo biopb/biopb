@@ -6,8 +6,8 @@ already-resident calibration metadata into the compact per-dimension
 carries (see ``TensorAdapter._physical_scale``). Kept here so the
 DICOM / TIFF / MicroManager adapters share one implementation of the
 label-mapping tail and the unit canonicalisation instead of each reinventing
-it. The NIfTI and HDF5 adapters map positionally (their calibration vectors are
-already axis-aligned) and so build their vectors directly rather than through
+it. The NIfTI adapter maps positionally (its calibration vector is
+already axis-aligned) and so builds its vector directly rather than through
 :func:`scale_by_label`.
 """
 
@@ -60,6 +60,16 @@ _UNIT_TO_UM: Dict[str, Optional[float]] = {
     "in": 25400.0,
     '"': 25400.0,
 }
+
+
+def scale_to_payload(scale):
+    """A physical scale as JSON: ``[[sizes], [units]]``, or None."""
+    return None if scale is None else [list(scale[0]), list(scale[1])]
+
+
+def scale_from_payload(scale):
+    """The inverse of :func:`scale_to_payload`."""
+    return None if scale is None else (list(scale[0]), list(scale[1]))
 
 
 def unit_to_um(unit) -> Optional[float]:
@@ -158,3 +168,30 @@ def mm_summary_scale(summary, dim_labels) -> Optional[Tuple[List[float], List[st
     pixel_um = _first_positive(("PixelSize_um", "PixelSizeUm", "PixelSize_um_"))
     z_um = _first_positive(("z-step_um", "zStep_um", "z_step_um", "Z-step_um"))
     return scale_by_label(dim_labels, {"x": pixel_um, "y": pixel_um, "z": z_um}, MICRON)
+
+
+def inherit_scale(parent, desc) -> None:
+    """Give *desc* the physical scale of the tensor *parent*, axis by axis.
+
+    An uploaded tensor or label set is source-scoped: it carries no calibration
+    of its own and takes its image's, matched by axis label (case-insensitive).
+    An axis the two do not share stays uncalibrated, and nothing is set when
+    the parent has no calibration or none of its axes appear in *desc*.
+    """
+    shown = parent.get_tensor_descriptor()
+    parent._fill_physical_scale(shown)
+    by_label = {
+        str(label).lower(): (size, unit)
+        for label, size, unit in zip(
+            shown.dim_labels,
+            shown.physical_scale,
+            shown.physical_unit,
+            strict=False,
+        )
+        if size > 0
+    }
+    pairs = [by_label.get(str(label).lower(), (0.0, "")) for label in desc.dim_labels]
+    if not any(size for size, _ in pairs):
+        return
+    desc.physical_scale[:] = [size for size, _ in pairs]
+    desc.physical_unit[:] = [unit for _, unit in pairs]

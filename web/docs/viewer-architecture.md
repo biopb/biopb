@@ -14,7 +14,7 @@ own design see [roi-annotations-ui.md](roi-annotations-ui.md).
 | `store/tensorView.ts`, `views.ts`, `roi.ts` | The per-tensor record and its LRU; ROI and label-overlay actions; ROI selectors and the scope-landing reducer |
 | `store/runtime.ts` | What only a mounted viewer observes, and the derived contrast selectors |
 | `store/slice.ts` | `PositionState`/`DisplayState`, `moved`, `sliceKey` |
-| `store/connection.ts`, `recents.ts`, `jobs.ts`, `preferences.ts` | Client and catalog poll; recents; resolve/warm jobs; preferences and channel colours |
+| `store/connection.ts`, `recents.ts`, `jobs.ts`, `preferences.ts` | Client and catalog poll; recents; resolve jobs; preferences and channel colours |
 | `components/TileViewer.tsx` | 2-D viewer: composes the hooks below and renders |
 | `components/VivStage.tsx` | The deck.gl half: view state, layers, camera mirror |
 | `components/SliceControls.tsx` | Axis sliders, 2-D/3-D toggle, contrast/gamma/colour |

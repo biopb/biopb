@@ -17,16 +17,20 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
-from biopb import _tls_material, _tls_record, _web_auth
-from biopb._fs_detect import unsafe_cache_dir_reason
-from biopb._locations import tensor_catalog_path, tls_server_cert
-from biopb.lifecycle import deathwatch as _deathwatch
+from biopb._config.locations import tensor_catalog_path, tls_server_cert
+from biopb._lifecycle import deathwatch as _deathwatch
+from biopb._security import (
+    tls_material as _tls_material,
+    tls_record as _tls_record,
+    web_auth as _web_auth,
+)
+from biopb.tensor._fs_detect import unsafe_cache_dir_reason
 from biopb.tensor._location import realign_transport_scheme
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
 
-from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
+from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters._handle_reaper import set_handle_reaper_ttl
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
 from biopb_tensor_server.cache import CacheManager
@@ -34,11 +38,13 @@ from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
     _read_config_file,
+    default_write_dir,
     load_config,
     validate_config_dict,
 )
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.retention import active_decode_rates
+from biopb_tensor_server.core.ticket_seal import load_seal_key
 from biopb_tensor_server.logging_config import (
     get_log_level_from_env,
     setup_logging,
@@ -47,8 +53,8 @@ from biopb_tensor_server.serving.http_server import run as run_http_server
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
-from biopb_tensor_server.serving.upload_manager import write_dir_under_root
 from biopb_tensor_server.sources.resolve import resolve_all_sources
+from biopb_tensor_server.sources.roots import RootKind
 from biopb_tensor_server.sources.source_manager import create_source_manager
 
 app = typer.Typer(
@@ -83,17 +89,9 @@ DEFAULT_FLIGHT_PORT = 8815
 def _print_verbatim(*rows: Tuple[str, object]) -> None:
     """Print a ``label: value`` block the operator will copy byte-for-byte.
 
-    Cert paths and fingerprints get pasted into a mount, an ``scp``, or a
-    client's trust config, so Rich's two conveniences become corruption:
+    Used to print cert paths and fingerprints so they can be copied and
+    get pasted into a mount, an ``scp``, or a client's trust config.
 
-    * it hard-wraps at the terminal width, splitting a long path mid-component
-      into something unusable that still *looks* like a path;
-    * it eats square brackets as style tags, so a state dir named
-      ``st[ate]dir`` prints as ``stdir`` -- a **wrong** path rendered as
-      confidently as a right one -- and rewrites the fingerprint's
-      colon-delimited hex pairs (``:cd:`` -> a CD emoji).
-
-    So: ``soft_wrap`` on, and markup/emoji/highlight off.
     """
     for label, value in rows:
         console.print(
@@ -135,20 +133,11 @@ def _resolve_flight_token(
     """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
     public bind.
 
-    The flight bind (``--host``, loopback by default) is the mode switch: a
-    loopback bind is **local mode** (tokenless, same-machine only); any
-    public bind is **remote mode** and MUST carry a token, so a public bind with
-    none supplied auto-generates one rather than serving the data API open.
-
     ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the deliberate,
     insecure escape hatch: it forces **tokenless** operation even on a public bind
     -- for a host-loopback-published Docker container (or any trusted network)
     where the token is pure friction. It only takes effect when no token is
-    otherwise supplied; a real ``--token`` / env token still wins. Off by default,
-    so the fail-closed guarantee is unchanged unless it is explicitly set.
-
-    Shared by ``serve`` and ``launch``; ``launch`` layers its sidecar fail-closed
-    check on top of the returned token (see ``_resolve_launch_token``).
+    otherwise supplied.
 
     Returns the effective token (``None`` = local mode).
     """
@@ -237,12 +226,7 @@ def _resolve_external_location(
 ) -> Optional[str]:
     """Resolve the address advertised via ``health`` (biopb/biopb#1158).
 
-    Required/fail-loud on a public bind, mirroring the embedded cache's own
-    rule (``_resolve_tensor_external_location`` in
-    ``biopb_image_base/server.py``) -- there is no way to guess a reachable
-    address for a wildcard bind. A loopback bind advertises nothing: the
-    fallback (a client uses whatever address it dialed) is already correct
-    for local mode, where every consumer is on this machine.
+    Required/fail-loud on a public bind. A loopback bind advertises nothing.
 
     ``port`` is for the error message's example address (the actual bind
     location). ``tls_cert_chain`` also keeps a supplied shorthand scheme aligned
@@ -264,9 +248,7 @@ def _resolve_external_location(
         return aligned
     if not _host_is_public(host):
         return None
-    example = _grpc_location(host, port)
-    if tls_cert_chain is not None:
-        example = example.replace("grpc://", "grpcs://", 1)
+    example = _flight_url(host, port, tls_cert_chain is not None)
     console.print(
         f"[red]--external-location is required when --host is a public bind "
         f"({host!r}). Set it to the externally reachable address a remote "
@@ -414,152 +396,21 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
             console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
 
 
-def _is_bare_host_upstream(source: SourceConfig) -> bool:
-    """True for a bare-host ``grpc://host:port`` tensor-server upstream (no ``/<id>``).
-
-    Only the bare-host "mirror everything" form has an upstream catalog to
-    re-list; a single-source ``grpc://host:port/<id>`` names exactly one source
-    and is registered directly. Mirrors the ``monitored_upstreams`` filter in
-    ``source_manager.create_source_manager``.
-    """
-    if not source.is_remote:
-        return False
-    if not source.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
-        return False
-    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
-
-    return _split_grpc_url(source.url)[1] is None
-
-
-def _resolve_serve_sources(
-    server_config: ServerConfig,
-    registry: Optional[AdapterRegistry] = None,
-) -> Tuple[List[SourceConfig], List[SourceConfig]]:
-    """Partition configured sources for the serve path.
-
-    Returns ``(static_sources, monitored_sources)``.
-
-    Local ``monitor = true`` directories are NOT expanded here: they are
-    (re)discovered by the bootstrap rescan, so expanding them at startup only
-    walks the tree an extra time before the server binds and crashes on a
-    not-yet-mounted directory (biopb/biopb#54). Remote monitor entries and
-    non-monitored entries are expanded as before; a single-file ``monitor=true``
-    entry is registered statically (with a warning) instead of being silently
-    dropped, and a missing/broken static source is warned-and-skipped rather
-    than aborting startup.
-    """
-    to_expand: List[SourceConfig] = []  # entries run through discover_sources
-    monitored_sources: List[SourceConfig] = []
-
-    for s in server_config.sources:
-        # The ``monitor`` flag alone decides live monitoring -- identically for
-        # cloud and non-cloud roots. ``cloud`` only controls *gating* (admit
-        # dehydrated placeholders as unresolved sources); it no longer forces a
-        # root onto the monitored pipeline. So a cloud root with monitor=false is
-        # scanned once at startup via the static-expand path (cloud-gated there
-        # too), exactly like any other monitor=false directory.
-        if s.monitor and not s.is_remote:
-            local_path = s.local_path
-            # local_path cannot be None here -- both is_remote and local_path
-            # derive from _is_remote_url(url), so `not is_remote` guarantees a
-            # resolved path. Guard anyway: if that invariant ever broke, a None
-            # path must NOT be registered as a monitored directory. Route it to
-            # the expansion path, which validates it (and skips under tolerant).
-            if local_path is None:
-                to_expand.append(s)
-                continue
-            if local_path.is_file():
-                # Files cannot be live-monitored: register as a static source
-                # instead of silently dropping it.
-                logger.warning(
-                    "Cannot live-monitor a single file; registering it as a "
-                    "static source: %s",
-                    s.url,
-                )
-                to_expand.append(s)
-                continue
-            if not local_path.exists():
-                # Not-yet-mounted dir: skip the (crashing) expansion. The
-                # periodic rescan picks it up when it appears (self-healing).
-                logger.warning(
-                    "Monitored path does not exist yet; will start monitoring "
-                    "when it appears: %s",
-                    s.url,
-                )
-            # A local `alias` sets a catalog tree-root, but that override is
-            # display-only and non-durable: a monitored directory is re-discovered
-            # under its native path on every rescan and re-merges into the shared
-            # tree, so the alias root would flicker away on the first rescan. Ignore
-            # it loudly rather than pretend it holds. (Honored fine for a static /
-            # monitor=false root, and for a monitor=true single *file* -- which is
-            # registered static, above -- neither of which is rescanned.)
-            if s.alias:
-                logger.warning(
-                    "Ignoring 'alias' tree-root %r on monitored directory %s: a "
-                    "monitored root re-merges into the shared path tree on rescan. "
-                    "Drop 'monitor' to keep the alias as its own catalog root.",
-                    s.alias,
-                    s.url,
-                )
-            monitored_sources.append(s)  # directory (or not-yet-mounted dir)
-            continue
-
-        # A bare-host tensor-server upstream ("mirror everything") is ALWAYS routed
-        # to the background seeded re-list, regardless of `monitor`. Inline
-        # expansion registers every mirrored source through a blocking per-source
-        # upstream get_descriptor RPC *before* mark_ready(), which both keeps the
-        # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
-        # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
-        # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
-        # seeds the entire catalog in ONE upstream query (no per-source RPC,
-        # biopb/biopb#266) and runs in the background, so the server reaches SERVING
-        # immediately and the mirror fills progressively -- exactly like a monitored
-        # local directory. `monitor=false` on a bare-host upstream is not "static":
-        # it just means the adaptive cadence reconciles once at the boot tick and
-        # then backs off toward full_rescan_interval, rather than never mirroring
-        # the upstream at all (biopb/biopb#178).
-        if _is_bare_host_upstream(s):
-            monitored_sources.append(s)
-            continue
-        # Remote monitor entries are also handed to create_source_manager.
-        if s.monitor:
-            monitored_sources.append(s)
-        to_expand.append(s)
-
-    # Expand only the non-monitored-dir entries. tolerant=True so one missing or
-    # broken static source is warned-and-skipped rather than killing the server.
-    sources = resolve_all_sources(
-        server_config, registry, sources=to_expand, tolerant=True
-    )
-
-    # Static sources: those NOT under a monitored directory (or remote sources).
-    # Still needed when a non-monitored entry's expansion lands under a
-    # monitored root. Remote sources are always static (no filesystem monitoring).
-    monitored_dirs = {
-        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
-    }
-    static_sources = [
-        s
-        for s in sources
-        if s.is_remote
-        or (
-            s.local_path
-            and not any(s.local_path.is_relative_to(md) for md in monitored_dirs)
-        )
-    ]
-    return static_sources, monitored_sources
-
-
-def _grpc_location(host: str, port: int) -> str:
-    """Build a ``grpc://`` URL, bracketing an IPv6 literal in the authority.
+def _host_port(host: str, port: int) -> str:
+    """``host:port``, bracketing an IPv6 literal in the authority.
 
     An IPv6 address contains ``:`` and must be wrapped in brackets to be a valid
-    URL authority, e.g. ``grpc://[::1]:8815``; IPv4 addresses and hostnames pass
-    through unchanged. Used for both the server bind location and the sidecar's
-    connect target so neither emits a malformed URL for an IPv6 host.
+    URL authority, e.g. ``[::1]:8815``; IPv4 addresses and hostnames pass through
+    unchanged. The server binds this form (it adds the scheme itself), and
+    :func:`_flight_url` prefixes the scheme a client dials.
     """
     authority = f"[{host}]" if isinstance(host, str) and ":" in host else host
-    return f"grpc://{authority}:{port}"
+    return f"{authority}:{port}"
+
+
+def _flight_url(host: str, port: int, tls: bool) -> str:
+    """The URL a client dials: ``grpcs://`` for a TLS server, else ``grpc://``."""
+    return f"{'grpcs' if tls else 'grpc'}://{_host_port(host, port)}"
 
 
 def _cert_expiry_date(cert_pem: bytes) -> str:
@@ -615,7 +466,7 @@ def _resolve_tls_material(
     # and by the shared rule, so what the control's preflight accepted is exactly
     # what this accepts.
     if tls_cert is not None:
-        from biopb._tls_material import TlsMaterialError, read_pem
+        from biopb._security.tls_material import TlsMaterialError, read_pem
 
         try:
             cert_pem = read_pem(tls_cert, "tls_cert")
@@ -684,7 +535,7 @@ def cert_init(
     reading off the fingerprint a client will pin on first connect (TOFU,
     biopb/biopb#604).
     """
-    from biopb._locations import tls_server_key
+    from biopb._config.locations import tls_server_key
 
     from biopb_tensor_server.serving.tls import (
         cert_fingerprint,
@@ -797,6 +648,8 @@ def _open_catalog(
             max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
             store_path=path,
             annotations_enabled=server_config.annotations.enabled,
+            checkpoint_threshold_mb=server_config.catalog.checkpoint_threshold_mb,
+            restore_sources=server_config.catalog.restore,
         )
         db.open()
         return db
@@ -833,6 +686,7 @@ def _setup_flight_server(
         server_config: Loaded server configuration
         host: Override host
         port: Override port
+        writable: Override the writable setting from the config file. If None, the config file decides.
         token: Access token for Flight server authentication
         tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
             together with ``tls_private_key`` (see ``TensorFlightServer``).
@@ -844,19 +698,13 @@ def _setup_flight_server(
 
     Returns:
         Tuple of (flight_server, source_manager, precache_worker)
-
-    Raises:
-        typer.Exit: If no sources configured or no sources loaded successfully
     """
-    # Apply overrides. `writable` is deliberately three-state: None means the
-    # caller expressed no opinion and the config file decides. Declaring the CLI
-    # option as a plain `bool` instead makes its absence indistinguishable from
-    # `--no-writable`, which silently pinned every config-driven deployment to
-    # read-only -- `server.writable: true` in the config had no effect at all,
-    # including for the control plane's supervised data plane, which passes no
-    # flag by design (biopb#1085).
     effective_writable = writable if writable is not None else server_config.writable
-    write_dir = server_config.write_dir
+    # Writable is the single switch the admin page can flip, so it also decides
+    # whether an unset write_dir has a default. A named one is always honored.
+    write_dir = server_config.write_dir or (
+        default_write_dir() if effective_writable else None
+    )
 
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
     # Off by default so recursive scans don't register screenshots/icons/movies.
@@ -866,16 +714,9 @@ def _setup_flight_server(
     # before any source registers, so it fully takes effect (biopb/biopb#71).
     set_handle_reaper_ttl(server_config.handle_reaper_ttl)
 
-    # Initialize cache manager for virtual chunks. The file cache mmaps its
-    # segments and assumes local-POSIX semantics (unlinked-but-mapped inodes
-    # stay alive, mapped pages never vanish). A network mount (NFS/CIFS) can
-    # SIGBUS/ESTALE a mapping to an evicted segment, and a cloud
-    # Files-On-Demand folder recalls a dehydrated segment on mmap read -- so
-    # classify the cache dir once and refuse to start rather than serve unsafe
-    # reads (biopb/biopb#571 follow-up). A cache dir that is not writable
-    # (e.g. read-only HPC scratch) fails the same way: the on-disk cache is
-    # required infrastructure now, not an optional accelerator with an
-    # in-memory fallback.
+    # The file cache needs safe mmaps semantics and be local. Check here once to
+    # reject network mounts (NFS/CIFS), cloud folders and unwritable directories
+    # before initializing the cache manager.
     cache_config = server_config.cache
     unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
     if unsafe:
@@ -899,7 +740,6 @@ def _setup_flight_server(
         f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
         f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
     )
-    # Check for recovery status. CacheManager is always file-backed now.
     recovery_status = manager.get_recovery_status()
     if recovery_status:
         console.print(
@@ -908,44 +748,15 @@ def _setup_flight_server(
             f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
             f"lost={recovery_status.lost_entries} entries"
         )
-        # (No per-segment error list here: recovery no longer scans segment
-        # bodies -- biopb/biopb#300 -- so it surfaces no read errors. Corrupt
-        # segments are detected, logged, and dropped by
-        # _rebuild_index_from_segments' own logger.error instead.)
-    console.print("[green]Raw chunk cache: OS page cache[/green]")
 
-    # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
-    static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
 
-    if not static_sources and not monitored_sources:
-        # An empty catalog is a valid state -- start and serve it (health SERVING,
-        # empty list_flights) rather than exiting. Sources can arrive after
-        # startup: runtime add_source (napari drag-drop), DoPut uploads, or a
-        # monitored dir that is currently empty but fills later. Refusing to boot
-        # would also make the control-plane data-plane supervisor read a healthy
-        # empty server as a crash -> backoff/restart loop (biopb/biopb#515).
-        console.print(
-            "[yellow]No data sources configured; serving an empty catalog "
-            "(sources can be added at runtime).[/yellow]"
-        )
-
-    console.print(
-        f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
-    )
-    if monitored_sources:
-        console.print(
-            f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
-        )
-
-    # The metadata database is mandatory (biopb/biopb#225): always constructed --
-    # it is the canonical source-browsing surface (`client.query`).
+    # metadata_db _is_ the client-facing catalog
     metadata_db = _open_catalog(
         server_config, _catalog_store_path(server_config, config_path)
     )
-    # Decode measurements live in the catalog, not beside the cache segments:
-    # the cache directory is the operator's to delete. Attached after open() so
-    # the table exists, and after CacheManager.initialize() above, which built
+    # Decode measurements live in the `decode_rates` table. Attached after open()
+    # so the table exists, and after CacheManager.initialize() above, which built
     # the object this installs a store on.
     active_decode_rates().attach(metadata_db)
     console.print(
@@ -955,9 +766,8 @@ def _setup_flight_server(
         f"catalog={metadata_db.store_path or 'in-memory (not persisted)'}"
     )
 
-    # Create and start server with gRPC message size tuned for 64MB chunks
-    location = _grpc_location(host, port)
-    # 80MB max message size (slightly above 64MB chunk threshold)
+    # 80MB max message size (slightly above 64MB transfer chunk threshold)
+    location = _host_port(host, port)
     server = TensorFlightServer(
         location,
         token=token,
@@ -972,129 +782,95 @@ def _setup_flight_server(
         upload_ttl=server_config.upload_ttl,
         scratch_ttl=server_config.scratch_ttl,
         external_location=external_location,
+        seal_key=load_seal_key(),
+        seal_ttl=server_config.seal_ttl,
     )
 
+    # Publish TLS fingerprint for any local clients.
     if tls_cert_chain is not None:
-        # Say what we serve, so a client on this machine verifies against the
-        # certificate this plane actually presents rather than guessing at the
-        # one it would have minted -- which a `--tls-cert` never is
-        # (biopb/biopb#916). Keyed by the bound port, since `--port 0` picks one
-        # and two planes can share a state tree.
         _tls_record.publish(
             getattr(server, "port", port) or port,
             _tls_material.fingerprint(_tls_material.leaf_pem(tls_cert_chain)),
         )
 
-    # Monitored local directories, and whether they are rescanned at all.
-    # `monitor_mode = "off"` keeps the sources but drops the periodic loop, so
-    # they are scanned once at startup and never again.
-    monitored_dirs = {
-        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
-    }
-    # An uploaded store is registered by the upload path; a write_dir that
-    # discovery also walks gets it claimed a second time under another id.
-    discovered_dirs = monitored_dirs | {
-        s.local_path
-        for s in static_sources
-        if not s.is_remote and s.local_path and s.local_path.is_dir()
-    }
-    inside = write_dir_under_root(write_dir, discovered_dirs)
-    if inside is not None:
-        console.print(
-            f"[yellow]⚠ write_dir {write_dir} lies inside the discovered "
-            f"directory {inside}: uploaded stores will be catalogued twice. "
-            "Point write_dir outside every source directory.[/yellow]"
-        )
-    rescan_interval = (
-        0.0 if server_config.monitor_mode == "off" else server_config.rescan_interval
-    )
-
-    # Register all sources (both static and monitored) through unified discovery
+    # Sort the configured sources and register them (static ones now, the rest by
+    # the manager's first rescan tick).
     source_manager = create_source_manager(
         server=server,
         registry=registry,
-        monitored_sources=monitored_sources,
-        static_sources=static_sources,
+        sources=server_config.sources,
+        write_dir=write_dir,
         metadata_db=metadata_db,
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
         full_rescan_interval=server_config.full_rescan_interval,
-        aggressive_dir_pruning=server_config.aggressive_dir_pruning,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
-        rescan_interval=rescan_interval,
+        rescan_interval=server_config.rescan_interval,
+        registration_workers=server_config.registration_workers,
+        walk_threads=server_config.walk_threads,
+        adapter_idle_seconds=server_config.adapter_idle_ttl,
     )
+    server.set_registration_pending_provider(source_manager.pending_registrations)
+    server.set_unregistered_provider(source_manager.unregistered_sources)
 
-    # Wire the runtime add_source handler (tensor-browser drag-drop): the server
-    # holds no SourceManager reference, so inject the entrypoint that routes a
-    # dropped path into the same claim -> adapter -> catalog pipeline. Its
-    # counterpart removes a dropped (dnd://) branch.
+    roots = source_manager.roots
+    monitored = roots.of_kind(RootKind.MONITORED)
+    upstreams = roots.of_kind(RootKind.UPSTREAM)
+    scan_once = roots.of_kind(RootKind.SCAN_ONCE)
+    if monitored:
+        console.print(
+            f"[green]Monitoring {len(monitored)} directory(s) for live updates[/green]"
+        )
+    if upstreams:
+        console.print(
+            f"[green]Mirroring {len(upstreams)} upstream tensor server(s)[/green]"
+        )
+    if scan_once:
+        console.print(
+            f"[green]Registering {len(scan_once)} unwatched path(s) once, in the background[/green]"
+        )
+
+    # Register hooks for `(de)register_local_path` actions: the server
+    # holds no SourceManager reference.
     server.set_add_source_handler(source_manager.add_local_source)
     server.set_remove_source_handler(source_manager.remove_dropped_root)
+    server.set_resolve_handler(source_manager.resolve_source)
 
-    # Note: the metadata DB is already populated at this point. Static sources
-    # are seeded via SourceManager._commit_add_claim -> _register_source_claim
-    # (which syncs each), and monitored sources stream in through the background
-    # first scan -- both before this line. No separate initial_sync is needed.
-
-    # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start(). Under progressive
-    # discovery the startup set is committed by the *background* scan (after
-    # start); the manager gates it out of the prompt enqueue via
-    # _initial_scan_done and seeds it into the backlog through the first-scan
-    # callback below. The worker no-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
+        # need to setup the hooks before source_manager.start()
         source_manager.set_source_committed_hook(precache_worker.enqueue)
-        # Residency gate (#174): let the worker re-check, at warm time, that a
-        # cloud-root source's files are still resident before reading them, so a
-        # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
-        # registration.
+        # wire should_warm() into precache_worker so it can avoid cloud-root
+        # source.
         precache_worker.should_warm = source_manager.should_warm
-
-    # Seed the precache backlog with the startup catalog the moment the first
-    # full scan establishes it (newest first; warmed when the server is idle).
-    # Wired before start() so the background scan's completion finds it.
-    def _seed_backlog_on_first_scan() -> None:
-        if precache_worker is not None and server_config.precache.backlog_enabled:
-            precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
-
-    source_manager.set_initial_scan_complete_hook(_seed_backlog_on_first_scan)
-
-    # Report "a full scan is running" from the first SERVING moment. The
-    # background scan sets this itself on entry, but pre-setting here closes the
-    # brief window between mark_ready() and the event loop picking up the first
-    # rescan, so a client never sees "SERVING, not scanning, never scanned".
-    if monitored_dirs:
-        server.set_full_scan_in_progress(True)
-
-    background_scan_running = False
-    try:
-        source_manager.start()
-        background_scan_running = source_manager.is_running()
-        if background_scan_running:
-            console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
-    except Exception as e:
-        console.print(f"[red]Failed to start monitoring: {e}[/red]")
-
-    if precache_worker is not None:
+        # Warming waits for the background registration it would compete with.
+        precache_worker.backlog_gate = source_manager.registration_idle
+        # Sources the first scan finds reach the backlog as they are registered.
+        if server_config.precache.backlog_enabled:
+            source_manager.set_startup_source_hook(precache_worker.enqueue_backlog)
         precache_worker.start()
 
-    # Progressive discovery: reach SERVING immediately. The monitored bootstrap
-    # scan runs in the background; the catalog populates live and the health
-    # action carries its freshness (full_scan_in_progress /
-    # last_full_scan_finished_at). A client needing a complete catalog waits on
-    # those fields, not on SERVING.
-    server.mark_ready()
+    # Report "a full scan is running" from the first SERVING moment. The scan sets
+    # this itself on entry; pre-setting it closes the window between mark_ready()
+    # and the loop's first tick, so a client never sees "SERVING, not scanning,
+    # never scanned".
+    if monitored or upstreams or scan_once:
+        server.set_full_scan_in_progress(True)
 
-    if not background_scan_running:
-        # No rescan loop is driving the bootstrap scan (rescanning is off, the
-        # loop failed to start, or there was nothing to monitor). The manager
-        # knows which fallback that calls for -- a synchronous scan, or just
-        # advancing the completion protocol for a static-only config.
-        source_manager.run_bootstrap_fallback()
+    # The first scan runs in this loop's first tick, in the background, and its
+    # tick also completes the startup protocol when there is nothing to scan.
+    source_manager.start()
+    monitoring = [r.url for r in (*monitored, *upstreams)]
+    if monitoring:
+        console.print(f"[green]Started monitoring: {monitoring}[/green]")
+
+    # Progressive discovery: reach SERVING now. The catalog fills as the scan runs;
+    # a client that needs it complete waits on the health action's
+    # full_scan_in_progress / last_full_scan_finished_at, not on SERVING.
+    server.mark_ready()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 
@@ -1183,7 +959,7 @@ def serve(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),
@@ -1315,10 +1091,8 @@ def serve(
             external_location=effective_external_location,
         )
 
-        location = _grpc_location(effective_host, port)
-        if tls_cert_chain is not None:
-            # Advertise the scheme clients actually dial for a TLS server.
-            location = location.replace("grpc://", "grpcs://", 1)
+        # Advertise the scheme clients actually dial.
+        location = _flight_url(effective_host, port, tls_cert_chain is not None)
         console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
         console.print("Press Ctrl+C to stop\n")
 
@@ -1326,7 +1100,7 @@ def serve(
         # so shutdown is clean.
         _install_sigterm_handler()
         # If launched under the control supervisor, self-terminate when it dies
-        # uncatchably (no-op when run standalone; see biopb.lifecycle.deathwatch).
+        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
         _deathwatch.install()
 
         server.serve()
@@ -1405,7 +1179,9 @@ def validate(
 
     try:
         server_config = load_config(config)
-        sources = resolve_all_sources(server_config)
+        sources = resolve_all_sources(
+            server_config.sources, credentials_config=server_config.credentials
+        )
         trust_problems = _unreadable_trust_anchors(server_config)
     except Exception as e:
         # Escaped: a validation message names its section as "[pyramid]", which
@@ -1446,7 +1222,9 @@ def list_tensors(
     """
     try:
         server_config = load_config(config)
-        sources = resolve_all_sources(server_config)
+        sources = resolve_all_sources(
+            server_config.sources, credentials_config=server_config.credentials
+        )
 
         table = Table(title="Data Sources and Tensors")
         table.add_column("Source ID", style="cyan")
@@ -1458,7 +1236,7 @@ def list_tensors(
         for source in sources:
             try:
                 adapter = _create_source_adapter(source)
-                tensor_descs = adapter.list_tensor_descriptors()
+                tensor_descs = adapter.list_tensors()
                 if len(tensor_descs) == 1:
                     desc = tensor_descs[0]
                     table.add_row(
@@ -1491,6 +1269,50 @@ def list_tensors(
     except Exception as e:
         console.print(f"[red]Error: {_rich_escape(str(e))}[/red]")
         raise typer.Exit(1)
+
+
+def _open_catalog_offline(
+    server_config: ServerConfig, config: Path, **db_kwargs
+) -> MetadataDatabase:
+    """Open the catalog file for an offline command, or exit.
+
+    Exits 0 when the config keeps no catalog on disk or the file does not exist
+    yet, and 1 when it cannot be opened -- almost always because the server holds
+    DuckDB's exclusive lock, which readers feel as well as writers.
+    """
+    store = _catalog_store_path(server_config, config)
+    if store is None:
+        console.print(
+            "[yellow]This config has no persistent catalog, so there is nothing "
+            "on disk to act on.[/yellow]"
+        )
+        raise typer.Exit(0)
+    if not store.exists():
+        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
+        raise typer.Exit(0)
+
+    # The open retries a held lock, which is right for a server racing a restart
+    # but is only noise ahead of a message this command formats itself.
+    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
+
+    db = MetadataDatabase(store_path=store, **db_kwargs)
+    try:
+        db.open()
+    except AnnotationStoreError as exc:
+        if "Conflicting lock" in str(exc):
+            # Much the likeliest reason to land here, and the server-facing
+            # message ("set persist false") is beside the point for this command.
+            console.print(
+                "[red]The catalog is open in another process -- almost certainly "
+                "the server itself.[/red]\n"
+                "DuckDB's lock is exclusive for readers as well as writers, so "
+                "this command needs the server stopped."
+            )
+        else:
+            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
+        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
+        raise typer.Exit(1) from None
+    return db
 
 
 @app.command(name="prune-annotations")
@@ -1540,39 +1362,7 @@ def prune_annotations(
         )
         raise typer.Exit(2)
 
-    store = _catalog_store_path(server_config, config)
-    if store is None:
-        console.print(
-            "[yellow]This config has no persistent catalog, so there is nothing "
-            "on disk to prune.[/yellow]"
-        )
-        raise typer.Exit(0)
-    if not store.exists():
-        console.print(f"[yellow]No catalog at {store} yet.[/yellow]")
-        raise typer.Exit(0)
-
-    # The open retries a held lock, which is right for a server racing a restart
-    # but is only noise ahead of a message this command formats itself.
-    logging.getLogger(MetadataDatabase.__module__).setLevel(logging.ERROR)
-
-    db = MetadataDatabase(store_path=store)
-    try:
-        db.open()
-    except AnnotationStoreError as exc:
-        if "Conflicting lock" in str(exc):
-            # Much the likeliest reason to land here, and the server-facing
-            # message ("set persist false") is beside the point for this command.
-            console.print(
-                "[red]The catalog is open in another process -- almost certainly "
-                "the server itself.[/red]\n"
-                "DuckDB's lock is exclusive for readers as well as writers, so "
-                "this command needs the server stopped."
-            )
-        else:
-            console.print(f"[red]{_rich_escape(str(exc))}[/red]")
-        console.print(f"\n[dim]{_rich_escape(str(exc.__cause__ or exc))}[/dim]")
-        raise typer.Exit(1) from None
-
+    db = _open_catalog_offline(server_config, config)
     try:
         cutoff = datetime.now() - timedelta(days=threshold)
         groups = db.unseen_rois(cutoff)
@@ -1611,6 +1401,31 @@ def prune_annotations(
         console.print(f"[red]Deleted {db.prune_unseen(cutoff)} annotation(s).[/red]")
     finally:
         db.close()
+
+
+@app.command(name="reset-catalog")
+def reset_catalog(
+    config: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Path to config file (biopb.json)",
+    ),
+):
+    """Empty the source catalog, keeping annotations.
+
+    For a server that will not start because the last run's catalog cannot be
+    restored. The next start finds its sources again by a scan, as a first run
+    does. Annotations and cache measurements in the same file are untouched.
+
+    **The server must be stopped**: DuckDB takes an exclusive lock on the file.
+
+    Example:
+        biopb-tensor-server reset-catalog biopb.json
+    """
+    server_config = _load_config_or_exit(config)
+    # Opening without a restore is what empties the tables.
+    _open_catalog_offline(server_config, config, restore_sources=False).close()
+    console.print("[green]Catalog emptied.[/green]")
 
 
 @app.command()
@@ -1700,7 +1515,7 @@ def launch(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),
@@ -1795,10 +1610,6 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    # Same three-state rule as `writable` below, and for the same reason: the
-    # config field existed, was documented in the JSON Schema (so the settings
-    # editor offered it), and nothing read it -- the flag's default won every
-    # time (biopb#1085).
     effective_log_scope = (
         log_scope_biopb
         if log_scope_biopb is not None
@@ -1814,22 +1625,19 @@ def launch(
     # reverts SIGTERM to the default (terminate) disposition -- so the process is
     # signal-killed (exit 143) before control reaches `_graceful_shutdown`, and
     # the file-cache process lock is left behind as a stale lock on every control
-    # stop/restart (biopb/biopb#516; #512's lock-release-first reorder is moot on
-    # this path until the finally actually runs). Owning the handler here routes
-    # SIGTERM through `except KeyboardInterrupt`/`finally` instead. Harmless no-op
-    # on Windows, which uses the sentinel-file path in
-    # http_server._install_windows_shutdown_listener.
+    # stop/restart. Owning the handler here routes SIGTERM through
+    # `except KeyboardInterrupt`/`finally` instead. No-op on Windows, which uses
+    # the sentinel-file path in http_server._install_windows_shutdown_listener.
     _install_sigterm_handler()
+
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
-    # port-holding conflict (no-op standalone; see biopb.lifecycle.deathwatch).
+    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
     _deathwatch.install()
 
     # --- Token management ---
     # The flight bind (--host) is the mode switch; the
     # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
-    # _resolve_launch_token decides the enforced token fail-closed (and refuses a
-    # public sidecar with no token). There is no separate dev flag.
     effective_host = host
     effective_token = _resolve_launch_token(
         effective_host,
@@ -1840,10 +1648,7 @@ def launch(
     )
 
     if effective_token is not None:
-        # The web app lives outside this package, so we can only show the token
-        # against the sidecar's own origin; a browser app appends it there (or
-        # carries it however that app expects). Normalize a wildcard bind to a
-        # dialable loopback host for display.
+        # Normalize a wildcard bind to a dialable loopback host for display.
         _display_host = web_host
         if _display_host in ("0.0.0.0", ""):
             _display_host = "127.0.0.1"
@@ -1853,9 +1658,6 @@ def launch(
             "\n[bold green]Access token (shown once — do not share):[/bold green]"
         )
         # soft_wrap keeps the URL on one line so the token stays copy-pasteable
-        # even in a narrow / non-TTY log (e.g. `docker logs`, where Rich would
-        # otherwise hard-wrap to width 80 and split the token). markup=False so
-        # nothing in the URL is interpreted as Rich markup.
         console.print(
             f"http://{_display_host}:{web_port}/?token={effective_token}",
             soft_wrap=True,
@@ -1868,21 +1670,18 @@ def launch(
         )
 
     # --- Start Flight server + HTTP sidecar ---
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+    effective_external_location = _resolve_external_location(
+        effective_host, port, tls_cert_chain, external_location
+    )
     # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
-    # cache process lock -- on EVERY exit path after cache init, not just a clean
-    # uvicorn return. _setup_flight_server acquires the lock during cache init and
+    # cache process lock. _setup_flight_server acquires the lock during cache init and
     # can still raise afterwards (e.g. a bad static source, or a bind failure
     # starting the flight thread below), so keeping the whole startup body inside
     # the try means such an early exit no longer orphans the lock as a stale lock
     # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
     # returns normally on shutdown (it does not re-raise), so cleanup must run in
     # `finally` rather than an except block regardless.
-    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
-
-    effective_external_location = _resolve_external_location(
-        effective_host, port, tls_cert_chain, external_location
-    )
-
     flight_server = source_manager = precache_worker = None
     try:
         flight_server, source_manager, precache_worker = _setup_flight_server(
@@ -1908,7 +1707,9 @@ def launch(
             _flight_connect_host = "127.0.0.1"
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
-        flight_location = _grpc_location(_flight_connect_host, port)
+        flight_location = _flight_url(
+            _flight_connect_host, port, tls_cert_chain is not None
+        )
         flight_fingerprint = None
         if tls_cert_chain is not None:
             from biopb_tensor_server.serving.tls import cert_fingerprint, leaf_pem
@@ -1927,7 +1728,6 @@ def launch(
             # not in peer certificate". Resolving by fingerprint ends with the
             # presented leaf as the anchor, which is what earns the override.
             flight_fingerprint = cert_fingerprint(leaf_pem(tls_cert_chain))
-            flight_location = flight_location.replace("grpc://", "grpcs://", 1)
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
 
@@ -1935,11 +1735,6 @@ def launch(
         if cors_origins:
             effective_cors = list(cors_origins)
         else:
-            # No web app is bundled here, so there is no frontend origin to derive
-            # by default. The control front reaches this sidecar over loopback for
-            # the data API, so allow all loopback variants of the server's own
-            # address; a browser app on any other origin must be allowed
-            # explicitly via --cors.
             from urllib.parse import urlparse as _urlparse
 
             _loopback_aliases: dict = {
@@ -1976,13 +1771,14 @@ def launch(
             config_path=str(config),
             tls_fingerprint=flight_fingerprint,
         )
+
     except AnnotationStoreError as exc:
-        # Operator-actionable and the message is the whole point of raising;
-        # a traceback would bury it.
         console.print(f"[red]{_rich_escape(str(exc))}[/red]")
         raise typer.Exit(1) from None
+
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
+
     finally:
         _graceful_shutdown(source_manager, flight_server, precache_worker)
 
@@ -1990,6 +1786,7 @@ def launch(
         from biopb_tensor_server import __version__
 
         console.print(f"TensorFlight server (using biopb-tensor-server {__version__})")
+
     except ImportError:
         console.print("TensorFlight server")
 

@@ -11,7 +11,9 @@ import { SourceTree } from "../components/SourceTree";
 import { ResolveModal } from "../components/ResolveModal";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
+import { useViewerShow } from "../hooks/useViewerShow";
 import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
+import { CaptureOverlay } from "../components/CaptureOverlay";
 import { usePlayback } from "../hooks/usePlayback";
 import { withBase } from "../base";
 import {
@@ -47,6 +49,7 @@ export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
   useViewerUrlSync();
   usePlayback();
+  const capture = useViewerShow();
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
@@ -187,6 +190,7 @@ export function HomePage() {
       </aside>
 
       <ResolveModal />
+      {capture.capturing && <CaptureOverlay cancel={capture.cancel} />}
 
       <main className="app-main">
         {splitter("sidebar", "Resize the source list")}

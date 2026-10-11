@@ -22,8 +22,8 @@ Low-level wrapper over the REST API. `new TensorHttpClient(apiBase, token)`.
 | Method | Endpoint |
 |--------|----------|
 | `livez()` / `readyz()` | `GET /livez` / `GET /readyz` |
-| `listSources()` | `GET /api/sources` |
-| `getSource(id)` / `getSourceMetadata(id)` | `GET /api/sources/{id}[/metadata]` |
+| `listSourcesPage(limit)` | `GET /api/sources?limit=N` (also reports `truncated`) |
+| `getSourceMetadata(id)` | `GET /api/sources/{id}/metadata` |
 | `slice(req)` | `POST /api/slice` |
 | `diagnostics()` | `GET /api/diagnostics` |
 
@@ -116,17 +116,15 @@ model are in `README.md`; the architectural notes that aren't there:
 - **Store (Zustand, `store/`, one slice file per lifetime).** Holds the `TensorHttpClient` + connection state,
   the source list (plus a `scanning` flag seeded from `/readyz` `backend_health` so
   the UI can distinguish "indexing" from "empty" during progressive discovery — see
-  `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
+  `../biopb-tensor-server/docs/catalog-persistence.md`), the active source/tensor,
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
   `initClient` / `loadSources` / `openTensor` / `setSlice` / `clearSession`.
 - **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
   A label set is an ordinary tensor at `<image array_id>/@labels/<name>`, so the
   path is the only thing that marks one — `splitLabelArrayId` is the single
-  reading of that rule, and the tree groups sets under their image with it. How
-  the set's axes line up with the image's is *read*, not derived: the server
-  states it as `TileInfo.image_axes` and `labelSelection` (also in the SDK)
-  applies it, falling back to the extent rule only against a server that
-  predates the field. The
+  reading of that rule, and the tree groups sets under their image with it. A
+  set has the image's rank (channel a singleton, RGB samples axis left out), so
+  `labelSelection` aligns the two by position. The
   overlay is a second Viv image layer over a second `PixelSource[]`, added to
   `deckProps.layers` beneath the annotation layers, with the colour step
   replaced by `LabelPaletteExtension`: a hue rotated by the golden-ratio

@@ -37,6 +37,7 @@ adapter-package namestore (``from .dv import DeltaVisionAdapter``).
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
@@ -47,6 +48,9 @@ from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -54,6 +58,11 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -71,6 +80,7 @@ _MAPPING_TTL = 5.0
 _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "dv-mapping-reaper", max_handles=8)
 
 
+@canonical_axes
 class DeltaVisionAdapter(TensorAdapter):
     """Reads DeltaVision DV volumes through ``mrc.DVFile``. Single-tensor source."""
 
@@ -117,27 +127,67 @@ class DeltaVisionAdapter(TensorAdapter):
 
         return cls(path, source.source_id)
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[Any] = None,
+    ) -> "DeltaVisionAdapter":
+        """Rebuild from the row's header facts and header summary: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        adapter = cls(path, source.source_id, probed=payload)
+        adapter._stored_metadata = metadata
+        return adapter
+
+    def catalog_payload(self) -> dict:
+        """The probed header facts a read needs: axes, shape, dtype, voxel size."""
+        return {
+            "axes": self._axes,
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype.str,
+            "voxel": {
+                axis: (None if v is None else float(v))
+                for axis, v in (
+                    ("x", self._voxel.x),
+                    ("y", self._voxel.y),
+                    ("z", self._voxel.z),
+                )
+            },
+        }
+
     def __init__(
         self,
         url: str,
         source_id: str,
+        probed: Optional[dict] = None,
     ):
         self.source_id = source_id
         self._url = url
         self._source_url = url
         self._source_type = self.SOURCE_TYPE
         self._content_version = content_version_from_path(url)
+        # The header summary a row holds, when the adapter was rebuilt from one.
+        self._stored_metadata: Optional[dict] = None
 
-        # Probe the header once now so a malformed file fails at registration
-        # rather than on the first read; the mapping is released immediately
-        # (a source that is catalogued but never read should pin nothing).
-        import mrc
+        if probed is not None:
+            self._axes = str(probed["axes"])
+            self._shape = tuple(int(s) for s in probed["shape"])
+            self._dtype = np.dtype(probed["dtype"])
+            self._voxel = SimpleNamespace(**probed["voxel"])
+        else:
+            # Probe the header once now so a malformed file fails at registration
+            # rather than on the first read; the mapping is released immediately
+            # (a source that is catalogued but never read should pin nothing).
+            import mrc
 
-        with mrc.DVFile(url) as probe:
-            self._axes = str(probe.axes)  # e.g. "CTZYX" -- native loop order + YX
-            self._shape = tuple(int(probe.sizes[axis]) for axis in self._axes)
-            self._dtype = probe.dtype
-            self._voxel = probe.voxel_size
+            with mrc.DVFile(url) as probe:
+                self._axes = str(probe.axes)  # e.g. "CTZYX" -- native loop order + YX
+                self._shape = tuple(int(probe.sizes[axis]) for axis in self._axes)
+                self._dtype = probe.dtype
+                self._voxel = probe.voxel_size
 
         self.dim_labels = list(self._axes)
 
@@ -149,7 +199,7 @@ class DeltaVisionAdapter(TensorAdapter):
         self._persistent_last_access = 0.0
         self._active_reads = 0
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -161,8 +211,8 @@ class DeltaVisionAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -172,7 +222,7 @@ class DeltaVisionAdapter(TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_slices(bounds))
+        return self._copy_out(bounds_to_slices(bounds))
 
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
@@ -181,7 +231,7 @@ class DeltaVisionAdapter(TensorAdapter):
         is cheap: indexing a memmap computes byte offsets, so the copy shrinks
         by the product of the strides."""
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_strided_slices(bounds, step))
+        return self._copy_out(bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:
         """Copy ``slices`` out of the shared mapping, counting the read.
@@ -250,19 +300,26 @@ class DeltaVisionAdapter(TensorAdapter):
         values = {"x": self._voxel.x, "y": self._voxel.y, "z": self._voxel.z}
         return scale_by_label(self.dim_labels, values, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """The DV header as a JSON-safe dict; skips the per-frame extended
         header (biopb/biopb#799 -- O(sections), not worth paying for a catalog
-        listing nobody asked to see frame-by-frame acquisition metadata in)."""
+        listing nobody asked to see frame-by-frame acquisition metadata in).
+
+        An adapter rebuilt from a row answers with the summary the row holds.
+        """
+        if self._stored_metadata is not None:
+            return metadata_record(self._stored_metadata)
         try:
             import mrc
 
             with mrc.DVFile(self._url) as probe:
                 header = dict(probe.hdr._asdict())
         except Exception:
-            return {"format": "dv"}
+            return metadata_record({"format": "dv"})
         header.pop("blank", None)
-        return {"format": "dv", "header": header}
+        return metadata_record({"format": "dv", "header": header})
 
 
 __all__ = ["DeltaVisionAdapter"]

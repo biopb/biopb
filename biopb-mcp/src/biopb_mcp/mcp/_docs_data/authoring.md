@@ -47,8 +47,8 @@ none at all. Name the type in the step:
   which is one of the two routes.
 
   Looking at it *yourself* is a third thing and not a substitute:
-  `take_screenshot` on a napari window, or your host's browser automation on a
-  [[web-viewer]] link. It is what stops you reporting a result you never saw —
+  `take_screenshot` on a napari window, or `show_view(..., image=True)` on the
+  [[web-viewer]]. It is what stops you reporting a result you never saw —
   but the user has to see it too, so a doc says to show it either way.
 - **validate-and-gate** *(blocking)* — immediately before something expensive or
   hard to undo: scaling out over the catalog, a full-volume GPU op, declaring

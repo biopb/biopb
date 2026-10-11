@@ -1,0 +1,117 @@
+"""Shared config-value constraint primitives, in the core ``biopb`` package.
+
+Both config-bearing packages validate leaf values against ranges/enums, but
+neither can import the other's config module: ``biopb-tensor-server`` is not on
+PyPI (so ``biopb-mcp`` cannot depend on it at runtime), and the two config
+*shapes* differ (the server validates dataclass instances in ``__post_init__``;
+biopb-mcp validates a merged dict by dotted path). What they *can* share is the
+tiny, format-agnostic core: the ``Range`` / ``Enum`` primitives, and the
+pyramid rows below.
+
+The pyramid rows are the tensor server's ``pyramid.{threshold,
+downscale_factor, pixel_budget_cubic_root}``: an out-of-range value there
+silently breaks pyramid construction (``downscale_factor=1`` -> a single
+full-res level; ``pixel_budget_cubic_root<=0`` -> an infinite loop)
+(biopb/biopb#34, #182).
+
+Deliberately stdlib-only, like the sibling :mod:`biopb._config.locations`, so
+importing it stays cheap and pulls in none of the heavy adapter/discovery
+machinery.
+"""
+
+from __future__ import annotations
+
+
+class Range:
+    """A numeric bound. ``min``/``max`` are inclusive; ``exclusive_min``/
+    ``exclusive_max`` are strict. Any subset may be omitted.
+    """
+
+    def __init__(self, *, min=None, max=None, exclusive_min=None, exclusive_max=None):  # noqa: A002 - min/max are the natural, keyword-only vocabulary for a numeric range
+        self.min = min
+        self.max = max
+        self.exclusive_min = exclusive_min
+        self.exclusive_max = exclusive_max
+
+    def ok(self, value) -> bool:
+        # bool is an int subclass; a bool where a number is expected is wrong.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        return (
+            (self.min is None or value >= self.min)
+            and (self.max is None or value <= self.max)
+            and (self.exclusive_min is None or value > self.exclusive_min)
+            and (self.exclusive_max is None or value < self.exclusive_max)
+        )
+
+    def describe(self) -> str:
+        parts = []
+        if self.min is not None:
+            parts.append(f">= {self.min}")
+        if self.exclusive_min is not None:
+            parts.append(f"> {self.exclusive_min}")
+        if self.max is not None:
+            parts.append(f"<= {self.max}")
+        if self.exclusive_max is not None:
+            parts.append(f"< {self.exclusive_max}")
+        if not parts:
+            return "a number"
+        return "a number " + " and ".join(parts)
+
+    def to_json_schema(self) -> dict:
+        """Bounds as JSON Schema keywords (for a schema emitter)."""
+        out: dict = {}
+        if self.min is not None:
+            out["minimum"] = self.min
+        if self.max is not None:
+            out["maximum"] = self.max
+        if self.exclusive_min is not None:
+            out["exclusiveMinimum"] = self.exclusive_min
+        if self.exclusive_max is not None:
+            out["exclusiveMaximum"] = self.exclusive_max
+        return out
+
+
+class Enum:
+    """Membership in a fixed set, optionally case-insensitive for strings."""
+
+    def __init__(self, allowed, *, case_insensitive=False):
+        self.case_insensitive = case_insensitive
+        self._display = set(allowed)
+        # Fold the allowed set too, so a lowercased value matches upper-case members.
+        self.allowed = {
+            a.lower() if (case_insensitive and isinstance(a, str)) else a
+            for a in allowed
+        }
+
+    def ok(self, value) -> bool:
+        if self.case_insensitive and isinstance(value, str):
+            value = value.strip().lower()
+        try:
+            return value in self.allowed
+        except TypeError:
+            # Unhashable (list / dict): never a member; keep ok() total.
+            return False
+
+    def describe(self) -> str:
+        return "one of: " + ", ".join(sorted(map(str, self._display)))
+
+    def to_json_schema(self) -> dict:
+        """The allowed set as a JSON Schema ``enum``, for case-sensitive enums only
+        (a hard ``enum`` would reject casings the consumer honors)."""
+        if self.case_insensitive:
+            return {}
+        return {"enum": sorted(self._display, key=str)}
+
+
+# The bounds of biopb-tensor-server's PyramidConfig knobs, keyed by leaf field
+# name. `reduction_method`'s enum stays local to the server.
+#
+#   downscale_factor >= 2         : must actually shrink; ==1 yields no pyramid.
+#   threshold >= 1                : max x/y extent of the coarsest level.
+#   pixel_budget_cubic_root >= 1  : cubed voxel budget; <=1 loops/OOMs.
+PYRAMID_CONSTRAINTS = {
+    "threshold": Range(min=1),
+    "downscale_factor": Range(min=2),
+    "pixel_budget_cubic_root": Range(min=1),
+}

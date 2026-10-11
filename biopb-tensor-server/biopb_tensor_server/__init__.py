@@ -6,14 +6,12 @@ multi-dimensional arrays through Apache Arrow Flight protocol.
 Key components:
 - TensorFlightServer: Flight server implementation
 - SourceAdapter / TensorAdapter: the source- and tensor-level adapter interfaces
-- Adapters: ZarrAdapter, Hdf5Adapter, OmeZarrAdapter, OmeTiffAdapter, ZeissAdapter, etc.
+- Adapters: ZarrAdapter, OmeZarrAdapter, OmeTiffAdapter, ZeissAdapter, etc.
 - Cache: CacheManager, CacheConfig for caching computed virtual chunks
 
 Note: This package is not distributed via PyPI. Install locally with:
     pip install -e biopb-tensor-server/
 """
-
-from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 
 # OME-TIFF is pure-tifffile (always available); it lives in its own module.
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
@@ -108,7 +106,6 @@ __all__ = [
     "ChunkEndpoint",
     "TensorReadPlan",
     "ZarrAdapter",
-    "Hdf5Adapter",
     "TiffAdapter",
     "LsmAdapter",
     "OmeTiffAdapter",

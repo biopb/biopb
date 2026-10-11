@@ -244,9 +244,9 @@ def _create_zarr_member(
             f"upload, or add the tensor under another name."
         ) from None
     grid = upload_grid(desc)
-    group = zarr.open_group(str(store), mode="w")
-    arr = group.create_dataset(
-        "0", shape=list(desc.shape), chunks=grid, dtype=desc.dtype
+    group = zarr.open_group(str(store), mode="w", zarr_format=2)
+    arr = group.create_array(
+        "0", shape=tuple(desc.shape), chunks=grid, dtype=desc.dtype
     )
     (store / ".zattrs").write_text(json.dumps(zattrs))
 

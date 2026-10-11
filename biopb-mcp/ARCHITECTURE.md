@@ -28,9 +28,12 @@ agreement on what a layer is (label sets, axes, pyramids).
 
 ## Process structure
 
-Everything the package runs is a chain of four processes, each spawned and reaped
-by the one above it. The whole chain is **client-scoped**: it comes up when an MCP
-client connects and is gone when that client disconnects.
+Everything the package runs is a chain of processes, but not one that ends
+together. The shim is **client-scoped**: it comes up when an MCP client connects
+and is gone when that client disconnects. It owns no session. A session is a
+detached process the control launched (or a person did, with `biopb mcp view`),
+and it outlives the client: it runs until a person stops it from the dashboard,
+and the next agent can attach to it.
 
 ```
               AI agent / MCP client
@@ -43,7 +46,7 @@ client connects and is gone when that client disconnects.
                             │  http → /mcp, dynamic port
                             ▼
    ┌──────────────────────────────────────────────────┐
-   │ session child            ephemeral, shim-owned   │
+   │ session child            detached, user-stopped  │
    │   FastMCP / uvicorn  — tools + resources         │
    │   KernelHost         — owns the kernel           │
    │   observe UI         — job history + cancel      │
@@ -62,16 +65,17 @@ client connects and is gone when that client disconnects.
       (outside this package — see ../development.md)
 ```
 
-One ownership fact deliberately does not follow the spawn chain: the **planes at
-the bottom are never started here** — the session is a pure client of them, and
-only *registers* itself with the control.
+One ownership fact deliberately does not follow the chain: the **planes at the
+bottom are never started here** — the session is a pure client of them, and only
+*registers* itself with the control.
 
 ### Why this shape
 
 The chain is split where it is because of **fd-1 corruption**. Under stdio MCP,
 **fd 1 *is* the JSON-RPC channel**, so any stray stdout from a heavy process
 (uvicorn/Qt/dask/kernel) corrupts it. Hence the **shim/heavy split**: a
-featherweight shim owns fd 1 and imports only the mcp SDK, and all heavy work runs
+featherweight shim (`biopb._shim` in the SDK, run as `biopb-shim`) owns fd 1 and
+imports only the mcp SDK, and all heavy work runs
 in a separate child it bridges to over http — making fd-1 corruption structurally
 impossible.
 
@@ -87,21 +91,92 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 ## Components
 
-### Shim-owned MCP sessions
+### Attaching a client to a session
 
-Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, which
+The shim (`biopb-shim`) is the interface the mcp clients (claude code) see. It
+starts **unbound** and owns nothing until the agent calls its local `attach` tool:
 
-1. **answers the handshake and the list requests itself**, from the FastMCP
-   server the child runs (imported, never served), so a client that never calls
-   a tool costs no child,
-2. on the **first request that needs one**, start-and-forgets the control plane and
-   **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
-   on a **dynamic OS-assigned port**; the child **registers itself** with the
-   control, under an id the shim mints,
-3. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin;
-   a child that fails to start is a tool error, retried by the next call,
-4. **reaps** the child and its kernel grandchild as a tree (POSIX process group +
-   parent-death pipe; Windows Job Object, #403) on the way out.
+1. **Unbound**, it answers the handshake with a paragraph saying to call `attach`,
+   and lists `attach` alone; a client that never attaches costs no session. It
+   imports no session code and holds no copy of any session's tools, docs or
+   instructions. Every other tool is an error that lists the live sessions and
+   whether each is free.
+2. `attach(session=<id>)` takes the session's **lease** and bridges stdio
+   JSON-RPC ↔ its `/mcp`. The tool, resource and prompt lists become the session's
+   own (`list_changed` is declared in the handshake and sent on attach and on
+   detach), and `attach` returns the session's operating rules, which cannot ride
+   the handshake any more; attaching again to the same session returns them
+   again. The session is not the shim's: the shim renews the lease on a short
+   beat and releases it on the way out, and never stops the session. A lease that
+   is lost (another holder forced it, or the session stopped answering) unbinds
+   the shim.
+
+   A client that does not follow `list_changed` (Codex, within a turn) uses
+   `--session <id|new|auto>` instead: the shim binds before it answers
+   `initialize`, so the handshake already carries the session's own instructions
+   and tools. `auto` takes the newest free session, else launches one; the client
+   gives up choosing in exchange.
+3. `attach(session='new')` asks the **control** to launch a session for this
+   client (`POST /api/sessions/new`, with the client's display variables),
+   starting the control first if need be, and leases it from birth. The session
+   is the user's, not the shim's: it runs until stopped from the dashboard, and
+   the next agent can attach to it, so the shim only releases it. No control is
+   an error, not a fallback: a session without one has no data plane, so one
+   started without it would attach and then fail on first use.
+   `--session new` (or `$BIOPB_SESSION`) does this before the handshake, with no
+   `attach` call.
+
+What the shim does own is itself: a shim that outlived its client would go on
+renewing its lease and keep the session locked, so it releases and exits on stdin
+EOF, on SIGTERM/SIGHUP, and -- where a multi-process client can keep the stdin
+handle open after it is gone (Windows, #403) -- when a watchdog sees the client
+exit.
+
+### The lease
+
+A session answers to one holder at a time, an `agent` or the built-in `chat`
+(`mcp/_lease.py`); the other kind is refused while the lease lives. So one agent
+per session, and chat and an agent never write to one kernel together. The session
+holds the lease, not the control: the shim reaches a session directly on its
+loopback port.
+
+- **Agent**: taken by `attach`, renewed by the shim every 10 s, lapsed after 30 s
+  of silence (three missed beats), so a `kill -9`'d shim frees the session. The
+  holder is identified by a token the shim keeps, not by the connection, so a
+  restarted shim reclaims its own lease.
+- **Chat**: taken by the first turn (not by opening the pane, so a session with an
+  open pane stays attachable), renewed by turns only, never by the history poll,
+  lapsed after 5 min and kept alive while a turn runs. Released on idle, on clear,
+  and by `/chat/release`. Losing it cancels a running turn and drops queued
+  messages, which must not replay against a kernel the agent changed.
+- **Refusals and force**: `attach` on a held session answers with the holder's
+  kind and age; a chat turn on an agent-held session is a 409 with the same
+  facts. `force` takes the lease, and taking it from a mid-turn chat cancels the
+  turn; nothing else ever aborts one.
+- **Busy status** in the session list is the lease: free, agent or chat.
+  A change of holder clears the kernel's one-agent claim (`_writers`).
+
+There is one token for all sessions; there are no per-session grants.
+
+### Attaching from another machine
+
+`biopb-shim --remote <control-url>` (token from `--token` or
+`$BIOPB_TENSOR_TOKEN`; `$BIOPB_REMOTE` for the URL) attaches to another machine's
+sessions through its control, which proxies `/session/<id>/mcp` where it enforces a
+token (biopb-control's ARCHITECTURE). The lease, status and listing take the same
+path, `/session/<id>/...` and `/api/sessions`, so everything above holds. The shim
+sends the token as `X-Biopb-Token` and only to that address; this machine's own
+credential file is never used for a remote. `--header 'Name: value'` (repeatable, or
+`$BIOPB_REMOTE_HEADERS`) adds what a portal in front of the control wants, such as
+its session cookie, and the URL may carry a path prefix. `attach new` launches on
+the host, headless: the client sends no display variables, since the viewer,
+screenshots, paths and data plane all belong to the session's host. The control has
+no TLS of its own, so a published control needs the operator's proxy for it.
+
+The shim and a session meet only over HTTP and the registry: `/api/lease/*`,
+`/api/status`, `/mcp`, the control's `/api/sessions`, `/api/sessions/new`,
+`/health` (`mcp_proxied`) and its `/session/<id>/...` proxy, and `biopb._lifecycle.sessions`.
+A change to any of them is a change to the SDK and biopb-mcp together.
 
 ### The kernel
 

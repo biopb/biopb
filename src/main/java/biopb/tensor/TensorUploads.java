@@ -5,6 +5,11 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 import org.apache.arrow.flight.Action;
@@ -55,11 +60,12 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  * tensor, and that descriptor is what every write takes. The scheme on an {@code array_id} names the store format and nothing
  * else; the answered id carries none. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
- * interval is walked on the calling thread, one chunk per planned endpoint,
- * each put finished before the next is encoded. Python instead stores the whole
- * array through dask with {@code lock=False} and the chunks go up concurrently,
- * which the server is built for (it counts arrivals into a set keyed by chunk
- * id). Closing that gap is biopb/biopb#1073.
+ * interval is walked on a bounded pool, one chunk per planned endpoint. Chunks
+ * go up concurrently, as they do from Python's {@code lock=False} store: each
+ * writes a disjoint region and the server counts arrivals into a set keyed by
+ * chunk id, so nothing here serializes them. One DoPut stream per chunk is
+ * forced by the wire shape (the chunk's bounds ride the descriptor); what is
+ * not forced is waiting for one ack before encoding the next.
  *
  * <p><b>What a chunk is, is the server's.</b> A write plans through
  * {@code GetFlightInfo} exactly as a read does and sends back the endpoint's
@@ -69,6 +75,9 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
 final class TensorUploads {
 
     private static final Logger LOGGER = Logger.getLogger(TensorUploads.class.getName());
+
+    /** Chunk puts in flight at once when the caller does not say. */
+    static final int DEFAULT_CONCURRENCY = 4;
 
     private final FlightSession session;
 
@@ -146,6 +155,15 @@ final class TensorUploads {
     /** Backs {@link TensorFlightClient#uploadArray}; see that method. */
     <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
             TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
+        return uploadArray(descriptor, array, DEFAULT_CONCURRENCY);
+    }
+
+    /** Backs {@link TensorFlightClient#uploadArray}; see that method. */
+    <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
+            TensorDescriptor descriptor, RandomAccessibleInterval<T> array, int concurrency) {
+        if (concurrency < 1) {
+            throw new IllegalArgumentException("uploadArray: concurrency must be at least 1, got " + concurrency);
+        }
         long[] shape = toLongArray(descriptor.getShapeList());
         if (array.numDimensions() != shape.length) {
             throw new IllegalArgumentException("uploadArray: array rank " + array.numDimensions()
@@ -174,14 +192,81 @@ final class TensorUploads {
 
         // One plan for the whole upload; each entry is one chunk, with the
         // ticket that names it.
-        for (PlannedChunk chunk : planWrite(descriptor.getArrayId(), null)) {
-            putChunk(descriptor, chunk.ticket, chunk.bounds, array, skipEmpty);
-        }
+        putAll(planWrite(descriptor.getArrayId(), null), concurrency,
+                chunk -> putChunk(descriptor, chunk.ticket, chunk.bounds, array, skipEmpty));
         // Publishing is what marks the source complete, so a whole-array upload
         // does it on the caller's behalf -- it is the one caller that knows,
         // from having written every block itself, that there is nothing more to
-        // send.
+        // send. Strictly after every put has been acked (putAll returns only
+        // then): sealing early would race a chunk still in flight.
         return setUploadStatus(descriptor.getArrayId(), UploadStatus.State.READY, "");
+    }
+
+    /**
+     * Run {@code put} over every chunk, up to {@code concurrency} at a time, and
+     * return when all have finished.
+     *
+     * <p>The first failure, in plan order, is the one thrown -- its type intact,
+     * so a refusal is still an {@link UploadRefusedException} carrying the
+     * {@code source_id}/{@code state}/{@code detail} it came with -- and the
+     * others ride it as suppressed. A failure stops chunks not yet started; the
+     * ones already running finish, so no put outlives this call. One thread (or
+     * one chunk) runs on the caller's thread, with no pool.
+     */
+    private static void putAll(
+            List<PlannedChunk> plan, int concurrency, java.util.function.Consumer<PlannedChunk> put) {
+        int width = Math.min(concurrency, plan.size());
+        if (width <= 1) {
+            for (PlannedChunk chunk : plan) {
+                put.accept(chunk);
+            }
+            return;
+        }
+        AtomicBoolean failed = new AtomicBoolean();
+        ExecutorService pool = Executors.newFixedThreadPool(width, runnable -> {
+            Thread thread = new Thread(runnable, "biopb-upload");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            List<Future<?>> puts = new ArrayList<>(plan.size());
+            for (PlannedChunk chunk : plan) {
+                puts.add(pool.submit(() -> {
+                    if (failed.get()) {
+                        return;
+                    }
+                    try {
+                        put.accept(chunk);
+                    } catch (RuntimeException | Error error) {
+                        failed.set(true);
+                        throw error;
+                    }
+                }));
+            }
+            RuntimeException first = null;
+            for (Future<?> done : puts) {
+                try {
+                    done.get();
+                } catch (ExecutionException error) {
+                    RuntimeException mapped = FlightSession.mapped(error.getCause());
+                    if (first == null) {
+                        first = mapped;
+                    } else if (first != mapped) {
+                        first.addSuppressed(mapped);
+                    }
+                } catch (InterruptedException error) {
+                    failed.set(true);
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("uploadArray interrupted", error);
+                }
+            }
+            if (first != null) {
+                throw first;
+            }
+        } finally {
+            failed.set(true);
+            pool.shutdownNow();
+        }
     }
 
     /** Backs {@link TensorFlightClient#uploadChunk}; see that method. */

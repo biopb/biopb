@@ -102,7 +102,7 @@ _SAMPLES_RANK = 4
 # sense counts as trailing: T and C classify through the same vocabulary but have
 # no canonical place, so they ride in the leading group with the unlabeled.
 #
-# It is NOT "every axis is labeled". An all-``dimN`` tensor (plain zarr / HDF5)
+# It is NOT "every axis is labeled". An all-``dimN`` tensor (plain zarr)
 # has no axis with a canonical place, so its permutation is the identity and the
 # consumers' positional reading (:func:`plane_axes` here, ``_resolve_axes`` in
 # biopb-mcp) keeps doing the work -- relabeling ``dimN`` to z/y/x would promote a

@@ -21,7 +21,6 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 
 from tests import catalog_server
 
@@ -30,9 +29,7 @@ CHUNK = (2, 2)
 
 
 def _serve(tmp_path, **kwargs):
-    server = catalog_server(
-        location="grpc://localhost:0", write_dir=Path(tmp_path), **kwargs
-    )
+    server = catalog_server(location="localhost:0", write_dir=Path(tmp_path), **kwargs)
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
     return server
@@ -64,7 +61,7 @@ class TestItIsThereBeforeAnythingAsks:
     def test_a_server_with_nowhere_to_write_has_none(self, tmp_path):
         """``write_dir`` is the switch, not ``writable``: with nowhere to put a
         tensor a scratch source is one nothing can be added to."""
-        server = catalog_server(location="grpc://localhost:0", writable=True)
+        server = catalog_server(location="localhost:0", writable=True)
         server.mark_ready()
         try:
             assert server.sources.get(SCRATCH_SOURCE_ID) is None
@@ -110,28 +107,14 @@ class TestItIsThereBeforeAnythingAsks:
         )
 
 
-class TestItCanBeWarmed:
-    def test_a_published_field_is_warmable(self, writable_server, client):
-        """biopb/biopb#1139: warming reads ``adapter.source_url`` as the
-        recall root, so it must stay the real ``<write_dir>/fields/scratch``
-        directory the published bytes live in, not the catalog's display
-        alias -- #1138 briefly conflated the two."""
-        _publish(client, _add(client, "warmed"))
-
-        result = client.warm_source(SCRATCH_SOURCE_ID)
-
-        assert result.files_total >= 1
-        assert result.files_done == result.files_total
-
-
 class TestItIsEmptyByDefault:
     def test_an_empty_one_is_a_source_with_no_tensors(self, writable_server):
         """Not a degenerate state: it is what a scrap heap looks like between
         uploads, and the catalog already models it."""
         adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
 
-        assert catalog_tensors(adapter) == []
-        assert adapter.get_metadata() == {}
+        assert writable_server.sources.catalog_tensors(SCRATCH_SOURCE_ID) == []
+        assert adapter.registration_record([], import_rois=False).metadata == {}
 
     def test_the_sweep_leaves_it_alone(self, writable_server, client):
         """It has no directory and no orphan row, so there is nothing for the
@@ -165,8 +148,7 @@ class TestItKeepsNoDirectoryOfItsOwn:
         second = _serve(tmp_path, writable=True)
         try:
             assert [
-                d.array_id
-                for d in catalog_tensors(second.sources.get(SCRATCH_SOURCE_ID))
+                d.array_id for d in second.sources.catalog_tensors(SCRATCH_SOURCE_ID)
             ] == [f"{SCRATCH_SOURCE_ID}/@fields/survivor"]
         finally:
             second.shutdown()

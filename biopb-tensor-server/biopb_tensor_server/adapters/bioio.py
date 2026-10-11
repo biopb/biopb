@@ -24,6 +24,7 @@ Chunk ID format:
 - array_id + bounds encoding (start, stop coordinates)
 """
 
+import copy
 import logging
 import math
 import os
@@ -41,10 +42,18 @@ from biopb_tensor_server.adapters._handle_reaper import (
 )
 from biopb_tensor_server.adapters._ome_rois import (
     imported_annotations,
+    ome_registration_record,
     tensors_by_image_order,
 )
 from biopb_tensor_server.core import chunk as chunk_policy
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
+    catalog_entry,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
     content_version_from_path,
@@ -53,6 +62,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +173,76 @@ def _claim_extensions() -> frozenset:
     return MICROSCOPY_EXTENSIONS
 
 
+# A source with more scenes than this stores no payload: building it binds every
+# scene, and a restart is better parsing a file that large than registering it slowly.
+_PAYLOAD_MAX_SCENES = 256
+
+# What ``_hydrated_scale`` answers when the adapter was not rebuilt from a payload.
+_NOT_HYDRATED = object()
+
+
+class _DeferredBioImage:
+    """A ``BioImage`` that is opened on first use, for an adapter rebuilt from a row.
+
+    The scene ids are answered from the row, so listing and describing a source
+    opens nothing; anything else (a scene bind, a read, a metadata ask) opens the
+    file once, as ``create_from_config`` would have, and is forwarded to the real
+    image. Only local files: a remote source is never rebuilt from a payload.
+    """
+
+    _OWN = frozenset({"_url", "_scene_ids", "_real", "_open_lock"})
+
+    def __init__(self, url: str, scene_ids: List[str]) -> None:
+        object.__setattr__(self, "_url", url)
+        object.__setattr__(self, "_scene_ids", tuple(scene_ids))
+        object.__setattr__(self, "_real", None)
+        object.__setattr__(self, "_open_lock", threading.Lock())
+
+    @property
+    def scenes(self) -> Tuple[str, ...]:
+        return self._scene_ids
+
+    def _image(self) -> "BioImage":
+        with self._open_lock:
+            if self._real is None:
+                from bioio import BioImage
+
+                object.__setattr__(self, "_real", BioImage(self._url))
+            return self._real
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._image(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._OWN:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._image(), name, value)
+
+
+class _Hydration:
+    """What a source rebuilt from a payload answers without its file: the scene
+    listing, each scene's serving facts, and the row's metadata."""
+
+    __slots__ = ("listing", "scenes", "metadata", "has_rois")
+
+    def __init__(
+        self,
+        listing: List[dict],
+        scenes: List[dict],
+        metadata: dict,
+        has_rois: bool,
+    ) -> None:
+        self.listing = listing
+        self.scenes = scenes
+        # The row's copy: ``rois`` is not in it, the annotation store owns them.
+        self.metadata = metadata
+        self.has_rois = has_rois
+
+
+@canonical_axes
 class _BioioAdapterBase(TensorAdapter):
     """Base adapter for bioio-supported vendor formats.
 
@@ -184,6 +264,9 @@ class _BioioAdapterBase(TensorAdapter):
     # Class-level source type (override in subclasses)
     SOURCE_TYPE: str = "aics"
     RETAIN_SCENE_DASK = True
+    # What a restart stored for this source; None for a parsed one. A default on the
+    # class, so an adapter built without ``__init__`` (as unit tests do) is parsed.
+    _hydration: Optional["_Hydration"] = None
 
     @classmethod
     def create_from_config(
@@ -224,6 +307,92 @@ class _BioioAdapterBase(TensorAdapter):
             source_url=str(source.url),
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[Any] = None,
+    ) -> Optional["_BioioAdapterBase"]:
+        """Rebuild a local source from its scene listing and each scene's facts.
+
+        The BioImage is opened on the first read, not here (see
+        :class:`_DeferredBioImage`). A remote source parses.
+        """
+        listing = payload.get("listing")
+        scenes = payload.get("scenes")
+        if source.is_remote or not listing or not scenes or len(listing) != len(scenes):
+            return None
+        url = str(source.url)
+        adapter = cls(
+            _DeferredBioImage(url, [entry["field"] for entry in listing]),
+            scene_index=None,
+            source_id=source.source_id,
+            source_url=url,
+        )
+        # A payload with no flag is read as "has ROIs": the safe answer is to look.
+        adapter._hydration = _Hydration(
+            listing, scenes, metadata or {}, bool(payload.get("has_rois", True))
+        )
+        adapter._cached_descriptors = [
+            TensorDescriptor(
+                array_id=f"{source.source_id}/{entry['field']}",
+                dim_labels=list(entry["dim_labels"]),
+                shape=[int(s) for s in entry["shape"]],
+                dtype=entry["dtype"],
+            )
+            for entry in listing
+        ]
+        return adapter
+
+    def catalog_payload(self) -> Optional[dict]:
+        """The scene listing and each scene's serving facts: grid, read block, scale.
+
+        Source-level only. Binds every scene to read them, so a source with more than
+        ``_PAYLOAD_MAX_SCENES`` stores none and a restart parses it.
+        """
+        if self.scene_index is not None:
+            return None
+        entries = self._native_entries()
+        if not entries or len(entries) > _PAYLOAD_MAX_SCENES:
+            return None
+        listing, scenes = [], []
+        for entry in entries:
+            field = strip_source_prefix(self.source_id, entry.array_id)
+            listing.append(
+                {
+                    "field": field,
+                    "dim_labels": list(entry.dim_labels),
+                    "shape": [int(s) for s in entry.shape],
+                    "dtype": entry.dtype,
+                }
+            )
+            scene = self.get_tensor_adapter(field)
+            descriptor = scene._native_descriptor()
+            block = scene.read_block_shape
+            scale = scene._physical_scale()
+            scenes.append(
+                {
+                    "dim_labels": list(descriptor.dim_labels),
+                    "shape": [int(s) for s in descriptor.shape],
+                    "chunk_shape": [int(s) for s in descriptor.chunk_shape],
+                    "dtype": descriptor.dtype,
+                    "read_block": None if block is None else [int(s) for s in block],
+                    "scale": None if not scale else [float(v) for v in scale[0]],
+                    "unit": None if not scale else [str(u) for u in scale[1]],
+                }
+            )
+        # Whether the file carries ``<ROI>`` elements. The row's metadata has them
+        # stripped (the annotation store owns them), so an adapter rebuilt from it
+        # cannot tell, and re-importing from an empty set would wipe the store's.
+        has_rois = (
+            self._hydration.has_rois
+            if self._hydration is not None
+            else bool(self._read_metadata().get("rois"))
+        )
+        return {"listing": listing, "scenes": scenes, "has_rois": has_rois}
+
     def __init__(
         self,
         bio_image: "BioImage",
@@ -233,6 +402,7 @@ class _BioioAdapterBase(TensorAdapter):
         io_lock: Optional[threading.Lock] = None,
         metadata_cache: Optional[Any] = None,
         shared_handle: Optional[Any] = None,
+        hydration: Optional[_Hydration] = None,
     ):
         """Initialize bioio adapter.
 
@@ -251,7 +421,7 @@ class _BioioAdapterBase(TensorAdapter):
         self.source_id = source_id
 
         # Serializes every touch of the shared BioImage. Reentrant because the
-        # guarded methods nest -- list_tensor_descriptors reaches _bio_image
+        # guarded methods nest -- list_tensors reaches _bio_image
         # both directly and through _metadata_for_listing.
         # Source-level creates lock, scene-level receives from source
         if io_lock is not None:
@@ -276,6 +446,9 @@ class _BioioAdapterBase(TensorAdapter):
 
         self._dask_data = None  # scene-level dask array, bound below
         self._scene_descriptor = None
+        # Set on an adapter rebuilt from a payload (and handed to its scenes): the
+        # facts it answers without binding a scene, which opens the file.
+        self._hydration: Optional[_Hydration] = hydration
         # (generation, frame map) -- the map is per SCENE, but it indexes into a
         # reader shared by every scene of this source, so a reopen invalidates it.
         self._nd2_frame_index_cache: Any = _FRAME_INDEX_UNCACHED
@@ -284,13 +457,25 @@ class _BioioAdapterBase(TensorAdapter):
         # subclasses that keep one warm. None here means "not shared yet";
         # whoever needs it makes it (see NikonAdapter._reader_handle).
         self._shared_handle: Any = shared_handle
-        self._cached_descriptors = None  # cached on first list_tensor_descriptors
+        self._cached_descriptors = None  # cached on first list_tensors
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
         # attribute exists; a per-instance dict, never a class attribute, for the
         # reason spelled out in biopb/biopb#522.
         self._tensor_adapters: dict = {}
-        if scene_index is not None:
+        if scene_index is not None and hydration is not None:
+            # Rebuilt from a payload: describe the scene from its stored facts and
+            # bind its dask array on the first read (``_scene_dask``).
+            facts = hydration.scenes[scene_index]
+            self.dim_labels = list(facts["dim_labels"])
+            self._scene_descriptor = TensorDescriptor(
+                array_id=self.array_id,
+                dim_labels=self.dim_labels,
+                shape=[int(s) for s in facts["shape"]],
+                chunk_shape=[int(s) for s in facts["chunk_shape"]],
+                dtype=facts["dtype"],
+            )
+        elif scene_index is not None:
             # Scene-level: bind this scene's bioio dask array eagerly.
             with self._io_lock:
                 self._bio_image.set_scene(scene_index)
@@ -313,8 +498,19 @@ class _BioioAdapterBase(TensorAdapter):
         that reads off a mapping rather than through Dask -- overrides this with
         ``None``; see :class:`NikonAdapter`.
         """
+        if self._hydration is not None and self.scene_index is not None:
+            block = self._hydration.scenes[self.scene_index]["read_block"]
+            return tuple(int(size) for size in block) if block else None
         block = self._native_block(self._dask_data)
         return tuple(int(size) for size in block) if block else None
+
+    def _scene_dask(self) -> Any:
+        """This scene's dask array, bound now if the adapter was rebuilt from a
+        payload and has not been read yet. Caller holds ``_io_lock``."""
+        if self._dask_data is None and self._hydration is not None:
+            self._bio_image.set_scene(self.scene_index)
+            self._dask_data = self._bio_image.dask_data
+        return self._dask_data
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's bioio dask array.
@@ -332,11 +528,11 @@ class _BioioAdapterBase(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._io_lock:
-            return self._dask_data[slices].compute()
+            return self._scene_dask()[slices].compute()
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter (bioio).
 
         Scene-level (scene_index set): computed from the bioio dask array.
@@ -357,13 +553,13 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: the default (first) scene -- answered by the adapter
         # bound to it, not read back off the catalog listing, which carries no
         # transfer grid (biopb/biopb#812).
-        entries = self.list_tensor_descriptors()
+        entries = self._native_entries()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no scenes",
                 reason="unknown_source",
             )
-        return self.get_tensor_adapter(entries[0].array_id).get_tensor_descriptor()
+        return self.get_tensor_adapter(entries[0].array_id)._native_descriptor()
 
     def _native_block(self, dask_data: Any) -> Optional[List[int]]:
         """The backend's own block, used to align the transfer grid.
@@ -413,7 +609,10 @@ class _BioioAdapterBase(TensorAdapter):
         with self._io_lock:
             return self._bio_image.ome_metadata
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
+        return self._native_entries()
+
+    def _native_entries(self) -> List[TensorEntry]:
         """List every scene as a structural catalog entry.
 
         Uses OME metadata for shapes without scene switching when possible, else
@@ -426,16 +625,13 @@ class _BioioAdapterBase(TensorAdapter):
             List of TensorDescriptor for all scenes in this source
         """
         # Source-level: use cached descriptors if available
-        if self._cached_descriptors is not None:
-            return self._cached_descriptors
-
-        with self._io_lock:
-            # Re-check: another thread may have built these while this one
-            # waited for the lock.
-            if self._cached_descriptors is not None:
-                return self._cached_descriptors
-            self._cached_descriptors = self._build_tensor_descriptors()
-        return self._cached_descriptors
+        if self._cached_descriptors is None:
+            with self._io_lock:
+                # Re-check: another thread may have built these while this one
+                # waited for the lock.
+                if self._cached_descriptors is None:
+                    self._cached_descriptors = self._build_tensor_descriptors()
+        return [catalog_entry(d) for d in self._cached_descriptors]
 
     def _build_tensor_descriptors(self) -> List[TensorDescriptor]:
         """Enumerate every scene's descriptor. Caller holds ``_io_lock``."""
@@ -525,11 +721,11 @@ class _BioioAdapterBase(TensorAdapter):
         descriptors are in series/scene order, so the position IS the scene
         index, and bioio's ``set_scene`` takes that int directly. Falls
         back to enumerating scenes when no descriptors are cached (e.g. a read
-        without a prior list_tensor_descriptors).
+        without a prior list_tensors).
         """
         if self._cached_descriptors is not None:
             for i, d in enumerate(self._cached_descriptors):
-                if self._within_source_field(d.array_id) == field:
+                if strip_source_prefix(self.source_id, d.array_id) == field:
                     return i
             raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
         with self._io_lock:
@@ -553,11 +749,11 @@ class _BioioAdapterBase(TensorAdapter):
         # Populate _cached_descriptors before resolving the scene index. Idempotent
         # (cached), and it closes the latent list(self._bio_image.scenes) parse in
         # _scene_index_for_field for a read that skipped registration.
-        self.list_tensor_descriptors()
+        self._native_entries()
 
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).
-        tensor_id = self._within_source_field(tensor_id)
+        tensor_id = strip_source_prefix(self.source_id, tensor_id)
 
         # Source-level: lazy initialize tensor level adapters
         scene_idx = self._scene_index_for_field(tensor_id)
@@ -573,6 +769,7 @@ class _BioioAdapterBase(TensorAdapter):
             io_lock=self._io_lock,
             metadata_cache=self._metadata_cache,
             shared_handle=self._shared_handle_for_scenes(),
+            hydration=self._hydration,
         )
         # Set tensor context in the adapter
         adapter._tensor_name = tensor_id
@@ -589,12 +786,8 @@ class _BioioAdapterBase(TensorAdapter):
         """
         return None
 
-    def get_metadata(self) -> dict:
-        """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
-
-        Returns:
-            OME metadata as dict, or empty dict if unavailable.
-        """
+    def _read_metadata(self) -> dict:
+        """The metadata as the file holds it, opening the file if need be."""
         try:
             with self._io_lock:
                 ome_meta = self._bio_image.ome_metadata
@@ -619,20 +812,48 @@ class _BioioAdapterBase(TensorAdapter):
         except Exception:
             return {}
 
-    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
-        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ):
+        """The metadata and the OME-XML ``<ROI>`` elements this file carries.
 
-        Matched by POSITION, not by id. A field here is named by
+        ROIs are matched by POSITION, not by id. A field here is named by
         ``BioImage.scenes`` -- a CZI scene label, an ND2 point name -- which is
         not the OME image id, so equality would match nothing at all. Position
         is the relation ``_build_tensor_descriptors`` already pairs these on.
+
+        An adapter rebuilt from a row has only the row's metadata, which no longer
+        holds the ``rois``: it reads them from the file, and only when the payload
+        says the file has some.
         """
-        return imported_annotations(
-            metadata,
-            tensors_by_image_order(metadata, tensors),
-            content_version=self.content_version,
-            max_per_tensor=max_per_tensor,
+
+        def read_rois(metadata):
+            if self._hydration is not None and self._hydration.has_rois:
+                metadata = self._read_metadata()
+            return imported_annotations(
+                metadata,
+                tensors_by_image_order(metadata, tensors),
+                content_version=self.content_version,
+                max_per_tensor=max_rois_per_tensor,
+            )
+
+        metadata = (
+            copy.deepcopy(self._hydration.metadata)
+            if self._hydration is not None
+            else self._read_metadata()
         )
+        return ome_registration_record(metadata, read_rois, import_rois=import_rois)
+
+    def _hydrated_scale(self) -> Any:
+        """The stored scale of this scene (the first, at source level), or
+        ``_NOT_HYDRATED`` when the adapter was parsed."""
+        if self._hydration is None:
+            return _NOT_HYDRATED
+        index = self.scene_index if self.scene_index is not None else 0
+        facts = self._hydration.scenes[index]
+        if not facts["scale"]:
+            return None
+        return list(facts["scale"]), list(facts["unit"])
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the bioio OME model.
@@ -642,6 +863,9 @@ class _BioioAdapterBase(TensorAdapter):
         axes get ``0.0`` / ``""``. Returns ``None`` when no positive size is known.
         See ``TensorAdapter._physical_scale``.
         """
+        stored = self._hydrated_scale()
+        if stored is not _NOT_HYDRATED:
+            return stored
         try:
             with self._io_lock:
                 ome = self._bio_image.ome_metadata
@@ -827,6 +1051,7 @@ class _Nd2Reader:
             pass
 
 
+@canonical_axes
 class NikonAdapter(_BioioAdapterBase):
     """Adapter for Nikon ND2 files."""
 
@@ -859,7 +1084,7 @@ class NikonAdapter(_BioioAdapterBase):
     def _metadata_for_listing(self) -> Any:
         return self._processed_metadata()
 
-    def get_metadata(self) -> dict:
+    def _read_metadata(self) -> dict:
         """Read and retain BioIO's processed metadata once for this ND2 source."""
         return self._metadata_to_dict(self._processed_metadata())
 
@@ -881,6 +1106,9 @@ class NikonAdapter(_BioioAdapterBase):
 
     def _physical_scale(self):
         """Derive this scene's scale from the shared processed metadata cache."""
+        stored = self._hydrated_scale()
+        if stored is not _NOT_HYDRATED:
+            return stored
         ome = self._processed_metadata()
         if ome is None or not getattr(ome, "images", None):
             return None
@@ -1020,7 +1248,7 @@ class NikonAdapter(_BioioAdapterBase):
         if not self._source_url or not os.path.isfile(self._source_url):
             return self._get_data_via_bioio(bounds, step)
 
-        desc = self.get_tensor_descriptor()
+        desc = self._native_descriptor()
         labels = [label.upper() for label in desc.dim_labels]
         if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
             return self._get_data_via_bioio(bounds, step)
@@ -1179,9 +1407,9 @@ class NikonAdapter(_BioioAdapterBase):
         paid reading the extent and striding it.
         """
         slices = (
-            self._bounds_to_slices(bounds)
+            bounds_to_slices(bounds)
             if step is None
-            else self._bounds_to_strided_slices(bounds, step)
+            else bounds_to_strided_slices(bounds, step)
         )
         with self._io_lock:
             self._bio_image.set_scene(self.scene_index)

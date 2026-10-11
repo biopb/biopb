@@ -37,7 +37,7 @@ change.
 ## Reserved sets
 
 A `set_name` starting with `@` is server-owned: a cache of the source file,
-filled by an adapter's `get_embedded_rois` and replaced wholesale on
+filled from an adapter's `registration_record` and replaced wholesale on
 re-registration (today's importer files OME-embedded ROIs into `@ome`). The
 store refuses a client write addressed to a reserved set, by name or by one
 of its ids, since an edit landing there would be silently destroyed at the

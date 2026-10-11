@@ -3,8 +3,8 @@
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
 collaborators share the connection via :class:`_ClientState`:
 
-- :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
-  registration (``list_sources`` / ``query`` / ``resolve`` / ... RPCs).
+- :class:`CatalogClient` -- discovery / metadata / resolve / source
+  registration (``query`` / ``resolve`` / ... RPCs).
 - :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
   build the lazy dask chunk-fetching array.
 
@@ -18,7 +18,7 @@ from ``biopb.tensor.client``.
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
@@ -47,15 +47,15 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
-    _descriptor_from_row,
     sql_literal,
     tensor_descriptors_from_row,
+    with_reason,
 )
-from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
+    _fetch_chunk_distributed,
     _get_shared_call_options,
     _get_thread_client,
 )
@@ -74,13 +74,13 @@ from biopb.tensor._tls import (
     is_tls_location,
     resolve_tls_trust,
 )
+from biopb.tensor._wire_version import FLIGHT_PROTOCOL_METADATA_KEY
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
     AddSourceResult,
     AddSourceStreamMessage,
     CatalogQuery,
-    DataSourceDescriptor,
     FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
@@ -90,17 +90,17 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     TensorReadOption,
     UploadStatus as UploadStatusPb,
-    WarmProgress,
-    WarmStreamMessage,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
+    ChunkRef,
     PutCommand,
     RoiDelete,
     RoiPut,
     RoiRead,
     TensorTicket,
+    TicketStub,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,13 @@ class _ClientState:
     # if the server didn't advertise one (an old server, a loopback
     # deployment, or the check was bypassed).
     advertised_location: Optional[str] = None
+    # The server's ``health`` body, read with ``protocol``. Empty until the
+    # check has run, and for a connection handed in directly.
+    server_health: Dict[str, Any] = field(default_factory=dict)
+    # The ``sources`` table's column names, from its flight's schema, read on
+    # first need (see ``CatalogClient._catalog_columns``). Empty when the server
+    # would not say, which a caller reads as "ask for the base columns only".
+    catalog_columns: Optional[frozenset] = None
 
     @property
     def client(self) -> flight.FlightClient:
@@ -150,7 +157,10 @@ class _ClientState:
         if not self.protocol_checked:
             try:
                 self.advertised_location = _check_flight_protocol(
-                    self.raw_client, self.call_options, self.location
+                    self.raw_client,
+                    self.call_options,
+                    self.location,
+                    health_out=self.server_health,
                 )
             except flight.FlightUnavailableError as exc:
                 raise _explain_handshake_failure(
@@ -165,6 +175,18 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
+
+    @property
+    def ticket_stubs(self) -> bool:
+        """Does the server issue a plan as one sealed stub plus an index per
+        chunk (``health.ticket_stubs``, biopb/biopb#1112)?
+
+        Reads ``health`` first if nothing has. A server that does not say, or a
+        connection handed in directly, is taken not to: its plans stay one full
+        ticket per chunk.
+        """
+        _ = self.client
+        return bool(self.server_health.get("ticket_stubs"))
 
     def trust_for(self, location: str) -> TlsTrust:
         """The trust a consumer dialing *location* is handed.
@@ -263,20 +285,49 @@ def _request_crop_slices(
 
 def _parse_flight_endpoints(
     info: "flight.FlightInfo",
-) -> Tuple[List[bytes], List[ChunkBounds]]:
-    """Decode a FlightInfo's endpoints into parallel ``(chunk_ids, bounds)`` lists.
+) -> Tuple[List[bytes], List[ChunkBounds], Optional[bytes]]:
+    """Decode a FlightInfo's endpoints into parallel ``(chunk_ids, bounds)``
+    lists, and the grant they were issued under.
 
-    chunk_id is an opaque server-minted token (echoed back to do_get); a chunk's
+    A chunk_id is the opaque token a chunk is cached and fetched by; a chunk's
     bounds ride on the endpoint's app_metadata, so the client never decodes the
     chunk_id byte format. Shared by every GetFlightInfo read planner.
+
+    A plan issued as a stub (``descriptor.ticket_stub``, biopb/biopb#1112) has
+    endpoints that carry only a grid index. The chunk's key is then the stub's
+    stable identity joined to that index, and the stub's grant -- which changes
+    with every plan -- is returned apart, to be joined at fetch time. Without a
+    stub the grant is None and the chunk_ids are the server's own.
     """
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    stub: Optional[TicketStub] = None
+    if descriptor.ticket_stub:
+        stub = TensorTicket.FromString(descriptor.ticket_stub).chunk_ref.stub
+    key_prefix = grant = None
+    if stub is not None:
+        key_prefix = TensorTicket(
+            chunk_ref=ChunkRef(stub=TicketStub(identity=stub.identity))
+        ).SerializeToString()
+        grant = TensorTicket(
+            chunk_ref=ChunkRef(stub=TicketStub(grant=stub.grant))
+        ).SerializeToString()
+
     chunks: List[bytes] = []
     chunk_bounds_list: List[ChunkBounds] = []
     for endpoint in info.endpoints:
-        ticket = TensorTicket.FromString(endpoint.ticket.ticket)
-        chunks.append(ticket.chunk_id)
+        if key_prefix is None:
+            chunks.append(TensorTicket.FromString(endpoint.ticket.ticket).chunk_id)
+        else:
+            chunks.append(key_prefix + endpoint.ticket.ticket)
         chunk_bounds_list.append(ChunkBounds.FromString(endpoint.app_metadata))
-    return chunks, chunk_bounds_list
+    return chunks, chunk_bounds_list, grant
+
+
+def _is_sealed(info: "flight.FlightInfo") -> bool:
+    """Did the server seal this plan: endpoints that are indices under a stub?"""
+    return bool(info.endpoints) and bool(
+        TensorDescriptor.FromString(info.descriptor.command).ticket_stub
+    )
 
 
 def _refetch_flight_info(
@@ -284,13 +335,16 @@ def _refetch_flight_info(
     location: str,
     token: Optional[str],
     tls_trust: Optional[TlsTrust] = None,
+    request: Optional[TensorReadOption] = None,
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
     For a handle that carries no endpoints -- a source declared before its
     chunks existed, or one whose producer chose not to embed a plan. The
-    request is rebuilt from the descriptor's realized slice, scale and
-    reduction, so the answer is the same plan its producer would have got.
+    request is the one the handle recorded (*request*, see :func:`_plan_request`)
+    replayed for its endpoints; a handle that recorded none has it rebuilt from
+    the descriptor's realized slice, so the answer is the same plan its producer
+    would have got either way.
 
     Reuses the worker's pooled per-thread connection (with its tuned gRPC
     message-size options) rather than dialing a throwaway client; a later
@@ -302,12 +356,15 @@ def _refetch_flight_info(
     # `endpoints` is explicit: this call exists to get them, and nothing is
     # implied by the mask any more.
     read_opt = _read_option(endpoints=True)
-    if descriptor.HasField("slice_hint"):
+    if request is not None and (
+        request.HasField("slice_hint") or request.scale_hint or request.reduction_method
+    ):
+        if request.HasField("slice_hint"):
+            read_opt.slice_hint.CopyFrom(request.slice_hint)
+        read_opt.scale_hint[:] = list(request.scale_hint)
+        read_opt.reduction_method = request.reduction_method
+    elif descriptor.HasField("slice_hint"):
         read_opt.slice_hint.CopyFrom(descriptor.slice_hint)
-    if descriptor.scale_hint:
-        read_opt.scale_hint[:] = list(descriptor.scale_hint)
-    if descriptor.reduction_method:
-        read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
     client = _get_thread_client(
@@ -320,14 +377,121 @@ def _refetch_flight_info(
     return info
 
 
-def _requested_slice(info: "flight.FlightInfo") -> Optional[SliceHint]:
-    """The slice a plan was asked for, off ``FlightInfo.app_metadata``.
+def _read_rois(
+    client: "flight.FlightClient",
+    call_options: "flight.FlightCallOptions",
+    array_id: str,
+    set_name: str,
+    roi_ticket: Optional[bytes],
+) -> "RoiListResult":
+    """One ``roi_read`` DoGet on *client*, decoded.
 
-    The server stamps the request's ``slice_hint`` there verbatim, beside the
-    chunk-aligned realized one in the descriptor. None for an unsliced read.
+    *roi_ticket* is the sealed ticket a plan carried; the one set is merged
+    onto it, since a serialized ``RoiRead{set_name}`` joined to it is one
+    ``RoiRead``. Without one the read is by *array_id* and the connection's own
+    credentials.
     """
+    if roi_ticket:
+        ticket_bytes = roi_ticket + (
+            TensorTicket(roi_read=RoiRead(set_name=set_name)).SerializeToString()
+            if set_name
+            else b""
+        )
+    else:
+        ticket_bytes = TensorTicket(
+            roi_read=RoiRead(array_id=array_id, set_name=set_name)
+        ).SerializeToString()
+    table = client.do_get(flight.Ticket(ticket_bytes), options=call_options).read_all()
+    metadata = table.schema.metadata or {}
+    sets = [
+        RoiSetInfo(
+            set_name=entry["set_name"],
+            count=int(entry["count"]),
+            reserved=bool(entry.get("reserved")),
+        )
+        for entry in json.loads(metadata.get(b"sets", b"[]"))
+    ]
+    return RoiListResult(
+        rois=table_to_rois(table),
+        truncated=metadata.get(b"truncated", b"").decode() == "True",
+        sets=sets,
+    )
+
+
+def _rois_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    set_name: str,
+    tls_trust: Optional[TlsTrust] = None,
+) -> "RoiListResult":
+    """The annotations of the tensor a plan describes, read as its holder.
+
+    Uses the plan's sealed ``roi_ticket`` when the sender issued one, so a
+    holder with no token reads them; a plan without one is read by the
+    descriptor's array_id under *token*, which the server then judges.
+    """
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    client = _get_thread_client(
+        location, token, tls_trust or resolve_tls_trust(location)
+    )
+    return _read_rois(
+        client,
+        _get_shared_call_options(location, token),
+        descriptor.array_id,
+        set_name,
+        descriptor.roi_ticket or None,
+    )
+
+
+def _plan_request(info: "flight.FlightInfo") -> TensorReadOption:
+    """The request a plan answers, as a ``TensorReadOption``, whichever protocol
+    wrote it.
+
+    A v3 plan carries the whole request in ``FlightInfo.app_metadata``. A v2 plan
+    carried only the requested ``SliceHint`` there and echoed the scale and
+    method on its descriptor, so those are put back together here: everything
+    past this function reads one shape, and a v2 server costs one branch. Which
+    wrote the plan is stamped on its schema, not asked of a connection, because
+    a plan travels (``SerializedTensor``). A plan with no stamp is v2, and one
+    built by hand with nothing recorded comes back empty.
+    """
+    metadata = info.schema.metadata or {}
+    stamped = metadata.get(FLIGHT_PROTOCOL_METADATA_KEY.encode())
     raw = info.app_metadata
-    return SliceHint.FromString(raw) if raw else None
+    if stamped and int(stamped) >= 3:
+        return TensorReadOption.FromString(raw) if raw else TensorReadOption()
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    request = TensorReadOption(array_id=descriptor.array_id)
+    if raw:
+        request.slice_hint.CopyFrom(SliceHint.FromString(raw))
+    request.scale_hint[:] = list(descriptor.scale_hint)
+    request.reduction_method = descriptor.reduction_method
+    return request
+
+
+def _crop_slices(
+    descriptor: TensorDescriptor,
+    request: Optional[TensorReadOption],
+    ndim: int,
+) -> Optional[Tuple[slice, ...]]:
+    """The slices that crop a plan's realized region back to what *request* asked
+    for, or None when it asked for no slice or the plan carries no realized one.
+
+    The one rule for both forms of a read (lazy and eager), so they cannot drift.
+    """
+    if (
+        request is None
+        or not request.HasField("slice_hint")
+        or not descriptor.HasField("slice_hint")
+    ):
+        return None
+    return _request_crop_slices(
+        ndim,
+        request.slice_hint,
+        descriptor.slice_hint,
+        list(request.scale_hint) if request.scale_hint else None,
+    )
 
 
 def _dask_from_flight_info(
@@ -336,19 +500,19 @@ def _dask_from_flight_info(
     token: Optional[str],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust],
-    requested: Optional[SliceHint] = None,
+    request: Optional[TensorReadOption] = None,
 ) -> da.Array:
     """The lazy array a planned read describes.
 
     The one reconstruction, whether the FlightInfo came from this connection's
     GetFlightInfo (``get_tensor``) or arrived serialized from another process
     (``tensor_from_pb``): decode the descriptor and endpoints, build the
-    chunk-fetching array, crop the realized region back to *requested* (the
-    plan's own ``app_metadata`` unless the caller kept an earlier one).
+    chunk-fetching array, crop the realized region back to *request* (the
+    plan's own unless the caller kept an earlier one).
     """
     _check_wire_protocol(info.schema)
     descriptor = TensorDescriptor.FromString(info.descriptor.command)
-    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    chunk_ids, bounds_list, grant = _parse_flight_endpoints(info)
     shape = tuple(descriptor.shape)
     chunk_map, grid_shape = _chunk_map_from_endpoints(chunk_ids, bounds_list, shape)
     dask_arr = _build_dask_array_from_chunk_map(
@@ -360,19 +524,52 @@ def _dask_from_flight_info(
         token,
         cache_bytes,
         tls_trust,
+        grant,
     )
-    if requested is None:
-        requested = _requested_slice(info)
-    if requested is not None and descriptor.HasField("slice_hint"):
-        dask_arr = dask_arr[
-            _request_crop_slices(
-                len(shape),
-                requested,
-                descriptor.slice_hint,
-                list(descriptor.scale_hint) if descriptor.scale_hint else None,
-            )
-        ]
-    return dask_arr
+    crop = _crop_slices(
+        descriptor,
+        _plan_request(info) if request is None else request,
+        len(shape),
+    )
+    return dask_arr if crop is None else dask_arr[crop]
+
+
+def _array_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    tls_trust: Optional[TlsTrust],
+) -> np.ndarray:
+    """The planned read, materialized now.
+
+    A plan whose one chunk is the whole realized region is fetched directly and
+    cropped, skipping dask: building and running even a one-task graph costs more
+    than the fetch itself. Any other plan goes through ``_dask_from_flight_info``
+    and computes it, so the two forms always agree on the result.
+    """
+    _check_wire_protocol(info.schema)
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    chunk_ids, bounds_list, grant = _parse_flight_endpoints(info)
+    shape = tuple(descriptor.shape)
+    start, stop = tuple(bounds_list[0].start), tuple(bounds_list[0].stop)
+    if len(chunk_ids) != 1 or any(start) or stop != shape:
+        return _dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust
+        ).compute()
+    arr = _fetch_chunk_distributed(
+        location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust, grant
+    )
+    crop = _crop_slices(descriptor, _plan_request(info), len(shape))
+    if crop is None:
+        return arr
+    cropped = arr[crop]
+    # dask's getitem rule: a small crop must not keep the whole chunk (a pinned
+    # segment mapping or a decoded transfer buffer) alive for as long as the
+    # caller holds it.
+    if not cropped.flags.owndata and arr.size >= 2 * cropped.size:
+        cropped = cropped.copy()
+    return cropped
 
 
 def _explain_handshake_failure(
@@ -390,8 +587,18 @@ def _explain_handshake_failure(
     return flight.FlightUnavailableError(f"{exc}\n{reason}") if reason else exc
 
 
+_TRANSIENT_FLIGHT_ERRORS = (
+    flight.FlightUnavailableError,
+    flight.FlightTimedOutError,
+    flight.FlightCancelledError,
+)
+
+
 def _check_flight_protocol(
-    client: flight.FlightClient, call_options: flight.FlightCallOptions, location: str
+    client: flight.FlightClient,
+    call_options: flight.FlightCallOptions,
+    location: str,
+    health_out: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Refuse a server whose Flight protocol shape is not this SDK's.
 
@@ -400,11 +607,17 @@ def _check_flight_protocol(
     prefix-sniffed tickets), which this SDK no longer does. An unreachable
     server is not this check's concern: its error propagates as it always did.
 
+    The ``health`` body is copied into *health_out* when one is given, for the
+    capabilities a caller reads off it (``ticket_stubs``).
+
     Returns the server's advertised ``external_location`` (biopb/biopb#1158),
     or None if it published none, could not be reached, or isn't a biopb
     server at all -- the caller falls back to its own dial address either way.
     """
-    from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
+    from biopb.tensor._wire_version import (
+        FLIGHT_PROTOCOL_VERSION,
+        SUPPORTED_FLIGHT_PROTOCOLS,
+    )
 
     try:
         results = client.do_action(flight.Action("health", b""), options=call_options)
@@ -421,15 +634,18 @@ def _check_flight_protocol(
         health = {}
     if not isinstance(health, Mapping):
         health = {}
+    if health_out is not None:
+        health_out.update(health)
     try:
         server_ver = int(health.get("protocol", 1))
     except (ValueError, TypeError):
         server_ver = 1
-    if server_ver != FLIGHT_PROTOCOL_VERSION:
-        stale = "server" if server_ver < FLIGHT_PROTOCOL_VERSION else "client"
+    if server_ver not in SUPPORTED_FLIGHT_PROTOCOLS:
+        stale = "server" if server_ver < min(SUPPORTED_FLIGHT_PROTOCOLS) else "client"
         raise RuntimeError(
             f"Incompatible biopb Flight protocol: the server at {location} speaks "
-            f"v{server_ver}, this client speaks v{FLIGHT_PROTOCOL_VERSION}. "
+            f"v{server_ver}, this client speaks "
+            f"v{min(SUPPORTED_FLIGHT_PROTOCOLS)}-v{FLIGHT_PROTOCOL_VERSION}. "
             f"Upgrade the {stale} so both sides match."
         )
     advertised = health.get("external_location")
@@ -542,7 +758,8 @@ def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
 
 
 def _unresolved_source_error(source_id: str) -> ValueError:
-    """Directive error for reading an *unresolved* (cloud / synced-folder) source.
+    """Directive error for reading an *unresolved* source: a cloud /
+    synced-folder one, or one the server has found but not yet registered.
 
     Shared by every read entry point so the guidance is uniform: name the cure
     (``client.resolve_source``) instead of leaking a bare internal "no tensors",
@@ -552,9 +769,9 @@ def _unresolved_source_error(source_id: str) -> ValueError:
     must not trigger it implicitly."""
     return ValueError(
         f"Source '{source_id}' is unresolved (no tensors listed yet). If this "
-        f"is a cloud / synced-folder source, call "
-        f"client.resolve_source('{source_id}') first to download and resolve "
-        f"it, then read it."
+        f"is a cloud / synced-folder source, or one the server has found but "
+        f"not yet registered, call client.resolve_source('{source_id}') first "
+        f"to resolve it, then read it."
     )
 
 
@@ -586,6 +803,7 @@ def _read_option(
     pyramid: bool = False,
     upload_status: bool = False,
     is_resident: bool = False,
+    ticket_stub: bool = False,
 ) -> TensorReadOption:
     """A ``TensorReadOption`` whose field mask names the parts asked for.
 
@@ -607,6 +825,7 @@ def _read_option(
             ("pyramid", pyramid),
             ("upload_status", upload_status),
             ("is_resident", is_resident),
+            ("ticket_stub", ticket_stub),
         )
         if wanted
     )
@@ -659,36 +878,13 @@ def do_action_one_result(
 class CatalogClient:
     """Catalog, metadata, and source-lifecycle RPCs over one Flight connection.
 
-    Owns discovery (``list_sources`` / ``query``), per-tensor metadata
-    probes, the experimental cloud ``resolve`` / ``warm`` streams, and runtime
+    Owns discovery (``query``), per-tensor metadata
+    probes, the experimental cloud ``resolve`` stream, and runtime
     source registration. Reads and writes the shared ``_ClientState`` caches.
     """
 
     def __init__(self, state: "_ClientState"):
         self._state = state
-
-    _SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
-
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
-        """Backs TensorFlightClient.list_sources; see that method for the full
-        documentation."""
-        table = self._query_table(self._SOURCES_SQL + " ORDER BY source_id")
-        source_descriptors = {}
-        for row in table.to_pylist():
-            source_desc = _descriptor_from_row(row)
-            source_descriptors[source_desc.source_id] = source_desc
-        logger.info(f"list_sources: returned {len(source_descriptors)} sources")
-        return source_descriptors
-
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
-        """Backs TensorFlightClient.get_source; see that method for the full
-        documentation."""
-        table = self._query_table(
-            f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
-        )
-        for row in table.to_pylist():
-            return _descriptor_from_row(row)
-        return None
 
     def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query; see that method for the full
@@ -774,11 +970,11 @@ class CatalogClient:
         # tensor-bound GetFlightInfo instead used to overlay the *first* field's
         # get_tensor_metadata() delta, so a multi-field source reported one
         # arbitrary field's extras as the source's metadata.
-        table = self._query_table(
+        query = (
             "SELECT is_resolved, metadata_json FROM sources "
             f"WHERE source_id = {sql_literal(source_id)}"
         )
-        rows = table.to_pylist()
+        rows = self._query_table(query).to_pylist()
         if not rows:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
@@ -824,7 +1020,7 @@ class CatalogClient:
 
         Backs the public ``get_descriptor`` (the array_id-keyed primitive). Uses
         the per-tensor ``GetFlightInfo`` RPC, which works even when the source is
-        beyond the (truncatable) ``list_sources()`` cap. A bare source_id ->
+        beyond the (truncatable) ``query`` row cap. A bare source_id ->
         the source's default (first) tensor (#44). This is a CHEAP probe: it
         does NOT resolve. An unresolved (cloud / synced-folder) source raises
         the directive ``_unresolved_source_error`` steering the caller to
@@ -967,6 +1163,37 @@ class CatalogClient:
         """
         return self._addressed_row("is_resolved, tensors", source_id)
 
+    def source_row_columns(self) -> str:
+        """``SOURCE_ROW_COLUMNS`` as a SELECT list, plus ``unresolved_reason``
+        when this server's ``sources`` schema has it. A row carries that key only
+        then."""
+        return with_reason(SOURCE_ROW_COLUMNS, self._catalog_columns())
+
+    def _catalog_columns(self) -> frozenset:
+        """The ``sources`` table's columns, so a projection can ask for one only
+        a newer server has instead of a second query for it.
+
+        One GetFlightInfo on the table's path, the first time it is needed on
+        this connection. Empty when the server will not say -- a capability
+        token reads a source's pixels, not the catalog -- and a caller then
+        projects the base columns only. A refusal is remembered; a dropped or
+        timed-out call is not, so the next call asks again.
+        """
+        state = self._state
+        if state.catalog_columns is None:
+            try:
+                info = state.client.get_flight_info(
+                    flight.FlightDescriptor.for_path("sources"),
+                    options=state.call_options,
+                )
+                state.catalog_columns = frozenset(info.schema.names)
+            except Exception as exc:  # noqa: BLE001 - a probe: failing reads as "unknown"
+                logger.debug("could not read the sources schema", exc_info=True)
+                if isinstance(exc, _TRANSIENT_FLIGHT_ERRORS):
+                    return frozenset()  # this call goes without; the next asks again
+                state.catalog_columns = frozenset()  # a refusal would repeat
+        return state.catalog_columns
+
     def _addressed_row(
         self, columns: str, source_id: str
     ) -> Optional[Mapping[str, Any]]:
@@ -991,7 +1218,7 @@ class CatalogClient:
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
         non-empty message.
 
-        The loop shared by :meth:`resolve_source` / :meth:`warm_source` / :meth:`register_local_path`:
+        The loop shared by :meth:`resolve_source` / :meth:`register_local_path`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
         into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
         ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
@@ -1000,7 +1227,7 @@ class CatalogClient:
         propagates unchanged.
 
         Cancellation is deliberately NOT handled here: its semantics differ per
-        caller (resolve/warm raise, register_local_path returns what it has), and the poll
+        caller (resolve raises, register_local_path returns what it has), and the poll
         must run *after* a message is consumed so a terminal already in hand is
         never discarded by a cancel landing on it (issue #4). Each caller polls
         ``should_cancel`` around its own dispatch.
@@ -1036,7 +1263,7 @@ class CatalogClient:
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
         # entry point that performs the (possibly minutes-long) recall, and its
         # terminal message carries the source's now-concrete catalog row -- no
-        # GetFlightInfo + list_sources two-step, so no truncation hole for
+        # GetFlightInfo + browse two-step, so no truncation hole for
         # multi-field sources beyond the list cap. The action streams
         # ``ResolveStreamMessage`` heartbeats (a ``progress`` arm) to keep the
         # connection warm under proxy idle timeouts. ``should_cancel`` /
@@ -1053,8 +1280,7 @@ class CatalogClient:
                 if on_progress is not None:
                     on_progress(msg.progress)
             elif which == "source_row":
-                # The same row list_sources reads, through the same decoder --
-                # one representation of a source, so a resolve and a subsequent
+                # The same row ``query`` reads: one representation of a source, so a resolve and a subsequent
                 # browse cannot disagree about it.
                 rows = pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
                 if rows:
@@ -1065,42 +1291,6 @@ class CatalogClient:
                 "(server closed the stream without a result)"
             )
         return dict(row)
-
-    def warm_source(
-        self,
-        source_id: str,
-        *,
-        on_progress: Optional[Callable[["WarmProgress"], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> "WarmProgress":
-        """Backs TensorFlightClient.warm_source; see that method for the full
-        documentation."""
-        action = flight.Action("warm", source_id.encode("utf-8"))
-        done: Optional[WarmProgress] = None
-        unknown = (
-            "Hydrate-ahead is unavailable: the tensor server is too old "
-            "to support the 'warm' action. Upgrade the server, or just "
-            "read the data on demand (it will recall lazily)."
-        )
-        for which, msg, _ in self._iter_action_messages(
-            action, WarmStreamMessage, unknown_action_msg=unknown
-        ):
-            if should_cancel is not None and should_cancel():
-                raise ResolveCancelled(
-                    f"warm_source('{source_id}') cancelled by caller"
-                )
-            if which == "progress":
-                if on_progress is not None:
-                    on_progress(msg.progress)
-            elif which == "done":
-                done = WarmProgress()
-                done.CopyFrom(msg.done)
-        if done is None:
-            raise RuntimeError(
-                f"warm_source('{source_id}') returned no terminal status "
-                "(server closed the stream without a 'done')"
-            )
-        return done
 
     def get_upload_status(self, array_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full
@@ -1138,6 +1328,7 @@ class CatalogClient:
         url: str,
         *,
         source_type: str = "",
+        cloud: bool = False,
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
@@ -1146,6 +1337,7 @@ class CatalogClient:
         req = AddSourceRequest(
             url=url,
             source_type=source_type,
+            cloud=cloud,
         )
         action = flight.Action("add_source", req.SerializeToString())
         unknown = (
@@ -1197,39 +1389,22 @@ class CatalogClient:
         )
         return RemoveSourceResult.FromString(result_bytes)
 
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """Backs TensorFlightClient.get_label_sets; see that method."""
-        prefix = sql_literal(f"{image_array_id}/{LABELS_SEGMENT}/")
-        table = self._query_table(
-            "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
-            f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
-        )
-        return table.column(0).to_pylist()
-
     # ---- ROI annotations ----
 
-    def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
+    def list_rois(
+        self,
+        array_id: str,
+        set_name: str = "",
+        *,
+        roi_ticket: Optional[bytes] = None,
+    ) -> "RoiListResult":
         """Backs TensorFlightClient.list_rois; see that method."""
-        ticket = TensorTicket(roi_read=RoiRead(array_id=array_id, set_name=set_name))
-        reader = self._state.client.do_get(
-            flight.Ticket(ticket.SerializeToString()), options=self._state.call_options
-        )
-        table = reader.read_all()
-        metadata = table.schema.metadata or {}
-        sets = [
-            RoiSetInfo(
-                set_name=entry["set_name"],
-                count=int(entry["count"]),
-                reserved=bool(entry.get("reserved")),
-            )
-            for entry in json.loads(metadata.get(b"sets", b"[]"))
-        ]
-        return RoiListResult(
-            rois=table_to_rois(table),
-            truncated=metadata.get(b"truncated", b"").decode() == "True",
-            sets=sets,
+        return _read_rois(
+            self._state.client,
+            self._state.call_options,
+            array_id,
+            set_name,
+            roi_ticket,
         )
 
     def _roi_put_stream(self, cmd: PutCommand, table: pa.Table) -> bytes:
@@ -1346,7 +1521,7 @@ class ChunkFetcher:
 
         # Build TensorReadOption with flattened fields. `endpoints` is explicit:
         # this is the read path, and the plan is what it came for.
-        read_opt = _read_option(endpoints=True)
+        read_opt = _read_option(endpoints=True, ticket_stub=self._state.ticket_stubs)
         if slice_hint_proto is not None:
             read_opt.slice_hint.CopyFrom(slice_hint_proto)
         if scale_hint is not None:
@@ -1396,9 +1571,13 @@ class ChunkFetcher:
             else self._state.location
         )
         if output == "pb":
+            # A plan the server sealed names what it reads and needs no
+            # credential to read it, so the reference leaves without the
+            # connection's own token (biopb/biopb#1112). Anything unsealed
+            # still carries it: the reader has nothing else to read with.
             return SerializedTensor(
                 location=location,
-                auth_token=self._state.token or "",
+                auth_token="" if _is_sealed(info) else (self._state.token or ""),
                 flight_info=info.serialize(),
                 tls_anchor=self._state.tls_anchor if is_tls_location(location) else b"",
             )
@@ -1408,4 +1587,22 @@ class ChunkFetcher:
             self._state.token,
             self._state.cache_bytes,
             self._state.trust_for(location),
+        )
+
+    def get_array(
+        self,
+        array_id: str,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> np.ndarray:
+        """Backs TensorFlightClient.get_array; see that method for the full
+        documentation."""
+        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        return _array_from_flight_info(
+            info,
+            self._state.location,
+            self._state.token,
+            self._state.cache_bytes,
+            self._state.trust_for(self._state.location),
         )

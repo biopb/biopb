@@ -53,16 +53,20 @@ The overlays are named separately in both the dispatcher and the tripwire,
 for two independent reasons, and missing either one hides them completely:
 they subclass **psygnal's** `EventedModel`, not napari's, so
 `isinstance(obj, napari.utils.events.EventedModel)` is `False` for every
-overlay; and napari publishes them as **properties** over a private
-container (`viewer.text_overlay`, `layer.bounding_box`), so a walk over
-pydantic fields never reaches them.
+overlay; and napari publishes them in evented-dict namespaces
+(`viewer.canvas.overlays.text`, `viewer.scene.overlays.axes`) and as
+properties (`layer.bounding_box`), so a walk over pydantic fields alone never
+reaches them.
 
 **Tripwire:** a test walks a headless viewer *through the proxy* and
 asserts every reachable handle is wrapped, following **public attribute
 access** — fields plus properties — because that is what agent code has,
-and a field-only walk misses the overlays for the reason above. A future
+and a field-only walk misses the overlays for the reason above. A name napari
+has deprecated is skipped (its replacement is walked on its own path), and the
+test asserts the walk reached where 0.9 put the camera, grid and overlays, so
+it cannot pass by skipping them. A future
 napari that adds a model or list method **breaks CI, not production**; the
-pinned `napari[all]==0.7.0` (`versions.json`) means the test certifies
+pinned `napari[all]==0.9.2` (`versions.json`) means the test certifies
 exactly the graph that ships.
 
 ## Gotchas

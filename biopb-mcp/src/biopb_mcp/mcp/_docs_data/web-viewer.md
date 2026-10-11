@@ -18,14 +18,13 @@ both:
 
 - **The user**, by clicking it. This is what a visual check is *for*; opening
   the page yourself shows them nothing.
-- **You**, if your host gives you browser automation. biopb ships no tool that
-  drives the page, but most agents have one, and on a session with no napari
-  window this is how you look at a result rather than only compute it.
+- **You**, through `show_view`, which moves the user's open tab to a view (and can
+  return the image to you); or through your host's browser automation, if it has any.
 
 ## Building the link
 
 ```python
-from biopb import user_base_url
+from biopb._control import user_base_url
 url = f"{user_base_url()}/viewer?id={array_id}"
 ```
 
@@ -64,9 +63,9 @@ the viewer's own default, so send the shortest link that says what you mean.
 | `g` | gamma |
 | `v=1` / `v=0` | render as a volume, or as a plane |
 | `vm` | volume mode: `mip`, `additive`, `minip` |
-| `tg=x,y` or `tg=x,y,z` | camera target — two components is a plane, three a volume |
+| `tg=x,y` or `tg=x,y,z` | camera target — two components is a plane, three a volume; in pixels or voxels, not physical units (below) |
 | `zm` | zoom, as log2 pixels per world unit |
-| `rx`, `ro` | 3-D pitch (±90) and orbit (degrees) |
+| `rx`, `ro` | 3-D pitch (±90) and orbit (degrees); part of the camera, so they need `tg` and `zm` (below) |
 | `lb` | a label set drawn over the image, as *its* `array_id` |
 | `lo` | the label overlay's alpha, 0–1 |
 | `rs` | an annotation set to show; repeat it per set (`rs=default&rs=@ome`). Absent means the tensor's default, `rs=` alone means none |
@@ -77,7 +76,17 @@ alone, so you can hand a link back and forth without losing anything.
 
 A camera is all-or-nothing on `tg` **and** `zm`: a target without a zoom frames
 the volume somewhere nobody chose, so it is ignored. Send neither and the view
-opens fitted, which is usually what you want.
+opens fitted, which is usually what you want. **`rx` and `ro` belong to that
+camera**: without `tg` and `zm` they are dropped, and a volume asked for at
+`rx=30&ro=45` opens face-on.
+
+**The target is in the viewer's own units, not µm.** On a plane it is image
+pixels at full resolution, so `tg=128,128` is the middle of a 256 × 256 image.
+On a volume it is the rendered volume's voxels with each axis stretched by its
+physical size relative to the finest one: a 256 × 256 × 60 stack with 0.26 µm
+pixels and 0.29 µm z-steps has its centre at about `tg=128,128,33.5`. Rather than
+work that out, open the view, orbit it by hand, and read `tg`/`zm`/`rx`/`ro` off
+the address bar.
 
 ## Showing something you made
 
@@ -113,22 +122,37 @@ control requires one (`--remote`), the user unlocks the page themselves; append
 `&token=…` only if they gave you a token for this purpose. Do not go looking for
 one.
 
-## Opening it yourself
+## Presenting a result
 
-Where you have browser automation, this page is the replacement for
-`take_screenshot` on a session with no napari window — `take_screenshot`
-captures the napari canvas and cannot see a browser.
+`show_view(view)` is how a session with no napari window presents a result. It
+moves the user's open viewer tab to `view` — the query string from
+[Parameters](#parameters), `id` required — and returns at once. Like napari, it
+changes the viewer: the view stays, so the user sees what you set. Overlays
+(`lb`, `rs`) must already be on the server (above).
 
-Three things to get right:
+`show_view(view, image=True)` also returns a PNG of what the page drew, which is
+how you check a result you are about to report; it waits for tiles and overlays
+to load, so it is slower. Leave it off to just present.
 
-- **Give it time.** The page fetches tiles after it loads, so a capture taken
-  the moment navigation finishes is of an empty canvas. Wait for the image, and
-  re-capture rather than reporting the blank one.
-- **Reachability is yours, not the user's.** The link is a loopback URL. Your
-  browser tool can only open it if it runs on this machine; from elsewhere it
-  will not resolve, which is a fact about where you run and not about the data.
-- **Looking is not showing.** Your capture is yours. The user still needs the
-  link, and a visual check is not satisfied by a screenshot they never saw.
+- **It needs a tab open, not on screen.** The user must have the web viewer
+  (`/viewer`) open. Otherwise it fails with "no viewer page is connected": give the
+  user the link (from `user_base_url()`, see above) and ask them to open it.
+- **A hidden tab moves but does not draw.** A minimised or fully covered window, or
+  a background tab, still takes the view, but the browser does not repaint it, so
+  the answer says the viewer is not visible and returns no image. Ask the user to
+  bring it forward; the view is waiting.
+- **Every open tab moves.** The control cannot tell which machine the user is at,
+  so each connected viewer tab gets the view, and the answer is the first one on
+  screen. A tab left open elsewhere is moved too.
+- **A note means partial.** If tiles or an overlay were still loading when the
+  page gave up waiting, the image comes back with a note saying so; ask again
+  rather than reporting it.
+- **Your own browser tool is the alternative**, where the host gives you one and
+  the link is reachable from where it runs (the link is loopback). Wait for the
+  tiles before capturing, or you get an empty canvas.
+
+Looking is not showing: the user still needs the link for any visual check they
+are meant to make.
 
 ## What it will not do
 
@@ -141,6 +165,6 @@ back with `rs`. And it shows nothing that is not on the server, which is a step
 
 - [[napari-viewer]] — the napari window: the other display surface, and the one that
   can show an array without an upload.
-- [[tensor-server-client]] — uploading a result so this page can read it.
+- [[upload]] — uploading a result so this page can read it.
 - [[tensor-server-client]] — what an `array_id` addresses, and the pyramid
   behind it.

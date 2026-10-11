@@ -270,7 +270,7 @@ def create_multiresolution_ome_zarr(
     zarr_path.mkdir(parents=True, exist_ok=True)
 
     # Create a zarr group first
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
 
     level_paths = []
     datasets = []
@@ -286,7 +286,7 @@ def create_multiresolution_ome_zarr(
             continue  # Skip levels with zero-size dimensions
 
         # Create level array within the group
-        arr = root.create_dataset(
+        arr = root.create_array(
             str(level),
             shape=level_shape,
             chunks=chunk_size,
@@ -642,37 +642,6 @@ def create_companion_ome_dataset(
     return str(companion_path), tiff_files, metadata_info
 
 
-def create_hdf5_dataset(
-    tmpdir: str,
-    shape: Tuple[int, ...] = (100, 100),
-    chunks: Tuple[int, ...] = (50, 50),
-    dtype: np.dtype = np.uint8,
-    dataset_name: str = "data",
-) -> Tuple[str, Tuple[int, ...], Tuple[int, ...]]:
-    """Create HDF5 dataset with chunked array.
-
-    Args:
-        tmpdir: Temporary directory to create file in
-        shape: Shape of dataset
-        chunks: Chunk size
-        dtype: Data type
-        dataset_name: Name of dataset inside HDF5 file
-
-    Returns:
-        Tuple of (h5_path, shape, chunks)
-    """
-    import h5py
-
-    h5_path = Path(tmpdir) / "test.h5"
-
-    with h5py.File(str(h5_path), "w") as f:
-        # Create chunked dataset with distinguishable values
-        data = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
-        f.create_dataset(dataset_name, data=data, chunks=chunks)
-
-    return str(h5_path), shape, chunks
-
-
 def create_zarr_array(
     tmpdir: str,
     shape: Tuple[int, ...] = (128, 128),
@@ -698,6 +667,7 @@ def create_zarr_array(
     arr = zarr.open_array(
         str(zarr_path),
         mode="w",
+        zarr_format=2,
         shape=shape,
         chunks=chunks,
         dtype=dtype,

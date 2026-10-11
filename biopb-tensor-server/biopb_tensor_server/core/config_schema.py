@@ -28,7 +28,7 @@ import dataclasses
 import typing
 from typing import Any, Dict, Optional, Tuple
 
-from biopb._config_schema import scalar_property as _scalar_property_core
+from biopb._config.schema import scalar_property as _scalar_property_core
 
 from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
@@ -81,8 +81,17 @@ _ONDISK_OVERRIDES: Dict[Tuple[str, str], Tuple[str, str]] = {
 # alias, and the deprecated metadata_db.enabled flag are handled in build_*.
 _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
     "server": {
-        "watcher_type": ("string", "Deprecated alias for monitor_mode."),
+        "monitor_mode": (
+            "string",
+            "Removed: monitored folders are always rescanned; this setting is "
+            "ignored. Drop it from your config.",
+        ),
+        "watcher_type": ("string", "Removed, like monitor_mode; ignored."),
         "poll_interval": ("number", "Deprecated alias for rescan_interval."),
+        "aggressive_dir_pruning": (
+            "boolean",
+            "Removed: rescans keep no snapshot to prune against; ignored.",
+        ),
     },
     "metadata_db": {
         # Removed (biopb/biopb#225): the metadata DB is mandatory. Kept in the
@@ -125,7 +134,7 @@ def _empty_section() -> Dict[str, Any]:
 
 def _scalar_property(class_name: str, f: dataclasses.Field) -> Dict[str, Any]:
     # The per-field projection (type/default/help->description/constraint) is the
-    # shared core (biopb._config_schema); this wrapper only looks up the value +
+    # shared core (biopb._config.schema); this wrapper only looks up the value +
     # constraint for a (class, field) pair.
     value = getattr(_DEFAULT_INSTANCES[class_name], f.name)
     constraint = _CONSTRAINTS.get(class_name, {}).get(f.name)
@@ -169,7 +178,6 @@ def _sources_schema() -> Dict[str, Any]:
         "properties": {
             "url": _prop("url", {"type": "string"}),
             "source_id": _prop("source_id", {"type": "string", "deprecated": True}),
-            "dataset": _prop("dataset", {"type": "string"}),
             "monitor": _prop("monitor", {"type": "boolean"}),
             "cloud": _prop("cloud", {"type": "boolean"}),
             "credentials_profile": _prop("credentials_profile", {"type": "string"}),

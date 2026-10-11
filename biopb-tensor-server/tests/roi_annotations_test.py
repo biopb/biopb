@@ -35,8 +35,8 @@ def _polygon(*pts):
 
 def _register_source(db, source_id, source_url):
     db._get_connection().execute(
-        "INSERT INTO sources (source_id, source_url, source_type, tensors) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO source_catalog (source_id, root_id, rel, source_type, tensors) "
+        "VALUES (?, 'internal', ?, ?, ?)",
         [source_id, source_url, "zarr", []],
     )
 
@@ -413,15 +413,11 @@ class TestStore:
         db.put_rois("zarr_a1b2c3/Image:1", [_annotation()])
         assert len(db.list_rois(ARRAY_ID)[0]) == 1
 
-    def test_rois_are_not_on_the_sql_surface(self):
-        """Annotations are private data, gated per source on the roi flight;
-        the public catalog query has no source to authorize against
-        (biopb/biopb#1010)."""
+    def test_rois_are_on_the_sql_surface(self):
         db = MetadataDatabase()
         db.put_rois(ARRAY_ID, [_annotation(label="mitotic")])
-        with pytest.raises(ValueError, match="disallowed table: rois"):
-            db.query("SELECT label FROM rois")
-        assert "rois" not in db.allowed_tables
+        got = db.query("SELECT label FROM rois").to_pylist()
+        assert got == [{"label": "mitotic"}]
 
     def test_a_filtered_query_is_not_reported_as_truncated(self):
         """Truncation is the server's own flag, not a difference of counts.
@@ -521,7 +517,7 @@ class TestStore:
         )
 
         db._get_connection().execute(
-            "DELETE FROM sources WHERE source_id = ?", ["zarr_a1b2c3"]
+            "DELETE FROM source_catalog WHERE source_id = ?", ["zarr_a1b2c3"]
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a", label="v2")])
 
@@ -583,7 +579,7 @@ class TestStore:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["dnd://exp.zarr", "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -595,19 +591,19 @@ class TestStore:
         )
         assert urls == [("a", "dnd://exp.zarr"), ("b", "dnd://exp.zarr")]
 
-    @pytest.mark.parametrize("unnamed", [None, ""])
+    @pytest.mark.parametrize("unnamed", [""])
     def test_a_catalog_row_that_names_nothing_leaves_the_label_alone(self, unnamed):
         """An unnamed source is not a rename.
 
         Refreshing from it would wipe the only human-readable thing an orphan
-        report has -- and `sources.source_url` is nullable, with the descriptor
-        path writing "" when a source carries no url of its own.
+        report has -- and the descriptor path writes "" when a source carries no
+        url of its own.
         """
         db = MetadataDatabase()
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             [unnamed, "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -707,12 +703,26 @@ class TestBatchAtomicity:
 class TestFlightActions:
     """One full server -> client gRPC round-trip over the roi flight."""
 
-    def test_round_trip(self):
+    @staticmethod
+    def _server(tmp_path):
+        """A serving server with one single-tensor source, ``zarr_a1b2c3``."""
+        import numpy as np
+        import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        store = zarr.open_array(
+            str(tmp_path / "a.zarr"), mode="w", shape=(8, 8), dtype="uint8"
+        )
+        store[:] = np.zeros((8, 8), dtype="uint8")
+        server = TensorFlightServer("localhost:0", metadata_db=MetadataDatabase())
+        server.register_source("zarr_a1b2c3", ZarrAdapter(store, "zarr_a1b2c3"))
+        server.mark_ready()
+        return server
+
+    def test_round_trip(self, tmp_path):
         from biopb.tensor import TensorFlightClient
 
-        db = MetadataDatabase()
-        server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
-        server.mark_ready()
+        server = self._server(tmp_path)
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(1)
 
@@ -743,11 +753,57 @@ class TestFlightActions:
         finally:
             server.shutdown()
 
+    def test_a_bare_source_id_is_the_default_tensor(self, tmp_path):
+        from biopb.tensor import TensorFlightClient
+
+        server = self._server(tmp_path)
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            tensor = "zarr_a1b2c3/Image:0"
+            # A single-tensor OME source: its tensor's id is not the bare one.
+            adapter = server.sources.get("zarr_a1b2c3")
+            adapter.list_tensors = lambda: [mock.Mock(array_id=tensor)]
+
+            put = client.put_rois(
+                "zarr_a1b2c3", [_annotation(array_id="zarr_a1b2c3", label="p")]
+            )
+            (roi_id,) = [r.roi_id for r in put.stored]
+
+            # Filed under the tensor's own id, found through either spelling.
+            assert [r.roi_id for r in client.list_rois(tensor).rois] == [roi_id]
+            assert [r.roi_id for r in client.list_rois("zarr_a1b2c3").rois] == [roi_id]
+            assert server.metadata_db.list_rois("zarr_a1b2c3")[0] == []
+
+            assert client.delete_rois("zarr_a1b2c3", [roi_id]).deleted == [roi_id]
+            assert client.list_rois(tensor).rois == []
+            client.close()
+        finally:
+            server.shutdown()
+
+    def test_a_write_to_an_unknown_source_is_refused(self, tmp_path):
+        from biopb.tensor import TensorFlightClient
+
+        server = self._server(tmp_path)
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{server.port}")
+            for bad in ("nope", "nope/Image:0"):
+                with pytest.raises(flight.FlightServerError, match="no known source"):
+                    client.put_rois(bad, [_annotation()])
+            # What an earlier write left behind can still be listed and removed.
+            assert client.list_rois("nope").rois == []
+            client.close()
+        finally:
+            server.shutdown()
+
     def test_disabled_server_reports_unavailable(self):
         from biopb.tensor import TensorFlightClient
 
         server = TensorFlightServer(
-            "grpc://localhost:0",
+            "localhost:0",
             metadata_db=MetadataDatabase(),
             annotations_enabled=False,
         )
@@ -1070,6 +1126,22 @@ class TestPersistence:
         assert back[0].roi == written.roi
         assert back[0].rev == written.rev
 
+    @pytest.mark.parametrize(("mb", "expected"), [(None, "1.0 GiB"), (64, "64.0 MiB")])
+    def test_the_checkpoint_threshold_reaches_the_file_backed_catalog(
+        self, tmp_path, mb, expected
+    ):
+        kwargs = {} if mb is None else {"checkpoint_threshold_mb": mb}
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb", **kwargs)
+        try:
+            row = (
+                db._get_connection()
+                .execute("SELECT current_setting('checkpoint_threshold')")
+                .fetchone()
+            )
+            assert row[0] == expected
+        finally:
+            db.close()
+
     def test_without_a_store_path_nothing_persists(self, tmp_path):
         # The default is unchanged: persistence is something a caller asks for.
         db = MetadataDatabase()
@@ -1186,7 +1258,7 @@ class TestPersistence:
         with the annotation actions off keeps a file for those alone, so
         `annotations_persisted` False no longer means nothing is persisted."""
         server = TensorFlightServer(
-            "grpc://localhost:0",
+            "localhost:0",
             metadata_db=MetadataDatabase(
                 store_path=tmp_path / "catalog.duckdb", annotations_enabled=False
             ),
@@ -1249,7 +1321,7 @@ class TestStorePathResolution:
     """Which file a server picks, which is what keeps two servers apart."""
 
     def test_the_default_is_derived_from_the_config_path(self, tmp_path):
-        from biopb._locations import tensor_catalog_path
+        from biopb._config.locations import tensor_catalog_path
         from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "biopb.json"
@@ -1258,7 +1330,7 @@ class TestStorePathResolution:
         )
 
     def test_two_configs_get_two_files(self, tmp_path):
-        from biopb._locations import tensor_catalog_path
+        from biopb._config.locations import tensor_catalog_path
 
         assert tensor_catalog_path(tmp_path / "a.json") != tensor_catalog_path(
             tmp_path / "b.json"
@@ -1359,7 +1431,7 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["lab/a.zarr", "zarr_a1b2c3"],
         )
 
@@ -1381,13 +1453,13 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE sources SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["lab/exp.zarr", "zarr_a1b2c3"],
         )
         db.mark_sources_seen()
 
         # The source goes away; absence writes nothing, so the label stands.
-        db._get_connection().execute("DELETE FROM sources")
+        db._get_connection().execute("DELETE FROM source_catalog")
         self._age(db, ARRAY_ID, days=40)
         db.mark_sources_seen()
 
@@ -1398,7 +1470,7 @@ class TestOrphanClock:
         # in_catalog and source_url are separate answers: presence is what
         # turns a fresh row's clock on, not whether a URL came with it.
         db = MetadataDatabase()
-        _register_source(db, "zarr_a1b2c3", None)
+        _register_source(db, "zarr_a1b2c3", "")
         db.put_rois(ARRAY_ID, [_annotation()])
         (seen,) = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()
         assert seen is not None
@@ -1890,9 +1962,6 @@ class TestDisabledAnnotationsTouchNothing:
             db._validate_query("SELECT * FROM rois")
         db._validate_query("SELECT * FROM sources")
 
-    def test_rois_is_never_queryable(self):
-        # Enabled or not: annotations are private data on the roi flight, and
-        # a query has no source to authorize against (biopb/biopb#1010).
-        db = MetadataDatabase()
-        with pytest.raises(ValueError, match="disallowed table: rois"):
-            db._validate_query("SELECT count(*) FROM rois")
+    def test_rois_is_queryable_only_when_annotations_are_on(self):
+        assert "rois" in MetadataDatabase().allowed_tables
+        assert "rois" not in MetadataDatabase(annotations_enabled=False).allowed_tables

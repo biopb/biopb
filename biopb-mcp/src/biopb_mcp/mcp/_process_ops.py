@@ -1,6 +1,6 @@
 """The kernel's ``ops``: the algorithm plane's ops as callables.
 
-The control names the servers (``biopb.algorithms()``): script entries
+The control names the servers (``biopb._control.algorithms()``): script entries
 it runs under uv, and url entries someone else runs. Every op they advertise
 becomes a callable in ``ops``, bound from the op lists the control cached, so
 binding starts nothing; a script entry's server starts on the first call to
@@ -20,15 +20,15 @@ without an event, and a Stop cancels it on the server.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
-import math
 import os
 import queue
 import re
 import threading
 import time
 from collections.abc import Callable
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 import biopb.image as proto
@@ -36,24 +36,21 @@ import dask.array as da
 import grpc
 import numpy as np
 from biopb.image import (
+    NDIM_LABELS,
     deserialize_image_data,
+    json_arg,
+    json_value,
+    make_channel,
+    op_error,
     serialize_from_numpy_to_image_data,
 )
 from biopb.tensor._location import same_location
-from google.protobuf import json_format, struct_pb2
 
 from .._config import get_setting
 
 logger = logging.getLogger(__name__)
 
 # biopb's ndim -> axis-label convention (see biopb.image._utils).
-_NDIM_LABELS = {
-    2: ["Y", "X"],
-    3: ["Y", "X", "C"],
-    4: ["Z", "Y", "X", "C"],
-    5: ["T", "Z", "Y", "X", "C"],
-}
-
 #: The tensor server's scratch source, which every writable server serves at
 #: this fixed id. An upload adds a tensor to a source that already exists, and
 #: an op result belongs to no source of the user's, so this is where it goes.
@@ -78,84 +75,29 @@ _REREAD_INTERVAL_S = 2.0
 _REREAD_TIMEOUT_S = 3.0
 
 
-def _make_channel(url: str, options=None) -> grpc.Channel:
-    """Build a gRPC channel from a ``grpc://`` or ``grpcs://`` URL."""
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-    target = parsed.netloc or parsed.path
-    if not target:
-        raise ValueError(f"algorithm server URL has no host: {url!r}")
-    if scheme == "grpcs":
-        return grpc.secure_channel(
-            target, grpc.ssl_channel_credentials(), options=options
-        )
-    if scheme == "grpc":
-        return grpc.insecure_channel(target, options=options)
-    raise ValueError(f"algorithm server URL must be grpc:// or grpcs://, got {url!r}")
-
-
 def _sanitize_name(name: str) -> str:
     return re.sub(r"\W", "_", name) or "op"
 
 
-# The sentinel a non-finite float (nan/inf/-inf) is carried under -- JSON has
-# no literal for one, and `google.protobuf.Value` refuses to serialize one to
-# JSON text at all (`MessageToDict` raises), so an argument or a result that
-# legitimately is one would otherwise crash rather than lose precision. Mirrors
-# `biopb_image_base.ops.NON_FINITE_FLOAT_KEY`, on the server side of this same
-# wire protocol; not imported from there; the two sides share no Python code.
-_NON_FINITE_FLOAT_KEY = "__float__"
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, float) and not math.isfinite(value):
-        return {_NON_FINITE_FLOAT_KEY: str(value)}
-    if isinstance(value, np.generic):
-        return _jsonable(value.item())
-    if isinstance(value, np.ndarray):
-        # Only a float array can hold a non-finite value; skip the per-element
-        # walk below unless one is actually there. Complex still falls
-        # through it, since a bare complex scalar isn't JSON either.
-        if value.dtype.kind == "f" and np.isfinite(value).all():
-            return value.tolist()
-        if value.dtype.kind not in "fc":
-            return value.tolist()
-        return _jsonable(value.tolist())
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
-
-
-def _from_json(value: Any) -> Any:
-    """A JSON result with its integral numbers as ints: JSON has only doubles,
-    so a count the server sent as 6 arrives as 6.0. Also restores a
-    `_NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
-    if isinstance(value, dict) and set(value) == {_NON_FINITE_FLOAT_KEY}:
-        return float(value[_NON_FINITE_FLOAT_KEY])
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, list):
-        return [_from_json(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _from_json(v) for k, v in value.items()}
-    return value
-
-
-def _refusal(name: str, exc: grpc.RpcError) -> Exception:
-    """The exception an op's failure raises in the kernel: the server's
-    message, typed by what went wrong rather than wrapped in gRPC's repr."""
-    detail = (exc.details() or "").strip() or exc.code().name
-    code = exc.code()
-    if code == grpc.StatusCode.INVALID_ARGUMENT:
-        return ValueError(f"{name}: {detail}")
-    if code == grpc.StatusCode.NOT_FOUND:
-        return LookupError(f"{name}: {detail}")
-    return RuntimeError(f"{name}: {code.name}: {detail}")
-
-
 _same_plane = same_location
+
+
+def _is_remote(kind: str, url: Optional[str]) -> bool:
+    """Does a registry entry run off this machine? A script entry is always the
+    control's own child on loopback; a url entry is whatever it names."""
+    return kind == "url" and not _is_loopback(url)
+
+
+def _is_loopback(url: Optional[str]) -> bool:
+    """Is *url* served from this machine? An unparseable or unnamed host is not."""
+    host = (urlparse(url or "").hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_loopback or address.is_unspecified
+    except ValueError:
+        return False
 
 
 class _Server:
@@ -172,11 +114,21 @@ class _Server:
             self._url = row.get("url")
         self._stub = None
 
+    @property
+    def remote(self) -> bool:
+        """Does this server run off this machine?"""
+        return _is_remote(self.kind, self._url)
+
+    @property
+    def url(self) -> Optional[str]:
+        """Where the server is dialled; None for a script entry not yet started."""
+        return self._url
+
     def stub(self):
         """The stub and call metadata, starting a script entry if needed."""
         with self._lock:
             if self._url is None:
-                from biopb import ensure_algorithm
+                from biopb._control import ensure_algorithm
 
                 row = ensure_algorithm(self.name, timeout=_ENSURE_TIMEOUT)
                 if row["state"] != "up":
@@ -188,7 +140,7 @@ class _Server:
                     )
                 self._url, self._token, self._stub = row["url"], row["token"], None
             if self._stub is None:
-                self._stub = proto.OpsStub(_make_channel(self._url, self._options))
+                self._stub = proto.OpsStub(make_channel(self._url, self._options))
             metadata = (
                 [("authorization", f"Bearer {self._token}")] if self._token else None
             )
@@ -229,17 +181,22 @@ class _OpCall:
                 )
             if self.mode == "EAGER":
                 return self._read_whole(name, value, client)
-            # The op server dials this handle from another host, so it carries
-            # the plane's advertised address, not the one this session dials.
-            return proto.Arg(
-                lazy=client.get_tensor(
-                    value, output="pb", export_location=client.advertised_location
-                )
-            )
+            # The op server dials this handle from elsewhere, so it carries the
+            # plane's advertised address, not the one this session dials. A
+            # server off this machine gets a reference only if the plane
+            # advertises one and the handle holds no bearer token (an unsealed
+            # handle carries the plane's); otherwise its input goes inline.
+            advertised = client.advertised_location
+            if self.server.remote and not advertised:
+                return self._read_whole(name, value, client)
+            handle = client.get_tensor(value, output="pb", export_location=advertised)
+            if self.server.remote and handle.auth_token:
+                return self._read_whole(name, value, client)
+            return proto.Arg(lazy=handle)
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)
-        labels = list(labels) if labels is not None else _NDIM_LABELS.get(arr.ndim)
+        labels = list(labels) if labels is not None else NDIM_LABELS.get(arr.ndim)
         image_data = serialize_from_numpy_to_image_data(arr, dim_labels=labels)
         return proto.Arg(eager=image_data.eager_data)
 
@@ -276,15 +233,16 @@ class _OpCall:
                 by_id = by_id or isinstance(value, str)
                 encoded[name] = self._tensor(name, value, dim_labels, client)
             else:
-                encoded[name] = proto.Arg(
-                    json=json_format.ParseDict(_jsonable(value), struct_pb2.Value())
-                )
+                encoded[name] = json_arg(value)
         return encoded, by_id
 
     # --- the stream ------------------------------------------------------ #
 
     def stream(self, arguments: Dict[str, proto.Arg]) -> List[proto.Event]:
         """The events that carry outputs, reading until the stream ends."""
+        if self.server.remote:
+            self._check_no_credential(arguments)
+            print(f"{self.name}: calling {self.server.url}", flush=True)
         for attempt in (1, 2):
             stub, metadata = self.server.stub()
             try:
@@ -305,6 +263,16 @@ class _OpCall:
                     continue
                 raise
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _check_no_credential(arguments: Dict[str, proto.Arg]) -> None:
+        """Refuse to send a remote server anything that carries a bearer token."""
+        for name, arg in arguments.items():
+            if arg.HasField("lazy") and arg.lazy.auth_token:
+                raise RuntimeError(
+                    f"{name}: refusing to send the tensor server's token to a "
+                    "remote algorithm server"
+                )
 
     def _read(self, call) -> List[proto.Event]:
         events: queue.Queue = queue.Queue()
@@ -360,7 +328,7 @@ class _OpCall:
     def value(self, arg: proto.Arg, by_id: bool):
         kind = arg.WhichOneof("kind")
         if kind == "json":
-            return _from_json(json_format.MessageToDict(arg.json))
+            return json_value(arg.json, ints=True)
         client = self.client_getter()
         if kind == "eager":
             array = deserialize_image_data(proto.ImageData(eager_data=arg.eager))
@@ -394,7 +362,7 @@ def _build_op(call: _OpCall) -> Callable:
         try:
             events = call.stream(arguments)
         except grpc.RpcError as exc:
-            raise _refusal(call.name, exc) from None
+            raise op_error(call.name, exc) from None
         values = [call.result(event, by_id) for event in events]
         if not values:
             return None
@@ -404,7 +372,8 @@ def _build_op(call: _OpCall) -> Callable:
     doc = [
         info.get("description") or f"The {call.name} op.",
         "",
-        f"Server: {call.server.name} ({call.server.kind} entry)",
+        f"Server: {call.server.name} ({call.server.kind} entry, "
+        f"{call.server.url or 'started on first call'})",
         f"Tensor arguments (axes the op sees): {tensors}",
     ]
     if info.get("labels"):
@@ -431,8 +400,8 @@ def _build_op(call: _OpCall) -> Callable:
         "Arguments go by name; one tensor argument may also go first.",
         "  A tensor is an np.ndarray (sent inline; axes by ndim: 2D=YX, 3D=YXC,",
         "  4D=ZYXC, 5D=TZYXC, or dim_labels='ZYX' / {name: axes}) or an array_id",
-        "  str (a lazy or blocks op's server reads it from the tensor server; an",
-        "  eager op gets it inline, read here).",
+        "  str (a lazy or blocks op's local server reads it from the tensor server;",
+        "  an eager op, or any remote server, gets it inline, read here).",
         "Tensor results are np.ndarray, or array_id str when an input was one or",
         "the server returned a reference. A tuple for several outputs; a list",
         "when a streaming op sent several events.",
@@ -441,6 +410,7 @@ def _build_op(call: _OpCall) -> Callable:
     op.__name__ = _sanitize_name(call.name)
     op.op_name = call.name
     op.server = call.server.name
+    op.url = call.server.url
     op.labels = list(info.get("labels") or [])
     op.description = info.get("description", "")
     op.kwargs_text = info.get("kwargs") or ""
@@ -552,7 +522,7 @@ class Ops:
         if now - self._last_reread < _REREAD_INTERVAL_S:
             return
         self._last_reread = now
-        from biopb import algorithms
+        from biopb._control import algorithms
 
         try:
             rows = algorithms(timeout=_REREAD_TIMEOUT_S)
@@ -567,7 +537,7 @@ class Ops:
         """Have the control install and describe new or edited server files,
         rebind, and say what changed. An entry still installing binds on a
         later refresh."""
-        from biopb import refresh_algorithms
+        from biopb._control import refresh_algorithms
 
         before = set(self._ops)
         rows = refresh_algorithms()
@@ -593,7 +563,7 @@ class Ops:
 
     def status(self) -> str:
         """Each server: its kind, state, ops, and the first line of any error."""
-        from biopb import algorithms
+        from biopb._control import algorithms
 
         rows = algorithms()
         if rows is None:
@@ -607,7 +577,8 @@ class Ops:
         lines = []
         for r in rows:
             names = ", ".join(o["name"] for o in r["ops"]) or "-"
-            line = f"{r['name']} ({r['kind']}): {r['state']}; ops: {names}"
+            at = f", {r['url']}" if r.get("url") else ""
+            line = f"{r['name']} ({r['kind']}{at}): {r['state']}; ops: {names}"
             if any((r["name"], o["name"]) not in bound for o in r["ops"]):
                 line += " (not bound in this kernel: call ops.refresh())"
             lines.append(line)
@@ -617,13 +588,13 @@ class Ops:
 
     def logs(self, name: str, lines: int = 50) -> str:
         """The tail of a server file's log: its install and its server's output."""
-        from biopb import algorithm_logs
+        from biopb._control import algorithm_logs
 
         return "\n".join(algorithm_logs(name, lines=lines))
 
     def restart(self, name: str) -> str:
         """Restart a server file's server (picking up an edit), and rebind."""
-        from biopb import algorithms, restart_algorithm
+        from biopb._control import algorithms, restart_algorithm
 
         row = restart_algorithm(name, timeout=_ENSURE_TIMEOUT)
         self.bind(algorithms())
@@ -640,7 +611,7 @@ def build_ops_from_config(config: dict, client_getter: Callable[[], object]) -> 
     connecting tensor client is picked up live. With no control, ``ops`` is
     empty and ``ops.status()`` says why.
     """
-    from biopb import algorithms
+    from biopb._control import algorithms
 
     max_msg_bytes = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
     ops = Ops(

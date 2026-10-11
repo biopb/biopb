@@ -1,5 +1,24 @@
 """Tests for biopb-tensor-server."""
 
+import threading
+import time
+
+
+def source_ids(client):
+    """The ``source_id`` set of every source the server's catalog holds."""
+    rows = client.query("SELECT source_id FROM sources", format="records")
+    return {r["source_id"] for r in rows}
+
+
+def label_sets(client, image_array_id):
+    """The ``array_id``s served under an image's ``@labels/`` prefix, sorted."""
+    prefix = image_array_id.replace("'", "''") + "/@labels/"
+    table = client.query(
+        "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
+        f"WHERE starts_with(t.array_id, '{prefix}') ORDER BY t.array_id"
+    )
+    return table.column(0).to_pylist()
+
 
 def catalog_server(*args, **kwargs):
     """A ``TensorFlightServer`` with a catalog, wired the way ``cli.py`` wires one.
@@ -33,3 +52,65 @@ def register_and_catalog(server, source_id, adapter):
     registered = server.register_source(source_id, adapter)
     server.metadata_db.sync_source_added(source_id, registered)
     return registered
+
+
+def make_manager(
+    *,
+    monitored_dirs=(),
+    cloud_roots=(),
+    monitored_aliases=None,
+    monitored_upstreams=(),
+    scan_once_sources=(),
+    **kwargs,
+):
+    """A ``SourceManager`` whose roots are spelled the way a test thinks of them.
+
+    ``monitored_dirs`` are watched directories; ``monitored_aliases`` gives some
+    of them a display root; ``cloud_roots`` marks paths cloud (a monitored
+    directory becomes a cloud directory, any other path a consented, dropped cloud root of its own);
+    ``monitored_upstreams`` and ``scan_once_sources`` are config entries.
+    """
+    from biopb_tensor_server.sources.roots import Root, RootKind, Roots
+    from biopb_tensor_server.sources.source_manager import SourceManager
+
+    aliases = {p.resolve(): a for p, a in (monitored_aliases or {}).items()}
+    cloud = {p.resolve() for p in cloud_roots}
+    roots = Roots()
+    for path in monitored_dirs:
+        roots.add(
+            Root(
+                RootKind.MONITORED,
+                str(path),
+                aliases.get(path.resolve()),
+                path.resolve() in cloud,
+            )
+        )
+    monitored = {p.resolve() for p in monitored_dirs}
+    for path in cloud_roots:
+        if path.resolve() not in monitored:
+            roots.add(Root(RootKind.DROPPED, str(path), cloud=True, label=path.name))
+    for source in scan_once_sources:
+        roots.add(Root.from_config(source, RootKind.SCAN_ONCE))
+    for source in monitored_upstreams:
+        roots.add(Root.from_config(source, RootKind.UPSTREAM))
+    return SourceManager(roots=roots, **kwargs)
+
+
+def serve(server):
+    """Run *server* on a daemon thread and give it a moment to bind."""
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(1)
+
+
+def grid_source(tmp_path, name="img", shape=(64, 64), chunks=(16, 16)):
+    """``(data, adapter)``: a uint8 zarr of ``arange`` values, served as a tensor
+    whose chunk grid is ``shape // chunks``."""
+    import numpy as np
+    import zarr
+    from biopb_tensor_server import ZarrAdapter
+
+    data = np.arange(shape[0] * shape[1], dtype=np.uint8).reshape(shape)
+    path = str(tmp_path / f"{name}.zarr")
+    arr = zarr.open_array(path, mode="w", shape=shape, chunks=chunks, dtype="uint8")
+    arr[:] = data
+    return data, ZarrAdapter(zarr.open_array(path, mode="r"), name, ["y", "x"])

@@ -20,7 +20,7 @@ import tifffile  # noqa: E402
 from biopb.tensor.descriptor_pb2 import TensorDescriptor  # noqa: E402
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 _QPI_DESC = (
     "<PerkinElmer-QPI-ImageDescription>"
@@ -263,7 +263,7 @@ class TestQptiffAdapter:
                 plan = adapter.get_read_plan(req)
                 # Chunk_ids carry the level suffix so DoGet dispatches to the level.
                 assert plan.chunk_endpoints
-                level_adapter = adapter.get_level_adapter("1")
+                level_adapter = adapter.get_tensor_adapter("1")
                 assert level_adapter.get_tensor_descriptor().array_id == (
                     f"{adapter.source_id}/1"
                 )
@@ -287,7 +287,7 @@ class TestQptiffAdapter:
             create_synthetic_qptiff(p, n_channels=3, base=512, n_levels=3)
             adapter = _adapter(p)
             try:
-                lvl = adapter.get_level_adapter("1")
+                lvl = adapter.get_tensor_adapter("1")
 
                 assert isinstance(lvl, SourceAdapter) and isinstance(lvl, TensorAdapter)
                 # Identity is built by the base array_id property from source_id +
@@ -301,11 +301,11 @@ class TestQptiffAdapter:
                 assert lvl.source_url == adapter._source_url
                 assert lvl.source_type == "qptiff"
                 assert lvl.source_id == adapter.source_id
-                assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
+                assert [d.array_id for d in lvl.list_tensors()] == [
                     f"{adapter.source_id}/1"
                 ]
                 # Cached: repeated calls return the same instance.
-                assert adapter.get_level_adapter("1") is lvl
+                assert adapter.get_tensor_adapter("1") is lvl
             finally:
                 adapter.close()
 
@@ -334,7 +334,7 @@ class TestQptiffAdapter:
             create_synthetic_qptiff(p, n_channels=3, baseline_marker="DAPI")
             adapter = _adapter(p)
             try:
-                meta = adapter.get_metadata()
+                meta = adapter.registration_record([], import_rois=False).metadata
                 assert meta["format"] == "qptiff"
                 # channels is positional (one entry per channel): the named
                 # baseline plus None gaps -- NOT collapsed to ["DAPI"], which
@@ -360,7 +360,7 @@ class TestQptiffAdapterIntegration:
             adapter = _adapter(p)
             source_id = adapter.source_id
 
-            server = catalog_server("grpc://localhost:0")
+            server = catalog_server("localhost:0")
             register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
@@ -370,7 +370,7 @@ class TestQptiffAdapterIntegration:
                 client = TensorFlightClient(
                     f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                 )
-                assert source_id in client.list_sources()
+                assert source_id in source_ids(client)
                 # Full-resolution read (single-tensor: array_id == source_id).
                 darr = client.get_tensor(source_id)
                 assert tuple(darr.shape) == (2, 512, 512)
@@ -395,7 +395,7 @@ class TestQptiffHandleReaper:
     Before this, ``close()`` had no caller anywhere in the package and the adapter
     registered with no reaper, so a QPTIFF held its ``TiffFile`` plus one live
     ``aszarr`` store per level read from registration until the process exited --
-    the pin biopb/biopb#71 removed from hdf5/mrc and OME-TIFF bounded with a
+    the pin biopb/biopb#71 removed from mrc and OME-TIFF bounded with a
     reaper, which this adapter got neither of.
     """
 
@@ -428,80 +428,75 @@ class TestQptiffHandleReaper:
     def _read(self, adapter, stop=(1, 8, 8)):
         return adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=list(stop)))
 
-    def test_registers_on_open_and_reaps_when_idle(self, tmp_path):
+    def _idle_sweep(self):
         from biopb_tensor_server.adapters import qptiff as qptiff_module
 
+        pool = qptiff_module._handle_pool
+        ttl = pool._pool_ttl
+        pool.set_ttl(0.001)
+        time.sleep(0.05)
+        try:
+            pool.sweep()
+        finally:
+            pool.set_ttl(ttl)
+
+    def _pooled(self, adapter):
+        from biopb_tensor_server.adapters import qptiff as qptiff_module
+
+        return adapter._pool_key() in qptiff_module._handle_pool._handles
+
+    def test_pools_on_open_and_reaps_when_idle(self, tmp_path):
         path = tmp_path / "s.qptiff"
         expected = create_synthetic_qptiff(path)
         adapter = self._open(path)
         self._read(adapter)
-        assert adapter._tiff is not None
-        assert adapter in list(qptiff_module._handle_reaper._adapters)
+        assert self._pooled(adapter)
 
-        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
-        qptiff_module._handle_reaper._sweep()
-        assert adapter._tiff is None
-        assert adapter._level_stores == {}
+        self._idle_sweep()
+        assert not self._pooled(adapter)
 
         # Reopening is transparent -- same pixels, rebuilt handle.
         np.testing.assert_array_equal(self._read(adapter), expected[0:1, 0:8, 0:8])
-        assert adapter._tiff is not None
+        assert self._pooled(adapter)
 
-    def test_a_read_in_flight_blocks_the_reap_and_close(self, tmp_path):
-        """Reads decode outside ``_io_lock`` so they stay parallel, which is why
-        the count is needed: closing the store under a decode would fail the read,
-        and the parent's lock alone cannot see a decode that does not hold it."""
+    def test_a_rebuilt_adapter_reuses_the_pooled_handle(self, tmp_path):
         from biopb_tensor_server.adapters import qptiff as qptiff_module
 
+        path = tmp_path / "s.qptiff"
+        create_synthetic_qptiff(path)
+        first = self._open(path)
+        self._read(first)
+        handle = qptiff_module._handle_pool._handles[first._pool_key()]
+        second = self._open(path)
+        self._read(second)
+        assert qptiff_module._handle_pool._handles[second._pool_key()] is handle
+
+    def test_a_read_in_flight_blocks_the_reap_and_close(self, tmp_path):
+        """A lease keeps the handle open: a sweep or an explicit close during a
+        decode would otherwise fail the read."""
         path = tmp_path / "s.qptiff"
         create_synthetic_qptiff(path)
         adapter = self._open(path)
         self._read(adapter)
-        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
-        adapter._active_reads = 1
-        try:
-            qptiff_module._handle_reaper._sweep()
-            assert adapter._tiff is not None
-            adapter.close()  # explicit close defers to the same guard
-            assert adapter._tiff is not None
-        finally:
-            adapter._active_reads = 0
-        adapter.close()
-        assert adapter._tiff is None
+        with adapter._file():
+            self._idle_sweep()
+            adapter.close()  # defers to the lease
+            assert self._pooled(adapter)
+        assert not self._pooled(adapter)
 
     def test_level_adapter_survives_a_reap(self, tmp_path):
         """DoGet resolves a level adapter and reads through it as two separate
         steps, so a sweep can land between them. The level adapter re-resolves its
-        store from the parent per read rather than capturing it once."""
-        from biopb_tensor_server.adapters import qptiff as qptiff_module
-
+        store from a lease per read rather than capturing it once."""
         path = tmp_path / "s.qptiff"
         create_synthetic_qptiff(path)
         adapter = self._open(path)
-        level = adapter.get_level_adapter("1")
+        level = adapter.get_tensor_adapter("1")
         bounds = ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8])
         before = level.get_data(bounds)
 
         # Reap out from under the adapter the caller already holds.
-        adapter._persistent_last_access -= qptiff_module._handle_reaper.ttl + 1
-        qptiff_module._handle_reaper._sweep()
-        assert adapter._tiff is None
+        self._idle_sweep()
+        assert not self._pooled(adapter)
 
         np.testing.assert_array_equal(level.get_data(bounds), before)
-
-    def test_level_adapter_read_counts_against_the_parent(self, tmp_path):
-        path = tmp_path / "s.qptiff"
-        create_synthetic_qptiff(path)
-        adapter = self._open(path)
-        level = adapter.get_level_adapter("1")
-        seen = []
-        real = adapter._end_read
-
-        def spy():
-            seen.append(adapter._active_reads)
-            real()
-
-        adapter._end_read = spy
-        level.get_data(ChunkBounds(start=[0, 0, 0], stop=[1, 8, 8]))
-        assert seen == [1]  # counted while the decode was in flight
-        assert adapter._active_reads == 0

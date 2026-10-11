@@ -20,7 +20,7 @@ pytest.importorskip("rsciio")
 
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 # numpy dtype -> MRC MODE code
 _MODE = {
@@ -284,7 +284,7 @@ class TestMrcAdapter:
     def test_metadata(self):
         with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir)
-            meta = adapter.get_metadata()
+            meta = adapter.registration_record([], import_rois=False).metadata
             assert meta["format"] == "mrc"
             assert "std_header" in meta
 
@@ -301,7 +301,7 @@ class TestMrcAdapterIntegration:
             adapter = MrcAdapter.create_from_config(SourceConfig(url=str(p)))
             source_id = adapter.source_id
 
-            server = catalog_server("grpc://localhost:0")
+            server = catalog_server("localhost:0")
             register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
@@ -311,7 +311,7 @@ class TestMrcAdapterIntegration:
                 client = TensorFlightClient(
                     f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                 )
-                assert source_id in client.list_sources()
+                assert source_id in source_ids(client)
                 darr = client.get_tensor(
                     source_id
                 )  # single-tensor: array_id == source_id

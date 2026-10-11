@@ -15,7 +15,7 @@ from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -139,7 +139,7 @@ class TestAdvertisedPlanIsWhatIsWarmed:
 
 class TestFlightIdleProbe:
     def test_idle_when_no_traffic(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             # last_active defaults to 0.0, monotonic() is large -> idle.
             assert server.flight_idle_for(0.0) is True
@@ -147,7 +147,7 @@ class TestFlightIdleProbe:
             server.shutdown()
 
     def test_not_idle_while_in_flight(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             entered = threading.Event()
             release = threading.Event()
@@ -170,7 +170,7 @@ class TestFlightIdleProbe:
             server.shutdown()
 
     def test_debounce_window(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             with server.activity.serving_request():
                 pass
@@ -203,7 +203,7 @@ class TestWarming:
         arr[:] = np.arange(int(np.prod(shape)), dtype="uint16").reshape(shape) % 1000
         labels = ["y", "x"]
         adapter = ZarrAdapter(arr, "warm-src", labels)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("warm-src", adapter)
         return server
 
@@ -229,7 +229,7 @@ class TestWarming:
             # Rebuild the same read plan and assert every chunk now locates on
             # disk -- i.e. a future do_get is a warm hit, no decode needed.
             adapter = server.sources.get("warm-src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             ta = adapter.get_tensor_adapter(td.array_id)
             scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
             assert scale == [8, 8]
@@ -313,7 +313,7 @@ class TestWarming:
                 # A caching-proxy source advertises a grpc:// source_url.
                 source_url = "grpc://upstream:8815/img"
 
-                def list_tensor_descriptors(self):
+                def list_tensors(self):
                     listed.append(True)  # must NOT be reached
                     return []
 
@@ -355,10 +355,9 @@ class TestWarming:
 class TestRuntimePhaseGating:
     def _bare_source_manager(self):
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
-        server = TensorFlightServer("grpc://localhost:0")
-        sm = SourceManager(
+        server = TensorFlightServer("localhost:0")
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
@@ -366,16 +365,22 @@ class TestRuntimePhaseGating:
         )
         return server, sm
 
-    def test_initial_scan_done_default_false_and_start_does_not_flip(self):
+    def test_initial_scan_done_default_false_and_the_first_tick_flips_it(self):
+        import threading
+
         server, sm = self._bare_source_manager()
         try:
             assert sm._initial_scan_done is False
-            # start() no longer flips the precache gate -- only the first full
-            # scan completing does. With nothing to rescan, start() is a no-op
-            # and leaves it False.
+            # start() itself does not flip the precache gate -- the first tick of
+            # the loop it starts does, once that tick has run. With nothing to
+            # scan, that is the whole of the first scan.
+            done = threading.Event()
+            sm.set_initial_scan_complete_hook(done.set)
             sm.start()
-            assert sm._initial_scan_done is False
+            assert done.wait(5)
+            assert sm._initial_scan_done is True
         finally:
+            sm.stop()
             server.shutdown()
 
     def test_commit_hook_fires_only_after_initial_scan(self, monkeypatch):
@@ -387,7 +392,7 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler,
                 "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
+                lambda claim, catalog_seed=None, catalog_url=None, **kw: True,
             )
             monkeypatch.setattr(
                 sm._reconciler._state, "add_claim", lambda claim, notify=False: True
@@ -395,13 +400,10 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler, "_build_claim_signatures", lambda claim: {}
             )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
-            )
 
             fired = []
             sm.set_source_committed_hook(fired.append)
-            claim = SimpleNamespace(source_id="s1", primary_path="/x")
+            claim = SimpleNamespace(source_id="s1", primary_path="/x", unresolved=False)
 
             # During the initial scan: startup sources go to the backlog, not the
             # prompt enqueue -- the hook must NOT fire.
@@ -416,50 +418,6 @@ class TestRuntimePhaseGating:
         finally:
             server.shutdown()
 
-    def test_suppress_live_precache_overrides_the_gate(self, monkeypatch):
-        """A commit during the boot-tick upstream re-list stays off the prompt
-        enqueue even though the initial scan is already done.
-
-        On the both-present boot tick the local walk flips _initial_scan_done
-        True before the upstream re-list runs; _suppress_live_precache keeps that
-        startup upstream mirror routed to the slow backlog (see _handle_rescan)."""
-        from types import SimpleNamespace
-
-        server, sm = self._bare_source_manager()
-        try:
-            monkeypatch.setattr(
-                sm._reconciler,
-                "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
-            )
-            monkeypatch.setattr(
-                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_build_claim_signatures", lambda claim: {}
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
-            )
-
-            fired = []
-            sm.set_source_committed_hook(fired.append)
-            sm._initial_scan_done = True
-            claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
-
-            # Suppressed: initial scan done, but this is the boot-tick upstream
-            # re-list -> backlog, not prompt enqueue.
-            sm._suppress_live_precache = True
-            assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == []
-
-            # Not suppressed (a later live delta): the hook fires as usual.
-            sm._suppress_live_precache = False
-            assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == ["up1"]
-        finally:
-            server.shutdown()
-
     def test_hook_exception_does_not_abort_commit(self, monkeypatch):
         from types import SimpleNamespace
 
@@ -468,7 +426,7 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler,
                 "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
+                lambda claim, catalog_seed=None, catalog_url=None, **kw: True,
             )
             monkeypatch.setattr(
                 sm._reconciler._state, "add_claim", lambda claim, notify=False: True
@@ -476,16 +434,13 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler, "_build_claim_signatures", lambda claim: {}
             )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
-            )
 
             def boom(_sid):
                 raise RuntimeError("hook failure")
 
             sm.set_source_committed_hook(boom)
             sm._initial_scan_done = True
-            claim = SimpleNamespace(source_id="s2", primary_path="/y")
+            claim = SimpleNamespace(source_id="s2", primary_path="/y", unresolved=False)
             # Commit still succeeds despite the hook raising.
             assert sm._reconciler._commit_add_claim(claim) is True
         finally:
@@ -517,7 +472,7 @@ class TestPreemptionAndLifecycle:
             )
             arr[:] = 7
             adapter = ZarrAdapter(arr, "pre-src", ["y", "x"])
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("pre-src", adapter)
 
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.05))
@@ -558,7 +513,7 @@ class TestPreemptionAndLifecycle:
             CacheManager.reset()
 
     def test_enqueue_dedup(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             worker = PrecacheWorker(server, PrecacheConfig())
             worker.enqueue("a")
@@ -603,7 +558,7 @@ def _located_all(server, cache_manager, source_ids):
 
     for sid in source_ids:
         adapter = server.sources.get(sid)
-        td = adapter.list_tensor_descriptors()[0]
+        td = adapter.list_tensors()[0]
         ta = adapter.get_tensor_adapter(td.array_id)
         scale = compute_precache_scale_hint(list(td.shape), list(td.dim_labels))
         req = TensorDescriptor(
@@ -663,10 +618,16 @@ class TestHeadroomProbe:
         assert worker._has_headroom() is False
 
 
+def _seed(worker, items):
+    """Put ``(source_id, mtime)`` pairs on a worker's backlog, as registration does."""
+    for source_id, mtime in items:
+        worker.enqueue_backlog(source_id, mtime)
+
+
 class TestBacklogSeeding:
     def test_orders_newest_mtime_first(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("old", 100.0), ("new", 200.0), ("mid", 150.0)])
+        _seed(worker, [("old", 100.0), ("new", 200.0), ("mid", 150.0)])
         assert worker._pop_backlog()[1] == "new"
         assert worker._pop_backlog()[1] == "mid"
         assert worker._pop_backlog()[1] == "old"
@@ -675,21 +636,21 @@ class TestBacklogSeeding:
     def test_skips_live_queued_sources(self):
         worker = PrecacheWorker(None, PrecacheConfig())
         worker.enqueue("a")  # now in the live tier (_seen)
-        worker.seed_backlog([("a", 100.0), ("b", 50.0)])
+        _seed(worker, [("a", 100.0), ("b", 50.0)])
         # 'a' is already live -> only 'b' lands in the backlog.
         assert worker._pop_backlog()[1] == "b"
         assert worker._pop_backlog() is None
 
     def test_seed_dedups_within_backlog(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0)])
-        worker.seed_backlog([("a", 999.0)])  # already present -> ignored
+        _seed(worker, [("a", 100.0)])
+        _seed(worker, [("a", 999.0)])  # already present -> ignored
         assert worker._pop_backlog()[1] == "a"
         assert worker._pop_backlog() is None
 
     def test_requeue_restores_front_priority(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0), ("b", 200.0)])
+        _seed(worker, [("a", 100.0), ("b", 200.0)])
         neg_mtime, sid = worker._pop_backlog()
         assert sid == "b"  # newest
         worker._requeue_backlog(sid, neg_mtime)
@@ -698,82 +659,85 @@ class TestBacklogSeeding:
         assert worker._pop_backlog()[1] == "a"
 
 
-class TestIterLocalSourceMtimes:
-    def _bare_sm(self):
-        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
+class TestStartupRouting:
+    """Where a registered source goes: the backlog if the first scan found it, the
+    live tier if it came later."""
 
-        server = TensorFlightServer("grpc://localhost:0")
-        sm = SourceManager(
+    @staticmethod
+    def _sm():
+        from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
+
+        server = TensorFlightServer("localhost:0")
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
             monitored_dirs=set(),
         )
-        return server, sm
+        startup, live = [], []
+        sm.set_startup_source_hook(lambda sid, mtime: startup.append((sid, mtime)))
+        sm.set_source_committed_hook(live.append)
+        return server, sm, startup, live
 
-    def test_skips_remote_and_unstatable(self, tmp_path):
-        server, sm = self._bare_sm()
+    @staticmethod
+    def _claim(sm, source_id, path, remote=False):
+        sm._reconciler._state.claims[source_id] = SimpleNamespace(
+            source_id=source_id, primary_path=path, is_remote=remote
+        )
+
+    def test_a_startup_source_goes_to_the_backlog_with_its_mtime(self, tmp_path):
+        server, sm, startup, live = self._sm()
         try:
-            real = tmp_path / "f.zarr"
-            real.mkdir()
-            sm._reconciler._state.claims["local"] = SimpleNamespace(
-                source_id="local", primary_path=str(real), is_remote=False
-            )
-            sm._reconciler._state.claims["remote"] = SimpleNamespace(
-                source_id="remote", primary_path="s3://bucket/x", is_remote=True
-            )
-            sm._reconciler._state.claims["gone"] = SimpleNamespace(
-                source_id="gone",
-                primary_path=str(tmp_path / "missing"),
-                is_remote=False,
-            )
-            out = dict(sm.iter_local_source_mtimes())
-            assert "local" in out
-            assert isinstance(out["local"], float)
-            assert "remote" not in out  # no os.stat mtime
-            assert "gone" not in out  # OSError -> skipped
+            store = tmp_path / "f.zarr"
+            store.mkdir()
+            self._claim(sm, "local", str(store))
+            sm._notify_source_committed("local")
+            assert [sid for sid, _ in startup] == ["local"]
+            assert startup[0][1] == store.stat().st_mtime
+            assert live == []
         finally:
             server.shutdown()
 
-    def test_snapshot_taken_under_lock(self):
-        # The read must snapshot _state.claims under self._lock (the same lock
-        # _commit_add_claim/_commit_remove_claim hold) so it can't iterate the
-        # dict while the rescan loop mutates it. Prove it by holding the
-        # lock in another thread: the reader must block until it is released.
-        server, sm = self._bare_sm()
-        holder = None
+    def test_a_remote_startup_source_is_not_enqueued(self):
+        server, sm, startup, live = self._sm()
         try:
-            sm._reconciler._state.claims["a"] = SimpleNamespace(
-                source_id="a", primary_path="/x", is_remote=True
-            )
-            held = threading.Event()
-            release = threading.Event()
-            done = threading.Event()
-
-            def hold_lock():
-                with sm._reconciler._lock:
-                    held.set()
-                    release.wait(2.0)
-
-            holder = threading.Thread(target=hold_lock, daemon=True)
-            holder.start()
-            assert held.wait(1.0)
-
-            reader = threading.Thread(
-                target=lambda: (sm.iter_local_source_mtimes(), done.set()),
-                daemon=True,
-            )
-            reader.start()
-            # Lock is held elsewhere -> the snapshot can't proceed yet.
-            assert not done.wait(0.3)
-            release.set()
-            # Released -> the read completes.
-            assert done.wait(2.0)
+            self._claim(sm, "remote", "s3://bucket/x", remote=True)
+            sm._notify_source_committed("remote")
+            assert startup == [] and live == []
         finally:
-            release.set()
-            if holder is not None:
-                holder.join(1.0)
+            server.shutdown()
+
+    def test_a_source_that_is_gone_is_not_enqueued(self):
+        server, sm, startup, live = self._sm()
+        try:
+            sm._notify_source_committed("never-claimed")
+            assert startup == [] and live == []
+        finally:
+            server.shutdown()
+
+    def test_a_source_after_the_first_scan_is_live(self, tmp_path):
+        server, sm, startup, live = self._sm()
+        try:
+            self._claim(sm, "local", str(tmp_path))
+            sm._initial_scan_done = True
+            sm._notify_source_committed("local")
+            assert live == ["local"] and startup == []
+        finally:
+            server.shutdown()
+
+    def test_a_deferred_source_is_startup_whenever_it_registers(self, tmp_path):
+        server, sm, startup, live = self._sm()
+        try:
+            self._claim(sm, "local", str(tmp_path))
+            sm._deferred["local"] = 123.0  # claimed by the first scan, registered later
+            sm._initial_scan_done = True
+            sm._notify_source_committed("local")
+            # With the mtime it was claimed with, not a second stat.
+            assert startup == [("local", 123.0)] and live == []
+            # It is startup once: a refresh of it afterwards is a live addition.
+            sm._notify_source_committed("local")
+            assert live == ["local"]
+        finally:
             server.shutdown()
 
 
@@ -790,12 +754,12 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "s-old")
             _register_zarr(server, tmp_path, "s-new")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("s-old", 100.0), ("s-new", 200.0)])
+            _seed(worker, [("s-old", 100.0), ("s-new", 200.0)])
             worker.start()
             cm = CacheManager.get_instance()
             deadline = time.time() + 8.0
@@ -814,12 +778,12 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "live")
             _register_zarr(server, tmp_path, "backlog")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("backlog", 100.0)])
+            _seed(worker, [("backlog", 100.0)])
             worker.enqueue("live")
             worker.start()
             cm = CacheManager.get_instance()
@@ -839,7 +803,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -847,9 +811,9 @@ class TestBacklogWarming:
             # before warming any chunk.
             worker._queue.put("live")
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
             assert cm.stats().misses == 0  # bailed before the first chunk
         finally:
@@ -861,15 +825,15 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
             assert cm.stats().misses == 0  # no eviction-causing writes
         finally:
@@ -881,15 +845,15 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             adapter = server.sources.get("src")
-            td = adapter.list_tensor_descriptors()[0]
+            td = adapter.list_tensors()[0]
             cm = CacheManager.get_instance()
             # Empty live queue + plenty of headroom -> warms, no preempt.
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is False
             assert cm.stats().misses > 0
         finally:
@@ -901,7 +865,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(
@@ -911,7 +875,7 @@ class TestBacklogWarming:
                 ),
             )
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            worker.seed_backlog([("src", 100.0)])
+            _seed(worker, [("src", 100.0)])
             worker.start()
             time.sleep(0.5)
             worker.stop()
@@ -964,7 +928,7 @@ class TestSkipNativePyramid:
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             adapter = self._ome_adapter(multires_ome_zarr)
             server.register_source("ome-native", adapter)
@@ -1003,15 +967,15 @@ class TestSkipUnscaledCoarsestLevel:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             adapter = _register_zarr(
                 server, tmp_path, "src", shape=shape, labels=labels, chunks=chunks
             )
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             cm = CacheManager.get_instance()
-            td = adapter.list_tensor_descriptors()[0]
-            preempted = worker._process_tensor(adapter, td, cm)
+            td = adapter.list_tensors()[0]
+            preempted = worker._process_tensor("src", td, cm)
             assert preempted is False
             return cm.stats().misses
         finally:
@@ -1524,7 +1488,7 @@ class TestAdvertisedPyramidDescriptor:
         return ZarrAdapter(arr, "big", ["y", "x"])
 
     def test_get_flight_info_advertises_computed_pyramid(self, tmp_path):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             desc = self._descriptor(self._flight_info(server, "big", "big"))
@@ -1543,7 +1507,7 @@ class TestAdvertisedPyramidDescriptor:
 
         zarr_path, _lp, _z = multires_ome_zarr
         root = zarr.open_group(zarr_path, mode="r")
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
             desc = self._descriptor(self._flight_info(server, "ome", "ome"))
@@ -1566,7 +1530,7 @@ class TestAdvertisedPyramidDescriptor:
             chunks=(8192,),
             dtype="uint8",
         )
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("line", ZarrAdapter(arr, "line", ["x"]))
             desc = self._descriptor(self._flight_info(server, "line", "line"))
@@ -1579,7 +1543,7 @@ class TestAdvertisedPyramidDescriptor:
     def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
         from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         try:
             register_and_catalog(server, "big", self._big_zarr_adapter(tmp_path))
             rows = server.metadata_db.query(
@@ -1610,7 +1574,7 @@ class TestAdvertisedPyramidDescriptor:
         # set => the computed pyramid rides the descriptor.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             bare = self._descriptor(
@@ -1636,7 +1600,7 @@ class TestAdvertisedPyramidDescriptor:
         # cheap call is the default and a read asks for "endpoints".
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(server, TensorReadOption(array_id="big"))
@@ -1654,7 +1618,7 @@ class TestAdvertisedPyramidDescriptor:
         # pyramid still honors its own mask, so describe+pyramid works without a plan.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(
@@ -1686,7 +1650,7 @@ class TestPrecacheAdvertisedAlignment:
             dtype="uint8",
         )
         adapter = ZarrAdapter(arr, "big", ["y", "x"])
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()

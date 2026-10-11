@@ -32,6 +32,7 @@ import threading
 import time
 from typing import Annotated
 
+from biopb._control import _client as _control_client
 from mcp.types import ImageContent, TextContent
 from pydantic import AnyUrl, Field
 
@@ -49,8 +50,8 @@ logger = logging.getLogger(__name__)
 
 #: What a session without a viewer loses, and the route that replaces it.
 _NO_VIEWER_HINT = (
-    "there is no `viewer` and no take_screenshot, so show results through the "
-    'web viewer (read_doc("web-viewer"))'
+    "there is no `viewer` and no take_screenshot, so present results with "
+    'show_view through the web viewer (read_doc("web-viewer"))'
 )
 
 _SCREENSHOT_SNIPPET = (
@@ -174,6 +175,7 @@ print("## Viewer")
 import os as _os
 import sys as _sys
 from biopb_mcp.mcp._bootstrap import no_viewer_reason as _no_viewer_reason
+from biopb_mcp.mcp._kernel_env import ViewerMode as _ViewerMode
 _no_viewer = _no_viewer_reason()
 if _no_viewer:
     print("  none -- " + _no_viewer)
@@ -183,7 +185,7 @@ else:
         # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
         # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
         print("  display: (host window server)")
-    elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+    elif _ViewerMode.from_env(_os.environ).virtual_display:
         # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
         # works, so the agent relaying it is the only thing that reaches the user
         # (#892). Kept as loud as start_kernel's — a session can reach here without
@@ -467,7 +469,7 @@ def _viewer_base_url() -> str:
     :func:`_viewer_user_url` for the link to give them.
     """
     try:
-        from biopb import base_url
+        from biopb._control import base_url
 
         return base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice
@@ -478,7 +480,7 @@ def _viewer_base_url() -> str:
 def _viewer_user_url() -> str:
     """Where the *user's* browser reaches the control, for a link handed to them
     (the proxied form behind a reverse proxy, else :func:`_viewer_base_url`)."""
-    from biopb import user_base_url
+    from biopb._control import user_base_url
 
     return user_base_url()
 
@@ -640,13 +642,13 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
-    if host.no_viewer_reason:
+    if not host.viewer.has_window:
         return [
             TextContent(
                 type="text",
                 text=(
                     "No screenshot: this session has no napari viewer "
-                    f"({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                    f"({host.viewer.reason}): {_NO_VIEWER_HINT}."
                 ),
             )
         ]
@@ -677,6 +679,64 @@ async def take_screenshot(canvas_only: bool = True) -> list:
         detail = res.get("error_text") or res.get("stdout") or res.get("status")
         return [TextContent(type="text", text=f"Screenshot failed: {detail}")]
     return [ImageContent(type="image", mimeType="image/png", data=data)]
+
+
+@mcp.tool()
+async def show_view(view: str, image: bool = False, max_edge: int = 1024) -> list:
+    """Show the user a view of their data in the web viewer, and optionally see it yourself.
+
+    Works in any session, napari window or not. The user's open viewer tab moves
+    to `view` -- the image, position, channels, overlays -- and stays there, so
+    this is how you present a result. It returns at once; the answer says whether
+    the viewer was on screen. A minimised, covered or background tab still moves
+    but cannot draw, and the answer says so: ask the user to bring it forward,
+    the view is waiting. Fails plainly when no viewer tab is open -- then give
+    the user the link instead, built with user_base_url() (read_doc("web-viewer")):
+    behind a proxy or --url-prefix it is not a bare /viewer.
+
+    Args:
+        view: The viewer's state as a query string, as in its address bar (a whole
+            address is accepted too), e.g.
+            "id=<array_id>&z=3&c=1&tg=256,256&zm=-1&lb=<label array_id>".
+            `id` is required. See read_doc("web-viewer") for the parameters.
+        image: Also return a PNG of what the page drew, to check it yourself. Waits
+            for tiles and overlays to load, so it is slower; leave it off to just
+            present. No image comes back when the viewer is not on screen.
+        max_edge: Longest edge of the returned image in pixels.
+
+    Returns a note on whether the viewer was on screen, plus the PNG when asked for
+    and drawn.
+    """
+    try:
+        got = await asyncio.to_thread(
+            _control_client.show_view, view, bool(image), int(max_edge)
+        )
+    except (_control_client.ShowError, OSError) as exc:
+        return [TextContent(type="text", text=f"Not shown: {exc}.")]
+    notes = list(got.get("notes") or [])
+    if not got.get("visible"):
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "The viewer moved to the view, but its window is not visible to "
+                    "the user (minimised, covered, or another tab is in front), so "
+                    "nothing was drawn"
+                    + (" and there is no image" if image else "")
+                    + ". Ask them to bring it forward."
+                ),
+            )
+        ]
+    if not got.get("png"):
+        return [TextContent(type="text", text="Shown: the viewer is on the view.")]
+    out = [ImageContent(type="image", mimeType="image/png", data=got["png"])]
+    if got.get("partial"):
+        notes.insert(
+            0, "the image may be incomplete: tiles or overlays were still loading"
+        )
+    if notes:
+        out.append(TextContent(type="text", text="; ".join(notes)))
+    return out
 
 
 #: ``intent``'s guidance, on the parameter rather than only in the prose above
@@ -760,7 +820,11 @@ async def execute_code(
       1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)
       source has an empty `tensors`, so any such predicate hides it; use
       `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
-      to list what hasn't been resolved yet).
+      to list what hasn't been resolved yet). Right after a server start many
+      sources are `is_resolved = false` with `unresolved_reason = 'pending'`:
+      found, not read yet, filling in (`client.health_check()
+      ["registration_pending"]` counts them). Reading one registers it at once,
+      and until they are done an empty structural search means "not known yet".
     - resolved is not the same as local. Assume a cloud or synced-folder
       source's bytes may not be on the serving machine, so its first read can
       be slow or fail offline -- say so before starting one, not after.
@@ -1047,7 +1111,7 @@ async def inspect_object(object_path: str) -> str:
     """Inspect a live object in the napari kernel namespace.
 
     Returns the type, docstring, and public methods/attributes.
-    Example: inspect_object("viewer.layers") or inspect_object("viewer.camera")
+    Example: inspect_object("viewer.layers") or inspect_object("viewer.scene.camera")
     """
     host, err = _app._require_kernel_host()
     if err is not None:
@@ -1190,7 +1254,8 @@ async def start_kernel() -> str:
     it -- a ready kernel is a no-op.
 
     It BLOCKS until the kernel is ready (or the bring-up fails), so on return
-    you can use execute_code / take_screenshot / inspect_object directly, with
+    you can use execute_code / inspect_object directly (and take_screenshot where
+    there is a napari viewer), with
     no polling.
 
     It is also the recovery path: after a failed start, a dead kernel, or the
@@ -1205,11 +1270,11 @@ async def start_kernel() -> str:
         return err
     result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
-        if host.no_viewer_reason:
+        if not host.viewer.has_window:
             return (
                 "Kernel ready: the tensor client (`client`) and `ops` are up; "
                 "use execute_code now. This session has no napari "
-                f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                f"viewer ({host.viewer.reason}): {_NO_VIEWER_HINT}."
             )
         ready = (
             "Kernel ready. The tensor client, `ops` and the "
@@ -1219,7 +1284,7 @@ async def start_kernel() -> str:
         # nothing downstream notices, but the user is watching a window that
         # does not exist and paying software GL for it. Only they can fix it, so
         # the agent has to be told to say so (#892).
-        display = host.virtual_display
+        display = host.viewer.virtual_display
         if display:
             ready += (
                 "\n\nWARNING: no display was detected, so the napari window is "
@@ -1288,7 +1353,7 @@ async def restart_kernel() -> str:
     if refusal is not None:
         return refusal
     note = f" Verification {discarded} was discarded with it." if discarded else ""
-    rebuilt = "" if host.no_viewer_reason else " Viewer rebuilt;"
+    rebuilt = " Viewer rebuilt;" if host.viewer.has_window else ""
     return f"Kernel restarted.{rebuilt} Previous variables are gone." + note
 
 
@@ -1467,9 +1532,9 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
 
     ``sock`` is an already-bound listening socket. When given we serve over it
     with an explicit ``uvicorn.Server`` instead of letting FastMCP bind ``port``
-    itself: the de-daemonized shim-owned child (ARCHITECTURE.md, Lifecycle)
-    binds port 0 up front so it can report the OS-assigned port back to
-    its shim *before* serving, then hands the socket here. The Starlette app
+    itself: a dynamic-port session (ARCHITECTURE.md, Lifecycle) binds port 0 up
+    front so a connection that arrives before uvicorn starts accepting queues
+    instead of being refused, then hands the socket here. The Starlette app
     FastMCP builds carries the ``session_manager.run()`` lifespan on its own
     (``streamable_http_app``), so a plain uvicorn run drives it — identical to
     the ``mcp.run`` path, only with the socket pre-bound.
@@ -1498,6 +1563,6 @@ def run(port: int = 8765, allowed_origins=(), allowed_hosts=(), *, sock=None):
     asyncio.run(server.serve(sockets=[sock]))
 
 
-# run_stdio() is gone: this process serves http only (the shim-owned session
-# model). stdio clients are served by the launcher's bridge mode
-# instead — see `_shim`, which fronts this server's /mcp endpoint.
+# run_stdio() is gone: this process serves http only. stdio clients are served
+# by the launcher's bridge mode instead — see `_shim`, which fronts this
+# server's /mcp endpoint.

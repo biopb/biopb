@@ -13,7 +13,7 @@ tensor server's ``biopb.json`` and the installer's client-definition ``mcp.json`
 (a *distinct* file: that one registers biopb-mcp with MCP clients; this one is
 biopb-mcp's own runtime settings). Logs -- runtime state, not config -- live in
 the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
-:mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
+:mod:`biopb._config.locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``viewer`` / ``services`` / ``observe`` / ``update`` are
@@ -45,11 +45,11 @@ from typing import List, Optional
 # Shared with the tensor server: the constraint primitives (so a knob is judged
 # by the same rules in both packages; biopb/biopb#182, #34) and the config-file
 # location.
-from biopb import _locations
-from biopb._config_constraints import Enum, Range
-from biopb._config_io import atomic_write_json
-from biopb._config_validate import MISSING, Problem, check_sections, warn_and_clamp
-from biopb._locations import mcp_config_path
+from biopb._config import locations as _locations
+from biopb._config.constraints import Enum, Range
+from biopb._config.io import atomic_write_json
+from biopb._config.locations import mcp_config_path
+from biopb._config.validate import MISSING, Problem, check_sections, warn_and_clamp
 
 logger = logging.getLogger(__name__)
 
@@ -117,24 +117,20 @@ class TransportConfig:
     kind: str = _h(
         "stdio",
         'Front-end transport: "http" (loopback streamable-http on `port`) or '
-        '"stdio" (the client spawns biopb-mcp; the shim owns a private http '
-        "session child on a dynamic port and bridges stdin/stdout to it).",
+        '"stdio" (the client spawns biopb-mcp, which bridges stdin/stdout to a '
+        "session the agent attaches to).",
     )
     port: int = _h(
         8765,
         "Fixed loopback port for the http server. Applies only to a directly-"
-        "launched `--transport http` server (the stdio shim and `biopb mcp view` "
-        "use dynamic ports).",
+        "launched `--transport http` server (a session the control launches, or "
+        "`biopb mcp view`, uses a dynamic port).",
     )
     kernel_log: str = _h(
         "",
-        "Force the stdio bridge's session child to log to ONE fixed file instead "
-        "of the default per-session file. Empty -> each session gets its own log.",
-    )
-    session_log_keep: int = _h(
-        5,
-        "How many per-session shim logs to keep (newest by mtime); older ones are "
-        "pruned on each new session. Ignored when kernel_log forces a shared file.",
+        "The log file a directly-launched `--transport http` server whose output "
+        "is redirected to a file reports as its own. Empty -> the canonical "
+        "mcp-server.log.",
     )
     allowed_origins: List[str] = _hlist(
         [],
@@ -283,7 +279,7 @@ class ChatConfig:
     The provider key is deliberately not here either. This file is served whole
     by the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
     key in it would be rendered in a browser; it lives in an owner-only
-    credential file instead (``biopb._credentials``, name ``chat-provider.token``)
+    credential file instead (``biopb._security.credentials``, name ``chat-provider.token``)
     for the same reasons that module was written. What is here is configuration
     a person may reasonably want to change and no one needs to keep secret.
     """
@@ -461,7 +457,6 @@ _CONSTRAINTS = {
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
-        "session_log_keep": Range(min=1),  # keep at least the current
     },
     "KernelConfig": {
         "startup_timeout": Range(exclusive_min=0),
@@ -525,7 +520,7 @@ def get_setting(config: dict, path: str, default=_MISSING):
 def get_config_path() -> Path:
     """Path to the config file (``~/.config/biopb/mcp-config.json``).
 
-    Delegates to :func:`biopb._locations.mcp_config_path` so biopb-mcp and
+    Delegates to :func:`biopb._config.locations.mcp_config_path` so biopb-mcp and
     the core-``biopb`` readers (control plane / ``_algorithms``) share one location.
     """
     return mcp_config_path()
@@ -537,7 +532,7 @@ def get_log_dir() -> Path:
     Logs are persistent runtime state, not user-editable config, so they live in
     the shared biopb *state* tree (``$BIOPB_STATE_HOME``), beside the tensor
     server's ``logs/`` and the session registry. Delegates to
-    :func:`biopb._locations.mcp_log_dir`, which creates it on access.
+    :func:`biopb._config.locations.mcp_log_dir`, which creates it on access.
     """
     return _locations.mcp_log_dir()
 
@@ -553,19 +548,6 @@ def get_workflow_dir() -> Path:
     newest N, as the per-session logs beside it are pruned.
     """
     d = get_log_dir() / "workflows"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def get_session_log_dir() -> Path:
-    """Directory for per-session stdio-shim logs (``<log dir>/sessions``).
-
-    Each shim-owned session writes its own logfile here rather than the shared
-    ``mcp-server.log``, so concurrent sessions never interleave; retention
-    (``transport.session_log_keep``) prunes it to the newest N. Composed from the
-    local :func:`get_log_dir` so it tracks any override of that seam.
-    """
-    d = get_log_dir() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -640,7 +622,7 @@ def config_problems(config: dict) -> List[Problem]:
 def _validate_and_clamp(config: dict) -> dict:
     """Warn on each out-of-range leaf and reset it to its default, in place.
 
-    The load-path policy (see :mod:`biopb._config_validate`): a bad value must
+    The load-path policy (see :mod:`biopb._config.validate`): a bad value must
     not reach the runtime, but must not take the session down either -- a raise
     here is a dead MCP client and no viewer. A leaf absent from the merged dict
     is skipped (nothing to check). Returns *config*.

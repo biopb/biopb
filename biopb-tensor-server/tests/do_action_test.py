@@ -12,7 +12,7 @@ def test_cache_stats_action_returns_stats(tmp_path):
     """do_action('cache_stats') returns the backend's CacheStats as JSON."""
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     try:
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         (raw,) = list(server.do_action(None, flight.Action("cache_stats", b"")))
         stats = json.loads(bytes(raw))
         for field in (
@@ -32,7 +32,7 @@ def test_cache_stats_action_returns_stats(tmp_path):
 def test_cache_stats_action_errors_without_cache():
     """Without an initialized cache the action raises rather than crashing."""
     CacheManager.reset()
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     try:
         list(server.do_action(None, flight.Action("cache_stats", b"")))
         raise AssertionError("expected FlightServerError")
@@ -42,6 +42,6 @@ def test_cache_stats_action_errors_without_cache():
 
 def test_cache_stats_listed_in_actions():
     """cache_stats is advertised by list_actions."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     action_types = {a.type for a in server.list_actions(None)}
     assert "cache_stats" in action_types

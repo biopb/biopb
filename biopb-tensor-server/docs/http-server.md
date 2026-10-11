@@ -32,7 +32,7 @@ X-Biopb-Token: <token>
 ```
 
 The check is timing-safe (`secrets.compare_digest`, via the shared
-`biopb._web_auth` policy the control plane also uses) and compares against
+`biopb._security.web_auth` policy the control plane also uses) and compares against
 the token the sidecar was launched with. A `None` token means no enforcement;
 a token present is enforced on every protected endpoint. There is no separate
 dev flag.
@@ -61,17 +61,13 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/readyz` | ✗ | Readiness — **200 when Flight reports `SERVING`, 503 otherwise**. Adds `ready`, `backend_health`, `backend_error`, `source_count`, `dev_mode`, `service`, `version` |
 | `GET` | `/healthz` | ✗ | Alias for `/readyz` |
 | `GET` | `/api/diagnostics` | ✓ | Diagnostics snapshot; rate-limited 1 req/s per session |
-| `GET` | `/api/sources` | ✓ | JSON array of `DataSourceDescriptor` objects |
-| `GET` | `/api/sources/{id}` | ✓ | Single descriptor, by targeted lookup — not capped like the listing |
-| `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed `metadata_json` field |
+| `GET` | `/api/sources` | ✓ | JSON array of the catalog's source rows (`source_id`, `source_url`, `source_type`, `is_resolved`, `tensors`, and `unresolved_reason` when the server has it), ordered by `source_id`. `?limit=N` caps the rows; `X-Truncated` says whether the listing is short of the catalog (by `limit` or by the server's own row cap) |
+| `GET` | `/api/sources/{id}/metadata` | ✓ | Parsed source metadata |
 | `POST` | `/api/sources/query` | ✓ | Server-side DuckDB SQL over the catalog |
 | `GET` | `/api/sources/{id}/ticket/{ticket_hex}` | ✓ | Resolve a Flight ticket to bytes |
 | `POST` | `/api/sources/{id}/resolve` | ✓ | Begin resolving an unresolved source; joins one already running (same-origin guarded) |
 | `GET` | `/api/sources/{id}/resolve/status` | ✓ | Poll that resolve; 404 if none was started |
 | `POST` | `/api/sources/{id}/resolve/cancel` | ✓ | Ask it to stop (same-origin guarded) |
-| `POST` | `/api/sources/{id}/warm` | ✓ | Hydrate-ahead a resolved source's member files (same-origin guarded) |
-| `GET` | `/api/sources/{id}/warm/status` | ✓ | Poll that warm; 404 if none was started |
-| `POST` | `/api/sources/{id}/warm/cancel` | ✓ | Ask it to stop (same-origin guarded) |
 | `GET` | `/api/tile_info/{array_id}` | ✓ | Tile grid, pyramid levels, selectable axes and the 3-D volume plan |
 | `GET` | `/api/tile/{array_id}` | ✓ | One tile, cacheable (raw bytes) |
 | `POST` | `/api/slice` | ✓ | Binary tensor sub-region; `scale_policy` delegates the scale |
@@ -83,10 +79,6 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth note above) |
 
-> **Route ordering:** `/api/sources/{id}/metadata`, `/ticket/{ticket_hex}` and
-> the `/resolve` + `/warm` sub-paths are registered *before* the greedy
-> `{source_id:path}` catch-all to avoid Starlette first-match shadowing.
->
 > **`/readyz` connects.** It opens the Flight connection if none exists yet,
 > so it answers from the backend rather than from whatever traffic happened
 > to arrive first, and it is safe for a supervisor to gate on. `backend_health`
@@ -96,16 +88,16 @@ to remember when a local, token-protected box can't browse.
 ### Sources
 
 **Source listings are structural.** Each `tensors[]` entry on `/api/sources`
-carries `array_id` / `dim_labels` / `shape` / `dtype`; `chunk_shape` is `[]`
-there and is **not** a usable grid. The transfer grid belongs to the tensor
-the server binds to serve a read, so ask `/api/tile_info/{array_id}` for it.
+carries `array_id` / `dim_labels` / `shape` / `dtype` and no `chunk_shape`.
+The transfer grid belongs to the tensor the server binds to serve a read, so
+ask `/api/tile_info/{array_id}` for it.
 
-**`/api/sources/{id}` is a single-row lookup** (a catalog query keyed on
-`source_id`), so it is not bounded by the listing's row cap — a source past
-that cap has a descriptor here but no entry on `/api/sources`. The catalog is
-public: a token-protected source is listed too (the token gates its pixels),
-but a `cache:` upload has no catalog row at all — reach one through
-`/api/tile_info/{array_id}`.
+**There is no single-source route.** One source is a catalog query keyed on
+`source_id` (`POST /api/sources/query`), which is not bounded by the listing's
+row cap — a source past that cap has no entry on `/api/sources` but is found
+there. The catalog is public: a token-protected source is listed too (the token
+gates its pixels), but a `cache:` upload has no catalog row at all — reach one
+through `/api/tile_info/{array_id}`.
 
 ### ROI annotations
 
@@ -119,12 +111,12 @@ not offer annotations (disabled, or no metadata DB); `422` means the request
 was rejected (geometry the store does not accept, mismatched `array_id`,
 per-tensor cap). Design in [roi-annotations.md](roi-annotations.md).
 
-### Resolve and warm
+### Resolve
 
-Both hydrate cloud / synced-folder data and both can run for minutes, which is
-longer than a request should be held open. They are **jobs**: `POST` to start,
+A resolve hydrates cloud / synced-folder data and can run for minutes, which is
+longer than a request should be held open. It is a **job**: `POST` to start,
 `GET .../status` to poll, `POST .../cancel` to stop. The recall itself lives
-on the server and outlives the HTTP request either way.
+on the server and outlives the HTTP request.
 
 **Polling, not SSE.** Every other route here is request/response, and a
 status object the client re-reads survives the two things a stream does not: a
@@ -138,18 +130,13 @@ bytes. `POST` answers `202` either way, with `started` saying which happened.
 | Field | Meaning |
 | --- | --- |
 | `state` | `running`, `done`, `error`, `cancelled` |
-| `progress` | Kind-specific. Resolve: `elapsed_seconds`, `target_name`, `target_bytes`. Warm: `files_total`/`files_done`, `bytes_total`/`bytes_done`, `current_name`, `elapsed_seconds` |
+| `progress` | `elapsed_seconds`, `target_name`, `target_bytes` |
 | `error` | Reason, on `state == "error"` only |
 | `cancel_requested` | Set the moment a cancel is asked for — before `state` turns, which only happens once the worker unwinds |
 
 **Cancelling a finished job is a no-op, not an error.** The click races the
 last heartbeat often enough that erroring would show a failure for doing
 nothing wrong.
-
-**Warm needs no client-side list of multi-file source types.** A source with
-nothing to warm finishes immediately with `files_total == 0` — the server
-decides structurally (is the source a directory), so no client has to keep a
-copy of that list and keep it in step.
 
 Finished outcomes stay readable for five minutes, then are reaped on the next
 start, so a slow poller still learns *why* a job ended.
@@ -207,7 +194,7 @@ and no `array_id` is a **422**.
 - `X-Scale-Hint: 1,2,2` — the per-axis scale actually read at
 
 `scale_hint` and `reduction_method` are forwarded verbatim to
-`TensorFlightClient.get_tensor(...)`, which resolves the appropriate
+`TensorFlightClient.get_array(...)`, which resolves the appropriate
 precomputed pyramid level (if available) or applies runtime downsampling.
 
 #### `scale_policy` — letting the server choose the scale

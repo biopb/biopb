@@ -17,6 +17,7 @@ is checked against a ``QObject`` directly, so no napari window is ever built.
 
 import threading
 import time
+import warnings
 
 import numpy as np
 import pytest
@@ -191,13 +192,13 @@ def test_assorted_mutations_from_worker(qapp, proxy, vm):
 def test_overlays_are_wrapped(proxy):
     """Overlays are handles too, and they are reached by a path of their own.
 
-    They hang off *properties* backed by a private container rather than off
-    pydantic fields, and they subclass psygnal's ``EventedModel`` rather than
+    They hang off a namespace of overlays (``canvas.overlays``, ``scene.overlays``)
+    rather than off pydantic fields, and they subclass psygnal's ``EventedModel`` rather than
     napari's -- so both the proxy's type check and the graph walk have to name
     them explicitly.
     """
     proxy.add_image(np.zeros((4, 4), np.uint8))
-    assert _is_proxy(proxy.text_overlay)
+    assert _is_proxy(proxy.canvas.overlays.text)
     assert _is_proxy(proxy.layers[0].bounding_box)
 
 
@@ -209,13 +210,13 @@ def test_overlay_mutation_from_worker(qapp, proxy, vm):
     the emission is what has to happen on the main thread.
     """
     fired_on = {}
-    vm.text_overlay.events.visible.connect(
+    vm.canvas.overlays.text.events.visible.connect(
         lambda *_: fired_on.setdefault("thread", threading.current_thread())
     )
 
-    _run_in_worker(lambda: setattr(proxy.text_overlay, "visible", True))
+    _run_in_worker(lambda: setattr(proxy.canvas.overlays.text, "visible", True))
 
-    assert vm.text_overlay.visible is True
+    assert vm.canvas.overlays.text.visible is True
     assert fired_on["thread"] is threading.main_thread()
 
 
@@ -244,8 +245,8 @@ def _reachable_names(cls):
     """Public attribute names on *cls* that can hand back a napari sub-object.
 
     Pydantic fields plus properties: napari publishes the overlays
-    (``viewer.text_overlay`` and friends) as properties over a private dict, so
-    a ``model_fields``-only walk misses them entirely.
+    (``viewer.canvas.overlays.text`` and friends) as properties over a private
+    dict, so a ``model_fields``-only walk misses them entirely.
     """
     names = list(getattr(cls, "model_fields", {}))
     names += [
@@ -285,6 +286,7 @@ def test_no_handle_leaks_through_proxy(proxy):
     HANDLE = (EventedModel, Overlay, Layer, EventedList, Selection, EventedDict)
     seen: set[int] = set()
     leaks: list[str] = []
+    walked: set[str] = set()
 
     def visit(value, path):
         real = _unwrap(value)
@@ -296,9 +298,15 @@ def test_no_handle_leaks_through_proxy(proxy):
         seen.add(id(real))
         if not _is_proxy(value):
             return  # inert leaf -- nothing to recurse into
+        walked.add(path)
         for name in _reachable_names(type(real)):
             try:
-                child = getattr(value, name)
+                # A deprecated name is skipped, not followed: its replacement is
+                # reached on its own path, and the walk is what must stay quiet
+                # when a napari bump deprecates something else.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", (DeprecationWarning, FutureWarning))
+                    child = getattr(value, name)
             except Exception:  # noqa: BLE001 - some fields aren't always live
                 continue
             visit(child, f"{path}.{name}")
@@ -316,3 +324,14 @@ def test_no_handle_leaks_through_proxy(proxy):
 
     visit(proxy, "viewer")
     assert not leaks, "napari handles leaked unwrapped:\n  " + "\n  ".join(leaks)
+    # Where napari 0.9 put the camera and the overlays: a walk that silently
+    # skipped them (a rename, or an access that now warns) would pass vacuously.
+    for path in (
+        "viewer.scene.camera",
+        "viewer.scene.overlays['axes']",
+        "viewer.canvas.grid",
+        "viewer.canvas.overlays['axes']",
+        "viewer.canvas.overlays['scale_bar']",
+        "viewer.canvas.overlays['text']",
+    ):
+        assert path in walked, f"the walk never reached {path}"

@@ -38,7 +38,7 @@ def _their_file(tmp_path, name="theirs", shape=SHAPE):
     store = tmp_path / "data" / f"{name}.zarr"
     if not store.exists():
         store.parent.mkdir(parents=True, exist_ok=True)
-        zarr.create(store=zarr.DirectoryStore(str(store)), shape=shape, dtype="uint16")
+        zarr.create_array(str(store), shape=shape, dtype="uint16", zarr_format=2)
     return ZarrAdapter(zarr.open_array(str(store), mode="r"), name)
 
 
@@ -52,7 +52,7 @@ def _add(client, source, name, scheme="zarr", arr=None, **kw):
 def _serve(tmp_path):
     """A fresh server on *tmp_path*'s ``write_dir`` -- a restart, in-process."""
     server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+        location="localhost:0", writable=True, write_dir=Path(tmp_path)
     )
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
@@ -154,9 +154,11 @@ class TestListingAndReading:
         client.upload_array(desc, _arr())
 
         adapter = writable_server.sources.get("theirs")
-        from biopb_tensor_server.core.adapter_base import catalog_tensors
 
-        assert [t.array_id for t in catalog_tensors(adapter)] == [
+        assert [
+            t.array_id
+            for t in writable_server.sources.catalog_tensors("theirs", adapter)
+        ] == [
             "theirs",
             "theirs/@fields/raw",
         ]
@@ -165,10 +167,10 @@ class TestListingAndReading:
         self, writable_server, client, discovered
     ):
         _add(client, discovered, "filling")
-        adapter = writable_server.sources.get("theirs")
+        attached = writable_server.sources.attached_to("theirs")
 
-        assert "@fields/filling" in adapter.attached_tensors
-        assert adapter.attached_fields == {}
+        assert "@fields/filling" in writable_server.sources.attachments("theirs")
+        assert attached.listed() == []
         status = client.get_upload_status("theirs/@fields/filling")
         assert status["state"] == "PENDING"
         with pytest.raises(flight.FlightError):
@@ -176,7 +178,7 @@ class TestListingAndReading:
 
     def test_a_label_set_binds_to_an_uploaded_field(self, client, discovered):
         """A field is a tensor of its source like any other, so a set may span
-        one (``SourceAdapter._normalized_tensors`` reads the attached fields)."""
+        one (``Attachments`` binds a set against the attached fields)."""
         desc = _add(client, discovered, "raw")
         client.upload_array(desc, _arr())
 
@@ -297,8 +299,7 @@ class TestDiscardAndDelete:
         client.set_upload_status(desc.array_id, "DISCARDED")
 
         assert not store.exists()
-        adapter = writable_server.sources.get("theirs")
-        assert adapter.attached_fields == {}
+        assert writable_server.sources.attached_to("theirs").listed() == []
 
     def test_a_field_adopted_from_an_earlier_life_deletes(
         self, writable_server, client, tmp_path
@@ -359,6 +360,47 @@ class TestDiscardAndDelete:
             assert second.metadata_db.list_rois(desc.array_id)[0] == []
         finally:
             second.shutdown()
+
+
+class TestADiscoveredSourceKeepsOneRow:
+    """A discovered source has a claim, so its row is the reconciler's; a field
+    uploaded to it re-lists that row rather than adding a second."""
+
+    @pytest.fixture
+    def claimed(self, writable_server, tmp_path):
+        from biopb_tensor_server.core.discovery import SourceClaim
+        from biopb_tensor_server.serving.metadata_db import CatalogRecord
+
+        db = writable_server.metadata_db
+        db.sync_roots([("r", "file:///data")])
+        adapter = writable_server.register_source("theirs", _their_file(tmp_path))
+        claim = SourceClaim("zarr", str(tmp_path / "data" / "theirs.zarr"), "theirs")
+        db.sync_source_added(
+            "theirs", adapter, CatalogRecord(claim, {}, "r", "theirs.zarr")
+        )
+        return db
+
+    @staticmethod
+    def _listed(db):
+        rows = db.query(
+            "SELECT [t.array_id for t in tensors] AS ids FROM sources "
+            "WHERE source_id = 'theirs'"
+        ).to_pylist()
+        return [r["ids"] for r in rows]
+
+    def test_a_published_field_is_listed_on_the_one_row(self, client, claimed):
+        desc = _add(client, "theirs", "raw")
+        client.upload_array(desc, _arr())
+
+        assert self._listed(claimed) == [["theirs", "theirs/@fields/raw"]]
+
+    def test_a_discarded_field_leaves_the_one_row(self, client, claimed):
+        desc = _add(client, "theirs", "raw")
+        client.upload_array(desc, _arr())
+        assert self._listed(claimed) == [["theirs", "theirs/@fields/raw"]]
+        client.set_upload_status(desc.array_id, "DISCARDED")
+
+        assert self._listed(claimed) == [["theirs"]]
 
 
 class TestScanSourceFields:

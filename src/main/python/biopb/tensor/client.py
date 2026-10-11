@@ -6,7 +6,6 @@ for accessing tensors stored in a Flight server.
 
 import json
 import logging
-import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dask.array as da
@@ -48,8 +47,9 @@ from biopb.tensor._session import (
     _ClientState,
     _dask_from_flight_info,
     _explain_handshake_failure,
+    _plan_request,
     _refetch_flight_info,
-    _requested_slice,
+    _rois_from_flight_info,
     split_array_id as split_array_id,
 )
 from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
@@ -57,11 +57,9 @@ from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
-    DataSourceDescriptor,
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
-    WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -190,62 +188,10 @@ class TensorFlightClient:
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
-        """List available data sources.
-
-        Deprecated:
-            Use :meth:`query`, which hands back rows in the format
-            you ask for and leaves the structure to you. This is a thin
-            wrapper around
-            ``SELECT ... FROM sources`` that inherits the server's query row
-            cap, so a large catalog comes back silently truncated -- and a
-            browse is exactly where that matters.
-
-        Returns:
-            Dictionary mapping source_id to DataSourceDescriptor.
-            Each DataSourceDescriptor.tensors carries the *structural* entry for
-            every tensor in that source -- array_id, dim_labels, shape, dtype.
-            The transfer ``chunk_shape`` is empty here by contract; ask
-            :meth:`get_descriptor` for the grid of a specific tensor
-            (biopb/biopb#812). ``is_resolved`` is not carried at all -- the
-            message has no field for it (biopb/biopb#1032).
-        """
-        warnings.warn(
-            "TensorFlightClient.list_sources() is deprecated and is capped by "
-            "the server's query row limit; use query(), which returns "
-            "rows in the format you ask for.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._catalog.list_sources()
-
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
-        """One source's ``DataSourceDescriptor`` by id, or ``None``.
-
-        Deprecated:
-            Use :meth:`query` with a ``WHERE source_id = ...``.
-
-        The catalog is public: a source whose pixels need a capability token
-        still has its descriptor here. Knowing its id is not authority to read
-        it -- that is what the token gates, on :meth:`get_tensor` and
-        :meth:`list_rois`.
-
-        Args:
-            source_id: The source's id, e.g. ``"zarr_a3f2"``. This is a *source*
-                id, not an array_id: pass the routing prefix, not
-                ``"aics_7f3/Image:0"``.
-
-        Returns:
-            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
-            that id.
-        """
-        warnings.warn(
-            "TensorFlightClient.get_source() is deprecated; use query() "
-            "with a WHERE source_id = ... instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._catalog.get_source(source_id)
+    def source_row_columns(self) -> str:
+        """The columns a ``sources`` listing needs, as a SELECT list: the base
+        columns, plus ``unresolved_reason`` when the server has it."""
+        return self._catalog.source_row_columns()
 
     def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Execute SQL query against server's source metadata database.
@@ -301,23 +247,6 @@ class TensorFlightClient:
             ```
         """
         return self._catalog.query(sql, format=format)
-
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
-        """Deprecated alias for :meth:`query`.
-
-        .. deprecated::
-            Use :meth:`query`. Same signature, same behavior -- ``query_sources``
-            just names it in terms of what it queries rather than what it does,
-            which stopped matching once other catalog tables (ROIs, uploads)
-            became queryable too.
-        """
-        warnings.warn(
-            "TensorFlightClient.query_sources() is deprecated; use query() "
-            "instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.query(sql, format=format)
 
     @staticmethod
     def _format_query_result(table, format):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
@@ -431,11 +360,8 @@ class TensorFlightClient:
         """Resolve an unresolved source and return its ``sources`` catalog row.
 
         Note:
-            Experimental. Cloud / remote source support (unresolved sources,
-            resolve_source, and `warm_source`) is experimental and its behavior may change.
-            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032
-            and now returns the row itself -- the same information, without
-            the SDK picking a structure for it.
+            Experimental. Cloud / remote source support (unresolved sources
+            and resolve_source) is experimental and its behavior may change.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
@@ -466,12 +392,10 @@ class TensorFlightClient:
             ``query(..., format="records")`` -- ``SOURCE_ROW_COLUMNS``,
             with every tensor enumerated under ``tensors``.
 
-            Unlike `warm_source`, which returns a *status* because residency is
-            not a durable catalog fact (biopb/biopb#1035) and its file counts
-            exist nowhere else, this returns the *result*: resolving is defined
-            by what it writes to the row. The recall's elapsed time and target
-            size ride ``on_progress`` instead -- both are things a caller can
-            already measure or derive, where `warm_source`'s counts are not.
+            Resolving is defined by what it writes to the row, so this returns
+            that row. The recall's elapsed time and target size ride
+            ``on_progress`` instead -- both are things a caller can already
+            measure or derive.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
@@ -480,68 +404,12 @@ class TensorFlightClient:
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
-    def warm_source(
-        self,
-        source_id: str,
-        *,
-        on_progress: Optional[Callable[[WarmProgress], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> WarmProgress:
-        """Hydrate-ahead: recall a resolved source's member files on the server.
-
-        Note:
-            Experimental. Cloud / remote source support (`resolve_source` and
-            this hydrate-ahead path) is experimental and its behavior may change.
-
-        `resolve_source` populates a source's *metadata* but, for a multi-file
-        cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
-        leaves the bulk pixel data dehydrated -- each member file then recalls
-        one-at-a-time, slowly, the first time a read touches it (the viewer
-        scrubbing planes is the worst case). ``warm_source`` opts into pulling
-        them all resident up front so later reads never stall.
-
-        The recall happens **entirely server-side** (the server walks the source
-        directory and reads each file to force the sync engine's recall); no
-        pixels cross the wire, only progress. It is idempotent -- already-resident
-        files are cheap local reads -- so a ``warm_source`` re-run after a cancel
-        simply finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it), and
-        a remote-url source (an object store, or a ``grpc://`` mirror) raises --
-        nothing on the serving machine can be made resident.
-
-        Args:
-            source_id: The (already-resolved) source to warm.
-            on_progress: Optional callback invoked with a ``WarmProgress``
-                (files/bytes done vs total, current file name, elapsed) on each
-                progress message. Called on the calling thread; keep it cheap.
-            should_cancel: Optional predicate polled per message; when it returns
-                True the client closes the stream -- which the server observes and
-                stops the recall promptly -- and this raises
-                `ResolveCancelled`. Files already recalled stay resident.
-
-        Returns:
-            The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident). ``files_total == 0``
-            means the source was local and had nothing to warm -- how a client
-            learns it is single-file. It never means "not applicable"; that
-            case raises (biopb/biopb#1035).
-
-        Raises:
-            ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
-            RuntimeError: if the server predates the ``warm`` action (too old for
-                hydrate-ahead), or closes the stream without a terminal status.
-            FlightServerError: if the source's url is remote. Warm it on the
-                server that holds the data.
-        """
-        return self._catalog.warm_source(
-            source_id, on_progress=on_progress, should_cancel=should_cancel
-        )
-
     def register_local_path(
         self,
         url: str,
         *,
         source_type: str = "",
+        cloud: bool = False,
         on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> AddSourceResult:
@@ -563,6 +431,12 @@ class TensorFlightClient:
             url: Absolute path (or directory) on the server's filesystem.
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
+            cloud: Treat the path as a cloud / synced folder (OneDrive, Dropbox,
+                iCloud "Files On Demand"): offline placeholders are registered as
+                sources whose content is read on first access instead of being
+                skipped. Set it only with the user's consent -- a wrong guess
+                turns off multi-file grouping. A path already under a configured
+                ``cloud`` root is treated as cloud regardless.
             on_progress: Optional callback invoked with an ``AddSourceProgress``
                 (count + current path) per source as it registers. Called on the
                 calling thread; keep it cheap.
@@ -587,6 +461,12 @@ class TensorFlightClient:
             sources under the path whose files are gone are deregistered and
             listed in ``removed``.
 
+            ``skipped_offline`` counts offline placeholder files the walk passed
+            over because ``cloud`` was not set; when it is non-zero the import
+            is incomplete, and a second call with ``cloud=True`` includes them.
+            ``skipped_cloud_dirs`` counts OneDrive directories the walk did not
+            enter; ``cloud=True`` includes them too.
+
         Raises:
             flight.FlightServerError: whole-request failure (path not found /
                 unreadable on the server, or the server declines the request).
@@ -596,35 +476,7 @@ class TensorFlightClient:
         return self._catalog.register_local_path(
             url,
             source_type=source_type,
-            on_progress=on_progress,
-            should_cancel=should_cancel,
-        )
-
-    def add_source(
-        self,
-        url: str,
-        *,
-        source_type: str = "",
-        on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> AddSourceResult:
-        """Deprecated alias for :meth:`register_local_path`.
-
-        .. deprecated::
-            Use :meth:`register_local_path`. Same signature, same behavior --
-            ``add_source`` read fine before the client had other kinds of
-            sources to add (an upload, a resolved cloud source); it no longer
-            says what's actually being added.
-        """
-        warnings.warn(
-            "TensorFlightClient.add_source() is deprecated; use "
-            "register_local_path() instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.register_local_path(
-            url,
-            source_type=source_type,
+            cloud=cloud,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
@@ -654,54 +506,28 @@ class TensorFlightClient:
         """
         return self._catalog.deregister_local_path(root_url)
 
-    def remove_source(self, root_url: str) -> RemoveSourceResult:
-        """Deprecated alias for :meth:`deregister_local_path`.
-
-        .. deprecated::
-            Use :meth:`deregister_local_path`. Same signature, same behavior.
-        """
-        warnings.warn(
-            "TensorFlightClient.remove_source() is deprecated; use "
-            "deregister_local_path() instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.deregister_local_path(root_url)
-
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """The ``array_id``s of the label sets served under an image.
-
-        A label set is an ordinary tensor of its image, named
-        ``<image array_id>/@labels/<name>``, so this is a catalog query over
-        the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
-        one like any other tensor. A set's descriptor carries an NGFF
-        ``image-label`` block in its ``metadata_json``, whose ``source.image``
-        names this image.
-
-        Args:
-            image_array_id: The image's ``array_id`` (``"src_ab12"``, or
-                ``"src_ab12/Image:0"`` on a multi-tensor source).
-
-        Returns:
-            The sets' ``array_id``s, sorted. Empty when the image has none.
-        """
-        return self._catalog.get_label_sets(image_array_id)
-
     # ---- ROI annotations ----
 
-    def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
+    def list_rois(
+        self,
+        array_id: str,
+        set_name: str = "",
+        *,
+        roi_ticket: Optional[bytes] = None,
+    ) -> RoiListResult:
         """Fetch a tensor's ROI annotations.
 
         There is no plane or bbox filter: a client hit-tests and re-renders
-        from the resident set. Annotations are private data, gated by the
-        tensor's source like its pixels, so they are not on the SQL surface.
+        from the resident set. Reads are gated by the tensor's source like its
+        pixels; the ``rois`` table in ``query`` is full-access only.
 
         Args:
             array_id: Unversioned array_id of the tensor.
             set_name: Restrict to one layer, and the only way to read a
                 reserved (``@``) set. Empty means the client-owned sets.
+            roi_ticket: The sealed ticket a reference carried
+                (:meth:`roi_ticket_from_pb`), to read through a connection that
+                holds no token of its own.
 
         Returns:
             ``RoiListResult`` with ``rois``, a ``truncated`` flag, and ``sets``
@@ -711,7 +537,7 @@ class TensorFlightClient:
         Raises:
             flight.FlightUnavailableError: annotations disabled, or no metadata DB.
         """
-        return self._catalog.list_rois(array_id, set_name)
+        return self._catalog.list_rois(array_id, set_name, roi_ticket=roi_ticket)
 
     def put_rois(
         self,
@@ -851,35 +677,26 @@ class TensorFlightClient:
             export_location=export_location,
         )
 
-    def get_tensor_pb(
+    def get_array(
         self,
         array_id: str,
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-        *,
-        export_location: Optional[str] = None,
-    ) -> SerializedTensor:
-        """Deprecated alias for :meth:`get_tensor` with ``output="pb"``.
+    ) -> np.ndarray:
+        """Read a region of a tensor now, as a numpy array.
 
-        .. deprecated::
-            Use ``get_tensor(..., output="pb")``. Same planned read, same
-            ``SerializedTensor`` result -- a separate method just meant the
-            two could (and did) drift on every other parameter.
+        The same plan and the same result as
+        ``get_tensor(...).compute()``, without dask's fixed per-call cost
+        (about 1.4 ms) when the region is one chunk -- what a tile or a
+        single-plane read is. A region spanning several chunks is read through
+        dask exactly as ``get_tensor`` would, so prefer ``get_tensor`` there for
+        its parallelism and laziness.
+
+        Args and errors are those of :meth:`get_tensor`.
         """
-        warnings.warn(
-            "TensorFlightClient.get_tensor_pb() is deprecated; use "
-            "get_tensor(..., output='pb') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_tensor(
-            array_id,
-            slice_hint,
-            scale_hint,
-            reduction_method,
-            output="pb",
-            export_location=export_location,
+        return self._fetcher.get_array(
+            array_id, slice_hint, scale_hint, reduction_method
         )
 
     @staticmethod
@@ -889,6 +706,47 @@ class TensorFlightClient:
         needs to describe what it was handed."""
         info = flight.FlightInfo.deserialize(pb.flight_info)
         return TensorDescriptor.FromString(info.descriptor.command)
+
+    @staticmethod
+    def roi_ticket_from_pb(pb: SerializedTensor) -> Optional[bytes]:
+        """The sealed ticket for reading a SerializedTensor's annotations, or
+        None if its sender issued none.
+
+        The server seals it into the plan it answers, so a reference that
+        carries no token can still read its tensor's ROI sets: pass it to
+        :meth:`list_rois` as ``roi_ticket``, or read the reference directly
+        with :meth:`list_rois_from_pb`.
+        """
+        return TensorFlightClient.descriptor_from_pb(pb).roi_ticket or None
+
+    @staticmethod
+    def list_rois_from_pb(pb: SerializedTensor, set_name: str = "") -> RoiListResult:
+        """A SerializedTensor's annotations, read as its holder.
+
+        The counterpart of :meth:`tensor_from_pb` for ROIs: it dials the
+        reference's own location and needs no client. A reference whose sender
+        sealed its plan carries the ticket to read the tensor's ROI sets and no
+        token; one that carries a token reads under it. A reference carrying
+        neither is refused by the server.
+
+        Args:
+            pb: SerializedTensor protobuf object
+            set_name: As :meth:`list_rois`.
+
+        Raises:
+            flight.FlightUnauthenticatedError: the reference grants no read of
+                the annotations (no token, no ticket, or an expired or
+                mismatched ticket).
+        """
+        token = pb.auth_token or None
+        location = normalize_flight_location(pb.location)
+        trust = (
+            anchored_trust(pb.tls_anchor)
+            if pb.tls_anchor and is_tls_location(location)
+            else resolve_tls_trust(location)
+        )
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        return _rois_from_flight_info(info, location, token, set_name, trust)
 
     @staticmethod
     def tensor_from_pb(
@@ -922,7 +780,7 @@ class TensorFlightClient:
         token = pb.auth_token or None
         location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
-        requested = _requested_slice(info)
+        request = _plan_request(info)
         # The sender's anchor, applied to the name dialed here; a sender that
         # predates the field sends none, and this falls back to TOFU.
         trust = (
@@ -937,6 +795,7 @@ class TensorFlightClient:
                 location,
                 token,
                 trust,
+                request,
             )
         return _dask_from_flight_info(
             info,
@@ -944,7 +803,7 @@ class TensorFlightClient:
             token,
             cache_bytes,
             trust,
-            requested,
+            request,
         )
 
     # ====================
@@ -997,9 +856,9 @@ class TensorFlightClient:
 
                 The one other form is ``"zarr://<image array_id>/@labels/<name>"``,
                 a label set of an image the server already serves. A set is
-                unsigned-integer, spans its image's non-channel axes at full
-                length, and its all-zero chunks are skipped by
-                ``upload_array``.
+                unsigned-integer, has its image's axes at the image's lengths
+                (a channel axis is a singleton, an RGB samples axis is left
+                out), and its all-zero chunks are skipped by ``upload_array``.
 
                 The scheme names the store format and nothing else: the
                 answered ``array_id`` carries none.
@@ -1011,9 +870,10 @@ class TensorFlightClient:
                 request, not a promise: the server plans on its own grid and
                 answers with it (``chunk_shape`` on the returned descriptor).
             dim_labels: Optional dimension labels
-            ome_metadata: Ignored except for a label set's ``image-label``
+            ome_metadata: Refused except for a label set's ``image-label``
                 block. Metadata is source-scoped: a tensor inherits its
-                source's, and the scratch source has none.
+                source's, physical scale included (matched by axis label),
+                and the scratch source has none.
             ttl_seconds: How long to keep this tensor, in seconds. ``None``
                 asks for no deadline. A source may **cap** the lifetime -- the
                 scratch source caps every upload on it, an unset request
@@ -1203,7 +1063,7 @@ class TensorFlightClient:
             - `source_count`: Number of registered sources
             - `metadata_db_enabled`: Whether the server offers a catalog.
                 False means it serves its sources by id alone and every
-                catalog surface (list_sources, query, resolve_source,
+                catalog surface (query, resolve_source,
                 annotations) refuses
             - `writable`: Whether server accepts uploads
             - `uptime_seconds`: Server uptime in seconds

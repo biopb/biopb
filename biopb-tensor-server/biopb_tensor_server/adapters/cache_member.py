@@ -45,6 +45,10 @@ from biopb_tensor_server.adapters.members import (
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY
 from biopb_tensor_server.cache.segment_store import SegmentStore
 from biopb_tensor_server.cache.types import ChunkLocation
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.chunk import decode_chunk_id, is_scaled_chunk
 
 __all__ = ["CacheMember", "create_cache_member", "open_cache_member"]
@@ -135,6 +139,12 @@ class CacheMember(CachedSourceAdapter):
         self._catalog_url = f"cache://{self.array_id}"
 
     # -- where the bytes are ---------------------------------------------------
+
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """Itself for its own name, as well as for the source's."""
+        if strip_source_prefix(self.source_id, tensor_id) == self._tensor_name:
+            return self
+        return super().get_tensor_adapter(tensor_id)
 
     def _store_chunk_batch(
         self,
@@ -317,7 +327,7 @@ def create_cache_member(
     # started tracking against this exact shape/chunk_shape -- the grid is the
     # uploaded one exactly, not a coalesced one: this format stores the chunks
     # as they arrive, and the index knows those bounds and no others
-    # (``get_transfer_chunk_size``).
+    # (``transfer_chunk_size``).
     member._expires_at = expires_at
     member._write_descriptor(UPLOAD_PENDING)
     return member

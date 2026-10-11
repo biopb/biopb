@@ -22,15 +22,26 @@ public final class LocationUris {
 
     private LocationUris() {}
 
+    /** {@code grpcs://}, the public spelling of Arrow's {@code grpc+tls://}, rewritten to it. */
+    static String normalizeScheme(String uri) {
+        return uri.regionMatches(true, 0, "grpcs://", 0, 8) ? "grpc+tls://" + uri.substring(8) : uri;
+    }
+
+    /** Whether {@code uri} is a TLS address in either spelling. */
+    static boolean isTls(String uri) {
+        return normalizeScheme(uri).regionMatches(true, 0, "grpc+tls://", 0, 11);
+    }
+
     /**
      * Parse {@code uri} into a Flight {@link Location}.
      *
      * <p>A scheme-less authority (e.g. {@code "host:port"}) defaults to an
      * insecure gRPC location; any explicit scheme Arrow understands
      * ({@code grpc}, {@code grpc+tcp}, {@code grpc+tls}, {@code grpc+unix}) is
-     * passed through as-is.
+     * passed through as-is, and {@code grpcs://} is read as {@code grpc+tls://}.
      */
     public static Location parse(String uri) {
+        uri = normalizeScheme(uri);
         try {
             return new Location(URI.create(uri));
         } catch (Exception e) {

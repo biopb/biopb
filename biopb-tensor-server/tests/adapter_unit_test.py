@@ -20,7 +20,13 @@ from biopb_tensor_server import (
     ZarrAdapter,
 )
 from biopb_tensor_server.core import downsample as _ds
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.config import parse_config
+from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 
 def _zarr_available() -> bool:
@@ -93,21 +99,17 @@ class TestTensorConfig:
         config = parse_config(
             {
                 "server": {
-                    "monitor_mode": "periodic",
                     "rescan_interval": 12,
                     "full_rescan_interval": 120,
                     "stability_window": 45,
-                    "aggressive_dir_pruning": True,
                 },
                 "sources": [],
             }
         )
 
-        assert config.monitor_mode == "periodic"
         assert config.rescan_interval == 12.0
         assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
-        assert config.aggressive_dir_pruning is True
 
     def test_parse_legacy_monitor_aliases(self):
         config = parse_config(
@@ -120,11 +122,25 @@ class TestTensorConfig:
             }
         )
 
-        assert config.monitor_mode == "off"
+        assert not hasattr(config, "monitor_mode")  # retired: always on
         assert config.rescan_interval == 9.0
         assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
-        assert config.aggressive_dir_pruning is False
+        assert not hasattr(config, "aggressive_dir_pruning")  # retired
+
+    @pytest.mark.parametrize("key", ["monitor_mode", "watcher_type"])
+    def test_retired_monitor_off_loads_but_warns(self, key, caplog):
+        """Monitoring is always on: the old key is tolerated, never obeyed."""
+        from biopb_tensor_server.core.config import validate_config_dict
+
+        data = {"server": {key: "off"}, "sources": []}
+
+        assert not validate_config_dict(data)  # not flagged as an unknown key
+        with caplog.at_level("WARNING"):
+            config = parse_config(data)
+
+        assert not hasattr(config, "monitor_mode")
+        assert f"server.{key} = 'off' is ignored" in caplog.text
 
     def test_claim_generic_images_defaults_off(self):
         config = parse_config({"server": {}, "sources": []})
@@ -158,6 +174,16 @@ class TestTensorConfig:
         assert config.handle_reaper_ttl == 45.0
         assert (
             parse_config({"server": {"handle_reaper_ttl": 0}}).handle_reaper_ttl == 0.0
+        )
+
+    def test_adapter_idle_ttl_is_off_by_default_and_parsed(self):
+        assert parse_config({"server": {}}).adapter_idle_ttl == 0.0
+        config = parse_config({"server": {"adapter_idle_ttl": 300}, "sources": []})
+        assert config.adapter_idle_ttl == 300.0
+
+    def test_a_negative_adapter_idle_ttl_falls_back_to_off(self):
+        assert (
+            parse_config({"server": {"adapter_idle_ttl": -1}}).adapter_idle_ttl == 0.0
         )
 
 
@@ -352,7 +378,7 @@ class TestGetScaledReadPlan:
 
 
 class TestEmptyChunkShapeFallback:
-    """get_transfer_chunk_size() must tolerate an empty/partial chunk_shape.
+    """transfer_chunk_size() must tolerate an empty/partial chunk_shape.
 
     A descriptor may still omit chunk_shape -- an unresolved source has no shape
     to size a grid from, and the bulk-seeded remote proxy mirrors whatever the
@@ -375,7 +401,7 @@ class TestEmptyChunkShapeFallback:
                 dim_labels=list(dim_labels),
             )
 
-        def get_tensor_descriptor(self):
+        def _native_descriptor(self):
             return self._desc
 
         def get_data(self, bounds):  # pragma: no cover - not exercised here
@@ -388,11 +414,13 @@ class TestEmptyChunkShapeFallback:
         def create_from_config(cls, source, credentials_config=None):
             raise NotImplementedError
 
-        def list_tensor_descriptors(self):
+        def list_tensors(self):
             return [self._desc]
 
-        def get_metadata(self):
-            return {}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({})
 
     def test_empty_chunk_shape_derives_default_grid(self):
         # The reproducer: a 5-D FITS-like tensor (>i2) with no chunk_shape, as a
@@ -402,7 +430,7 @@ class TestEmptyChunkShapeFallback:
 
         from biopb_tensor_server.core.chunk import compute_safe_chunk_size
 
-        chunk = adapter.get_transfer_chunk_size()
+        chunk = transfer_chunk_size(adapter.get_tensor_descriptor())
         # A full-rank grid (no longer a 0-length tuple).
         assert len(chunk) == len(shape)
         # Matches the server's default transfer-grid policy exactly.
@@ -427,7 +455,7 @@ class TestEmptyChunkShapeFallback:
         )
         # The adapter's declared grid, served verbatim -- the server clamps to
         # the Arrow ceiling and re-sizes nothing (biopb/biopb#809).
-        assert adapter.get_transfer_chunk_size() == (50, 50)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (50, 50)
 
     def test_unresolved_empty_dtype_raises_source_unresolved_not_typeerror(self):
         # An unresolved descriptor (shape known, dtype still empty) must fail the
@@ -439,14 +467,14 @@ class TestEmptyChunkShapeFallback:
             [1, 1, 1000, 512, 512], "", ["T", "C", "Z", "Y", "X"]
         )
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_transfer_chunk_size()
+            transfer_chunk_size(adapter.get_tensor_descriptor())
 
     def test_unresolved_empty_shape_raises_source_unresolved(self):
         from biopb_tensor_server.core.errors import SourceUnresolvedError
 
         adapter = self._StubTensorAdapter([], "", [])
         with pytest.raises(SourceUnresolvedError):
-            adapter.get_transfer_chunk_size()
+            transfer_chunk_size(adapter.get_tensor_descriptor())
 
 
 class TestDeclaredGridIsServedVerbatim:
@@ -469,11 +497,11 @@ class TestDeclaredGridIsServedVerbatim:
         adapter = self._Stub(
             [1, 1, 64, 1024, 1024], "<u2", ["t", "c", "z", "y", "x"], [1, 1, 1, 64, 64]
         )
-        assert adapter.get_transfer_chunk_size() == (1, 1, 1, 64, 64)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (1, 1, 1, 64, 64)
 
     def test_grid_declaring_one_chunk_is_honoured(self):
         adapter = self._Stub([64, 64], "uint8", ["y", "x"], [64, 64])
-        assert adapter.get_transfer_chunk_size() == (64, 64)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (64, 64)
 
     def test_grid_above_the_arrow_ceiling_is_resplit(self):
         from biopb_tensor_server.core.chunk import (
@@ -483,7 +511,7 @@ class TestDeclaredGridIsServedVerbatim:
 
         shape = [1, 1, 512, 2048, 2048]
         adapter = self._Stub(shape, "<u2", ["t", "c", "z", "y", "x"], shape)
-        grid = adapter.get_transfer_chunk_size()
+        grid = transfer_chunk_size(adapter.get_tensor_descriptor())
 
         assert estimate_chunk_bytes(grid, "<u2") <= MAX_ARROW_BATCH_BYTES
         # Clamped, not re-optimized: it is not pulled down to the 8 MB target.
@@ -493,7 +521,7 @@ class TestDeclaredGridIsServedVerbatim:
 
     def test_grid_is_clipped_to_the_shape(self):
         adapter = self._Stub([4, 8], "uint8", ["y", "x"], [64, 64])
-        assert adapter.get_transfer_chunk_size() == (4, 8)
+        assert transfer_chunk_size(adapter.get_tensor_descriptor()) == (4, 8)
 
 
 class TestTransferChunkSize:
@@ -841,8 +869,8 @@ class TestGetPhysicalScale:
         import zarr
 
         zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-        root = zarr.open_group(zarr_path, mode="w")
-        root.create_dataset("0", shape=shape, chunks=chunks, dtype="uint8")
+        root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+        root.create_array("0", shape=shape, chunks=chunks, dtype="uint8")
         with open(os.path.join(zarr_path, ".zattrs"), "w") as f:
             json.dump(zattrs, f)
         root = zarr.open_group(zarr_path, mode="r")
@@ -1174,38 +1202,6 @@ class TestGetPhysicalScale:
         assert scale == [2.0, 0.8, 0.8]
         assert unit == ["mm", "mm", "mm"]
 
-    # ---- HDF5 --------------------------------------------------------------
-
-    @staticmethod
-    def _make_hdf5(dim_labels, attrs):
-        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-        a = Hdf5Adapter.__new__(Hdf5Adapter)
-        a.dim_labels = dim_labels
-        a._element_size_um = attrs.get("element_size_um")
-        return a
-
-    def test_hdf5_element_size_um(self):
-        """element_size_um maps positionally onto the dataset axes, in µm."""
-        a = self._make_hdf5(
-            ["z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
-        )
-        scale, unit = a._physical_scale()
-        assert scale == [2.0, 0.5, 0.5]
-        assert unit == ["µm", "µm", "µm"]
-
-    def test_hdf5_no_attribute(self):
-        """No element_size_um attribute -> None."""
-        a = self._make_hdf5(["z", "y", "x"], {})
-        assert a._physical_scale() is None
-
-    def test_hdf5_length_mismatch_none(self):
-        """A vector whose length != rank cannot be aligned -> None."""
-        a = self._make_hdf5(
-            ["t", "z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
-        )
-        assert a._physical_scale() is None
-
     # ---- MicroManager (NDTiff + legacy) ------------------------------------
 
     def test_ndtiff_physical_scale_from_summary(self):
@@ -1499,6 +1495,37 @@ class TestGetPhysicalScale:
         return plate
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_is_listed_once_per_adapter(self):
+        """Registration asks for a plate's tensors several times; the field
+        metadata is read once. A rebuilt adapter lists afresh (a refresh)."""
+        from unittest import mock
+
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        def build(path):
+            return OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=path, type="ome-zarr-hcs")
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._make_hcs_plate(tmpdir)
+            plate = build(path)
+            with mock.patch.object(
+                OmeZarrAdapter,
+                "_enumerate_hcs_fields",
+                autospec=True,
+                side_effect=OmeZarrAdapter._enumerate_hcs_fields,
+            ) as enumerate_fields:
+                first = plate.list_tensors()
+                first.clear()  # a caller's edit must not reach the cache
+                assert len(plate.list_tensors()) == 1
+                assert enumerate_fields.call_count == 1
+
+                build(path).list_tensors()
+                assert enumerate_fields.call_count == 2
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_hcs_field_missing_axes_falls_back_to_source_axes(self):
         """A field whose multiscales omits ``axes`` still resolves units, by
         falling back to the plate source's axes (from the first field)."""
@@ -1535,7 +1562,7 @@ class TestGetPhysicalScale:
             assert plate._physical_scale() is None
 
             # Bind the field by its full array_id (well/field).
-            field_id = plate.list_tensor_descriptors()[0].array_id
+            field_id = plate.list_tensors()[0].array_id
             field = plate.get_tensor_adapter(field_id)
             scale, unit = field._physical_scale()
             assert scale == [0.0, 0.5, 0.5]
@@ -1572,7 +1599,7 @@ class TestGetPhysicalScale:
             assert "_field_adapters" in vars(a)
             assert "_field_adapters" in vars(b)
 
-            field_id = a.list_tensor_descriptors()[0].array_id
+            field_id = a.list_tensors()[0].array_id
             fa = a.get_tensor_adapter(field_id)
             fb = b.get_tensor_adapter(field_id.split("/", 1)[1])
             assert fa is not fb
@@ -1593,12 +1620,12 @@ class TestOmeZarrPrecompute:
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create OME-Zarr structure with multiscales
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
             # Create level arrays
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
-            root.create_dataset("2", shape=(25, 25), chunks=(12, 12), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("2", shape=(25, 25), chunks=(12, 12), dtype="uint8")
 
             # Create .zattrs with multiscales
             zattrs = {
@@ -1655,13 +1682,13 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
             # Create and populate level arrays
-            arr0 = root.create_dataset(
+            arr0 = root.create_array(
                 "0", shape=(100, 100), chunks=(50, 50), dtype="uint8"
             )
-            arr1 = root.create_dataset(
+            arr1 = root.create_array(
                 "1", shape=(50, 50), chunks=(25, 25), dtype="uint8"
             )
             arr0[:] = 1
@@ -1727,10 +1754,10 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
 
             zattrs = {
                 "multiscales": [
@@ -1782,10 +1809,10 @@ class TestOmeZarrPrecompute:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
 
-            root.create_dataset("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
-            root.create_dataset("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
+            root.create_array("0", shape=(100, 100), chunks=(50, 50), dtype="uint8")
+            root.create_array("1", shape=(50, 50), chunks=(25, 25), dtype="uint8")
 
             zattrs = {
                 "multiscales": [
@@ -1875,19 +1902,18 @@ class TestSliceConversion:
         assert _convert_slice_to_level(None, [4, 2]) is None
 
 
-class TestGetLevelAdapterContract:
-    """``get_level_adapter`` is a TensorAdapter contract, not a sniffed method.
+class TestLevelRouting:
+    """A native pyramid level resolves through ``get_tensor_adapter``.
 
-    The server's chunk dispatch asks every source adapter for a native pyramid
-    level; a non-native adapter answers ``None`` and the read falls back to the
-    tensor field. This replaces the old ``hasattr(adapter, "get_level_adapter")``
-    duck-typing, whose mere-presence test mis-routed an HCS ``well/field`` chunk
-    to a (non-existent) level store (biopb/biopb#557).
+    The server's chunk dispatch asks the source for the id in the chunk's route
+    and gets a level, a tensor field or a typed miss from the one lookup. An
+    HCS ``well/field`` chunk must not be mistaken for a level store
+    (biopb/biopb#557).
     """
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_plain_tensor_adapter_returns_none(self):
-        """A format with no native pyramid uses the base default (None)."""
+    def test_plain_tensor_adapter_has_no_levels(self):
+        """A format with no native pyramid refuses a level path."""
         import zarr
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1899,10 +1925,11 @@ class TestGetLevelAdapterContract:
                 dtype="uint8",
             )
             adapter = ZarrAdapter(arr, "plain", ["y", "x"])
-            assert adapter.get_level_adapter("1") is None
+            with pytest.raises(TensorNotFound):
+                adapter.get_tensor_adapter("plain/1")
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_hcs_plate_returns_none(self):
+    def test_hcs_plate_has_no_levels(self):
         """An HCS plate has no native pyramid: a suffix is a field id, not a level."""
         from biopb_tensor_server.core.config import SourceConfig
 
@@ -1912,14 +1939,14 @@ class TestGetLevelAdapterContract:
                 SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
             )
             assert plate._is_hcs_plate
-            assert plate.get_level_adapter("A/1/0") is None
+            assert plate._level_path("A/1/0") is None
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_hcs_field_chunk_routes_to_field_adapter(self):
         """An HCS field chunk resolves to the field adapter, not a level store.
 
         Regression: under the old ``hasattr`` dispatch this landed on
-        ``get_level_adapter("well/field")`` and failed to open a level.
+        a level lookup of ``well/field`` that failed to open a level.
         """
         from biopb_tensor_server import TensorFlightServer
         from biopb_tensor_server.core.config import SourceConfig
@@ -1929,7 +1956,7 @@ class TestGetLevelAdapterContract:
             plate = OmeZarrAdapter.create_from_config(
                 SourceConfig(source_id="plate", url=plate_path, type="ome-zarr-hcs")
             )
-            field_id = plate.list_tensor_descriptors()[0].array_id
+            field_id = plate.list_tensors()[0].array_id
             field = plate.get_tensor_adapter(field_id)
             chunk_id = (
                 field.get_read_plan(field.get_tensor_descriptor())
@@ -1937,7 +1964,7 @@ class TestGetLevelAdapterContract:
                 .chunk_id
             )
 
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("plate", plate)
             resolved = server._get_adapter_for_chunk(chunk_id)
             assert resolved.get_tensor_descriptor().array_id == field_id
@@ -2208,6 +2235,50 @@ class TestGetData:
             assert data.shape == (32, 48)
             np.testing.assert_array_equal(data, expected)
 
+    def test_micromanager_v1_framekey_metadata(self):
+        """Pre-1.4 Micro-Manager datasets name their files with
+        ``FrameKey-<frame>-<channel>-<slice>`` entries and no ``Coords-`` keys;
+        the frames still resolve to their files, in time order."""
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Frames": 3,
+                    "Slices": 1,
+                    "ChNames": ["Eos"],
+                    "Width": 8,
+                    "Height": 6,
+                }
+            }
+            for t in range(3):
+                fname = f"img_{t:09d}_Eos_000.tif"
+                tifffile.imwrite(
+                    os.path.join(tmpdir, fname),
+                    np.full((6, 8), 10 * t, dtype=np.uint16),
+                    photometric="minisblack",
+                )
+                meta[f"FrameKey-{t}-0-0"] = {
+                    "FileName": fname,
+                    "Channel": "Eos",
+                    "Frame": t,
+                    "Slice": 0,
+                }
+            with open(os.path.join(tmpdir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            adapter = MicroManagerLegacyAdapter(tmpdir, "mm_v1")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.dim_labels) == ["t", "y", "x"]
+            assert list(desc.shape) == [3, 6, 8]
+            data = adapter.get_data(ChunkBounds(start=[1, 0, 0], stop=[3, 6, 8]))
+            assert data[:, 0, 0].tolist() == [10, 20]
+
 
 class TestOmeZarrStorePathResolution:
     """One store->path resolution, at construction (biopb/biopb#530).
@@ -2232,11 +2303,13 @@ class TestOmeZarrStorePathResolution:
             def __repr__(self):
                 return self._repr
 
-        # file:// URL wins over everything (checked first, as __init__ did).
-        assert _store_filesystem_path(_Store("file:///data/p.zarr")) == "/data/p.zarr"
-        # zarr 2: DirectoryStore / FSStore expose .path
-        assert _store_filesystem_path(_Store("<DirectoryStore>", path="/d/a")) == "/d/a"
-        # zarr 3: LocalStore exposes .root -- the case _open_level_array omitted
+        # A store with no path or root falls back to parsing its file:// URL.
+        assert Path(_store_filesystem_path(_Store("file:///data/p.zarr"))) == Path(
+            "/data/p.zarr"
+        )
+        # FsspecStore exposes .path
+        assert _store_filesystem_path(_Store("<FsspecStore>", path="/d/a")) == "/d/a"
+        # LocalStore exposes .root and no .path
         assert _store_filesystem_path(_Store("<LocalStore>", root="/d/b")) == "/d/b"
         # Nothing recognizable: the repr, same degraded behaviour as before.
         assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
@@ -2256,9 +2329,9 @@ class TestOmeZarrStorePathResolution:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             zarr_path = os.path.join(tmpdir, "test.ome.zarr")
-            root = zarr.open_group(zarr_path, mode="w")
-            root.create_dataset("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
-            root.create_dataset("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
+            root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+            root.create_array("0", shape=(40, 40), chunks=(20, 20), dtype="uint8")
+            root.create_array("1", shape=(20, 20), chunks=(10, 10), dtype="uint8")
             zattrs = {
                 "multiscales": [
                     {
@@ -2300,7 +2373,7 @@ class TestOmeZarrStorePathResolution:
             adapter = ome_zarr_mod.OmeZarrAdapter(base, "test")
             assert len(calls) == 1  # __init__
 
-            level = adapter.get_level_adapter("1")
+            level = adapter.get_tensor_adapter("1")
             assert len(calls) == 1  # the level rode on __init__'s root
             assert list(level.get_tensor_descriptor().shape) == [20, 20]
 

@@ -106,19 +106,54 @@ html, body {
   padding: 0.35rem 1rem;
   transition: background 0.1s;
 }
+/* One line per row: a long name (or one a hyphen could break) is cut with an
+   ellipsis before the badge or button at its right is squeezed out. min-width:0
+   lets the flex item shrink below its text. */
+.tree-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tree-item:hover { background: #1e2435; color: #e2e8f0; }
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
 /* An unresolved (cloud / synced-folder) source: dimmed and not openable until
-   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+   the server hydrates it. Matches the napari tensor_browser's greyed row. It
+   still answers the pointer: hover highlights it and a click (focus) marks it
+   selected, so the row never looks dead. */
 .tree-item.unresolved {
   color: #64748b;
-  cursor: not-allowed;
+  cursor: default;
   font-style: italic;
 }
-.tree-item.unresolved:hover { background: none; color: #64748b; }
+.tree-item.unresolved:hover { background: #1e2435; color: #94a3b8; }
+.tree-item.unresolved:focus { background: #2a3347; color: #94a3b8; outline: none; }
+/* A resolve under way: the name pulses and trails animated dots, so the row
+   reads as busy for as long as the download takes. */
+.tree-item.unresolved.resolving { color: #93c5fd; animation: resolving-pulse 1.4s ease-in-out infinite; }
+.tree-item.unresolved.resolving .tree-name::after {
+  content: "...";
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: bottom;
+  width: 0;
+  animation: resolving-dots 1.2s steps(4, end) infinite;
+}
+@keyframes resolving-dots { to { width: 1.2em; } }
+@keyframes resolving-pulse { 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) {
+  .tree-item.unresolved.resolving { animation: none; }
+  .tree-item.unresolved.resolving .tree-name::after { animation: none; width: 1.2em; }
+}
+.tree-item.unresolved:focus-visible { outline: 1px solid #2d5a8f; outline-offset: -1px; }
 
 .unresolved-glyph {
+  /* Same footprint as a Chevron, so it sits in the chevron column. */
+  display: inline-block;
+  width: 16px;
+  flex-shrink: 0;
+  text-align: center;
   font-size: 11px;
   font-style: normal;
   line-height: 1;
@@ -139,81 +174,45 @@ html, body {
   color: #93c5fd;
   cursor: pointer;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .resolve-btn:hover { background: #2d5a8f; color: #dbeafe; }
-
-/* Hydrate-ahead tray, pinned to the foot of the catalog pane. flex-shrink so
-   it keeps its height while the tree above it takes the slack. */
-.warm-tray {
-  flex-shrink: 0;
-  border-top: 1px solid #2d3748;
-  background: #11151d;
-  padding: 0.5rem 0.75rem 0.6rem;
-  max-height: 40%;
-  overflow-y: auto;
-}
-.warm-tray-title {
+.resolve-hint {
   font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #64748b;
-  margin-bottom: 0.4rem;
-}
-.warm-tray-list { list-style: none; margin: 0; padding: 0; }
-
-.warm-row { margin-bottom: 0.55rem; }
-.warm-row:last-child { margin-bottom: 0; }
-.warm-row-head { display: flex; align-items: center; gap: 0.5rem; }
-.warm-row-name {
-  flex: 1;
-  font-size: 11px;
-  color: #cbd5e1;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-style: normal;
+  margin-left: 8px;
+  color: #93c5fd;
   white-space: nowrap;
+  flex-shrink: 0;
 }
-.warm-row-action {
-  background: none;
-  border: none;
-  color: #64748b;
-  font-size: 10px;
-  cursor: pointer;
-  padding: 0 2px;
-}
-.warm-row-action:hover:not(:disabled) { color: #e2e8f0; }
-.warm-row-action:disabled { cursor: default; opacity: 0.6; }
-.warm-row-detail { font-size: 10px; color: #64748b; margin-top: 2px; }
-.warm-row.error .warm-row-detail { color: #fca5a5; }
 
-.warm-bar {
+
+.resolve-bar {
   height: 3px;
   background: #1e293b;
   border-radius: 2px;
   overflow: hidden;
   margin-top: 4px;
 }
-.warm-bar-fill { height: 100%; background: #3b82f6; transition: width 0.2s; }
-.warm-row.done .warm-bar-fill { background: #34d399; }
-.warm-row.error .warm-bar-fill { background: #ef4444; }
-.warm-row.cancelled .warm-bar-fill { background: #64748b; }
+.resolve-bar-fill { height: 100%; background: #3b82f6; transition: width 0.2s; }
 
-/* Enumerating, or a resolve, where the server reports no completed fraction at
+/* A resolve, where the server reports no completed fraction at
    all -- so the bar has to say "working" without implying a number. */
-.warm-bar.indeterminate .warm-bar-fill {
+.resolve-bar.indeterminate .resolve-bar-fill {
   width: 100% !important;
   background: linear-gradient(
     90deg,
     transparent 0%, #3b82f6 50%, transparent 100%
   );
   background-size: 200% 100%;
-  animation: warm-sweep 1.4s linear infinite;
+  animation: resolve-sweep 1.4s linear infinite;
 }
-@keyframes warm-sweep {
+@keyframes resolve-sweep {
   from { background-position: 200% 0; }
   to { background-position: -200% 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .warm-bar.indeterminate .warm-bar-fill { animation: none; opacity: 0.55; }
+  .resolve-bar.indeterminate .resolve-bar-fill { animation: none; opacity: 0.55; }
 }
 
 .tree-folder {
@@ -239,6 +238,8 @@ html, body {
   border-radius: 3px;
   padding: 1px 5px;
   color: #94a3b8;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .dim-badge {
@@ -248,6 +249,7 @@ html, body {
   padding: 1px 5px;
   color: #64748b;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .status-pill { font-size: 11px; border-radius: 999px; padding: 2px 10px; font-weight: 500; }

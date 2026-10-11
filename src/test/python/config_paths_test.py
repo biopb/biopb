@@ -1,4 +1,4 @@
-"""Unit tests for the XDG-aware path resolution in :mod:`biopb._locations`.
+"""Unit tests for the XDG-aware path resolution in :mod:`biopb._config.locations`.
 
 Pins the on-disk contract every biopb component (and both installers) must agree
 on: the three XDG base trees, the derived log/session/pid/sentinel paths, the
@@ -13,7 +13,7 @@ import pathlib
 import sys
 
 import pytest
-from biopb import _locations as L
+from biopb._config import locations as L
 
 
 @pytest.fixture(autouse=True)
@@ -155,6 +155,16 @@ class TestRotateLog:
         f.write_bytes(b"a" * 2048)
         (tmp_path / "x.log.1").write_text("old1")
         L.rotate_log(f, max_bytes=1024, backup_count=3)
+        assert (tmp_path / "x.log.2").read_text() == "old1"
+        assert (tmp_path / "x.log.1").read_bytes() == b"a" * 2048
+
+    def test_drops_the_oldest_when_every_backup_exists(self, tmp_path):
+        f = tmp_path / "x.log"
+        f.write_bytes(b"a" * 2048)
+        for i in (1, 2, 3):
+            (tmp_path / f"x.log.{i}").write_text(f"old{i}")
+        L.rotate_log(f, max_bytes=1024, backup_count=3)
+        assert (tmp_path / "x.log.3").read_text() == "old2"
         assert (tmp_path / "x.log.2").read_text() == "old1"
         assert (tmp_path / "x.log.1").read_bytes() == b"a" * 2048
 

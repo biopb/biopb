@@ -56,7 +56,9 @@ from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
@@ -66,6 +68,11 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -176,6 +183,36 @@ class _Nd2Layout:
             if label != _POSITION_AXIS
         ]
 
+    def to_payload(self) -> dict:
+        """The layout as JSON, without ``ome_summary``: the catalog row already
+        holds it as ``metadata_json``."""
+        return {
+            "labels": list(self.labels),
+            "shape": [int(s) for s in self.shape],
+            "dtype": self.dtype.str,
+            "voxel_um": dict(self.voxel_um),
+            # One [loop coordinate..., frame index] row per frame.
+            "frame_indices": [
+                [*key, frame] for key, frame in sorted(self.frame_indices.items())
+            ],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict, ome_summary: Optional[dict] = None):
+        """Rebuild a layout from :meth:`to_payload`; *ome_summary* is the row's
+        metadata, which a hydrated adapter reports as its own."""
+        return cls(
+            labels=tuple(payload["labels"]),
+            shape=tuple(int(s) for s in payload["shape"]),
+            dtype=np.dtype(payload["dtype"]),
+            voxel_um=dict(payload["voxel_um"]),
+            ome_summary=dict(ome_summary or {}),
+            frame_indices={
+                tuple(int(c) for c in row[:-1]): int(row[-1])
+                for row in payload["frame_indices"]
+            },
+        )
+
 
 def _loop_key(coordinates: Dict[str, int], present: Tuple[str, ...]) -> Tuple[int, ...]:
     return tuple(coordinates.get(axis, 0) for axis in present)
@@ -231,6 +268,7 @@ def read_layout(path: str) -> _Nd2Layout:
     )
 
 
+@canonical_axes
 class Nd2Adapter(TensorAdapter):
     """Reads a Nikon ND2 file through the ``nd2`` package, one tensor per XY
     stage position.
@@ -286,6 +324,20 @@ class Nd2Adapter(TensorAdapter):
             layout=read_layout(path),
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "Nd2Adapter":
+        """Rebuild from the row's probed layout: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        layout = _Nd2Layout.from_payload(payload["layout"], metadata)
+        return cls(path, source.source_id, layout=layout)
+
     def __init__(
         self,
         url: str,
@@ -327,6 +379,13 @@ class Nd2Adapter(TensorAdapter):
         self._shared_handle: Optional[_Nd2Reader] = shared_handle
         self._tensor_adapters: Dict[str, Nd2Adapter] = {}
 
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The probed layout: everything a read needs from the file. Source-level
+        only."""
+        if self.position is not None:
+            return None
+        return {"layout": self._layout.to_payload()}
+
     def _position_frame_plan(
         self, layout: "_Nd2Layout", position: int
     ) -> Tuple[Dict[Tuple[int, ...], int], Tuple[int, ...]]:
@@ -367,19 +426,19 @@ class Nd2Adapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(self._layout.n_positions)
         ]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         if self.position is not None:
             return self._descriptor_for(self.position, labels=self.dim_labels)
-        return self.get_tensor_adapter(f"{_POSITION_AXIS}:0").get_tensor_descriptor()
+        return self.get_tensor_adapter(f"{_POSITION_AXIS}:0")._native_descriptor()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> "Nd2Adapter":
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         position = self._position_for_field(field)
         cached = self._tensor_adapters.get(field)
         if cached is not None:
@@ -555,8 +614,10 @@ class Nd2Adapter(TensorAdapter):
             return None
         return scale_by_label(self.dim_labels, self._layout.voxel_um, MICRON)
 
-    def get_metadata(self) -> dict:
-        return dict(self._layout.ome_summary)
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(dict(self._layout.ome_summary))
 
 
 __all__ = ["Nd2Adapter"]

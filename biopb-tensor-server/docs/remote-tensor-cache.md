@@ -60,7 +60,7 @@ degrading to TOFU — see *Misconfiguration is not unreachability* below.
 
 `resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
 frozen, hashable `UpstreamCredentials` from the source + profile, and every
-dial site — the adapter's pooled client, the reconciler's bulk catalog fetch,
+dial site — the adapter's pooled client, the mirror's re-list,
 and the bare-host expansion — uses it, so a `grpcs://` upstream's configured CA
 is honored everywhere it is dialed, not just on the adapter's own connection.
 
@@ -85,9 +85,9 @@ adapter, so the proxy inherits the persistent file cache, eviction, crash
 recovery and the `chunk_locate` mmap fast path unchanged — it adds no caching
 code of its own.
 
-- **Catalog surface** (`list_tensor_descriptors`, `get_metadata`,
-  `get_tensor_descriptor`) mirrors the upstream with `array_id` rewritten
-  local-ward, and degrades to an empty placeholder rather than raising when the
+- **Catalog surface** (`list_tensors`, `get_tensor_descriptor`) mirrors the
+  upstream with `array_id` rewritten local-ward, and the row's metadata and
+  resolved flag are the upstream row's, written with the local row, and degrades to an empty placeholder rather than raising when the
   upstream is unreachable — see *Unreachable upstream* below.
 - **Read planning** (`plan_flight_info`) forwards the whole `GetFlightInfo` to
   the upstream and localizes the response: only the upstream knows the grid,
@@ -102,6 +102,15 @@ code of its own.
   result under the envelope's own key. Forwarding the *scaled* inner means the
   upstream does any downsampling, so only the small result crosses the
   network.
+- **Stub plans.** When the caller asks for `ticket_stub` and the upstream offers
+  it (`health.ticket_stubs`), the proxy wraps the upstream's stub identity once,
+  in the same route/epoch/content_version frame, and keeps the upstream's
+  indices. A chunk is then keyed by that envelope plus the index and forwarded
+  upstream as `identity + index` under the proxy's own credentials, so the
+  upstream's grant is dropped and the proxy seals what it serves with its own
+  key. The local route in either frame is the tensor the plan is for: it only
+  has to reach an adapter of this source, which forwards the inner verbatim, so
+  the proxy reads no upstream id -- a native level's chunks included.
 - **Writes are not forwarded.** The proxy is read-only: `add_tensor` and other
   write verbs are refused on a mirrored source, exactly as on the wire.
 
@@ -162,14 +171,34 @@ The upstream's own **scratch** source is never mirrored: it is a temp store
 whose tensors have a deadline set by that server's policy, not a catalog worth
 carrying.
 
-**Enumeration and seeding are one bulk query.** `fetch_upstream_catalog` reads
-every upstream source's id, tensors, metadata, `is_resolved` and `indexed_at`
-in a single server-side `query`, which is not truncated (unlike
-`list_sources()`), so mirroring costs one upstream RPC regardless of catalog
-size and a re-list can safely remove sources that disappeared. An upstream
-with no SQL catalog falls back to id-only enumeration, and removals are then
-skipped — a truncated or degraded list must never be treated as a complete
-one, or a re-list would drop sources it simply failed to see.
+**A re-list reads two columns, then only what changed.** `list_upstream_versions`
+reads every upstream source's id, `indexed_at` and `metadata_json` length with
+server-side `query` calls. An upstream caps one query's rows
+(`max_query_results`) and flags the cut only in the result's metadata, so the read
+is keyset-paged (`ORDER BY source_id LIMIT n`, resuming after the last id, and
+continuing past any page the server flags `truncated`); the result is complete,
+so a re-list can safely remove sources that disappeared. Full rows (tensors, metadata, `is_resolved`) are then
+fetched by `fetch_upstream_rows`, in batches cut by that length (`FETCH_BYTES`;
+`metadata_json` is wildly uneven, so a count would not bound memory), for sources
+that are new or whose `indexed_at` differs from the one the mirror was synced
+at. A steady re-list of a six-figure catalog therefore moves a few MB, and a first sync never holds more than one batch. There is no
+fallback: if the query fails the re-list raises, the mirrored catalog is left as
+it is, and the next tick retries. Enumerating ids and syncing each source over
+its own RPC would put two round trips per source on an upstream that is already
+down, slow or refusing us.
+
+**A mirror is not a claim.** A bare-host upstream is a root, and its
+`MirrorSet` (`sources/mirror.py`) holds that root and the `indexed_at` each of
+its sources was synced at. A re-list writes catalog rows and builds no adapter;
+a read builds it from the row (`MirrorSet.materialize`, through the registry's
+miss path) and the idle sweep lets it go again. There is nothing to persist (the
+root is rebuilt from config on every start, and the catalog drops its rows at
+open) and no file to re-find. Rows are written from the upstream's rows in one batch
+(`MetadataDatabase.sync_mirrored_rows`): array_id prefixes swapped, the url
+rewritten, `metadata_json` passed through as the upstream wrote it. A row the
+upstream did not change is left as it is. A source configured on its own
+(`grpc://host:port/<id>`) is an ordinary claim, and reads its metadata from
+the upstream when it registers.
 
 **Cache staleness is versioned, not open.** The upstream's `indexed_at`
 becomes this mirror's `content_version`, folded into every chunk_id's proxy
@@ -180,7 +209,7 @@ proxy's cached chunks for it instead of leaking through them.
 
 **Refresh via `monitor=true`.** For a bare-host upstream, `monitor=true`
 generalizes the filesystem rescan into a periodic re-list: each upstream has
-its own adaptive cadence, re-listing every rescan tick (default 30s) while
+its own adaptive cadence, re-listing every rescan tick (default 120s) while
 changing or failing, with the period doubling per unchanged re-list up to
 about an hour. Any change or connectivity failure resets it back to
 every-tick, so a new or recovered upstream is mirrored within about one tick.
@@ -195,9 +224,9 @@ not just silence.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
 download, so recovery is transparent — there is no unresolved-source consent
-step. The catalog surface degrades to a placeholder (`list_tensor_descriptors`
-/ `get_metadata` return empty, so registration's metadata-DB sync succeeds
-with a row of no tensors) while the serve surface stays live and raises a
+step. The catalog surface degrades to a placeholder (`list_tensors`
+returns empty, so registration's metadata-DB sync succeeds with a row of no
+tensors) while the serve surface stays live and raises a
 retryable error on a miss, dropping the dead upstream connection so the next
 call reconnects. Already-cached chunks keep serving through an outage.
 

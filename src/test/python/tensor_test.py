@@ -142,12 +142,6 @@ class TestQuerySourcesFormat:
         with pytest.raises(ValueError, match="unknown format"):
             client.query("SELECT 1", format="polars")
 
-    def test_query_sources_is_a_deprecated_alias_for_query(self):
-        client = _offline_client()
-        with pytest.warns(DeprecationWarning, match="query_sources"):
-            with pytest.raises(ValueError, match="unknown format"):
-                client.query_sources("SELECT 1", format="polars")
-
 
 class TestGetPhysicalScale:
     """get_physical_scale describes the tensor, every call.
@@ -364,6 +358,9 @@ class TestResolveDescriptorAddressing:
     def _client(row):
         client = _offline_client(raw_client=Mock())
         client._catalog._source_tensors_row = Mock(return_value=row)
+        # Not a source awaiting registration, whatever it is: that probe is
+        # covered by ``TestPendingRegistration``.
+        client._catalog._register_if_pending = Mock(return_value=False)
         # The row answers every case here; reaching the probe is the failure.
         client._catalog._fetch_tensor_descriptor = Mock(
             side_effect=AssertionError("the row should have answered")
@@ -418,6 +415,47 @@ class TestResolveDescriptorAddressing:
         client = self._client(self._row("solo"))
 
         assert client._catalog._resolve_descriptor("solo").array_id == "solo"
+
+
+class TestUnresolvedRefusal:
+    """An unresolved source is refused, whatever the reason, and never resolved
+    implicitly: a cloud placeholder (a download), a source the server has found but
+    not registered (``pending``) and one whose registration failed all send the
+    caller to ``resolve_source``, which registers or downloads it."""
+
+    @staticmethod
+    def _client(rows):
+        client = _offline_client(raw_client=Mock())
+        catalog = client._catalog
+        catalog.resolve_source = Mock()
+        catalog._source_tensors_row = Mock(side_effect=rows)
+        return catalog
+
+    @staticmethod
+    def _row():
+        return {"is_resolved": False, "tensors": []}
+
+    @pytest.mark.parametrize("reason", ["pending", "failed", "needs_recall"])
+    def test_a_descriptor_read_is_refused(self, reason):
+        catalog = self._client([self._row()])
+
+        with pytest.raises(ValueError, match=r"client\.resolve_source"):
+            catalog._resolve_descriptor("solo")
+        catalog.resolve_source.assert_not_called()
+
+    def test_a_metadata_read_is_refused(self):
+        catalog = self._client([])
+        catalog._query_table = Mock(
+            return_value=Mock(
+                to_pylist=Mock(
+                    return_value=[{"is_resolved": False, "metadata_json": None}]
+                )
+            )
+        )
+
+        with pytest.raises(ValueError, match=r"client\.resolve_source"):
+            catalog.get_source_metadata("solo")
+        catalog.resolve_source.assert_not_called()
 
 
 if __name__ == "__main__":
@@ -521,7 +559,9 @@ class TestExportLocation:
         client = _offline_client(raw_client=Mock())
         client._state.advertised_location = "grpc://real-host:8815"
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
         return client
 
@@ -639,7 +679,9 @@ class TestExportedTrust:
     def test_pb_carries_the_anchor_for_a_tls_location_only(self):
         client = self._tls_client()
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
         pb = client._fetcher.get_tensor("test-tensor", output="pb")
         assert pb.tls_anchor == self.LEAF
@@ -660,7 +702,7 @@ class TestExportedTrust:
                 FlightInfo=SimpleNamespace(deserialize=lambda b: Mock(endpoints=[1]))
             ),
         )
-        monkeypatch.setattr(client_mod, "_requested_slice", lambda info: None)
+        monkeypatch.setattr(client_mod, "_plan_request", lambda info: None)
         monkeypatch.setattr(
             client_mod,
             "_dask_from_flight_info",
@@ -681,7 +723,7 @@ class TestExportedTrust:
 
 
 class TestGetTensorOutputSwitch:
-    """get_tensor's output="da"/"pb" switch replaces the separate get_tensor_pb
+    """get_tensor's output="da"/"pb" switch replaced the separate get_tensor_pb
     method, so both forms share one signature and cannot drift apart."""
 
     def test_unknown_output_rejected_before_network(self):
@@ -689,14 +731,15 @@ class TestGetTensorOutputSwitch:
         with pytest.raises(ValueError, match="unknown output"):
             client.get_tensor("test-tensor", output="numpy")
 
-    def test_get_tensor_pb_is_a_deprecated_alias(self):
+    def test_get_tensor_output_pb(self):
         client = _offline_client(raw_client=Mock())
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
 
-        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
-            pb = client.get_tensor_pb("test-tensor")
+        pb = client.get_tensor("test-tensor", output="pb")
 
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
@@ -705,13 +748,14 @@ class TestGetTensorOutputSwitch:
     def test_get_tensor_pb_forwards_export_location(self):
         client = _offline_client(raw_client=Mock())
         client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+            return_value=SimpleNamespace(
+                serialize=lambda: b"fake-flight-info", endpoints=[]
+            )
         )
 
-        with pytest.warns(DeprecationWarning):
-            pb = client.get_tensor_pb(
-                "test-tensor", export_location="grpc://override-host:9999"
-            )
+        pb = client.get_tensor(
+            "test-tensor", output="pb", export_location="grpc://override-host:9999"
+        )
 
         assert pb.location == "grpc://override-host:9999"
 

@@ -10,11 +10,10 @@ Endpoints (unauthenticated — probes):
 
 Endpoints (token required):
   GET  /api/diagnostics              — runtime diagnostics
-  GET  /api/sources                  — list DataSourceDescriptors
+  GET  /api/sources[?limit=N]        — list the catalog's source rows (X-Truncated)
   POST /api/sources/query            — SQL query against source metadata
-  GET  /api/sources/{source_id}/metadata          — parsed metadata_json
+  GET  /api/sources/{source_id}/metadata          — parsed source metadata
   GET  /api/sources/{source_id}/ticket/{ticket_hex} — resolve a Flight ticket to bytes
-  GET  /api/sources/{source_id}      — single DataSourceDescriptor
   GET  /api/tile_info/{array_id}     — tile grid, pyramid levels + volume plan
   GET  /api/tile/{array_id}          — one tile, cacheable (raw | png | jpeg)
   POST /api/slice                    — fetch array slice as binary (body: array_id);
@@ -24,9 +23,6 @@ Endpoints (token required):
   PUT  /api/config                   — update config (same-origin guarded)
   GET  /api/admin/status             — server/catalog status for the admin page
   GET  /api/admin/browse             — server-side filesystem browse (data-folder picker)
-
-  The specific /api/sources/{id}/… routes are registered before the greedy
-  /{id:path} catch-all so Starlette does not shadow them (see route defs).
 
 Authentication:
   Pass the website token in the ``Authorization: Bearer <token>`` header or
@@ -62,9 +58,9 @@ from typing import (
 
 import numpy as np
 import pyarrow.flight as flight
-from biopb import _web_auth
+from biopb._security import web_auth as _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.tensor._catalog_rows import sql_literal
+from biopb.tensor._catalog_rows import reasons_for, sql_literal
 from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -83,7 +79,6 @@ from google.protobuf import json_format
 from pydantic import BaseModel
 
 from biopb_tensor_server.core.chunk import current_epoch
-from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +350,7 @@ class _SidecarContext:
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
         self._client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
-        # In-flight resolve/warm recalls. Per-app, so two apps in one process
+        # In-flight resolve recalls. Per-app, so two apps in one process
         # (tests) cannot see each other's jobs.
         self.jobs = _SourceJobs()
 
@@ -428,7 +423,7 @@ class _SidecarContext:
     def check_token(self, request: Request) -> None:
         """Raise 401 if the request does not carry a valid token.
 
-        Delegates the token decision to the shared ``biopb._web_auth`` policy
+        Delegates the token decision to the shared ``biopb._security.web_auth`` policy
         (the single source the control uses too). A ``None`` token — local mode,
         where every listener is loopback-bound — is the "no token enforced" case,
         expressed as a falsy ``expected``.
@@ -439,9 +434,9 @@ class _SidecarContext:
 
 
 # ---------------------------------------------------------------------------
-# Resolve / warm jobs
+# Resolve jobs
 #
-# Both are minutes-long, consenting recalls of cloud / synced-folder data, which
+# A resolve is a minutes-long, consenting recall of cloud / synced-folder data, which
 # is longer than any request should be held open. They run on a daemon thread
 # and the browser polls; the shape is start -> poll -> (optionally) cancel.
 #
@@ -467,7 +462,7 @@ _JOB_RUNNING = "running"
 
 
 class _SourceJob:
-    """One resolve or warm, in flight or recently finished.
+    """One resolve, in flight or recently finished.
 
     Every field a route reads is taken under ``_lock``: the worker thread writes
     progress on the Flight client's callback while a request thread is rendering
@@ -484,6 +479,7 @@ class _SourceJob:
         self._progress: Dict[str, Any] = {}
         self._error: Optional[str] = None
         self._finished_at: Optional[float] = None
+        self._source: Optional[Dict[str, Any]] = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -495,6 +491,11 @@ class _SourceJob:
     def set_progress(self, progress: Dict[str, Any]) -> None:
         with self._lock:
             self._progress = progress
+
+    def set_source(self, source: Dict[str, Any]) -> None:
+        """The catalog row a resolve ends with, handed to the client on done."""
+        with self._lock:
+            self._source = source
 
     def finish(self, state: str, error: Optional[str] = None) -> None:
         with self._lock:
@@ -527,11 +528,14 @@ class _SourceJob:
                 # worker has actually unwound. A UI needs the first to stop
                 # offering a button it has already been told about.
                 "cancel_requested": self._cancel.is_set(),
+                # A finished resolve carries the source's now-concrete row, so a
+                # client updates its catalog copy without re-reading the listing.
+                **({"source": self._source} if self._source is not None else {}),
             }
 
 
 class _SourceJobs:
-    """The per-app registry of resolve/warm jobs, keyed by ``(kind, source_id)``.
+    """The per-app registry of resolve jobs, keyed by ``(kind, source_id)``.
 
     Keyed by the pair, not by a generated job id, because that key *is* the
     idempotency the callers need: a double-click, a retry, or a second tab must
@@ -593,7 +597,7 @@ def _require_same_origin(request: Request) -> None:
     user merely visits can fire a cross-origin ``POST``/``PUT`` at the
     loopback sidecar; it cannot read the response (CORS) but a state change
     does not need to. The CSRF decision lives in the shared
-    ``biopb._web_auth.is_forgeable_cross_site`` policy: a request carrying a
+    ``biopb._security.web_auth.is_forgeable_cross_site`` policy: a request carrying a
     token header is not forgeable, and a browser that stamped
     ``Sec-Fetch-Site`` cross-site is the vector; a non-browser client (curl)
     sends none and is allowed -- a token-gated server still enforces
@@ -780,41 +784,8 @@ def _versioned_array_id(array_id: str, token: Optional[str]) -> str:
     return f"{source}{_VERSION_SEP}{token}{slash}{field}"
 
 
-def _names_label_set(array_id: str) -> bool:
-    """Whether *array_id* addresses a label set rather than an image.
-
-    ``source_id`` is the slash-free prefix by the identity policy, so the
-    within-source field is everything after the first "/". The one reading of
-    the path in this module; see ``core/labels.py``.
-    """
-    return split_label_field(array_id.partition("/")[2]) is not None
-
-
-def _label_image_axes(td: Any) -> Optional[List[int]]:
-    """Which of the image's axes each axis of this set indexes, as the server
-    states it (``biopb.labels.image_axes``), or None.
-
-    Read, never re-derived: the whole point of the server publishing it is that
-    a client matching the two tensors' axes by name gets `t`/`z` right and an
-    unnamed axis wrong. None for a server that predates the block, which leaves
-    the client to fall back to the extent rule as it did before.
-    """
-    raw = getattr(td, "metadata_json", None)
-    if not raw:
-        return None
-    try:
-        wrapped = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    block = ((wrapped or {}).get("metadata") or {}).get("biopb") or {}
-    axes = (block.get("labels") or {}).get("image_axes")
-    if not isinstance(axes, list) or not all(isinstance(a, int) for a in axes):
-        return None
-    return axes
-
-
 def _tensor_desc_by_array_id(
-    client: TensorFlightClient, array_id: str, *, with_metadata: bool = False
+    client: TensorFlightClient, array_id: str
 ) -> Tuple[Any, Optional[str]]:
     """``(TensorDescriptor, current version token)`` for *array_id*.
 
@@ -848,9 +819,7 @@ def _tensor_desc_by_array_id(
     """
     array_id, asked_version = _split_array_version(array_id)
     try:
-        bound = client.get_descriptor(
-            array_id, with_pyramid=False, with_metadata=with_metadata
-        )
+        bound = client.get_descriptor(array_id, with_pyramid=False)
     except (flight.FlightServerError, ValueError):
         # The two terminal answers: a Flight-side addressing refusal (NOT_FOUND
         # / INVALID_ARGUMENT ride FlightServerError -- pyarrow exposes no typed
@@ -1806,10 +1775,9 @@ def _tile_etag(array_id: str, params: Sequence[Tuple[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 #
-# All handlers are module-level functions registered on this one router (the
-# registration order below is load-bearing: the /metadata and /ticket routes
-# must precede the greedy {source_id:path} catch-all). create_app() simply
-# include_router()s it, so per-handler complexity is measured per-handler.
+# All handlers are module-level functions registered on this one router.
+# create_app() simply include_router()s it, so per-handler complexity is
+# measured per-handler.
 # ---------------------------------------------------------------------------
 
 _router = APIRouter()
@@ -1896,19 +1864,77 @@ async def diagnostics(request: Request) -> JSONResponse:
 # -- Sources ----------------------------------------------------------------
 
 
+def _truncation(table: Any, n_rows: int) -> Tuple[int, int, bool]:
+    """``(total, returned, truncated)`` of a catalog query result.
+
+    Read from the schema metadata. An untagged Arrow table has
+    ``schema.metadata is None``, not an empty dict, so go through a fallback:
+    a result carrying no truncation keys must degrade to "returned == total"
+    rather than raise an AttributeError that a route's handler would then report
+    as a 502 Flight error.
+    """
+    table_metadata = table.schema.metadata or {}
+    # Prefer this query's own row counts; fall back to the legacy source-count
+    # keys for a server that predates them, then to the table.
+    total = int(
+        table_metadata.get(b"total_rows")
+        or table_metadata.get(b"total_sources")
+        or n_rows
+    )
+    returned = int(
+        table_metadata.get(b"returned_rows")
+        or table_metadata.get(b"returned_sources")
+        or n_rows
+    )
+    # Trust the server's own flag: it is the only party that saw the pre-cap
+    # size. Differencing the counts is what made every filtered query report
+    # truncation -- `total_sources` counts the catalog, not this result. Fall
+    # back to the difference only for a server that predates the flag.
+    flag = table_metadata.get(b"truncated")
+    truncated = flag.decode() == "True" if flag else total > returned
+    return total, returned, truncated
+
+
 @_router.get("/api/sources")
-async def list_sources(request: Request) -> JSONResponse:
+async def list_sources(
+    request: Request, limit: Optional[int] = Query(None, ge=1)
+) -> JSONResponse:
+    """The catalog as DataSourceDescriptors, ordered by ``source_id``.
+
+    ``limit`` caps the rows returned (the server's own ``max_query_results`` cap
+    applies regardless). ``X-Truncated`` says whether the listing is short of the
+    catalog, by either cap.
+    """
     ctx = _sidecar(request)
     ctx.check_token(request)
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
-        result = [_source_row_to_dict(row) for row in rows]
+
+        def listing() -> JSONResponse:
+            # One row past the limit is how a caller learns it was cut, without
+            # a second query for the catalog's size.
+            page = f" LIMIT {limit + 1}" if limit is not None else ""
+            table = client.query(
+                _source_list_sql(client) + " ORDER BY source_id" + page
+            )
+            rows = table.to_pylist()
+            _, _, truncated = _truncation(table, len(rows))
+            if limit is not None and len(rows) > limit:
+                rows, truncated = rows[:limit], True
+            _add_unresolved_reasons(client, rows)
+            # Up to a few 10k rows to query, convert and encode: off the loop,
+            # which tile reads share.
+            return JSONResponse(
+                [_source_row_to_dict(row) for row in rows],
+                headers={"X-Truncated": str(truncated).lower()},
+            )
+
+        response = await run_in_threadpool(listing)
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
-        logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
-        return JSONResponse(result)
+        logger.debug(f"list_sources: answered in {elapsed:.1f}ms")
+        return response
     except HTTPException:
         raise
     except Exception as exc:
@@ -1979,30 +2005,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
 
-        # Truncation info from schema metadata. An untagged Arrow table has
-        # `schema.metadata is None`, not an empty dict, so go through a fallback:
-        # a result carrying no truncation keys must degrade to "returned ==
-        # total" rather than raise an AttributeError that the handler below would
-        # then report as a 502 Flight error.
-        table_metadata = arrow_table.schema.metadata or {}
-        # Prefer this query's own row counts; fall back to the legacy
-        # source-count keys for a server that predates them, then to the table.
-        total = int(
-            table_metadata.get(b"total_rows")
-            or table_metadata.get(b"total_sources")
-            or len(result)
-        )
-        returned = int(
-            table_metadata.get(b"returned_rows")
-            or table_metadata.get(b"returned_sources")
-            or len(result)
-        )
-        # Trust the server's own flag: it is the only party that saw the pre-cap
-        # size. Differencing the counts is what made every filtered query report
-        # truncation -- `total_sources` counts the catalog, not this result.
-        # Fall back to the difference only for a server that predates the flag.
-        flag = table_metadata.get(b"truncated")
-        truncated = flag.decode() == "True" if flag else total > returned
+        total, returned, truncated = _truncation(arrow_table, len(result))
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -2029,9 +2032,6 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         )
 
 
-# NOTE: the /metadata and /ticket routes must be registered before the greedy
-# {source_id:path} route, otherwise Starlette's first-match routing would
-# shadow them.
 @_router.get("/api/sources/{source_id:path}/metadata")
 async def get_source_metadata(source_id: str, request: Request) -> JSONResponse:
     ctx = _sidecar(request)
@@ -2141,11 +2141,7 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         )
 
 
-# -- Resolve / warm (consented cloud recalls) --------------------------------
-#
-# Registered above the greedy /api/sources/{source_id:path} catch-all, the same
-# way /metadata and /ticket are: route order is what keeps a sub-path from being
-# swallowed as part of the id.
+# -- Resolve (a consented cloud recall) --------------------------------
 
 
 def _run_recall(
@@ -2154,7 +2150,7 @@ def _run_recall(
     call: Callable[[], Any],
     on_success: Callable[[Any], None] = lambda _result: None,
 ) -> None:
-    """Shared try/except/finish skeleton for a resolve or warm job.
+    """Shared try/except/finish skeleton for a resolve job.
 
     ``call`` does the blocking Flight-client recall; ``on_success`` gets its
     return value to record any final progress before the job finishes done.
@@ -2172,11 +2168,26 @@ def _run_recall(
         job.finish(_JOB_DONE)
 
 
+def _attach_resolved_row(job: _SourceJob, row: Any) -> None:
+    """Hand a finished resolve's row to the client, if it can be rendered.
+
+    Best-effort: the source is resolved whatever happens here, so a row that
+    cannot be rendered must not turn the job into an error -- the client falls
+    back to re-reading the listing.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        job.set_source(_source_row_to_dict(row))
+    except Exception:  # noqa: BLE001
+        logger.warning(f"resolve row for {job.source_id} not rendered", exc_info=True)
+
+
 def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
     """Body of a resolve job. Runs on the registry's daemon thread."""
 
-    def _call() -> None:
-        ctx.get_client().resolve_source(
+    def _call() -> Dict[str, Any]:
+        return ctx.get_client().resolve_source(
             job.source_id,
             on_progress=lambda p: job.set_progress(
                 {
@@ -2188,39 +2199,11 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
             should_cancel=job.cancel_requested,
         )
 
-    _run_recall(ctx, job, _call)
-
-
-def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
-    """Body of a warm job. Runs on the registry's daemon thread."""
-
-    def _snapshot(p: Any) -> Dict[str, Any]:
-        # Coerced, not passed through: `progress` is rendered straight to JSON
-        # by the status route, so anything unserializable landing here would
-        # turn every subsequent poll into a 500 rather than a failed job.
-        return {
-            "files_total": int(p.files_total),
-            "files_done": int(p.files_done),
-            "bytes_total": int(p.bytes_total),
-            "bytes_done": int(p.bytes_done),
-            "current_name": str(p.current_name),
-            "elapsed_seconds": float(p.elapsed_seconds),
-        }
-
-    def _call() -> Any:
-        return ctx.get_client().warm_source(
-            job.source_id,
-            on_progress=lambda p: job.set_progress(_snapshot(p)),
-            should_cancel=job.cancel_requested,
-        )
-
-    # The terminal counts, not the last heartbeat: a fast warm can finish
-    # without ever emitting one, and `files_total == 0` is how a client learns
-    # the source had nothing to warm (single-file -- resolve already recalled
-    # it). That is the server's own structural answer, so no client has to
-    # keep its own list of which source types are multi-file.
     _run_recall(
-        ctx, job, _call, on_success=lambda final: job.set_progress(_snapshot(final))
+        ctx,
+        job,
+        _call,
+        on_success=lambda row: _attach_resolved_row(job, row),
     )
 
 
@@ -2297,68 +2280,13 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     return _start_job("resolve", _resolve_worker, source_id, request)
 
 
-@_router.post("/api/sources/{source_id:path}/warm/cancel")
-async def cancel_warm(source_id: str, request: Request) -> JSONResponse:
-    """Ask an in-flight warm to stop. Files already recalled stay resident."""
-    return _cancel_job("warm", source_id, request)
-
-
-@_router.get("/api/sources/{source_id:path}/warm/status")
-async def warm_status(source_id: str, request: Request) -> JSONResponse:
-    """Progress of the warm on this source. 404 if none was ever started."""
-    return _job_status("warm", source_id, request)
-
-
-@_router.post("/api/sources/{source_id:path}/warm")
-async def start_warm(source_id: str, request: Request) -> JSONResponse:
-    """Hydrate-ahead: recall a resolved source's member files server-side.
-
-    Idempotent and safe to call on any resolved source -- one with nothing to
-    warm finishes immediately with ``files_total == 0``, which is how a client
-    tells a single-file source from a multi-file one without keeping its own
-    list of source types.
-    """
-    return _start_job("warm", _warm_worker, source_id, request)
-
-
-@_router.get("/api/sources/{source_id:path}")
-async def get_source(source_id: str, request: Request) -> JSONResponse:
-    ctx = _sidecar(request)
-    ctx.check_token(request)
-    t0 = time.monotonic()
-    try:
-        client = ctx.get_client()
-        # One row, not the whole catalog. This route is addressed -- the id is
-        # already in hand -- so streaming every source to look one up cost
-        # O(catalog) per call and, worse, inherited the listing's safety cap:
-        # a source past it answered 404 while being perfectly readable.
-        rows = client.query(
-            f"{_SOURCE_LIST_SQL} WHERE source_id = {sql_literal(source_id)}",
-            format="records",
-        )
-        if not rows:
-            raise HTTPException(
-                status_code=404, detail=f"Source not found: {source_id}"
-            )
-        ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_row_to_dict(rows[0]))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        ctx.diag.mark_error("GET_SOURCE_FAILED", str(exc))
-        raise HTTPException(
-            status_code=502, detail=f"Flight error: {type(exc).__name__}"
-        )
-
-
 # -- Tiles (cacheable GET reads) --------------------------------------------
 
 
 # ---------------------------------------------------------------------------
 # ROI annotations
 #
-# Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
-# /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
+# Its own /api/rois/* namespace. Bodies are canonical proto3 JSON in
 # both directions -- json_format here, protobuf-es in the SPA -- so one schema
 # serves both ends and neither hand-writes a DTO.
 # ---------------------------------------------------------------------------
@@ -2517,13 +2445,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         # Published here and nowhere else: the viewer threads this array_id
         # through every subsequent tile URL, so the versioned form IS the
         # delivery mechanism -- no new field, no client change (biopb/biopb#780).
-        # Metadata is asked for only when the id names a label set: it is
-        # where the axis mapping rides, and pulling a source's whole metadata
-        # row (an OME-XML, say) for every image's grid would be a real cost for
-        # a field only a set has.
-        td, version = _tensor_desc_by_array_id(
-            client, array_id, with_metadata=_names_label_set(array_id)
-        )
+        td, version = _tensor_desc_by_array_id(client, array_id)
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
         levels = () if td is None else _advertised_levels(client, td, version)
     except HTTPException:
@@ -2549,7 +2471,6 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
 
-    image_axes = _label_image_axes(td)
     return JSONResponse(
         {
             "array_id": _versioned_array_id(td.array_id, version),
@@ -2566,10 +2487,6 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
-            # A label set only: which of its image's axes each of its own
-            # indexes, as the server states it. Absent for an image, and for a
-            # server that predates the block.
-            **({"image_axes": image_axes} if image_axes is not None else {}),
             # Advisory: the ladder the SERVER advertises, which is what the rungs
             # above are actually read from -- a native on-disk level where the
             # source ships one, else the computed level precache warms. Published
@@ -2806,15 +2723,16 @@ async def get_tile(
             read_level=plan.read_level,
             read_scale_hint=plan.scale_hint,
         )
-        arr_lazy = client.get_tensor(
-            # The array_id the geometry above was read from, not a rebuilt one:
-            # the two used to be derived separately and could disagree.
-            td.array_id,
-            slice_hint=_build_slice_hint(start, stop),
-            scale_hint=scale_hint,
-            reduction_method=plan.method,
+        arr = _normalize_array(
+            client.get_array(
+                # The array_id the geometry above was read from, not a rebuilt
+                # one: the two used to be derived separately and could disagree.
+                td.array_id,
+                slice_hint=_build_slice_hint(start, stop),
+                scale_hint=scale_hint,
+                reduction_method=plan.method,
+            )
         )
-        arr = _normalize_array(arr_lazy.compute())
         if plan.residual is None:
             return arr
         return _normalize_array(downsample_block(arr, tuple(plan.residual), "nearest"))
@@ -2924,14 +2842,15 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
 
         def _read() -> np.ndarray:
             # Pass slice_hint to gRPC for optimized slicing (world coordinates)
-            arr_lazy = client.get_tensor(
-                # The array_id the descriptor above was read from, not a rebuilt one.
-                td.array_id,
-                slice_hint=slice_hint,
-                scale_hint=scale_hint,
-                reduction_method=scale_method or req.reduction_method or None,
+            return _normalize_array(
+                client.get_array(
+                    # The array_id the descriptor above was read from, not a rebuilt one.
+                    td.array_id,
+                    slice_hint=slice_hint,
+                    scale_hint=scale_hint,
+                    reduction_method=scale_method or req.reduction_method or None,
+                )
             )
-            return _normalize_array(arr_lazy.compute())
 
         # Off the event loop for the same reason the tile route is: a blocking
         # compute here starves the loop of the turn it needs to notice that
@@ -3127,6 +3046,7 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            "registration_pending": _h("registration_pending"),
             "annotations_persisted": _h("annotations_persisted"),
             "catalog_persisted": _h("catalog_persisted"),
         }
@@ -3315,12 +3235,24 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-#: The catalog columns the source routes project. Deliberately not
-#: ``metadata_json``: the listing is structural, and the OME tree is its own
-#: route (``/api/sources/{id}/metadata``).
-_SOURCE_LIST_SQL = (
-    "SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources"
-)
+def _source_list_sql(client: Any) -> str:
+    """The query the source routes project. Deliberately not ``metadata_json``:
+    the listing is structural, and the OME tree is its own route
+    (``/api/sources/{id}/metadata``). ``unresolved_reason`` rides along when the
+    server has the column."""
+    return f"SELECT {client.source_row_columns()} FROM sources"
+
+
+def _add_unresolved_reasons(
+    client: Any, rows: List[Dict[str, Any]], where: str = ""
+) -> None:
+    """Set ``unresolved_reason`` on the rows that are not resolved. Without an
+    answer (a server older than the column) the key stays absent, which a client
+    reads as the cloud case it always was."""
+    reasons = reasons_for(rows, lambda sql: client.query(sql, format="records"), where)
+    for row in rows:
+        if not row.get("is_resolved", True) and row["source_id"] in reasons:
+            row["unresolved_reason"] = reasons[row["source_id"]]
 
 
 def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3329,16 +3261,21 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_id": row["source_id"],
         "source_url": row.get("source_url") or "",
         "source_type": row.get("source_type") or "",
-        # Always null on a listing; see _SOURCE_LIST_SQL.
-        "metadata_json": None,
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
-        # action, never by a row (biopb/biopb#1035). `is_resolved` is the
+        # read-mask field, never by a row (biopb/biopb#1035). `is_resolved` is the
         # opposite case and belongs here -- monotonic, so a persisted row can
         # only lag in the harmless direction. Default True for a row from a
         # server predating the column, the right reading for every pre-existing
-        # source.
+        # source. Source metadata is its own route (``/metadata``), not a row field.
         "is_resolved": bool(row.get("is_resolved", True)),
+        # Why it is not resolved (cloud recall, queued registration, a failed
+        # one); absent for a resolved row and for a server that predates it.
+        **(
+            {"unresolved_reason": row["unresolved_reason"]}
+            if row.get("unresolved_reason")
+            else {}
+        ),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 
@@ -3346,16 +3283,14 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
 def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:
     """JSON form of one tensor entry inside a source listing.
 
-    ``chunk_shape`` is carried for shape-compatibility with the TS
-    ``TensorDescriptor`` and is always ``[]`` here: a source listing is
-    structural, and the transfer grid is answered per resolved tensor by
-    ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
+    Structural only. There is no transfer grid here: it belongs to a resolved
+    tensor and is answered per ``array_id`` by ``/api/tile_info`` (which
+    describes the tensor) -- biopb/biopb#812.
     """
     return {
         "array_id": t["array_id"],
         "dim_labels": list(t.get("dim_labels") or []),
         "shape": [int(x) for x in (t.get("shape") or [])],
-        "chunk_shape": [],
         "dtype": t.get("dtype") or "",
     }
 
@@ -3369,16 +3304,35 @@ def shutdown_sentinel_path() -> os.PathLike:
     """Path of the shutdown sentinel file the control supervisor writes (Windows).
 
     The one definition ``DataPlaneSupervisor._win_stop_sentinel`` also binds to
-    (both call ``biopb._locations.tensor_stop_sentinel``), so the writer and
+    (both call ``biopb._config.locations.tensor_stop_sentinel``), so the writer and
     this watcher cannot drift. A single fixed name in the user's biopb state dir -
     NOT keyed by PID: on Windows the process the supervisor records can differ from
     the one running launch()/uvicorn (Store-Python/uv shims), so a PID in the name
     would make writer and watcher disagree. The control is the sole owner of the
     plane, so a fixed name is unambiguous.
     """
-    from biopb import _locations
+    from biopb._config import locations as _locations
 
     return _locations.tensor_stop_sentinel()
+
+
+_PROBE_PATHS = ("/livez", "/readyz", "/healthz")
+
+
+class _ProbeAccessFilter(logging.Filter):
+    """Drop the access-log line of a probe that succeeded.
+
+    Supervisors and proxies poll the probes every few seconds, which buries every
+    other request. A failing probe still logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn's access record: (client, method, path, http_version, status).
+        try:
+            _client, _method, path, _version, status = record.args
+        except (TypeError, ValueError):
+            return True
+        return not (str(path).split("?", 1)[0] in _PROBE_PATHS and status == 200)
 
 
 def _install_windows_shutdown_listener(server) -> None:
@@ -3454,6 +3408,7 @@ def run(
         config_path=config_path,
         tls_fingerprint=tls_fingerprint,
     )
+    logging.getLogger("uvicorn.access").addFilter(_ProbeAccessFilter())
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher
     # that flips server.should_exit (no-op on other platforms, which use SIGTERM).

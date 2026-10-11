@@ -8,7 +8,7 @@ Key components:
 - Connection: the data plane this machine's control names, dialed and shared
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
 - query / resolve hand back `sources` catalog rows; what you decode
-  them into is yours (descriptors_from_rows is the deprecated proto form)
+  them into is yours
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -20,15 +20,9 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
-from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
-from biopb.tensor._labels import (
-    LABELS_SEGMENT,
-    RESERVED_LABEL_PREFIX,
-    LabelAddress,
-    is_reserved_label_name,
-    label_image_axes,
-    split_label_array_id,
-)
+# Raised by Connection when the local plane's TLS certificate cannot be trusted.
+# Stdlib only, so it needs no lazy import.
+from biopb._control import LocalTrustError
 
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
@@ -38,7 +32,6 @@ from biopb.tensor.descriptor_pb2 import (
     SliceHint,
     TensorDescriptor,
     TensorReadOption,
-    WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
@@ -80,22 +73,10 @@ __all__ = [
     "TensorReadOption",
     "CatalogQuery",
     "ResolveProgress",
-    "WarmProgress",
     "SerializedTensor",
-    # Deprecated: `sources` rows as DataSourceDescriptor (biopb/biopb#1032).
-    # There is no replacement -- a row is the data structure.
-    "descriptor_from_row",
-    "descriptors_from_rows",
-    # Label sets: what an array_id says, and how a set lines up with its
-    # image. Pure string/shape rules -- no client needed to ask them.
-    "LABELS_SEGMENT",
-    "RESERVED_LABEL_PREFIX",
-    "LabelAddress",
-    "is_reserved_label_name",
-    "label_image_axes",
-    "split_label_array_id",
     # Client
     "Connection",
+    "LocalTrustError",
     "TensorFlightClient",
     "ResolveCancelled",
     "UploadRefused",

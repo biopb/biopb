@@ -12,7 +12,7 @@ workflow leaning on session state would verify green and fail on a fresh kernel.
 Three things live here, and they are one module because they are one decision.
 
 * **The kernel.** A full bootstrap with the user-facing parts left out
-  (``_bootstrap.ENV_SCRATCH``), no watchdog, and no window-close pipe. The
+  (``_kernel_env.ENV_SCRATCH``), no watchdog, and no window-close pipe. The
   watchdog is off deliberately: for the session kernel a respawn is recovery,
   but for this one **death is the verdict**. An OOM means "this workflow does
   not fit", and respawning would re-run a workflow that just killed a process,
@@ -529,7 +529,7 @@ def _prune_spool():
     """Keep only the newest :data:`_SPOOL_KEEP` spooled notebooks; best-effort.
 
     Run after the current one is written, so the newest always survives -- the
-    same shape as ``_shim._prune_session_logs``, for the same reason.
+    the point being that the one just written always survives.
     """
     from .._config import get_workflow_dir
 

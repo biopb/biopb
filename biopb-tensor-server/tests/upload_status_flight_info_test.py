@@ -80,7 +80,7 @@ class TestOnTheDescriptor:
 def _gate(writable_server, source, array_id, token):
     """Put a grant on the uploaded tensor *array_id*, the only place one sits."""
     field = array_id[len(source) + 1 :]
-    writable_server.sources.get(source).attached_tensor(field).capability_token = token
+    writable_server.sources.attached(source, field).capability_token = token
 
 
 class TestCapabilityHolderCanPoll:

@@ -6,13 +6,15 @@ This reference is generated from the source of the released version and covers
 the public SDK surface:
 
 - **[`biopb.image`](reference/biopb/image/index.md)** — the `biopb.image`
-  protocol: the `Ops` gRPC service stubs and messages, ROI types, and its
-  image-data serialization helpers.
+  protocol: the `Ops` gRPC service stubs and messages, the `connect()` /
+  `OpsClient` client of an algorithm server, the `encode_arg` / `decode_arg`
+  codec for op arguments and results, ROI types, and its image-data
+  serialization helpers.
 - **[`biopb.tensor`](reference/biopb/tensor/index.md)** — the Arrow Flight
   tensor framework: `TensorFlightClient` for lazy, larger-than-memory tensor
   access, plus the associated descriptor / ticket messages.
 - **[`biopb` CLI](cli.md)** — the `biopb` console script's full command tree
-  (`biopb tensor ...`, `biopb image ...`, and the rest), rendered from the
+  (`biopb tensor ...`, `biopb image ...`, `biopb algorithm ...`, and the rest), rendered from the
   actual Typer app rather than its source.
 
 !!! note "Protocol definitions"

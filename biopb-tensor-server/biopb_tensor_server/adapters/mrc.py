@@ -47,7 +47,7 @@ Single chunk strategy - base class handles splitting for oversized arrays.
 
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -57,6 +57,9 @@ from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -64,6 +67,11 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -76,6 +84,20 @@ MRC_EXTENSIONS = (".mrc", ".mrcs", ".rec", ".st", ".map")
 # Standard MRC-2014 header is 1024 bytes; the extended header (NEXT bytes)
 # follows, then the raw data.
 _MRC_HEADER_BYTES = 1024
+
+# The header blocks ``registration_record`` reports, and so the part of rsciio's
+# ``original_metadata`` the row keeps.
+_HEADER_KEYS = ("std_header", "fei_header")
+
+
+def _positive_float(value: Any) -> float:
+    """``value`` as a float, 0.0 when it is not a number: the reading of an axis
+    scale ``axes_scale`` makes, kept in the payload so it is JSON."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 # Seconds an idle mapping is kept warm. Short on purpose, and for a different
 # reason than the parse-a-directory formats: what a held MRC mapping saves is a
@@ -93,6 +115,7 @@ _MAPPING_TTL = 5.0
 _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "mrc-mapping-reaper", max_handles=8)
 
 
+@canonical_axes
 class MrcAdapter(TensorAdapter):
     """Adapter for MRC electron-microscopy volumes.
 
@@ -154,6 +177,48 @@ class MrcAdapter(TensorAdapter):
             source_url=url,
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "MrcAdapter":
+        """Rebuild from the row's header facts: neither rsciio nor the mapping is
+        touched until a read. The layout was probed when the row was written."""
+        url = str(source.url)
+        return cls(
+            source_id=source.source_id,
+            url=url,
+            shape=tuple(int(s) for s in payload["shape"]),
+            dtype=np.dtype(payload["dtype"]),
+            axes=payload["axes"],
+            std_header={"NEXT": int(payload["offset"]) - _MRC_HEADER_BYTES},
+            original_metadata={
+                key: metadata[key] for key in _HEADER_KEYS if key in metadata
+            },
+            source_url=url,
+            probe=False,
+        )
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """What the header said that a read needs: shape, dtype, the axes' names
+        and calibration, and where the data region starts."""
+        return {
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype.str,
+            "axes": [
+                {
+                    "name": ax.get("name"),
+                    "scale": _positive_float(ax.get("scale")),
+                    "units": ax.get("units"),
+                }
+                for ax in self._axes
+            ],
+            "offset": int(self._offset),
+        }
+
     def __init__(
         self,
         source_id: str,
@@ -164,6 +229,7 @@ class MrcAdapter(TensorAdapter):
         std_header: dict,
         original_metadata: dict,
         source_url: Optional[str] = None,
+        probe: bool = True,
     ):
         self.source_id = source_id
         self._url = url
@@ -199,8 +265,11 @@ class MrcAdapter(TensorAdapter):
 
         # Probe the mapping once now so an unmappable layout fails at
         # registration rather than on the first read. Released immediately: a
-        # source that is catalogued but never read should pin nothing.
-        self._release(self._map())
+        # source that is catalogued but never read should pin nothing. A source
+        # rebuilt from its row passed this probe when the row was written, and its
+        # files are unchanged, so it is not repeated.
+        if probe:
+            self._release(self._map())
 
     def _map(self) -> np.memmap:
         """Map the data region read-only. Caller must ``_release`` the result."""
@@ -219,7 +288,7 @@ class MrcAdapter(TensorAdapter):
         if underlying is not None:
             underlying.close()
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -234,13 +303,13 @@ class MrcAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_slices(bounds))
+        return self._copy_out(bounds_to_slices(bounds))
 
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
@@ -255,7 +324,7 @@ class MrcAdapter(TensorAdapter):
         and I/O only where the stride outruns the readahead.
         """
         super().get_data(bounds)
-        return self._copy_out(self._bounds_to_strided_slices(bounds, step))
+        return self._copy_out(bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:
         """Copy ``slices`` out of the shared mapping, counting the read.
@@ -332,10 +401,12 @@ class MrcAdapter(TensorAdapter):
         """
         return axes_scale(self._axes, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """MRC header as a JSON-safe dict (rsciio hex-encodes byte/void fields)."""
         meta = {"format": "mrc"}
-        for key in ("std_header", "fei_header"):
+        for key in _HEADER_KEYS:
             if key in self._original_metadata:
                 meta[key] = self._original_metadata[key]
-        return meta
+        return metadata_record(meta)

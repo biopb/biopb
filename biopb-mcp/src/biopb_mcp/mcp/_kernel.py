@@ -19,42 +19,15 @@ import threading
 import time
 from typing import List, Optional
 
-from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from ._job_log import JobLog
+from ._kernel_env import ENV_HOST_SESSION, ENV_WINDOW_CLOSE_FD, ViewerMode
 from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelDied, KernelGone
 
 logger = logging.getLogger(__name__)
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-# Env var carrying the inherited *write* end of the window-close pipe. The
-# in-kernel bootstrap writes a byte to this fd when the user
-# closes the napari window; the launcher's reader thread reaps the kernel back
-# to idle on the signal. The literal is mirrored in _bootstrap._install_window_
-# close_hook (kept in sync by this comment, like _deathwatch.ENV_FD).
-ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
-
-# Env var marking a kernel as the scratch one a verification runs in
-# (``_scratch``). The in-kernel bootstrap reads it and leaves out everything
-# user-facing -- above all it builds ``napari.Viewer(show=False)``, so the
-# scratch kernel can take the session's own display, and its real GPU, without a
-# window appearing in front of the user. The literal is mirrored in
-# _bootstrap.is_scratch_kernel (kept in sync by this comment, like
-# ENV_WINDOW_CLOSE_FD above).
-ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
-
-# Env var the launcher sets when the session has no viewer, carrying why (config
-# off, napari not installed, no display). Its presence makes the bootstrap skip
-# Qt and napari; its value is what the tools tell the agent. The literal is
-# mirrored in _bootstrap.no_viewer_reason (kept in sync by this comment).
-ENV_NO_VIEWER = "BIOPB_NO_VIEWER"
-
-# Env var handing the kernel the host client's session id, so its gate
-# (_kernel_gate) can tell this process's requests from another Jupyter
-# client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
-# sync by this comment).
-ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
 
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
@@ -137,7 +110,7 @@ def _status_result(status: str, error_text: str) -> dict:
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb.lifecycle.deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
 # Whether the viewer window is still open, evaluated after an agent's cell: a
@@ -214,7 +187,7 @@ class KernelHost:
         watchdog_max_respawns: int = 3,
         watchdog_respawn_window: float = 60.0,
         parent_death_pipe: bool = True,
-        window_close_pipe: bool = True,
+        viewer: Optional[ViewerMode] = None,
         window_poll_interval: float = 2.0,
     ):
         self._extra_arguments = list(extra_arguments or [])
@@ -225,6 +198,8 @@ class KernelHost:
         self._health_probe_expect = health_probe_expect
         self._cwd = cwd
         self._env = env
+        # Where the viewer is: given by the launcher, or read back from *env*.
+        self.viewer = viewer or ViewerMode.from_env(env or {})
         # Where the kernel subprocess' native stdout/stderr fds go. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher
         # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
@@ -296,7 +271,7 @@ class KernelHost:
         # write end and writes a byte when the user closes the napari window; the
         # launcher holds this read end and a reader thread reaps the kernel back
         # to idle on the signal.
-        self._window_close_pipe = window_close_pipe and os.name == "posix"
+        self._window_close_pipe = self.viewer.has_window and os.name == "posix"
         self._window_r = None
         self._window_thread = None
         # Windows can't inherit the pipe fd (subprocess has no pass_fds there),
@@ -304,7 +279,7 @@ class KernelHost:
         # in-kernel _viewer_window_alive() probe on a thread and tearing the
         # kernel down to idle once the user closes the napari window. Same
         # feature flag, same teardown path -- only the transport differs by OS.
-        self._window_close_poll = window_close_pipe and os.name == "nt"
+        self._window_close_poll = self.viewer.has_window and os.name == "nt"
         self._window_poll_interval = window_poll_interval
         self._window_poll_stop = threading.Event()
         # Liveness watchdog (failure mode 2): respawn an unexpectedly-dead
@@ -484,8 +459,7 @@ class KernelHost:
         self._attach_command = attach_command(self._km.connection_file)
         # The client made below shares this session id, so the kernel knows
         # its host before anything can connect.
-        env = dict(env)
-        env[ENV_HOST_SESSION] = self._km.session.session
+        env = {**env, **self.viewer.env(), ENV_HOST_SESSION: self._km.session.session}
         self.jobs.host_session = self._km.session.session
         if self.generation:  # not the first kernel: what ran before is gone
             self.jobs.mark_restart()
@@ -1193,20 +1167,6 @@ class KernelHost:
             self._watchdog_stop.set()
 
     # -- status ---------------------------------------------------------
-
-    @property
-    def virtual_display(self):
-        """The Xvfb display the kernel renders on, or None when it has the
-        user's real one. The launcher (#90) marks the kernel env it hands us;
-        the session child's own environ never carries it."""
-        env = self._env or {}
-        return env.get("DISPLAY") if env.get("BIOPB_VIRTUAL_DISPLAY") else None
-
-    @property
-    def no_viewer_reason(self):
-        """Why this session has no napari viewer, or None when it has one. Set by
-        the launcher in the kernel env it hands us (ENV_NO_VIEWER)."""
-        return (self._env or {}).get(ENV_NO_VIEWER) or None
 
     def health(self) -> dict:
         """Liveness summary for server_status (cheap; no kernel round trip)."""

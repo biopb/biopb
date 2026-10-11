@@ -12,6 +12,10 @@ from biopb_tensor_server.core.adapter_base import (
     TensorDescriptor,
     strip_source_prefix,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 from tests import catalog_server, register_and_catalog
 
@@ -53,7 +57,7 @@ class MockMultifieldAdapter(TensorAdapter):
         self._source_url = "mock://multifield"
         self._source_type = "mock-multifield"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return descriptor for the first tensor (default)."""
         first_spec = self.tensor_specs[0]
         return TensorDescriptor(
@@ -63,7 +67,7 @@ class MockMultifieldAdapter(TensorAdapter):
             dtype=first_spec[2],
         )
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         """Return descriptors for all tensors - multifield override."""
         descriptors = []
         for tensor_id, shape, dtype in self.tensor_specs:
@@ -83,8 +87,12 @@ class MockMultifieldAdapter(TensorAdapter):
             return self._tensor_adapters[tensor_id]
         raise ValueError(f"Unknown tensor: {tensor_id}")
 
-    def get_metadata(self) -> dict:
-        return {"multifield": True, "n_tensors": len(self.tensor_specs)}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(
+            {"multifield": True, "n_tensors": len(self.tensor_specs)}
+        )
 
     def get_data(self, bounds):
         """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
@@ -120,7 +128,7 @@ class MockSingleTensorAdapter(TensorAdapter):
         self._source_url = ""
         self._source_type = "mock-single"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             shape=list(self.shape),
@@ -128,7 +136,7 @@ class MockSingleTensorAdapter(TensorAdapter):
             dtype=self.dtype,
         )
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
     def get_data(self, bounds) -> np.ndarray:
@@ -140,16 +148,18 @@ class MockSingleTensorAdapter(TensorAdapter):
         )
         return np.full(shape, self.value, dtype=self.dtype)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return mock metadata."""
-        return {"mock_tensor": True, "value": self.value}
+        return metadata_record({"mock_tensor": True, "value": self.value})
 
 
 class TestMultifieldSourceLevel:
     """Tests for source-level methods in multifield adapters."""
 
-    def test_list_tensor_descriptors_returns_all_tensors(self):
-        """list_tensor_descriptors() should return all tensor descriptors."""
+    def test_list_tensors_returns_all_tensors(self):
+        """list_tensors() should return all tensor descriptors."""
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
             ("tensor_1", (128, 128), "uint8"),
@@ -157,7 +167,7 @@ class TestMultifieldSourceLevel:
         ]
         adapter = MockMultifieldAdapter("multifield-source", tensor_specs)
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert len(descriptors) == 3
         assert descriptors[0].array_id == "tensor_0"
@@ -184,7 +194,7 @@ class TestMultifieldSourceLevel:
     def test_catalog_row_fields_cover_all_tensors(self):
         """What the source contributes to its catalog row: its own id/url/type,
         and a structural entry per tensor (not just tensors[0])."""
-        from biopb_tensor_server.core.adapter_base import catalog_tensors
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
@@ -195,23 +205,22 @@ class TestMultifieldSourceLevel:
         assert adapter.source_id == "multifield-source"
         assert adapter.catalog_url == "mock://multifield"
         assert adapter.source_type == "mock-multifield"
-        entries = catalog_tensors(adapter)
+        entries = SourceRegistry().catalog_tensors("multifield-source", adapter)
         assert [t.array_id for t in entries] == ["tensor_0", "tensor_1"]
-        assert all(not t.chunk_shape for t in entries)  # #812
 
 
 class TestMultifieldServerClient:
     """Tests for server/client with multifield sources."""
 
     def test_list_sources_returns_all_tensors_in_descriptor(self):
-        """list_sources() should return DataSourceDescriptor with all tensors."""
+        """The sources row should carry all tensors."""
         tensor_specs = [
             ("pos_0", (64, 64), "uint8"),
             ("pos_1", (100, 100), "uint8"),
         ]
         adapter = MockMultifieldAdapter("multifield-test", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multifield-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -221,14 +230,14 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            sources = client.list_sources()
-
-            assert "multifield-test" in sources
-            source_desc = sources["multifield-test"]
-            assert len(source_desc.tensors) == 2
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'multifield-test'",
+                format="records",
+            )
+            tensors = row["tensors"]
+            assert len(tensors) == 2
             # Client has all tensor shape info upfront
-            assert source_desc.tensors[0].shape == [64, 64]
-            assert source_desc.tensors[1].shape == [100, 100]
+            assert sorted(list(t["shape"]) for t in tensors) == [[64, 64], [100, 100]]
 
             client.close()
         finally:
@@ -242,7 +251,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-access", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("multifield-access", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -285,7 +294,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-default", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("multifield-default", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -315,7 +324,7 @@ class TestMultifieldServerClient:
             server.shutdown()
 
     def test_get_descriptor_enumeration_vs_probe(self):
-        """Issue #75: enumeration is list_sources(); get_descriptor() is a single
+        """Issue #75: enumeration is the catalog query; get_descriptor() is a single
         tensor probe that reaches any scene and never clobbers the full
         enumeration."""
         tensor_specs = [
@@ -325,7 +334,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multi", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multi", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -335,10 +344,14 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # Enumeration: list_sources() carries ALL scenes for the source.
-            enumerated = client.list_sources()["multi"].tensors
+            # Enumeration: the sources row carries ALL scenes for the source.
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'multi'",
+                format="records",
+            )
+            enumerated = row["tensors"]
             assert len(enumerated) == 3
-            assert sorted(list(t.shape) for t in enumerated) == [
+            assert sorted(list(t["shape"]) for t in enumerated) == [
                 [16, 16],
                 [32, 32],
                 [64, 64],
@@ -377,7 +390,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf-liberal", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("mf-liberal", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -410,7 +423,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "mf", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -450,7 +463,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf-fetch", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("mf-fetch", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -465,7 +478,7 @@ class TestMultifieldServerClient:
                 f"grpc://localhost:{server.port}",
                 None,
             )
-            chunk_ids, bounds = _parse_flight_endpoints(info)
+            chunk_ids, bounds, _grant = _parse_flight_endpoints(info)
 
             assert len(chunk_ids) > 0
             assert len(chunk_ids) == len(bounds)
@@ -483,7 +496,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("single-source", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "single-source", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -493,8 +506,11 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            sources = client.list_sources()
-            assert len(sources["single-source"].tensors) == 1
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'single-source'",
+                format="records",
+            )
+            assert len(row["tensors"]) == 1
 
             # Access the single tensor -- a bare source id resolves the sole tensor.
             arr = client.get_tensor("single-source")
@@ -517,7 +533,7 @@ class TestMultifieldDifferentDtypes:
         ]
         adapter = MockMultifieldAdapter("mixed-dtype-source", tensor_specs)
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert descriptors[0].dtype == "uint8"
         assert descriptors[1].dtype == "float32"
@@ -530,7 +546,7 @@ class MockImage0Adapter(TensorAdapter):
     Models a single-scene aicsimageio file: every such file names its one
     tensor "Image:0", so two distinct sources share a *non-unique* bare
     array_id. It also mirrors aicsimageio's two array_id forms (issue #45
-    fault 2): list_tensor_descriptors() advertises the bare "Image:0", while
+    fault 2): list_tensors() advertises the bare "Image:0", while
     the tensor-level get_tensor_descriptor() carries the source-qualified
     "source_id/Image:0".
     """
@@ -552,7 +568,12 @@ class MockImage0Adapter(TensorAdapter):
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-aics"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def get_tensor_adapter(self, tensor_id):
+        if strip_source_prefix(self.source_id, tensor_id) == self._tensor_name:
+            return self
+        return super().get_tensor_adapter(tensor_id)
+
+    def _native_descriptor(self) -> TensorDescriptor:
         # Tensor-level: source-qualified array_id, like aicsimageio.
         return TensorDescriptor(
             array_id=self.array_id,
@@ -562,7 +583,7 @@ class MockImage0Adapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         # Source-level listing: bare array_id, like aicsimageio.
         return [
             TensorDescriptor(
@@ -574,8 +595,10 @@ class MockImage0Adapter(TensorAdapter):
             )
         ]
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def _physical_scale(self):
         return list(self._phys_scale), list(self._phys_unit)
@@ -624,7 +647,7 @@ class TestFieldWithinSource:
 
 class TestStripSourcePrefix:
     """strip_source_prefix: the pure, policy-free reduction shared by the server
-    chokepoint and the adapters' _within_source_field (biopb/biopb#277 item F)."""
+    chokepoint and the adapters' strip_source_prefix (biopb/biopb#277 item F)."""
 
     def test_strips_prefix(self):
         assert strip_source_prefix("src", "src/Image:0") == "Image:0"
@@ -661,7 +684,7 @@ class TestSameBareFieldNameAcrossSources:
             "aics_bbb", (181, 1024, 1024), [4.0, 0.1, 0.1], ["um", "um", "um"]
         )
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("aics_aaa", srcA)
         server.register_source("aics_bbb", srcB)
 

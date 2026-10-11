@@ -6,15 +6,14 @@ KeyboardInterrupt into its thread), hard-restart the kernel, save the session as
 a notebook, and — where this session owns its own reap — end it. On by default
 (opt-out via ``observe.enabled``).
 
-**Stopping the session** (``/api/shutdown``) exists only for an agentless
-session (``biopb mcp view``, or the dashboard's new session), and runs the launcher's own ``_shutdown``: the same
-single path Ctrl-C and SIGTERM take, injected at wiring time
-(:func:`set_session_owns_its_reap`) rather than reimplemented. That is what
-keeps the control out of the ownership question — it proxies a session ending
-*itself*, so a viewer someone started in a terminal and one the dashboard
-launched behave identically and neither is anybody's to kill. A shim-owned child
-gets no such route: its shim owns its reap, and ending it here would leave that
-shim bridging to a dead process.
+**Stopping the session** (``/api/shutdown``) exists on every session, and runs
+the launcher's own ``_shutdown``: the same single path Ctrl-C and SIGTERM take,
+injected at wiring time (:func:`set_session_mode`) rather than reimplemented. That
+is what keeps the control out of the ownership question — it proxies a session
+ending *itself*, so a viewer someone started in a terminal, one the dashboard
+launched and one an agent attached to behave identically, and each ends when a
+person stops it. A shim whose session is stopped sees it stop answering and
+unbinds.
 
 The observe **page** itself is served by the control front — it is the React
 ``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
@@ -32,7 +31,7 @@ on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
 the MCP loop and port (``transport.port``) with ``/mcp``. The server is
 http-only (ARCHITECTURE.md, Lifecycle), so the API is always
 available — stdio clients reach it too: they connect through the launcher's
-stdio→http bridge (``mcp/_shim.py``) and so hit ``/api/*`` on the shared daemon
+stdio→http bridge (``biopb._shim``) and so hit ``/api/*`` on the shared daemon
 like any other http client. (It was once skipped under a stdio-*serving*
 launcher, where standing a second uvicorn up inside the protocol process risked
 the fd-1 JSON-RPC channel and raced the one ``KernelHost`` — that launcher no
@@ -60,7 +59,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _app, _http, _notebook, _scratch, _writers
+from . import _app, _http, _lease, _notebook, _scratch, _session_mode, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -74,21 +73,19 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 # Whether the built-in chat client is actually mounted on this session. Not a
-# config mirror: chat is served only on an agentless session
+# config mirror: chat is served only on a session whose mode allows it
 # and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
 # set_chat_enabled() rather than configure(), which resets its extras on every
 # call and so cannot be called twice.
 _chat_enabled = False
-# Whether this session owns its own reap -- an agentless session a human
-# opened, as opposed to a child a stdio shim spawned and will reap. The stop
-# route exists only for the former: ending a shim's child would leave the shim
-# bridging to a dead process and its MCP client reading errors instead of a
-# clean close. Deliberately NOT keyed off _chat_enabled, which is a config
-# switch that is off by default -- a viewer with chat disabled still owns its
-# reap and still needs a way out.
-_agentless = False
-# The session's own teardown (the launcher's `_shutdown`), or None where there
-# is nothing this session may end. Injected rather than reimplemented: it is the
+# This session's mode (`_session_mode`), reported on /api/status. It decides
+# what the session serves (chat), not whether it can be stopped: every session
+# can, whatever started it. Deliberately NOT keyed off _chat_enabled, which is a
+# config switch that is off by default -- a viewer with chat disabled still needs
+# a way out.
+_mode = _session_mode.DIRECT
+# The session's own teardown (the launcher's `_shutdown`), or None where none was
+# wired (the standalone test app). Injected rather than reimplemented: it is the
 # same single path Ctrl-C and SIGTERM take, so a stop from the web de-registers,
 # reaps the kernel and closes the cluster in exactly the same order.
 _shutdown_hook = None
@@ -117,17 +114,11 @@ def configure(
     _http.configure(allowed_origins, allowed_hosts)
 
 
-def set_session_owns_its_reap(agentless, on_shutdown=None):
-    """Record that this session may be stopped from the web, and how.
-
-    Must run before :func:`register_http_routes`, which reads it to decide
-    whether the stop route exists at all -- an absent route rather than a
-    refusing one, the same shape the chat gate uses, so "can this session be
-    ended from here?" is one answer and not a status code to interpret.
-    """
-    global _agentless, _shutdown_hook
-    _agentless = bool(agentless)
-    _shutdown_hook = on_shutdown if _agentless else None
+def set_session_mode(mode, on_shutdown=None):
+    """Record this session's mode, and the teardown its stop route runs."""
+    global _mode, _shutdown_hook
+    _mode = mode
+    _shutdown_hook = on_shutdown
 
 
 def set_chat_enabled(enabled):
@@ -326,19 +317,68 @@ async def _api_status(request):
     # of hardcoding it — the page is now static and can't be server-templated.
     # chat_enabled rides here for the control's dashboard, which probes this
     # endpoint per session anyway and needs it to label the session's link -- a
-    # agentless session leads with chat, an MCP client's child with the
+    # session that serves chat leads with chat, an MCP client's child with the
     # job list -- so that one probe is the whole answer.
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
             "chat_enabled": _chat_enabled,
-            # Two different questions, both read by the control's dashboard off
-            # this one probe: chat_enabled says what the page leads with,
-            # agentless says who owns the reap -- and so whether to offer a stop.
-            "agentless": _agentless,
+            "mode": _mode,
+            # Who this session answers to, and whether it has a window: what an
+            # agent choosing a session to attach to needs to know about each.
+            "lease": _lease.snapshot(),
+            "viewer": bool(host.viewer.has_window),
         }
     )
+
+
+async def _api_lease(_request):
+    return JSONResponse(_lease.snapshot())
+
+
+async def _lease_token(request):
+    """``(token, payload, None)`` from the body, or ``(None, None, 400)``."""
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return None, None, err
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        return (
+            None,
+            None,
+            JSONResponse({"error": "missing 'token'"}, status_code=400),
+        )
+    return token, payload, None
+
+
+async def _api_lease_acquire(request):
+    """Take the agent lease for ``token``; 409 with the holder if it is held.
+
+    Only the agent kind is takeable here: chat takes its own lease in-process
+    with its first turn.
+    """
+    token, payload, err = await _lease_token(request)
+    if err is not None:
+        return err
+    result = _lease.acquire("agent", token, force=bool(payload.get("force")))
+    return JSONResponse(result, status_code=200 if result["ok"] else 409)
+
+
+async def _api_lease_renew(request):
+    token, _, err = await _lease_token(request)
+    if err is not None:
+        return err
+    if not _lease.renew(token):
+        return JSONResponse({"error": "lease not held", **_lease.snapshot()}, 409)
+    return JSONResponse({"ok": True})
+
+
+async def _api_lease_release(request):
+    token, _, err = await _lease_token(request)
+    if err is not None:
+        return err
+    return JSONResponse({"released": _lease.release(token)})
 
 
 # How long the stop route waits before tearing the process down. The teardown
@@ -384,24 +424,22 @@ _ROUTES = [
     ("/api/kernel/interrupt", ["POST"], _route(_api_interrupt)),
     ("/api/kernel/restart", ["POST"], _route(_api_restart)),
     ("/api/status", ["GET"], _route(_api_status)),
-]
-
-# Served only where this session owns its own reap. Under ``api`` rather than a
-# root of its own: the control already proxies that root everywhere, and it
-# already carries a comparably destructive verb in /api/kernel/restart. This is
-# not an execute surface, so it needs none of the chat root's local-only gating.
-_SHUTDOWN_ROUTES = [
-    ("/api/shutdown", ["POST"], _route(_api_shutdown)),
+    ("/api/lease", ["GET"], _route(_api_lease)),
+    ("/api/lease/acquire", ["POST"], _http.json_route(_api_lease_acquire)),
+    ("/api/lease/renew", ["POST"], _http.json_route(_api_lease_renew)),
+    ("/api/lease/release", ["POST"], _http.json_route(_api_lease_release)),
 ]
 
 
 def _routes():
-    """The routes to serve: the data API, plus the stop route where this
-    session owns its reap."""
-    routes = list(_ROUTES)
-    if _agentless:
-        routes += _SHUTDOWN_ROUTES
-    return routes
+    """The routes to serve: the data API, the lease, and the stop route.
+
+    The stop route is under ``api`` rather than a root of its own: the control
+    already proxies that root everywhere, and it already carries a comparably
+    destructive verb in /api/kernel/restart. It is not an execute surface, so it
+    needs none of the chat root's local-only gating.
+    """
+    return [*_ROUTES, ("/api/shutdown", ["POST"], _route(_api_shutdown))]
 
 
 # ---------------------------------------------------------------------------
@@ -421,10 +459,7 @@ def register_http_routes():
     for path, methods, handler in _routes():
         _app.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
-    logger.info(
-        "observe API mounted on the MCP app at /api/* (stop: %s)",
-        "on" if _agentless else "off",
-    )
+    logger.info("observe API mounted on the MCP app at /api/*")
 
 
 def _build_standalone_app():

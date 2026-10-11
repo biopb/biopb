@@ -17,13 +17,13 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-# Match the rest of the stack (biopb / biopb-tensor-server / biopb-mcp are all
-# >=3.10,<3.13). The control is deliberately lean: it *supervises* the durable
+# Match the rest of the stack (biopb-tensor-server and biopb-mcp are both
+# >=3.12,<3.15). The control is deliberately lean: it *supervises* the durable
 # planes as subprocesses and never imports them. Its deps are the
 # dependency-light core SDK (for the shared control-endpoint location,
 # biopb._endpoints) plus a light ASGI stack for the Layer-3 single-origin
@@ -31,15 +31,19 @@ classifiers = [
 # httpx reverse-proxies the supervised tensor server's HTTP sidecar.
 # None of these drag in napari / dask / Qt / pyarrow / tensor-server / mcp, so
 # the lean-control discipline holds.
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.15"
 dependencies = [
-    # The algorithm registry (biopb._algorithms); .dev0 admits a pre-tag dev build.
-    "biopb >= 0.11.1",
+    # The algorithm Ops protocol (biopb.image).
+    "biopb >= 0.12.0",
     "starlette>=0.37",
     # No websockets extra: the control proxies HTTP only and runs uvicorn with
     # ws="none", so neither a server impl nor a client library is pulled in.
     "uvicorn>=0.34",
     "httpx>=0.27",
+    # httpcore imports sniffio on every request and, when it is missing (anyio 4
+    # no longer pulls it in), pays a failed-import path scan each time: ~45% of
+    # the /data_plane proxy's CPU per request.
+    "sniffio>=1.3",
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same

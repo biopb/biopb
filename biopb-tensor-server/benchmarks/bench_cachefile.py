@@ -56,7 +56,7 @@ def _start_server(zpath):
     cache_dir = Path(tempfile.mkdtemp()) / "cache"
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=str(cache_dir)))
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=MetadataDatabase())
+    server = TensorFlightServer("localhost:0", metadata_db=MetadataDatabase())
     registered = server.register_source(
         "gt", ZarrAdapter(zarr.open_array(zpath, mode="r"), "gt", ["z", "y", "x"])
     )

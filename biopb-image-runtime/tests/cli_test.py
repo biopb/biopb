@@ -1,6 +1,7 @@
 """CLI integration tests for the biopb image commands, against an Ops server
 (the ``ops_server`` fixture in conftest.py)."""
 
+import importlib.util
 import json
 import pickle
 import subprocess
@@ -8,7 +9,15 @@ from pathlib import Path
 
 import imageio
 import numpy as np
+import pytest
 from biopb.tensor.serialized_pb2 import SerializedTensor
+
+# A result returned by reference goes through the embedded tensor server, which
+# is optional.
+needs_tensor_server = pytest.mark.skipif(
+    importlib.util.find_spec("biopb_tensor_server") is None,
+    reason="biopb-tensor-server is not installed",
+)
 
 
 def _biopb(*args, text=True, timeout=60):
@@ -21,7 +30,7 @@ class TestImageCliOps:
     """Tests for 'biopb image ops'."""
 
     def test_ops_lists_operations_and_their_arguments(self, ops_server):
-        result = _biopb("ops", "--server", f"grpc://{ops_server}")
+        result = _biopb("ops", f"grpc://{ops_server}")
         assert result.returncode == 0
         assert "mock_echo" in result.stdout
         assert "mock_random" in result.stdout
@@ -29,7 +38,7 @@ class TestImageCliOps:
         assert "seed=0" in result.stdout
 
     def test_ops_connection_error(self):
-        result = _biopb("ops", "--server", "grpc://invalid:9999", timeout=30)
+        result = _biopb("ops", "grpc://invalid:9999", timeout=30)
         assert result.returncode == 1
         assert "error" in result.stderr.lower()
 
@@ -40,56 +49,55 @@ def _png(tmp_path: Path, shape=(128, 128)) -> Path:
     return path
 
 
-class TestImageCliProcess:
-    """Tests for 'biopb image process'."""
+class TestImageCliCall:
+    """Tests for 'biopb image call'."""
 
     def test_eager_in_eager_out(self, ops_server, tmp_path):
         output = tmp_path / "out.png"
         result = _biopb(
-            "process",
-            str(_png(tmp_path, (256, 256))),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_echo",
+            "--input",
+            str(_png(tmp_path, (256, 256))),
             "--output",
             str(output),
-            "--server",
-            f"grpc://{ops_server}",
         )
         assert result.returncode == 0, result.stderr
         assert imageio.imread(str(output)).shape == (256, 256)
 
+    @needs_tensor_server
     def test_a_large_result_comes_back_by_reference(self, ops_server, tmp_path):
         # Over the 64 MB inline cap, so the server returns it through its
         # embedded tensor server.
         path = tmp_path / "large.tif"
         imageio.imwrite(str(path), np.random.rand(8192, 2049).astype(np.float32))
         result = _biopb(
-            "process",
-            str(path),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_echo",
+            "--input",
+            str(path),
             "--output",
             "-",
-            "--server",
-            f"grpc://{ops_server}",
             text=False,
             timeout=120,
         )
         assert result.returncode == 0, result.stderr
         assert SerializedTensor.FromString(result.stdout).location.startswith("grpc://")
 
+    @needs_tensor_server
     def test_a_reference_as_pickle(self, ops_server, tmp_path):
         result = _biopb(
-            "process",
-            str(_png(tmp_path)),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_echo_lazy",
+            "--input",
+            str(_png(tmp_path)),
             "--output",
             "-",
             "--format",
             "pickle",
-            "--server",
-            f"grpc://{ops_server}",
             text=False,
         )
         assert result.returncode == 0, result.stderr
@@ -99,14 +107,13 @@ class TestImageCliProcess:
 
     def test_eager_to_stdout_is_refused(self, ops_server, tmp_path):
         result = _biopb(
-            "process",
-            str(_png(tmp_path)),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_echo",
+            "--input",
+            str(_png(tmp_path)),
             "--output",
             "-",
-            "--server",
-            f"grpc://{ops_server}",
         )
         assert result.returncode == 1
         assert "stdout not allowed" in result.stderr.lower()
@@ -114,16 +121,15 @@ class TestImageCliProcess:
     def test_kwargs_and_labels(self, ops_server, tmp_path):
         output = tmp_path / "labels.png"
         result = _biopb(
-            "process",
-            str(_png(tmp_path, (64, 48))),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_random",
+            "--input",
+            str(_png(tmp_path, (64, 48))),
             "--kwargs",
             '{"seed": 3}',
             "--output",
             str(output),
-            "--server",
-            f"grpc://{ops_server}",
         )
         assert result.returncode == 0, result.stderr
         labels = imageio.imread(str(output))
@@ -133,16 +139,15 @@ class TestImageCliProcess:
         output = tmp_path / "echo.png"
         image = _png(tmp_path)
         result = _biopb(
-            "process",
-            str(image),
-            "--op",
+            "call",
+            f"grpc://{ops_server}",
             "mock_stats",
+            "--input",
+            str(image),
             "--kwargs",
             '{"scale": 2}',
             "--output",
             str(output),
-            "--server",
-            f"grpc://{ops_server}",
         )
         assert result.returncode == 0, result.stderr
         assert output.exists()
@@ -153,12 +158,11 @@ class TestImageCliProcess:
 
     def test_an_unknown_op_is_named(self, ops_server, tmp_path):
         result = _biopb(
-            "process",
-            str(_png(tmp_path)),
-            "--op",
-            "nope",
-            "--server",
+            "call",
             f"grpc://{ops_server}",
+            "nope",
+            "--input",
+            str(_png(tmp_path)),
         )
         assert result.returncode == 1
         assert "mock_echo" in result.stderr

@@ -124,6 +124,21 @@ class InvalidReadRequest(TensorResolutionError):
     grpc_code = "INVALID_ARGUMENT"
 
 
+class AttachedTensorMismatch(TensorResolutionError):
+    """An attached tensor no longer fits the source it is attached to.
+
+    Canonical gRPC ``FAILED_PRECONDITION``: the tensor is listed, but reading it
+    would hand back data misaligned with its image -- a label set whose source
+    file was replaced by one of another shape. The message says how it differs;
+    deleting the tensor clears it.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="attached_mismatch")
+
+
 class UnknownResolutionError(TensorResolutionError):
     """A resolution-path exception that could not be classified.
 
@@ -162,6 +177,27 @@ class StaleChunkError(TensorResolutionError):
     """
 
     grpc_code = "NOT_FOUND"
+
+
+class SourceRegistrationError(TensorResolutionError):
+    """A read of a source whose registration failed.
+
+    The server claims a source on the first scan and registers it afterwards; when
+    that registration raises (a corrupt or unreadable file), the source stays in
+    the catalog marked ``failed`` and every read says why. Canonical
+    ``FAILED_PRECONDITION``: terminal, unlike the retriable "open to resolve" of a
+    cloud source -- the file has to change (the server retries the registration
+    on its own schedule), not the request.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str, error: str) -> None:
+        super().__init__(
+            f"source {source_id!r} could not be registered: {error}",
+            reason="registration_failed",
+        )
+        self.source_id = source_id
 
 
 class UploadNotPublishedError(TensorResolutionError):
@@ -339,4 +375,13 @@ class AnnotationStoreError(RuntimeError):
     Named for annotations because they are the rows the promise is about -- a
     server not serving them degrades to an in-memory catalog instead of raising
     this, since nothing else in the file is load-bearing.
+    """
+
+
+class CatalogRestoreError(AnnotationStoreError):
+    """The last run's catalog could not be restored at start.
+
+    Fatal for the same reason as its parent: starting anyway would mean a catalog
+    that is not the one on disk. The catalog tables can be emptied with
+    ``biopb-tensor-server reset-catalog``, which leaves annotations alone.
     """

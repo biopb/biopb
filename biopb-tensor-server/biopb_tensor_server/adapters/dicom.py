@@ -3,6 +3,8 @@
 Handles single DICOM files and multi-file DICOM series using pydicom.
 """
 
+import copy
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,9 +14,16 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._scale import scale_by_label
+from biopb_tensor_server.adapters._scale import (
+    scale_by_label,
+    scale_from_payload,
+    scale_to_payload,
+)
+from biopb_tensor_server.adapters._signature_memo import SignatureMemo
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -25,10 +34,54 @@ from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
 )
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+# The claims' header probe, memoized per local file: ``(has Rows and Columns,
+# SeriesInstanceUID)``. A series directory costs one header parse per slice, so
+# without the memo every rescan pays it again.
+_HEADER_MEMO = SignatureMemo(200_000)
+
+
+def _read_header_summary(path: str) -> Tuple[bool, Optional[str]]:
+    """``(image-capable, SeriesInstanceUID)`` from a slice's header.
+
+    A file that is not DICOM reads as ``(False, None)``. Raises ``OSError`` when
+    the file cannot be read, which says nothing about its content.
+    """
+    import pydicom
+
+    try:
+        ds = pydicom.dcmread(path, stop_before_pixels=True)
+    except OSError:
+        raise
+    except Exception:
+        return False, None
+    uid = getattr(ds, "SeriesInstanceUID", None)
+    image = hasattr(ds, "Rows") and hasattr(ds, "Columns")
+    # One string per series, not one per slice.
+    return image, (sys.intern(str(uid)) if uid is not None else None)
+
+
+def _header_summary(
+    path: str, *, memoize: bool = True
+) -> Optional[Tuple[bool, Optional[str]]]:
+    """:func:`_read_header_summary`, memoized on the file's identity; ``None``
+    for an unreadable file, which is not memoized."""
+    try:
+        return _HEADER_MEMO.get(
+            path, lambda: _read_header_summary(path), memoize=memoize
+        )
+    except OSError:
+        return None
 
 
 # =============================================================================
@@ -281,7 +334,7 @@ def _dicom_common_metadata(ds) -> dict:
 # Image/Instance-level attributes that vary slice-to-slice within a series
 # (DICOM PS3.3 assigns them to the Image IE, not Patient/Study/Series). Reading
 # them off the first slice and reporting them as the series' value is misleading,
-# so ``DicomSeriesAdapter.get_metadata`` drops them from the shared first-slice
+# so ``DicomSeriesAdapter.registration_record`` drops them from the shared first-slice
 # metadata. Surfacing the real per-slice values is tracked in #560.
 _SERIES_NONINVARIANT_TAGS = frozenset(
     {
@@ -312,6 +365,7 @@ _SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
 # =============================================================================
 
 
+@canonical_axes
 class DicomAdapter(TensorAdapter):
     """Adapter for single DICOM files.
 
@@ -329,6 +383,10 @@ class DicomAdapter(TensorAdapter):
     pay to decode the whole study (#821). Re-reads are absorbed by the chunk
     cache above the adapter, not by retaining pixels here.
     """
+
+    # What a source rebuilt from its row answers without the file (see
+    # ``create_from_payload``); None for one parsed from it.
+    _stored: Optional[dict] = None
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -365,17 +423,23 @@ class DicomAdapter(TensorAdapter):
             )
 
         try:
-            import pydicom
+            if not ctx.is_remote and ctx._path is not None:
+                # A local file: the memoized header probe (shared with the series
+                # claim, which reads the same headers).
+                summary = _header_summary(str(ctx._path), memoize=ctx.monitored)
+                if summary is None or not summary[0]:
+                    return None
+            else:
+                import pydicom
 
-            # Read metadata only (no pixel data). ctx.open() is the shape-agnostic
-            # read seam -- a local Path handle or a remote store handle -- so this
-            # stays blind to whether the context is local or remote.
-            with ctx.open("rb") as fobj:
-                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
+                # Read metadata only (no pixel data) through ctx.open(), the read
+                # seam for a remote store handle.
+                with ctx.open("rb") as fobj:
+                    ds = pydicom.dcmread(fobj, stop_before_pixels=True)
 
-            # Check for image-related tags (indicating pixel data capability)
-            if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
-                return None
+                # Check for image-related tags (indicating pixel data capability)
+                if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
+                    return None
 
             state.try_claim_path(ctx.path_str)
 
@@ -434,6 +498,40 @@ class DicomAdapter(TensorAdapter):
             remote_path=fs_path,
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[Any] = None,
+    ) -> Optional["DicomAdapter"]:
+        """Rebuild a local file from the row: shape, dtype, scale and metadata are
+        the row's, and the file is read by the first read. A remote file is parsed
+        (its reads need a filesystem built from credentials)."""
+        if source.is_remote:
+            return None
+        return cls(
+            None,
+            source.source_id,
+            source_url=str(source.url),
+            stored={
+                "shape": tuple(int(s) for s in payload["shape"]),
+                "dtype": payload["dtype"],
+                "scale": scale_from_payload(payload["scale"]),
+                "metadata": metadata,
+            },
+        )
+
+    def catalog_payload(self) -> Optional[dict]:
+        """The image's shape and dtype and the pixel-spacing scale: what the
+        descriptor and the scale hint are made of."""
+        return {
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype,
+            "scale": scale_to_payload(self._physical_scale()),
+        }
+
     def __init__(
         self,
         dicom_dataset,
@@ -441,6 +539,8 @@ class DicomAdapter(TensorAdapter):
         source_url: Optional[str] = None,
         remote_fs: Optional[Any] = None,
         remote_path: Optional[str] = None,
+        *,
+        stored: Optional[dict] = None,
     ):
         """Initialize DICOM adapter.
 
@@ -469,36 +569,44 @@ class DicomAdapter(TensorAdapter):
         # to be -- headers only, whatever the caller handed us.
         self._remote_fs = remote_fs
         self._remote_path = remote_path
-        self.ds = _dicom_header_only(dicom_dataset)
+        # What a source rebuilt from its row answers without the file; None for one
+        # parsed from it.
+        self._stored = stored
+        self.ds = None if stored is not None else _dicom_header_only(dicom_dataset)
         # Cheap content_version from the file's stat signature (#178): O(1),
         # folded into minted chunk_ids so a re-saved file gets a fresh cache
         # namespace. None (unresolved / non-file url) leaves the source unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "dicom"
 
-        # Get shape info
-        rows = int(self.ds.get("Rows", 0))
-        cols = int(self.ds.get("Columns", 0))
-        num_frames = int(self.ds.get("NumberOfFrames", 1))
-
-        if num_frames > 1:
-            self._shape = (num_frames, rows, cols)
-            self._is_multiframe = True
+        if stored is not None:
+            self._shape = stored["shape"]
+            self._is_multiframe = len(self._shape) == 3
+            self._dtype = stored["dtype"]
         else:
-            self._shape = (rows, cols)
-            self._is_multiframe = False
+            # Get shape info
+            rows = int(self.ds.get("Rows", 0))
+            cols = int(self.ds.get("Columns", 0))
+            num_frames = int(self.ds.get("NumberOfFrames", 1))
 
-        # Get dtype from pixel representation
-        bits_stored = int(self.ds.get("BitsStored", 16))
-        pixel_repr = int(self.ds.get("PixelRepresentation", 0))
-        self._dtype = _dicom_dtype(bits_stored, pixel_repr)
+            if num_frames > 1:
+                self._shape = (num_frames, rows, cols)
+                self._is_multiframe = True
+            else:
+                self._shape = (rows, cols)
+                self._is_multiframe = False
+
+            # Get dtype from pixel representation
+            bits_stored = int(self.ds.get("BitsStored", 16))
+            pixel_repr = int(self.ds.get("PixelRepresentation", 0))
+            self._dtype = _dicom_dtype(bits_stored, pixel_repr)
 
         if self._is_multiframe:
             self.dim_labels = ["frame", "y", "x"]
         else:
             self.dim_labels = ["y", "x"]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -511,8 +619,8 @@ class DicomAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -560,7 +668,7 @@ class DicomAdapter(TensorAdapter):
         from pydicom.pixels import iter_pixels, pixel_array
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
         with self._io_lock, self._pixel_source() as src:
@@ -574,12 +682,18 @@ class DicomAdapter(TensorAdapter):
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (mm) from this file's ``PixelSpacing`` etc."""
+        if self._stored is not None:
+            return self._stored["scale"]
         return _dicom_physical_scale(self.ds, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract DICOM metadata: format identifier, tags, derived spatial info,
         and patient/study info."""
-        return _dicom_common_metadata(self.ds)
+        if self._stored is not None:
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
+        return metadata_record(_dicom_common_metadata(self.ds))
 
 
 # =============================================================================
@@ -587,6 +701,7 @@ class DicomAdapter(TensorAdapter):
 # =============================================================================
 
 
+@canonical_axes
 class DicomSeriesAdapter(TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
@@ -601,6 +716,10 @@ class DicomSeriesAdapter(TensorAdapter):
     nothing; repeat reads are absorbed by the chunk cache above the adapter
     (#821).
     """
+
+    # What a source rebuilt from its row answers without the files; None for one
+    # parsed from them.
+    _stored: Optional[dict] = None
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -646,8 +765,6 @@ class DicomSeriesAdapter(TensorAdapter):
             return None
 
         try:
-            import pydicom
-
             # Group the image-capable files by SeriesInstanceUID. Keying off the
             # first globbed file's series (the old approach) made the result depend
             # on glob order: a directory holding a singleton series ahead of a real
@@ -656,17 +773,14 @@ class DicomSeriesAdapter(TensorAdapter):
             # decision independent of discovery order.
             series_to_files = {}
             for f in dcm_files:
-                try:
-                    ds = pydicom.dcmread(str(f), stop_before_pixels=True)
-                except Exception:
+                summary = _header_summary(str(f), memoize=ctx.monitored)
+                if summary is None:
                     continue
-                series_uid = getattr(ds, "SeriesInstanceUID", None)
+                image, series_uid = summary
                 # Rows/Columns indicate pixel-data capability.
-                if series_uid is None or not (
-                    hasattr(ds, "Rows") and hasattr(ds, "Columns")
-                ):
+                if series_uid is None or not image:
                     continue
-                series_to_files.setdefault(str(series_uid), []).append(f)
+                series_to_files.setdefault(series_uid, []).append(f)
 
             # Claim the largest series with at least two slices.
             series_uid, series_files = max(
@@ -708,10 +822,47 @@ class DicomSeriesAdapter(TensorAdapter):
         """
         return cls(str(source.url), source.source_id)
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[Any] = None,
+    ) -> "DicomSeriesAdapter":
+        """Rebuild from the row: the sorted slice files, the slice size, dtype,
+        scale and metadata. Parsing a series reads every slice's header; this reads
+        none, and each slice file is opened when a read covers it."""
+        return cls(
+            str(source.url),
+            source.source_id,
+            stored={
+                "files": list(payload["files"]),
+                "rows": int(payload["rows"]),
+                "cols": int(payload["cols"]),
+                "dtype": payload["dtype"],
+                "scale": scale_from_payload(payload["scale"]),
+                "metadata": metadata,
+            },
+        )
+
+    def catalog_payload(self) -> Optional[dict]:
+        """The series in slice order (file names under the directory), a slice's
+        size, the dtype and the scale: what parsing reads every header to learn."""
+        return {
+            "files": [Path(f).name for f in self.dicom_files],
+            "rows": int(self._rows),
+            "cols": int(self._cols),
+            "dtype": self._dtype,
+            "scale": scale_to_payload(self._physical_scale()),
+        }
+
     def __init__(
         self,
         directory: str,
         source_id: str,
+        *,
+        stored: Optional[dict] = None,
     ):
         """Initialize DICOM series adapter.
 
@@ -719,11 +870,12 @@ class DicomSeriesAdapter(TensorAdapter):
             directory: Path to directory containing DICOM series
             source_id: Unique identifier for this data source
         """
-        import pydicom
-
         self.directory = Path(directory)
         self.source_id = source_id
         self._io_lock = threading.Lock()
+        # What a source rebuilt from its row answers without the files; None for
+        # one parsed from them.
+        self._stored = stored
 
         # Source-level metadata
         self._source_url = str(directory)
@@ -732,6 +884,19 @@ class DicomSeriesAdapter(TensorAdapter):
         # for a multi-file series. None (unresolved url) leaves it unversioned.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "dicom-series"
+
+        self.dim_labels = ["z", "y", "x"]
+        if stored is not None:
+            self.dicom_files = [self.directory / name for name in stored["files"]]
+            self._num_slices = len(self.dicom_files)
+            self._dtype = stored["dtype"]
+            self._rows = stored["rows"]
+            self._cols = stored["cols"]
+            self._shape = (self._num_slices, self._rows, self._cols)
+            self._first_ds = None
+            return
+
+        import pydicom
 
         # Find and sort DICOM files
         dcm_files = (
@@ -795,7 +960,7 @@ class DicomSeriesAdapter(TensorAdapter):
         if self._num_slices == 0:
             raise ValueError(f"No valid DICOM files found in series: {directory}")
 
-        # Read the first slice's header (shape/dtype + the tags get_metadata and
+        # Read the first slice's header (shape/dtype + the tags registration_record and
         # _physical_scale later report). Header-only -- everything read from
         # _first_ds lives in the header, so stop_before_pixels avoids loading and
         # retaining a whole slice's pixel data for the source's lifetime.
@@ -810,13 +975,10 @@ class DicomSeriesAdapter(TensorAdapter):
         self._rows = rows
         self._cols = cols
 
-        # Dimension labels
-        self.dim_labels = ["z", "y", "x"]
-
         # Store first dataset for metadata extraction
         self._first_ds = first_full
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -832,8 +994,8 @@ class DicomSeriesAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -857,7 +1019,7 @@ class DicomSeriesAdapter(TensorAdapter):
         from pydicom.pixels import pixel_array
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])
 
@@ -891,11 +1053,15 @@ class DicomSeriesAdapter(TensorAdapter):
 
         X/Y from ``PixelSpacing``; the ``z`` (slice) axis from
         ``SpacingBetweenSlices`` / ``SliceThickness`` -- both read off
-        ``_first_ds``, the same slice ``get_metadata`` reports from.
+        ``_first_ds``, the same slice ``registration_record`` reports from.
         """
+        if self._stored is not None:
+            return self._stored["scale"]
         return _dicom_physical_scale(self._first_ds, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract DICOM series metadata: the first slice's *series-invariant*
         per-file metadata plus a series-level block.
 
@@ -904,6 +1070,8 @@ class DicomSeriesAdapter(TensorAdapter):
         ``_SERIES_NONINVARIANT_TAGS``) are dropped here rather than advertised as
         series-wide. Full per-slice metadata is tracked in #560.
         """
+        if self._stored is not None:
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
         metadata = _dicom_common_metadata(self._first_ds)
         for section in ("tags", "patient"):
             for name in _SERIES_NONINVARIANT_TAGS:
@@ -914,4 +1082,4 @@ class DicomSeriesAdapter(TensorAdapter):
             "num_slices": self._num_slices,
             "directory": str(self.directory),
         }
-        return metadata
+        return metadata_record(metadata)

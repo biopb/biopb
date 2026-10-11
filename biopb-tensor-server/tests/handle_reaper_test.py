@@ -180,3 +180,20 @@ def test_cap_skips_a_handle_mid_read_rather_than_blocking():
     # Once that read finishes, the next register collects it.
     reaper.register(_FakeReapable())
     assert busy.released == 1
+
+
+def test_discard_inside_a_block_holding_the_lock_does_not_deadlock():
+    """A finalizer run by the cycle collector inside ``_sweep``'s locked block
+    releases its handle through ``discard`` on the same thread."""
+    a = _FakeReapable()
+    reaper = _reaper_with(a)
+
+    def finalizer_in_a_locked_block():
+        with reaper._lock:
+            reaper.discard(a)
+
+    t = threading.Thread(target=finalizer_in_a_locked_block, daemon=True)
+    t.start()
+    t.join(5)
+    assert not t.is_alive(), "discard waited on the lock its own thread holds"
+    assert a not in reaper._adapters

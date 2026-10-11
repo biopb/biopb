@@ -11,7 +11,7 @@ index of the mask's ROI in that image's own ``roi_refs`` order.
 Pure by design, like its sibling: dict in (the OME metadata), a list of
 :class:`_MaskShape` per image out (:func:`masks_by_image`).
 :class:`RasterizedMaskAdapter` is the tensor adapter. Read-only.
-Built only by ``OmeTiffAdapter.get_embedded_labels``.
+Built only by ``OmeTiffAdapter._embedded_sets``.
 """
 
 from __future__ import annotations
@@ -29,11 +29,20 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._ome_rois import Tensor
-from biopb_tensor_server.adapters.labels import NearestPyramidMixin
-from biopb_tensor_server.core.adapter_base import TensorAdapter, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    catalog_entry,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.errors import WriteNotSupportedError
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+    strip_mask_bindata,
+)
 
 __all__ = ["RasterizedMaskAdapter", "masks_by_image", "strip_mask_bindata"]
 
@@ -123,49 +132,6 @@ def _mask_shape(shape: Mapping[str, Any], label: int) -> Optional[_MaskShape]:
     )
 
 
-def strip_mask_bindata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
-    """*metadata* with every ``rois[].union.masks[].bin_data.value`` dropped.
-
-    A mask's bitmap is arbitrary binary -- base64 text on the fast metadata
-    path (:func:`~biopb_tensor_server.adapters.ome_tiff._b64_encode_mask_bindata`),
-    raw bytes elsewhere -- and can be large; it belongs in the rasterized
-    ``@ome`` tensor this module builds, never in the SQL-queryable
-    ``sources.metadata_json`` column. Unlike ``rois`` as a whole, this runs
-    whether or not ROI *annotations* import ran: a mask is not an
-    annotation, so it is not covered by that stripping (``metadata_db.py``),
-    and its bitmap must not leak into metadata_json regardless.
-
-    Returns *metadata* unchanged (same object) when there is nothing to
-    strip, so a caller can skip the JSON re-dump in the common case of no
-    masks at all.
-    """
-    rois = metadata.get("rois")
-    if not isinstance(rois, list) or not rois:
-        return metadata
-    changed = False
-    new_rois = []
-    for roi in rois:
-        union = roi.get("union") if isinstance(roi, Mapping) else None
-        masks = union.get("masks") if isinstance(union, Mapping) else None
-        if not masks:
-            new_rois.append(roi)
-            continue
-        new_masks = []
-        for mask in masks:
-            bin_data = mask.get("bin_data") if isinstance(mask, Mapping) else None
-            if isinstance(bin_data, Mapping) and "value" in bin_data:
-                mask = {
-                    **mask,
-                    "bin_data": {k: v for k, v in bin_data.items() if k != "value"},
-                }
-                changed = True
-            new_masks.append(mask)
-        new_rois.append({**roi, "union": {**union, "masks": new_masks}})
-    if not changed:
-        return metadata
-    return {**metadata, "rois": new_rois}
-
-
 def masks_by_image(
     metadata: Mapping[str, Any], by_image_id: Mapping[str, Tensor]
 ) -> Dict[str, List[_MaskShape]]:
@@ -225,7 +191,7 @@ def masks_by_image(
     return out
 
 
-class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
+class RasterizedMaskAdapter(TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
     Computed, not stored -- there is no backend to read again, only the
@@ -235,12 +201,12 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     adapter's life. Read-only: replacing the set means re-registering the file.
 
     ``dim_labels`` / ``shape`` are the image's own canonical axes with the
-    channel axis dropped. Y/X are located by *label*
-    (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`) and an interleaved
-    RGB(A) source keeps its trailing samples axis (``S``) here.
+    channel axis a singleton and an RGB samples axis left out. Y/X are located by
+    *label* (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`), so the
+    singleton channel is just another axis painted across.
     """
 
-    _normalizable_axes = False
+    categorical = True
 
     def __init__(
         self,
@@ -283,11 +249,10 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     def dim_labels(self) -> List[str]:
         return self._dim_labels
 
-    def get_metadata(self) -> dict:
-        return {}
-
-    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
-        return {}  # a set has no sets of its own
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     @classmethod
     def create_from_config(
@@ -295,13 +260,21 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     ) -> RasterizedMaskAdapter:
         raise NotImplementedError(
             "RasterizedMaskAdapter is built from a parent's OME metadata by "
-            "OmeTiffAdapter.get_embedded_labels(), not from config"
+            "OmeTiffAdapter._embedded_sets(), not from config"
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """Itself for its own name, as well as for the source's."""
+        if self._tensor_name is not None and (
+            strip_source_prefix(self.source_id, tensor_id) == self._tensor_name
+        ):
+            return self
+        return super().get_tensor_adapter(tensor_id)
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
+
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self._dim_labels,

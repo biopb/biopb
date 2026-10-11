@@ -4,7 +4,6 @@ Tests the full pipeline from adapter registration through client access
 to dask compute for each adapter type.
 """
 
-import importlib.util
 import tempfile
 import threading
 import time
@@ -17,7 +16,7 @@ from biopb.tensor import (
 )
 from biopb_tensor_server import TensorFlightServer
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 
 def _zarr_available() -> bool:
@@ -29,11 +28,6 @@ def _zarr_available() -> bool:
         return True
     except ImportError:
         return False
-
-
-def _h5py_available() -> bool:
-    """Check if h5py is available."""
-    return importlib.util.find_spec("h5py") is not None
 
 
 # Directory of real vendor samples (CZI/ND2/LIF) for the fixture-gated read
@@ -79,7 +73,7 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -93,8 +87,7 @@ class TestZarrIntegration:
             )
 
             # List sources
-            sources = client.list_sources()
-            assert "zarr-integration" in sources
+            assert "zarr-integration" in source_ids(client)
 
             # Get tensor (source_id matches tensor_id for single-tensor sources)
             darr = client.get_tensor("zarr-integration")
@@ -136,7 +129,7 @@ class TestZarrIntegration:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "be", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("be", adapter)
             server_thread = threading.Thread(target=server.serve, daemon=True)
             server_thread.start()
@@ -165,7 +158,7 @@ class TestZarrIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "zarr-scaled", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("zarr-scaled", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -210,7 +203,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-integration")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -257,7 +250,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-virtual")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-zarr-virtual", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -304,8 +297,8 @@ class TestOmeZarrIntegration:
 
         # OME-Zarr with real physical units (the fixture uses relative scales).
         zarr_path = os.path.join(temp_dir, "phys.ome.zarr")
-        root = zarr.open_group(zarr_path, mode="w")
-        root.create_dataset("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
+        root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+        root.create_array("0", shape=(64, 64), chunks=(32, 32), dtype="uint8")
         zattrs = {
             "multiscales": [
                 {
@@ -330,7 +323,7 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="r")
         adapter = OmeZarrAdapter(root["0"], "phys")
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "phys", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -376,7 +369,7 @@ class TestOmeZarrIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "plain", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("plain", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -406,10 +399,10 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "ome-tiff-integration")
 
         # Get scene_id for tensor access
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-tiff-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -451,10 +444,10 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "ome-tiff-channels")
 
         # Get scene_id for tensor access
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-tiff-channels", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -521,9 +514,9 @@ class TestOmeTiffIntegration:
             },
         )
         adapter = OmeTiffAdapter(path, "ome213")
-        array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
+        array_id = adapter.list_tensors()[0].array_id  # registration
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome213", adapter)
         server.mark_ready()
         adapter._bio_image = _Tripwire()  # any OME parse from here is a failure
@@ -558,7 +551,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "multi-series-test")
 
         # List all tensors (series)
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert len(descriptors) == series_info["n_series"]
 
         # Each descriptor should have a unique array_id
@@ -574,7 +567,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "multi-series-access")
 
         # Get actual scene IDs from adapter
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         scene_ids = [d.array_id for d in descriptors]
 
         # Access each series and verify data
@@ -595,7 +588,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -608,11 +601,10 @@ class TestMultiSeriesOmeTiffIntegration:
             )
 
             # List sources
-            sources = client.list_sources()
-            assert "multi-series-server" in sources
+            assert "multi-series-server" in source_ids(client)
 
             # Get actual scene IDs
-            descriptors = adapter.list_tensor_descriptors()
+            descriptors = adapter.list_tensors()
             first_scene_id = descriptors[0].array_id
 
             # first_scene_id is the source-qualified array_id (e.g. 'multi-series-server/Image:0')
@@ -641,7 +633,7 @@ class TestMultiSeriesOmeTiffIntegration:
         adapter = OmeTiffAdapter(tiff_path, "lazy-tile-test")
 
         # Get actual scene IDs
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         first_scene_id = descriptors[0].array_id
 
         # Get first series adapter
@@ -653,6 +645,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         assert data.shape == (1, 1, 1, 32, 32)
         assert data[0, 0, 0].mean() == 1  # First plane has value 1
+        adapter.close()  # the pooled store would pin the file past the fixture
 
 
 class TestCompanionOmeIntegration:
@@ -671,84 +664,6 @@ class TestCompanionOmeIntegration:
         companion_path, _tiff_files, _metadata_info = companion_ome_dataset
         ctx = ClaimContext(Path(companion_path))
         assert OmeTiffAdapter.claim(ctx, DiscoveryState()) is None
-
-
-class TestHdf5Integration:
-    """Integration tests for Hdf5Adapter with server/client."""
-
-    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
-    def test_hdf5_read(self, hdf5_dataset):
-        """Test reading from HDF5 through server."""
-        import h5py
-        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        # HDF5 adapter needs the dataset object, so we need to keep file open
-        with h5py.File(h5_path, "r") as f:
-            dataset = f["data"]
-            adapter = Hdf5Adapter(dataset, "hdf5-integration")
-
-            server = TensorFlightServer("grpc://localhost:0")
-            server.register_source("hdf5-integration", adapter)
-
-            server_thread = threading.Thread(target=server.serve, daemon=True)
-            server_thread.start()
-            time.sleep(1)
-
-            try:
-                client = TensorFlightClient(
-                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
-                )
-
-                darr = client.get_tensor("hdf5-integration")
-                assert darr.shape == shape
-
-                data = darr.compute()
-                assert data.shape == shape
-
-                client.close()
-            finally:
-                server.shutdown()
-
-    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
-    def test_hdf5_element_size_um_reaches_client(self, temp_dir):
-        """An ilastik/Imaris element_size_um attribute rides the descriptor to
-        the client as physical_scale (issue #272)."""
-        import os
-
-        import h5py
-        import numpy as np
-        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-        h5_path = os.path.join(temp_dir, "calibrated.h5")
-        with h5py.File(h5_path, "w") as f:
-            dset = f.create_dataset(
-                "data", data=np.zeros((4, 16, 16), dtype="uint8"), chunks=(1, 16, 16)
-            )
-            dset.attrs["element_size_um"] = np.array([2.0, 0.25, 0.25])
-
-        with h5py.File(h5_path, "r") as f:
-            adapter = Hdf5Adapter(f["data"], "cal")
-
-            server = TensorFlightServer("grpc://localhost:0")
-            server.register_source("cal", adapter)
-            server.mark_ready()
-            server_thread = threading.Thread(target=server.serve, daemon=True)
-            server_thread.start()
-            time.sleep(1)
-
-            try:
-                client = TensorFlightClient(
-                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
-                )
-                client.get_tensor("cal")
-                scale, unit = client.get_physical_scale("cal")
-                assert list(scale) == [2.0, 0.25, 0.25]
-                assert list(unit) == ["µm", "µm", "µm"]
-                client.close()
-            finally:
-                server.shutdown()
 
 
 class TestCacheIntegration:
@@ -774,7 +689,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("cache-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -827,7 +742,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-regions", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("cache-regions", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -872,7 +787,7 @@ class TestConcurrentAccess:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "concurrent-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("concurrent-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -935,7 +850,7 @@ class TestBioioReadPath:
         src = adapter_cls(
             BioImage(path), scene_index=None, source_id="s", source_url=path
         )
-        descs = src.list_tensor_descriptors()
+        descs = src.list_tensors()
         assert descs, "bioio produced no tensor descriptors"
         scene = src.get_tensor_adapter(descs[0].array_id)
         desc = scene.get_tensor_descriptor()

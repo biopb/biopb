@@ -42,10 +42,11 @@ createRoot(root).render(
             path="/session/:sessionId/observe"
             element={<ObservePage />}
           />
+          {/* Outside ViewerLayout so ClientBootstrap remounts after unlock. */}
+          <Route path="/unlock" element={<UnlockPage />} />
           <Route element={<ViewerLayout />}>
             <Route path="/viewer" element={<HomePage />} />
             <Route path="/admin" element={<AdminPage />} />
-            <Route path="/unlock" element={<UnlockPage />} />
           </Route>
         </Routes>
       </Suspense>

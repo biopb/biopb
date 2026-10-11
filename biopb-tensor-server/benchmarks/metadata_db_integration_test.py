@@ -22,6 +22,10 @@ import time
 
 import pytest
 from biopb.tensor import TensorFlightClient
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -50,7 +54,7 @@ class MockAdapter:
     def is_resolved(self):
         return True
 
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         return [
@@ -61,11 +65,15 @@ class MockAdapter:
             )
         ]
 
-    def get_metadata(self):
-        return {
-            "plate_id": self.source_id.split("-")[0],
-            "acquisition_date": "2024-01-01",
-        }
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(
+            {
+                "plate_id": self.source_id.split("-")[0],
+                "acquisition_date": "2024-01-01",
+            }
+        )
 
 
 def populate_server_sources(
@@ -104,7 +112,7 @@ def _create_server_with_sources(n_sources: int):
     location = f"grpc://127.0.0.1:{port}"
 
     db = MetadataDatabase()
-    server = TensorFlightServer(location, metadata_db=db)
+    server = TensorFlightServer(location.removeprefix("grpc://"), metadata_db=db)
 
     server_thread = threading.Thread(target=server.serve, daemon=True)
     server_thread.start()
@@ -160,7 +168,7 @@ def server_with_metadata_db():
     location = f"grpc://127.0.0.1:{port}"
 
     db = MetadataDatabase()
-    server = TensorFlightServer(location, metadata_db=db)
+    server = TensorFlightServer(location.removeprefix("grpc://"), metadata_db=db)
 
     server_thread = threading.Thread(target=server.serve, daemon=True)
     server_thread.start()

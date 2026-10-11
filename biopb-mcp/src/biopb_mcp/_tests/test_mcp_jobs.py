@@ -308,7 +308,7 @@ class TestJobConcurrency:
         policy (no Qt, no GL, no napari), so the whole verification path runs
         in CI."""
         from biopb_mcp.mcp import _scratch
-        from biopb_mcp.mcp._kernel import ENV_SCRATCH
+        from biopb_mcp.mcp._kernel_env import ENV_SCRATCH, ViewerMode
 
         env = dict(os.environ)
         env[ENV_SCRATCH] = "1"
@@ -321,7 +321,7 @@ class TestJobConcurrency:
                 startup_timeout=120.0,
                 env=env,
                 watchdog_interval=0,
-                window_close_pipe=False,
+                viewer=ViewerMode.none("no window in this test"),
             )
         )
         session = KernelHost(health_probe_code=None, startup_timeout=60.0)

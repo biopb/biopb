@@ -51,7 +51,6 @@ import argparse
 import hashlib
 import inspect
 import logging
-import math
 import os
 import re
 import sys
@@ -64,13 +63,16 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import biopb.image as proto
 import grpc
 import numpy as np
-from biopb._web_auth import host_is_public_bind
+from biopb._security.web_auth import host_is_public_bind
 from biopb.image import (
+    NDIM_LABELS,
     deserialize_image_data,
+    json_arg,
+    json_value,
     normalize_array_dims,
     serialize_from_numpy_to_image_data,
 )
-from google.protobuf import json_format, struct_pb2
+from google.protobuf import json_format
 
 from biopb_image_base.common import (
     _MAX_EAGER_SIZE,
@@ -92,17 +94,6 @@ TOKEN_ENV = "BIOPB_ALGORITHM_TOKEN"
 _INPUT_MODES = ("eager", "lazy", "blocks")
 _SPATIAL_AXES = frozenset("ZYX")
 
-# biopb's ndim -> axis-label convention (see biopb.image._utils).
-_NDIM_LABELS = {
-    2: ["Y", "X"],
-    3: ["Y", "X", "C"],
-    4: ["Z", "Y", "X", "C"],
-    5: ["T", "Z", "Y", "X", "C"],
-}
-
-
-# =============================================================================
-# Declaring ops
 # =============================================================================
 
 
@@ -344,54 +335,6 @@ def describe(definitions: Sequence[_OpDef]) -> proto.OpList:
 # =============================================================================
 
 
-#: The key `_jsonable` carries a non-finite float under, and `_from_json` (the
-#: kernel's `ops` client, `_process_ops.py`) reads it back from. JSON has no
-#: literal for nan/inf/-inf, and `google.protobuf.Value` refuses to serialize
-#: one to JSON text (`MessageToDict` raises) -- so a measurement that
-#: legitimately returns nan (an empty-input rate, "undefined" not "zero") or
-#: inf (an unbounded resolution) would otherwise crash decoding the result,
-#: not just lose precision.
-NON_FINITE_FLOAT_KEY = "__float__"
-
-
-def _jsonable(value: Any) -> Any:
-    """*value* as plain JSON types: numpy values converted, tables as columns,
-    a non-finite float carried as ``{"__float__": "nan"}`` (see
-    :data:`NON_FINITE_FLOAT_KEY`)."""
-    if value is None or isinstance(value, (bool, str)):
-        return value
-    if isinstance(value, float) and not math.isfinite(value):
-        return {NON_FINITE_FLOAT_KEY: str(value)}
-    if isinstance(value, (int, float)):
-        return value
-    if isinstance(value, np.generic):
-        return _jsonable(value.item())
-    if isinstance(value, np.ndarray):
-        # Only a float array can hold a non-finite value; skip the per-element
-        # walk below unless one is actually there. Complex still falls
-        # through it, since a bare complex scalar isn't JSON either.
-        if value.dtype.kind == "f" and np.isfinite(value).all():
-            return value.tolist()
-        if value.dtype.kind not in "fc":
-            return value.tolist()
-        return _jsonable(value.tolist())
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):  # a pandas DataFrame or Series
-        try:
-            return _jsonable(to_dict(orient="list"))
-        except TypeError:
-            return _jsonable(to_dict())
-    raise TypeError(f"an output of type {type(value).__name__} is not JSON")
-
-
-def _json_arg(value: Any) -> proto.Arg:
-    return proto.Arg(json=json_format.ParseDict(_jsonable(value), struct_pb2.Value()))
-
-
 @dataclass
 class _Pixels:
     """A decoded tensor argument: the array and its axis labels."""
@@ -419,7 +362,7 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
     else:
         raise ValueError(f"{name} is a tensor argument; got {kind or 'nothing'}")
     if not labels:
-        labels = _NDIM_LABELS.get(array.ndim)
+        labels = NDIM_LABELS.get(array.ndim)
         if labels is None:
             raise ValueError(f"{name}: a {array.ndim}D input needs its dim_labels")
     if len(labels) != array.ndim:
@@ -429,21 +372,10 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
     return _Pixels(array, list(labels))
 
 
-def _undo_non_finite(value: Any) -> Any:
-    """Restore a `NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
-    if isinstance(value, dict) and set(value) == {NON_FINITE_FLOAT_KEY}:
-        return float(value[NON_FINITE_FLOAT_KEY])
-    if isinstance(value, list):
-        return [_undo_non_finite(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _undo_non_finite(v) for k, v in value.items()}
-    return value
-
-
 def _decode_kwarg(definition: _OpDef, name: str, arg: proto.Arg) -> Any:
     if arg.WhichOneof("kind") != "json":
         raise ValueError(f"{name} is not a tensor argument of {definition.name}")
-    value = _undo_non_finite(json_format.MessageToDict(arg.json))
+    value = json_value(arg.json)
     if (
         name in definition.int_kwargs
         and isinstance(value, float)
@@ -788,7 +720,7 @@ class _OpsServicer(proto.OpsServicer):
                 ):
                     compressible = True
             else:
-                event.outputs[key].CopyFrom(_json_arg(item))
+                event.outputs[key].CopyFrom(json_arg(item))
         if self._compress and not compressible:
             context.disable_next_message_compression()
         return event
@@ -948,7 +880,7 @@ def serve(
     setup_logging(get_log_level_from_env())
     # Under the control, die with it: it passes a parent-death pipe, so a
     # control that dies uncatchably leaves no server holding a GPU.
-    from biopb.lifecycle import deathwatch
+    from biopb._lifecycle import deathwatch
 
     deathwatch.install()
     token = os.environ.get(TOKEN_ENV) or None

@@ -5,8 +5,8 @@ The id is fixed (:data:`SCRATCH_SOURCE_ID`), so there is no container to mint
 and nothing to remember between runs.
 
 It owns no directory. Its tensors are uploaded fields under
-``<write_dir>/fields/scratch/``, re-attached at boot by
-``fields.fields_attacher`` like any other source's, and an empty scratch source
+``<write_dir>/fields/scratch/``, adopted at boot by the
+registry's scan like any other source's, and an empty scratch source
 is simply one between uploads -- never reclaimed. What it does own is
 :attr:`~ScratchSource.max_upload_ttl`, the cap that keeps a temp store from
 accumulating forever.
@@ -17,10 +17,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
-from biopb.tensor.descriptor_pb2 import TensorDescriptor
-
-from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    TensorAdapter,
+    TensorEntry,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 __all__ = ["DEFAULT_SCRATCH_TTL", "SCRATCH_SOURCE_ID", "ScratchSource"]
 
@@ -43,10 +50,9 @@ class ScratchSource(SourceAdapter):
     tensor list -- so the base resolves and lists what is attached to it exactly
     as it does for a discovered source.
 
-    Its ``content_version`` is None, the base's word for content this adapter
-    does not serve. Every member carries its own token, minted when it is
-    uploaded, so a name reclaimed after a discard never inherits the chunk-id
-    namespace of what held it before.
+    It has no content version of its own: every member carries its own token,
+    minted when it is uploaded, so a name reclaimed after a discard never
+    inherits the chunk-id namespace of what held it before.
     """
 
     _source_type = "scratch"
@@ -58,7 +64,7 @@ class ScratchSource(SourceAdapter):
     ) -> None:
         self.source_id = SCRATCH_SOURCE_ID
         #: The real backing tree (``<write_dir>/fields/scratch``) -- the
-        #: adapter contract's addressable url, which warm/recall/residency all
+        #: adapter contract's addressable url, which recall and residency checks
         #: trust to be genuine (``SourceAdapter.source_url``). None on a server
         #: with no ``write_dir``, where nothing can be uploaded here anyway
         #: (see ``UploadManager.install_scratch``).
@@ -81,34 +87,32 @@ class ScratchSource(SourceAdapter):
             "the scratch source is the server's own, never configured as a data source"
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
         """None of its own: every tensor here was uploaded, and
-        ``catalog_tensors`` appends the published ones after this."""
+        the registry's listing appends the published ones after this."""
         return []
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Nothing. Metadata describes an acquisition; the tensors here have
         nothing to do with each other and bring their own axes and shape."""
-        return {}
+        return metadata_record({})
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        """The source's default tensor, or a typed miss; never ``self``.
+        """A typed miss; never ``self``.
 
-        Reached only after ``resolve_tensor`` has missed the attachment index,
-        so a named field here names nothing, and an unnamed one asks for the
-        first published field -- of which an empty scratch source has none.
+        Reached only after the attachments have missed, so a field named here
+        names nothing, and an unnamed id has no tensor to resolve to.
         """
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field:
             raise TensorNotFound(
                 f"{self.source_id} has no tensor {field!r}.",
                 reason="unknown_field",
             )
-        default = next(iter(self.attached_fields.values()), None)
-        if default is None:
-            raise TensorNotFound(
-                f"{self.source_id} has no tensors yet: add one with "
-                f"add_tensor before reading it.",
-                reason="empty_source",
-            )
-        return default
+        raise TensorNotFound(
+            f"{self.source_id} has no tensors yet: add one with "
+            f"add_tensor before reading it.",
+            reason="empty_source",
+        )

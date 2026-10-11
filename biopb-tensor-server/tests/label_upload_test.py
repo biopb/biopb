@@ -3,7 +3,7 @@
 The third upload kind: selected by an ``array_id`` with no ``kind:`` prefix
 and a ``/@labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
-look an upload up (the parent's ``label_uploads``, not the registry) and a
+look an upload up (the source's attachment index, not the upload registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
 ``setup_array_upload`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.
@@ -15,17 +15,18 @@ from pathlib import Path
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor._session import _parse_flight_endpoints
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb.tensor.ticket_pb2 import TensorTicket
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
-from biopb_tensor_server.core.adapter_base import catalog_tensors
-from biopb_tensor_server.core.chunk import content_version_of
+from biopb_tensor_server.core.chunk import content_version_of, expand_identity
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
-from tests import register_and_catalog
+from tests import label_sets, register_and_catalog
 from tests.label_attachment_test import _write_label_group
 
 SHAPE = (64, 64)
@@ -105,7 +106,7 @@ class TestTheRoundTrip:
         ids = _tensor_ids(served)
         assert ids[0] == "oz1"  # the image is still tensors[0]
         assert ids[-1] == "oz1/@labels/nuclei"
-        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert label_sets(client, "oz1") == ["oz1/@labels/nuclei"]
 
     def test_the_descriptor_names_its_image(self, served, client):
         desc = _create(client, "oz1/@labels/nuclei")
@@ -122,7 +123,7 @@ class TestTheRoundTrip:
     def test_two_sets_coexist_under_one_image(self, served, client):
         for name in ("nuclei", "cells"):
             client.upload_array(_create(client, f"oz1/@labels/{name}"), _labels())
-        assert client.get_label_sets("oz1") == [
+        assert label_sets(client, "oz1") == [
             "oz1/@labels/cells",
             "oz1/@labels/nuclei",
         ]
@@ -142,6 +143,188 @@ class TestTheRoundTrip:
         )["metadata"]
         assert meta["image-label"]["colors"] == colors
         assert meta["image-label"]["source"] == {"image": "oz1"}
+
+
+def _image_with_axes(root, axes, shape, source_id="img", scale=None, unit=None):
+    """A one-level OME-Zarr image whose axes are *axes* (``"tcyx"``, ``"yxs"``...)."""
+    import zarr
+
+    types = {"t": "time", "c": "channel", "z": "space", "y": "space", "x": "space"}
+    store = Path(root) / f"{source_id}.ome.zarr"
+    group = zarr.open_group(str(store), mode="w", zarr_format=2)
+    group.create_array("0", shape=shape, chunks=shape, dtype="uint8")
+    meta = {
+        "multiscales": [
+            {
+                "version": "0.4",
+                "axes": [
+                    {
+                        "name": a,
+                        **({"type": types[a]} if a in types else {}),
+                        **({"unit": unit} if unit and a in "zyx" else {}),
+                    }
+                    for a in axes
+                ],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": scale or [1.0] * len(axes)}
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    (store / ".zattrs").write_text(json.dumps(meta))
+    return store
+
+
+class TestACalibratedImage:
+    """An uploaded tensor and a label set are source-scoped: they take the
+    image's physical scale, matched by axis label."""
+
+    @staticmethod
+    def _serve(server, tmp_path):
+        store = _image_with_axes(
+            tmp_path,
+            "tcyx",
+            (1, 1, 64, 64),
+            scale=[1.0, 1.0, 0.5, 0.25],
+            unit="micrometer",
+        )
+        register_and_catalog(server, "img", _adapter(store, "img"))
+
+    @staticmethod
+    def _scale(client, array_id):
+        d = client.get_descriptor(array_id)
+        return list(d.dim_labels), list(d.physical_scale), list(d.physical_unit)
+
+    def test_a_label_set_takes_the_images_scale(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path)
+        arr = np.zeros((1, 1, 64, 64), "uint32")
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(1, 1, 32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        labels, scale, unit = self._scale(client, "img/@labels/n")
+        assert dict(zip(labels, scale, strict=True)) == {
+            "t": 0,
+            "c": 0,
+            "y": 0.5,
+            "x": 0.25,
+        }
+        assert unit[-2:] == ["micrometer", "micrometer"]
+
+    def test_a_field_takes_it_by_label_and_leaves_other_axes_alone(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path)
+        arr = np.zeros((64, 64), "uint16")
+        desc = client.setup_array_upload(
+            "zarr://img/@fields/smooth", arr, dim_labels=["Y", "X"]
+        )
+        client.upload_array(desc, arr)
+
+        _, scale, unit = self._scale(client, "img/@fields/smooth")
+        assert scale == [0.5, 0.25] and unit == ["micrometer"] * 2
+
+
+class TestTheExtentOfASet:
+    """A set has the image's axes at the image's lengths: the channel axis a
+    singleton, an RGB samples axis left out. A set written before that rule,
+    without the channel axis, is still taken."""
+
+    @staticmethod
+    def _serve(server, tmp_path, axes, shape):
+        store = _image_with_axes(tmp_path, axes, shape)
+        register_and_catalog(server, "img", _adapter(store, "img"))
+
+    def test_a_channel_axis_is_a_singleton(self, writable_server, client, tmp_path):
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+        arr = np.zeros((2, 1, 64, 64), "uint32")
+        arr[1, 0, :8, :8] = 7
+
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(1, 1, 32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        assert list(desc.dim_labels) == ["t", "c", "y", "x"]
+        np.testing.assert_array_equal(client.get_tensor("img/@labels/n").compute(), arr)
+
+    def test_create_refuses_the_earlier_shape_without_the_channel_axis(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/old",
+                np.zeros((2, 64, 64), "uint32"),
+                chunk_shape=(1, 32, 32),
+            )
+
+    def test_a_listing_refuses_it_too(self, writable_server, tmp_path):
+        # A native NGFF group or an older server's sidecar without the channel
+        # axis is not listed.
+        from types import SimpleNamespace
+
+        store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
+        reg = SourceRegistry()
+        reg.register("img", _adapter(store, "img"))
+        old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
+
+        why = reg.attached_to("img").conform_label("@labels/old", old)
+        assert "does not span" in why
+
+    def test_a_channel_axis_at_the_images_length_is_refused(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/n",
+                np.zeros((2, 3, 64, 64), "uint32"),
+                chunk_shape=(1, 1, 32, 32),
+            )
+
+    def test_an_rgb_image_has_a_set_without_the_samples_axis(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path, "yxs", (64, 64, 3))
+        arr = np.zeros((64, 64), "uint32")
+        arr[:8, :8] = 4
+
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        assert list(desc.dim_labels) == ["y", "x"]
+        np.testing.assert_array_equal(client.get_tensor("img/@labels/n").compute(), arr)
+
+    def test_a_mask_with_a_colour_axis_is_refused_for_an_rgb_image(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "yxs", (64, 64, 3))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/n",
+                np.zeros((64, 64, 3), "uint32"),
+                chunk_shape=(32, 32, 3),
+            )
 
 
 class TestWhatTheKindRefuses:
@@ -199,10 +382,12 @@ class TestWhatTheKindRefuses:
         """Sealed, like any finished upload -- there is no chunk-level edit."""
         from biopb_tensor_server.core.errors import UploadSealedError
 
-        registered = served.sources.get("oz1")
+        served.sources.get("oz1")
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         with pytest.raises(UploadSealedError):
-            registered.label_sets["@labels/nuclei"].put_chunk(None, None, None, None)
+            served.sources.attached_to("oz1").get("@labels/nuclei").put_chunk(
+                None, None, None, None
+            )
 
     def test_a_set_that_is_not_an_upload_refuses_a_write_outright(self, tmp_path):
         """A sidecar read back at startup tracks no upload at all."""
@@ -268,13 +453,13 @@ class TestTheSidecar:
         served.shutdown()
 
         fresh = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         try:
             registered = register_and_catalog(fresh, "oz1", _adapter(image))
-            assert "@labels/nuclei" in registered.label_sets
+            assert fresh.sources.attached_to("oz1").get("@labels/nuclei") is not None
             assert "oz1/@labels/nuclei" in [
-                t.array_id for t in catalog_tensors(registered)
+                t.array_id for t in fresh.sources.catalog_tensors("oz1", registered)
             ]
         finally:
             fresh.shutdown()
@@ -297,7 +482,7 @@ class TestDiscard:
 
         assert self._gone(client, "oz1/@labels/nuclei")["state"] == "DISCARDED"
         assert not store.exists()
-        assert client.get_label_sets("oz1") == []
+        assert label_sets(client, "oz1") == []
 
     def test_a_pending_set_is_discardable_too(self, served, client, tmp_path):
         """It was never listed, so only the store goes."""
@@ -350,11 +535,11 @@ class TestDiscard:
         register_and_catalog(
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )
-        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
+        assert label_sets(client, "oz2") == ["oz2/@labels/own"]
 
         assert self._gone(client, "oz2/@labels/own")["state"] == "UNKNOWN"
         assert group.exists()
-        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
+        assert label_sets(client, "oz2") == ["oz2/@labels/own"]
 
 
 class TestTheSweep:
@@ -383,7 +568,7 @@ class TestTheSweep:
 
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         assert served.uploads.reap(now=time.monotonic() + 10_000) == (0, 0)
-        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert label_sets(client, "oz1") == ["oz1/@labels/nuclei"]
 
     def test_a_crashed_upload_is_removed_at_boot(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "crashed.zarr"
@@ -393,7 +578,7 @@ class TestTheSweep:
         from tests import catalog_server
 
         fresh = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         try:
             assert not store.exists()
@@ -411,10 +596,18 @@ class TestContentVersion:
     """
 
     def _chunk_ids(self, client, array_id):
+        """The chunk_ids the plan stands for: its stub, completed by each index."""
         info = flight.FlightInfo.deserialize(
             client.get_tensor(array_id, output="pb").flight_info
         )
-        return set(_parse_flight_endpoints(info)[0])
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        identity = TensorTicket.FromString(desc.ticket_stub).chunk_ref.stub.identity
+        return {
+            expand_identity(
+                identity, TensorTicket.FromString(ep.ticket.ticket).chunk_ref.index
+            )
+            for ep in info.endpoints
+        }
 
     def _minted(self, client, array_id):
         """The content_version the read plan's chunk_ids carry."""

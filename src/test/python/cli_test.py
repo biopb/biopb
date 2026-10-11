@@ -7,10 +7,12 @@ requiring a live server.
 import json
 import os
 import socket
+import sys
 import tempfile
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+import dask.array as da
 import numpy as np
 import pytest
 from biopb.tensor.cli import _parse_slice_hint, app
@@ -368,6 +370,32 @@ class TestArrayIdFirstAddressing:
             assert call_args.args[0] == "my-source/pos_0"
             assert "source_id" not in call_args.kwargs
             assert "tensor_id" not in call_args.kwargs
+
+    def test_zarr_output_without_zarr_names_the_package(self, monkeypatch):
+        """zarr is optional: its absence fails the zarr format, not the CLI."""
+        monkeypatch.setitem(sys.modules, "zarr", None)  # import raises ImportError
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_fc_class.return_value = _build_mock_client()
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out.zarr")
+                result = runner.invoke(app, ["get", "my-source/pos_0", "-o", out])
+
+        assert result.exit_code != 0
+        assert "'zarr' package" in result.stderr
+
+    def test_zarr_output_writes_a_store(self):
+        zarr = pytest.importorskip("zarr")
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            mock_client = _build_mock_client()
+            mock_client.get_tensor.return_value = da.from_array(
+                np.arange(16).reshape(4, 4)
+            )
+            mock_fc_class.return_value = mock_client
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "out.zarr")
+                result = runner.invoke(app, ["get", "my-source/pos_0", "-o", out])
+                assert result.exit_code == 0, result.stderr
+                assert zarr.open_array(out, mode="r").shape == (4, 4)
 
     def test_stats_passes_array_id_as_single_argument(self):
         """`stats` forwards the raw array_id positionally to get_tensor."""

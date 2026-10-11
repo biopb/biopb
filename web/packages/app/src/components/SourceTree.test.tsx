@@ -1,10 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
-import { TreeRow } from "./SourceTree";
+import { TreeRow, createSourceSearch, sourceSearchSql } from "./SourceTree";
 import {
   UNRESOLVED_GLYPH,
   type TreeNode,
+  buildTree,
   recentNode,
 } from "../utils/sourceTree";
 
@@ -17,7 +18,6 @@ const LISTED: DataSourceDescriptor = {
   source_id: "zarr_a3f2",
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
-  metadata_json: null,
   is_resolved: true,
   tensors: [],
 };
@@ -26,14 +26,12 @@ const UPLOAD: DataSourceDescriptor = {
   source_id: "upload_7f3",
   source_url: "",
   source_type: "",
-  metadata_json: null,
   is_resolved: true,
   tensors: [
     {
       array_id: "upload_7f3",
       dim_labels: ["Y", "X"],
       shape: [1024, 1024],
-      chunk_shape: [],
       dtype: "uint16",
     },
   ],
@@ -87,7 +85,6 @@ describe("TreeRow for an unresolved source", () => {
     source_id: "onedrive_9c1",
     source_url: "file:///data/cloud/timelapse.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: false,
     tensors: [],
   };
@@ -107,6 +104,10 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).toContain("unresolved");
   });
 
+  it("is focusable, so a click highlights it without opening anything", () => {
+    expect(render(sourceNode(CLOUD))).toContain('tabindex="0"');
+  });
+
   it("is not openable: selecting it would fetch a tile that cannot exist", () => {
     // The row is a div, not a button, so there is nothing to activate. That
     // also keeps the Resolve button below legal -- interactive content cannot
@@ -116,7 +117,7 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).not.toContain("<button");
   });
 
-  it("offers Resolve, the only control on the row", () => {
+  it("asks for a double-click to resolve a cloud source, with no button", () => {
     const html = renderToStaticMarkup(
       <TreeRow
         node={sourceNode(CLOUD)}
@@ -129,7 +130,23 @@ describe("TreeRow for an unresolved source", () => {
         resolving={new Set()}
       />,
     );
-    expect(html).toContain("Resolve");
+    expect(html).toContain("Double-click to resolve");
+    expect(html).not.toContain("resolve-btn");
+  });
+
+  it("keeps the Load button for a local pending source, which costs nothing", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode({ ...CLOUD, unresolved_reason: "pending" })}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set()}
+      />,
+    );
     expect(html).toContain("resolve-btn");
   });
 
@@ -147,7 +164,24 @@ describe("TreeRow for an unresolved source", () => {
       />,
     );
     expect(html).toContain("Resolving");
-    expect(html).toContain("disabled");
+  });
+
+  it("marks the row as resolving, for the animation, only while one is under way", () => {
+    const row = (resolving: string[]) =>
+      renderToStaticMarkup(
+        <TreeRow
+          node={sourceNode(CLOUD)}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+          startResolve={() => {}}
+          resolving={new Set(resolving)}
+        />,
+      );
+    expect(row(["onedrive_9c1"])).toContain("unresolved resolving");
+    expect(row([])).not.toContain("resolving\"");
   });
 
   it("explains itself on hover, keeping the url", () => {
@@ -173,26 +207,55 @@ describe("TreeRow for an unresolved source", () => {
   });
 });
 
+describe("shape badge", () => {
+  const withShape = (shape: number[]): DataSourceDescriptor => ({
+    ...UPLOAD,
+    tensors: [{ ...UPLOAD.tensors[0]!, shape }],
+  });
+  const badge = (shape: number[]) =>
+    /dim-badge[^>]*>([^<]*)</.exec(
+      renderToStaticMarkup(
+        <TreeRow
+          node={{ id: "u", name: "u", type: "source", children: [], source: withShape(shape), depth: 1 }}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+        />,
+      ),
+    )?.[1];
+
+  it("drops leading singleton axes", () => {
+    expect(badge([1, 1, 343, 278, 300])).toBe("343×278×300");
+  });
+
+  it("keeps singletons that follow a real axis", () => {
+    expect(badge([1, 3, 1, 512, 512])).toBe("3×1×512×512");
+  });
+
+  it("keeps a lone 1 for an all-ones shape", () => {
+    expect(badge([1, 1])).toBe("1");
+  });
+});
+
 describe("TreeRow with label sets", () => {
   const WITH_LABELS: DataSourceDescriptor = {
     source_id: "zarr_b1",
     source_url: "file:///data/experiment/cells.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: true,
     tensors: [
       {
         array_id: "zarr_b1",
         dim_labels: ["t", "c", "y", "x"],
         shape: [50, 3, 512, 512],
-        chunk_shape: [],
         dtype: "uint16",
       },
       {
         array_id: "zarr_b1/@labels/nuclei",
         dim_labels: ["t", "y", "x"],
         shape: [50, 512, 512],
-        chunk_shape: [],
         dtype: "uint32",
       },
     ],
@@ -270,21 +333,18 @@ describe("TreeRow with more than one image", () => {
     source_id: "zarr_c2",
     source_url: "file:///data/experiment/wells.zarr",
     source_type: "zarr",
-    metadata_json: null,
     is_resolved: true,
     tensors: [
       {
         array_id: "zarr_c2/well1",
         dim_labels: ["y", "x"],
         shape: [512, 512],
-        chunk_shape: [],
         dtype: "uint16",
       },
       {
         array_id: "zarr_c2/well2",
         dim_labels: ["y", "x"],
         shape: [512, 512],
-        chunk_shape: [],
         dtype: "uint16",
       },
     ],
@@ -313,5 +373,102 @@ describe("TreeRow with more than one image", () => {
     expect(html).toContain("tensor-item");
     expect(html).toContain("well1");
     expect(html).toContain("well2");
+  });
+});
+
+describe("buildTree", () => {
+  const src = (id: string, url: string): DataSourceDescriptor => ({
+    ...LISTED,
+    source_id: id,
+    source_url: url,
+  });
+
+  it("groups sources under their shared folders", () => {
+    const root = buildTree([
+      src("a", "file:///data/x/one.tif"),
+      src("b", "file:///data/x/two.tif"),
+      src("c", "file:///data/y/three.tif"),
+    ]);
+    // `data` has two folder children, so nothing above them merges.
+    const data = root.children[0]!;
+    expect(data.children.map((c) => c.name)).toEqual(["x", "y"]);
+    expect(data.children[0]!.children).toHaveLength(2);
+    expect(data.children[1]!.children).toHaveLength(1);
+  });
+
+  it("builds 100k single-image folders in one directory promptly", () => {
+    // Finding each folder by scanning its parent's children is quadratic in a
+    // directory's width: this took ~22 s that way, and the build reruns on every
+    // filter change. The bound is generous; the regression is orders of magnitude.
+    const many = Array.from({ length: 100_000 }, (_, i) =>
+      src(`s${i}`, `file:///data/exp${i}/img.tif`),
+    );
+    const t = performance.now();
+    const root = buildTree(many);
+    expect(performance.now() - t).toBeLessThan(3000);
+    expect(root.children[0]!.children).toHaveLength(100_000);
+  });
+});
+
+// DuckDB's LIKE has no default escape character: a backslash escapes only
+// under an explicit ESCAPE clause, otherwise `_` and `%` never match literally.
+describe("sourceSearchSql", () => {
+  it("escapes % and _ and declares the escape character on every LIKE", () => {
+    const sql = sourceSearchSql("protein_transport");
+    expect(sql.match(/LIKE '%protein\\_transport%' ESCAPE '\\'/g)).toHaveLength(3);
+    expect(sourceSearchSql("50%")).toContain("LIKE '%50\\%%' ESCAPE '\\'");
+  });
+
+  it("escapes a literal backslash first, and doubles quotes", () => {
+    expect(sourceSearchSql("a\\b")).toContain("LIKE '%a\\\\b%'");
+    expect(sourceSearchSql("a\\_b")).toContain("LIKE '%a\\\\\\_b%'");
+    expect(sourceSearchSql("it's")).toContain("LIKE '%it''s%'");
+  });
+});
+
+describe("sourceSearchSql columns", () => {
+  it("selects the descriptor, not just the id, so a match needs no loaded copy", () => {
+    expect(sourceSearchSql("x")).toMatch(
+      /^SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources WHERE/,
+    );
+  });
+});
+
+describe("createSourceSearch", () => {
+  const rows = { rows: [], totalSources: 0, returnedSources: 0, truncated: false };
+
+  it("asks for the reason, and keeps asking while it is answered", async () => {
+    const query = vi.fn().mockResolvedValue(rows);
+    const search = createSourceSearch();
+    await search(query, "a");
+    await search(query, "b");
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls.every(([sql]) => sql.includes("unresolved_reason"))).toBe(true);
+  });
+
+  it("asks again without the column a server refuses, and remembers", async () => {
+    const query = vi.fn((sql: string) =>
+      sql.includes("unresolved_reason")
+        ? Promise.reject(new Error("no such column"))
+        : Promise.resolve(rows),
+    );
+    const search = createSourceSearch();
+    await expect(search(query, "a")).resolves.toBe(rows);
+    expect(query).toHaveBeenCalledTimes(2);
+    await search(query, "b");
+    // Straight to the plain form: no third refusal to pay for.
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[2]![0]).not.toContain("unresolved_reason");
+  });
+
+  it("does not take a dropped connection for a missing column", async () => {
+    const down = new Error("network down");
+    const query = vi.fn().mockRejectedValue(down);
+    const search = createSourceSearch();
+    await expect(search(query, "a")).rejects.toBe(down);
+    // Still asks with the reason next time.
+    query.mockResolvedValue(rows);
+    await search(query, "b");
+    expect(query.mock.calls.at(-1)![0]).toContain("unresolved_reason");
   });
 });

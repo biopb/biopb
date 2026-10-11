@@ -1,54 +1,59 @@
-/** Mirror of biopb.tensor.TensorDescriptor (JSON form from FastAPI). */
+/**
+ * One tensor of a source listing: structural only. The transfer grid belongs to
+ * a resolved tensor, not to its source's row; ask `GET /api/tile_info`
+ * (`TileInfo.chunk_shape` / `tile_size`) per `array_id`.
+ */
 export interface TensorDescriptor {
   array_id: string;
   dim_labels: string[];
   /** Full array shape (per dimension). */
   shape: number[];
-  /**
-   * Transfer grid. EMPTY inside a `DataSourceDescriptor.tensors` entry: a source
-   * listing is structural, and the grid is answered per resolved tensor. Use
-   * `GET /api/tile_info` (`TileInfo.chunk_shape` / `tile_size`) when you need
-   * one -- an empty array is not a usable grid.
-   */
-  chunk_shape: number[];
   /** NumPy-style dtype string, e.g. "uint8", "float32". */
   dtype: string;
 }
 
-/** Mirror of biopb.tensor.DataSourceDescriptor (JSON form from FastAPI). */
+/**
+ * One row of the server's `sources` catalog, as the sidecar lists it. Source
+ * metadata is not part of it: read that with `getSourceMetadata`.
+ */
 export interface DataSourceDescriptor {
   source_id: string;
   source_url: string;
   source_type: string;
-  /** Raw OME-NGFF JSON string, or null. */
-  metadata_json: string | null;
   /**
    * Deterministic: does a real, hydrated adapter back this source right now?
-   * False only for an unresolved cloud/synced-folder source awaiting an
-   * explicit `resolve`. Unlike a residency/warm-state flag, this never flips
+   * False for an unresolved cloud/synced-folder source awaiting an explicit
+   * `resolve`, and for a local source whose registration has not run yet (see
+   * `unresolved_reason`). Unlike a residency flag, this never flips
    * back to false once true for the life of the server process.
    */
   is_resolved: boolean;
+  /**
+   * Why `is_resolved` is false, or null when it is true. `needs_recall`: a
+   * cloud placeholder, opening it downloads it, so ask first. `pending`: a
+   * local source whose registration is still queued; reading it, or `resolve`,
+   * registers it at once and costs no download. `failed`: registration raised.
+   * Absent from an older server's rows.
+   */
+  unresolved_reason?: "needs_recall" | "pending" | "failed" | null;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
 }
 
 /**
- * One resolve or warm job on one source, as `/api/sources/{id}/{kind}/status`
- * reports it.
+ * One resolve job on one source, as `/api/sources/{id}/{kind}/status` reports it.
  *
- * Both hydrate cloud / synced-folder data and both can run for minutes, so they
- * are jobs rather than requests: start, poll, optionally cancel. The recall
+ * A resolve hydrates cloud / synced-folder data and can run for minutes, so it
+ * is a job rather than a request: start, poll, optionally cancel. The recall
  * lives on the server and outlives any one HTTP request.
  */
 export interface SourceJobStatus {
-  kind: "resolve" | "warm";
+  kind: "resolve";
   source_id: string;
   state: "running" | "done" | "error" | "cancelled";
   /**
-   * Kind-specific counters. Resolve reports `elapsed_seconds`, `target_name`
-   * and `target_bytes`; warm reports files/bytes done vs total plus
-   * `current_name`. Empty until the first heartbeat lands.
+   * `elapsed_seconds`, `target_name` and `target_bytes`. Empty until the first
+   * heartbeat lands.
    */
   progress: Partial<SourceJobProgress>;
   /** Reason, on `state === "error"` only. */
@@ -62,27 +67,17 @@ export interface SourceJobStatus {
   cancel_requested: boolean;
   /** Only on the response that started it: false means it joined one running. */
   started?: boolean;
+  /** A finished resolve's now-concrete catalog row; absent otherwise. */
+  source?: DataSourceDescriptor;
 }
 
-/** The union of both job kinds' progress counters; each reports its own subset. */
+/** A resolve's progress counters. */
 export interface SourceJobProgress {
   elapsed_seconds: number;
-  /** Resolve: basename of the recall target. */
+  /** Basename of the recall target. */
   target_name: string;
-  /** Resolve: size of the recall target, 0 when unknown. */
+  /** Size of the recall target, 0 when unknown. */
   target_bytes: number;
-  /**
-   * Warm: files discovered under the source. **0 on a finished warm means the
-   * source had nothing to warm** -- it is single-file, and resolve already
-   * recalled it. That is the server's own structural answer, so no client
-   * keeps its own list of which source types are multi-file.
-   */
-  files_total: number;
-  files_done: number;
-  bytes_total: number;
-  bytes_done: number;
-  /** Warm: the file being recalled right now. */
-  current_name: string;
 }
 
 /** Parameters for a single array-slice request. */
@@ -171,6 +166,11 @@ export interface BackendHealth {
   full_scan_in_progress?: boolean;
   /** Epoch seconds of the last successful full scan, or null until the first. */
   last_full_scan_finished_at?: number | null;
+  /**
+   * Claimed sources still waiting for their registration. Their rows are in the
+   * catalog with `unresolved_reason` "pending" and no tensors; 0 means whole.
+   */
+  registration_pending?: number;
 }
 
 export interface ReadyzSnapshot {
@@ -191,6 +191,12 @@ export interface ReadyzSnapshot {
    * null `backend_health` could also mean "no request has connected yet."
    */
   backend_error?: string | null;
+}
+
+/** A catalog listing, and whether the server cut it short of the catalog. */
+export interface SourceListing {
+  sources: DataSourceDescriptor[];
+  truncated: boolean;
 }
 
 export interface QuerySourcesResult {
@@ -251,6 +257,8 @@ export interface AdminStatus {
   uptime_seconds: number | null;
   full_scan_in_progress: boolean | null;
   last_full_scan_finished_at: number | null;
+  /** Claimed sources still waiting for their registration; absent on an older server. */
+  registration_pending?: number | null;
   /** True in local mode (no token enforced, loopback-only). The admin UI shows
    * the server-side file/dir chooser only when this is true — in local mode the
    * server's filesystem is the user's own machine (biopb/biopb#244). Absent on an
@@ -336,20 +344,6 @@ export interface TileInfo {
    */
   sel_axes: TileAxis[];
   levels: TileLevel[];
-  /**
-   * A label set only: which of its image's axes each of its own indexes.
-   *
-   * `[0, 2, 3, 4]` for a `T Z Y X` set of a `T C Z Y X` image. The server
-   * states it because the two tensors do not number their axes alike -- a set
-   * spans the image's *non-channel* extent -- and a client matching them by
-   * name gets `t`/`z` right and an unnamed axis wrong, which reads frame 0 of
-   * a timelapse where frame 40 was asked for. That is a picture rather than an
-   * error, so it is not a rule worth re-deriving.
-   *
-   * Absent on an image, and on a server that predates the field; see
-   * {@link labelSelection}, which falls back to the extent rule there.
-   */
-  image_axes?: number[];
   /**
    * The ladder the *server* advertises, which is what each rung of `levels` is
    * read from: the coarsest entry whose `scale_hint` divides the rung's scale,

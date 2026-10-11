@@ -14,8 +14,18 @@ TENSOR_WIRE_PROTOCOL_VERSION = 2
 # schema and the GetFlightInfo schema. Stored as a UTF-8 string on the wire.
 WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 
-# The Flight protocol version. Distinct from the chunk encoding above.
-#
-# Reported by the ``health`` action (``protocol``) and checked by the SDK before
-# its first Flight call.
-FLIGHT_PROTOCOL_VERSION = 2
+# The Flight protocol version a server speaks, distinct from the chunk encoding
+# above. Reported by the ``health`` action (``protocol``) and checked by the SDK
+# before its first Flight call. v3: a plan's ``FlightInfo.app_metadata`` is the
+# whole ``TensorReadOption`` it answers (v2: the requested ``SliceHint`` alone,
+# with the scale and method echoed on the descriptor).
+FLIGHT_PROTOCOL_VERSION = 3
+
+# The protocol versions this SDK can talk to. An older SDK compares for equality
+# and so refuses a newer server.
+SUPPORTED_FLIGHT_PROTOCOLS = frozenset({2, FLIGHT_PROTOCOL_VERSION})
+
+# Schema-metadata key carrying the protocol a plan was written under, so a plan
+# handed between processes (a ``SerializedTensor``) says how to read it without a
+# connection to ask. Absent means v2.
+FLIGHT_PROTOCOL_METADATA_KEY = "flight_protocol"

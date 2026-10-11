@@ -12,15 +12,18 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import (
+    deserialize_image_data,
+    json_arg as _json_arg,
+    json_value,
+    make_channel as _make_channel,
+    serialize_from_numpy_to_image_data,
+)
 from biopb.tensor import SerializedTensor, TensorDescriptor
-from google.protobuf import json_format, struct_pb2
 
 from biopb_mcp.mcp import _process_ops
 from biopb_mcp.mcp._process_ops import (
-    _NON_FINITE_FLOAT_KEY,
     Ops,
-    _make_channel,
     _same_plane,
 )
 
@@ -34,7 +37,7 @@ def _eager(arr, labels=None) -> proto.Arg:
 
 
 def _json(value) -> proto.Arg:
-    return proto.Arg(json=json_format.ParseDict(value, struct_pb2.Value()))
+    return _json_arg(value)
 
 
 def _reference(array_id: str, location: str) -> proto.Arg:
@@ -81,7 +84,7 @@ class _Servicer(proto.OpsServicer):
             )
         elif op == "stats":
             kwargs = {
-                k: json_format.MessageToDict(v.json)
+                k: json_value(v.json, ints=True)
                 for k, v in args.items()
                 if v.WhichOneof("kind") == "json"
             }
@@ -107,16 +110,10 @@ class _Servicer(proto.OpsServicer):
         elif op == "count":
             yield proto.Event(outputs={"result": _json({"n": 6, "xs": [1, 2.5]})})
         elif op == "nonfinite":
-            # What a real biopb_image_base server sends for a nan/inf result --
-            # JSON has no literal for one, so it is carried sentinel-encoded.
-            yield proto.Event(
-                outputs={
-                    "result": _json({"x": {_NON_FINITE_FLOAT_KEY: "nan"}, "ok": 1.5})
-                }
-            )
+            yield proto.Event(outputs={"result": _json({"x": float("nan"), "ok": 1.5})})
         elif op == "echo_kwarg":
             kwargs = {
-                k: json_format.MessageToDict(v.json)
+                k: json_value(v.json, ints=True)
                 for k, v in args.items()
                 if v.WhichOneof("kind") == "json"
             }
@@ -300,10 +297,10 @@ def test_build_ops_from_config_reads_the_control(monkeypatch):
             "ops": [_info("seg")],
         }
     ]
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: rows)
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: rows)
     ops = _process_ops.build_ops_from_config({}, lambda: None)
     assert list(ops) == ["seg"]
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: None)
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: None)
     assert len(_process_ops.build_ops_from_config({}, lambda: None)) == 0
 
 
@@ -404,22 +401,20 @@ def test_integral_json_numbers_are_ints(url_ops):
     assert type(result["n"]) is int
 
 
-def test_non_finite_result_is_restored_not_left_sentinel_encoded(url_ops):
-    # JSON has no literal for nan, so the server carries it sentinel-encoded
-    # (see `_NON_FINITE_FLOAT_KEY`); the client must undo that, not hand the
-    # agent a `{"__float__": "nan"}` dict where it expected a float.
+def test_non_finite_result_arrives_as_a_float(url_ops):
     result = url_ops.nonfinite()
     assert result["x"] != result["x"]  # nan
     assert result["ok"] == 1.5
 
 
 def test_non_finite_kwarg_survives_the_round_trip(url_ops):
-    # The reverse leg: an agent passing nan/inf as an argument must not crash
-    # `json_format.ParseDict` building the call. `echo_kwarg` sends back
-    # whatever it decoded, sentinel-encoded again, which `_from_json` restores
-    # on the way back in -- so the value survives a full round trip unchanged.
-    result = url_ops.echo_kwarg(value=float("inf"))
-    assert result == {"value": float("inf")}
+    assert url_ops.echo_kwarg(value=float("inf")) == {"value": float("inf")}
+
+
+def test_a_single_key_dict_is_data_not_an_encoding(url_ops):
+    assert url_ops.echo_kwarg(value={"__float__": "inf"}) == {
+        "value": {"__float__": "inf"}
+    }
 
 
 def test_silence_times_out_and_cancels(serve):
@@ -449,7 +444,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
         ensured.append(name)
         return next(answers)
 
-    monkeypatch.setattr("biopb.ensure_algorithm", ensure)
+    monkeypatch.setattr("biopb._control.ensure_algorithm", ensure)
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
     assert ops.track() == "done"
     assert ensured == ["seg"]
@@ -461,7 +456,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
 
 def test_a_script_entry_that_fails_says_where_to_look(monkeypatch):
     monkeypatch.setattr(
-        "biopb.ensure_algorithm",
+        "biopb._control.ensure_algorithm",
         lambda name, timeout: {"state": "failed", "error": "ImportError: torch"},
     )
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
@@ -481,7 +476,7 @@ def test_refresh_rebinds_and_reports(monkeypatch):
         {"name": "b", "kind": "script", "state": "installing", "ops": []},
         {"name": "c", "kind": "script", "state": "failed", "ops": [], "error": "x"},
     ]
-    monkeypatch.setattr("biopb.refresh_algorithms", lambda: rows)
+    monkeypatch.setattr("biopb._control.refresh_algorithms", lambda: rows)
     ops = _ops(None)
     report = ops.refresh()
     assert list(ops) == ["seg"]
@@ -500,10 +495,12 @@ def test_status_logs_restart(monkeypatch):
             "error": "exited before serving\nTraceback...",
         }
     ]
-    monkeypatch.setattr("biopb.algorithms", lambda: rows)
-    monkeypatch.setattr("biopb.algorithm_logs", lambda name, lines: ["l1", "l2"])
+    monkeypatch.setattr("biopb._control.algorithms", lambda: rows)
     monkeypatch.setattr(
-        "biopb.restart_algorithm",
+        "biopb._control.algorithm_logs", lambda name, lines: ["l1", "l2"]
+    )
+    monkeypatch.setattr(
+        "biopb._control.restart_algorithm",
         lambda name, timeout: {"state": "up", "error": None},
     )
     ops = _ops(rows)
@@ -526,7 +523,7 @@ _BUILT = {"name": "a", "kind": "script", "state": "stopped", "ops": [_info("seg"
 def test_a_miss_rereads_the_registry_once_the_server_is_built(monkeypatch):
     ops = _ops([_NEW])
     assert repr(ops) == "<ops: none; not built yet: a>"
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_BUILT])
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: [_BUILT])
     assert ops.seg.op_name == "seg"
     assert ops["seg"] is ops.seg
     assert repr(ops) == "<ops: seg>"
@@ -534,7 +531,7 @@ def test_a_miss_rereads_the_registry_once_the_server_is_built(monkeypatch):
 
 def test_a_miss_names_the_servers_not_built_yet(monkeypatch):
     ops = _ops([_NEW])
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_NEW])
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: [_NEW])
     with pytest.raises(AttributeError, match="Not built yet: a"):
         _ = ops.seg
 
@@ -542,7 +539,7 @@ def test_a_miss_names_the_servers_not_built_yet(monkeypatch):
 def test_misses_reread_at_most_once_per_interval(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "biopb.algorithms", lambda timeout: calls.append(timeout) or [_NEW]
+        "biopb._control.algorithms", lambda timeout: calls.append(timeout) or [_NEW]
     )
     ops = _ops([_NEW])
     for _ in range(3):
@@ -552,7 +549,8 @@ def test_misses_reread_at_most_once_per_interval(monkeypatch):
 
 def test_an_underscore_probe_does_not_reread(monkeypatch):
     monkeypatch.setattr(
-        "biopb.algorithms", lambda timeout: pytest.fail("a probe must not read")
+        "biopb._control.algorithms",
+        lambda timeout: pytest.fail("a probe must not read"),
     )
     assert not hasattr(_ops([_NEW]), "_repr_html_")
 
@@ -561,7 +559,7 @@ def test_a_failed_reread_still_raises_the_miss(monkeypatch):
     def boom(timeout):
         raise OSError("no control")
 
-    monkeypatch.setattr("biopb.algorithms", boom)
+    monkeypatch.setattr("biopb._control.algorithms", boom)
     with pytest.raises(AttributeError, match="no op 'seg'"):
         _ = _ops([_NEW]).seg
     with pytest.raises(KeyError):
@@ -570,7 +568,7 @@ def test_a_failed_reread_still_raises_the_miss(monkeypatch):
 
 def test_status_says_when_the_control_has_ops_this_kernel_lacks(monkeypatch):
     ops = _ops([_NEW])
-    monkeypatch.setattr("biopb.algorithms", lambda: [_BUILT])
+    monkeypatch.setattr("biopb._control.algorithms", lambda: [_BUILT])
     assert "(not bound in this kernel: call ops.refresh())" in ops.status()
     ops.bind([_BUILT])
     assert "not bound" not in ops.status()
@@ -601,3 +599,49 @@ def test_make_channel_schemes():
         _make_channel("http://localhost:1")
     with pytest.raises(ValueError):
         _make_channel("grpc://")
+
+
+# --------------------------------------------------------------------------- #
+# Local or remote
+# --------------------------------------------------------------------------- #
+
+
+def _remote_ops(client, url="grpc://algo.example.org:443"):
+    return _ops(
+        [{"name": "far", "kind": "url", "url": url, "state": "up", "ops": OPS}], client
+    )
+
+
+def test_an_op_shows_the_url_of_its_server(url_ops, client):
+    assert url_ops.double.url.startswith("grpc://127.0.0.1:")
+    assert f"url entry, {url_ops.double.url}" in url_ops.double.__doc__
+    far = _remote_ops(client)
+    assert far.double.url == "grpc://algo.example.org:443"
+    assert "algo.example.org" in far.double.__doc__
+
+
+def test_a_remote_server_is_never_handed_the_plane_token(client):
+    handle = _reference("src/@fields/x", PLANE).lazy
+    handle.auth_token = "plane-secret"
+    client.get_tensor = lambda *_a, **_k: (
+        handle if _k.get("output") == "pb" else (da.ones((2, 2), np.uint8, chunks=2))
+    )
+    far = _remote_ops(client)
+    call = far.lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    with pytest.raises(RuntimeError, match="remote algorithm server"):
+        call._check_no_credential({"image": proto.Arg(lazy=handle)})
+
+
+def test_a_remote_server_gets_inline_data_when_the_plane_advertises_nothing(client):
+    client.advertised_location = None
+    call = _remote_ops(client).lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    assert client.exports == []
+    client.advertised_location = "grpc://plane.example:8815"
+    assert (
+        call._tensor("image", "src/@fields/x", None, client).WhichOneof("kind")
+        == "lazy"
+    )

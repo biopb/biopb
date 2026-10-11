@@ -71,7 +71,7 @@ _MAX_TOOL_ROUNDS = 12
 #: Tools whose only useful result is a picture. Withdrawn when images cannot
 #: reach the model: it would spend a round on a screenshot and be handed a
 #: parenthetical.
-_IMAGE_TOOLS = frozenset({"take_screenshot"})
+_IMAGE_TOOLS = frozenset({"take_screenshot", "show_view"})
 
 #: What stands in for an image the provider will not be sent, in the projection.
 _NO_VISION_NOTE = " -- not sent: this model does not accept images."
@@ -98,6 +98,16 @@ _session_id = _endpoint.new_session_id()
 # only point at which the notice is provably delivered -- see
 # :func:`_discharge_notice`.
 _pending_notice = None
+
+# Messages the user sent while a turn was running, oldest first. Held as text
+# and only appended to the thread at a round boundary (:func:`_drain_pending`):
+# a user message stored between an assistant turn's ``tool_calls`` and their
+# results is rejected by the provider, and being stored, on every later turn.
+_pending_user: list = []
+
+# Jobs already written into the thread as an activity note, so a notice whose
+# ack the kernel declined (another writer holds the claim) is not noted twice.
+_noted_jobs: set = set()
 # The compacted prefix: a summary of the first `_compacted` messages, standing
 # in for them when the thread is projected to the provider. Projection only --
 # `_messages` keeps every word, because the human's record of the conversation
@@ -132,10 +142,10 @@ _turn_lock = asyncio.Lock()
 class TurnInProgress(RuntimeError):
     """Raised when a turn is asked for while one is already running.
 
-    Refused rather than queued, as a cell is (``_server._submit_job``): a
-    queued turn would be composed against a conversation its sender has not seen
-    the end of, which is an ordering nobody can inspect. The transport reports
-    it as state, with a 409.
+    Only a *turn* is refused. A message sent mid-turn goes through
+    :func:`queue_user` instead, which delivers it at a round boundary; this is
+    what a second turn, or a compaction under a running one, gets. The transport
+    reports it as state, with a 409.
     """
 
 
@@ -207,6 +217,19 @@ def session_id() -> str:
     return _session_id
 
 
+def drop_unsent():
+    """Forget what is waiting to enter the thread: queued messages and the
+    jobs already noted.
+
+    Called when the chat loses the session (its lease lapsed or was taken):
+    whoever holds it next may change the kernel, so a message queued against the
+    old state, or a note that suppresses a later one, would be replayed into a
+    conversation it no longer describes.
+    """
+    _pending_user.clear()
+    _noted_jobs.clear()
+
+
 def reset():
     """Drop the conversation.
 
@@ -225,6 +248,7 @@ def reset():
     """
     global _running_job_id, _summary, _compacted, _session_id
     _messages.clear()
+    drop_unsent()
     _running_job_id = None
     _summary, _compacted = None, 0
     # A new thread is a new conversation to anyone outside this process, so it
@@ -248,6 +272,67 @@ def _append(role, content, **extra):
     return msg
 
 
+def queue_user(text):
+    """Hold a message sent mid-turn until the turn's next round boundary."""
+    _pending_user.append(text)
+
+
+def queued():
+    """The messages waiting for a round boundary, oldest first. A read."""
+    return list(_pending_user)
+
+
+def _drain_pending():
+    """Move the queued messages into the thread. Round boundaries only.
+
+    Legal exactly where the loop is about to ask the model again: every call of
+    the last round has answered and its images are in. Anywhere else it would
+    split a ``tool_calls`` turn from its results.
+    """
+    while _pending_user:
+        _append("user", _pending_user.pop(0))
+
+
+def _render_activity(digest):
+    who, listed = _writers._attribute_foreign(digest)
+    return (
+        f"{who} ran code in this kernel since your last turn: {listed}. "
+        "Variables and layers may have changed -- re-check with dir() / "
+        "viewer.layers rather than trusting what you last saw. Read the cells "
+        "with poll_job."
+    )
+
+
+def _sync_activity():
+    """Append a note for cells someone else finished since the thread last heard.
+
+    In the thread rather than only on a tool result, so a turn that answers
+    without calling a tool still knows the namespace moved, and so the pane
+    shows the human their own console cells. Not a turn: nothing is asked of the
+    model. Running cells stay pending -- their final status is what is reported.
+    """
+    host = _app._kernel_host
+    if host is None:
+        return
+    digest = [
+        d
+        for d in host.jobs.foreign_digest(ORIGIN)
+        if d.get("status") != "running" and d["job_id"] not in _noted_jobs
+    ]
+    if not digest:
+        return
+    _noted_jobs.update(d["job_id"] for d in digest)
+    _append("user", _render_activity(digest), note=True)
+    _writers._ack_foreign_digest(host, digest, WRITER_ID)
+
+
+def sync_activity():
+    """:func:`_sync_activity` for an idle thread; a running turn has the tool-result
+    seam and must not be written under."""
+    if not _turn_lock.locked():
+        _sync_activity()
+
+
 def history():
     """The conversation as the views render it, oldest first.
 
@@ -262,9 +347,14 @@ def history():
     ]
 
 
+def _is_typed_turn(msg):
+    """A user message someone typed: not a screenshot, not an activity note."""
+    return msg["role"] == "user" and not msg.get("image") and not msg.get("note")
+
+
 def _last_user_text():
     for msg in reversed(_messages):
-        if msg["role"] == "user" and not msg.get("image"):
+        if _is_typed_turn(msg):
             return msg["content"]
     return ""
 
@@ -312,7 +402,20 @@ def _describe(tool):
     description = tool.description or ""
     if tool.name != "execute_code":
         return description
-    return description.replace(_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH)
+    # Python 3.13 strips a docstring's indentation at compile time, so the
+    # paragraph is also matched in its unindented form.
+    for old, new in (
+        (_server.PROMOTE_PARAGRAPH, _CHAT_RUN_PARAGRAPH),
+        (_unindent(_server.PROMOTE_PARAGRAPH), _unindent(_CHAT_RUN_PARAGRAPH)),
+    ):
+        if old in description:
+            return description.replace(old, new)
+    return description
+
+
+def _unindent(paragraph):
+    """*paragraph* with the four-space docstring indent off its continuation lines."""
+    return paragraph.replace("\n    ", "\n")
 
 
 async def tool_payload():
@@ -501,7 +604,18 @@ def _llm_messages():
         # something anyone said: a user turn would be answerable, and a model
         # that answers the summary has lost the turn it was asked for.
         out.append({"role": "system", "content": _SUMMARY_PREFIX + _summary})
+    prev_note = False
     for msg in _messages[_compacted:]:
+        # Notes between two real turns fold into one message: a session with
+        # many console cells would otherwise carry a line per cell forever.
+        if msg.get("note"):
+            if prev_note:
+                out[-1]["content"] += "\n" + msg["content"]
+            else:
+                out.append({"role": "user", "content": msg["content"]})
+            prev_note = True
+            continue
+        prev_note = False
         if msg.get("image") and not images_allowed():
             # The picture stays in `_messages` for the pane; only the projection
             # drops it, and it drops *every* one -- an image already in the
@@ -627,9 +741,7 @@ def _cut_point(keep_turns):
     summary.
     """
     starts = [
-        i
-        for i, m in enumerate(_messages)
-        if i >= _compacted and m["role"] == "user" and not m.get("image")
+        i for i, m in enumerate(_messages) if i >= _compacted and _is_typed_turn(m)
     ]
     if len(starts) <= keep_turns:
         return 0
@@ -803,9 +915,11 @@ async def _run_turn(user_text, model, on_progress):
     try:
         # Before the first await: the user's own turn is one of the new messages
         # a view has to render, not context it already had.
+        _sync_activity()
         _append("user", user_text)
         tools = await tool_payload()
         for _round in range(_MAX_TOOL_ROUNDS):
+            _drain_pending()
             reply, tools = await _ask(model, tools)
             calls = reply.get("tool_calls") or []
             # `**echoed_fields`: the reply is kept for the pane, but what the
@@ -818,6 +932,10 @@ async def _run_turn(user_text, model, on_progress):
                 **echoed_fields(reply),
             )
             if not calls:
+                # A message queued during this answer starts another round
+                # rather than waiting for a turn of its own.
+                if _pending_user:
+                    continue
                 break
             # Images are held back until every call in the round has answered.
             # A tool message that does not directly follow its assistant turn is
@@ -905,5 +1023,11 @@ async def _run_turn(user_text, model, on_progress):
     finally:
         _writers._local_identity.reset(token)
         _writers._local_origin.reset(origin_token)
+        # A turn that ended with messages still queued (cancelled, failed, out of
+        # rounds) must not lose them. The open calls are answered first so the
+        # thread is well-formed where they land.
+        if _pending_user:
+            _close_open_calls("Turn ended before this call finished.")
+            _drain_pending()
 
     return _messages[start:]

@@ -41,6 +41,9 @@ export interface HistoryPage {
    * child did not recognise, which after a reset is every other window's. */
   full: boolean;
   busy: boolean;
+  /** Messages sent mid-turn that have not reached the thread yet: they enter
+   * at the turn's next round boundary. Empty on an older child. */
+  queued: string[];
   /** The cell being polled right now, and what it has printed. */
   live: LiveOutput | null;
 }
@@ -142,6 +145,9 @@ export async function fetchHistory(
       // Absent on an older child, where every page was effectively a delta.
       full: !!j.full,
       busy: !!j.busy,
+      queued: Array.isArray(j.queued)
+        ? j.queued.filter((t: unknown) => typeof t === "string")
+        : [],
       // Empty on an older child, which the pane reads as "keep what you have"
       // rather than as "no model is set".
       model: typeof j.model === "string" ? j.model : "",
@@ -172,7 +178,9 @@ function readLive(raw: unknown): LiveOutput | null {
   };
 }
 
-/** Start a turn. Returns an error to show, or null when it was accepted.
+/** Start a turn, or queue the message behind the one running. Returns an error
+ * to show, or null when it was accepted either way (202, `queued` in the body
+ * for the second case).
  *
  * A 409 is state, not a failed action, so it comes back as prose about waiting
  * rather than about retrying. */
@@ -195,6 +203,9 @@ export async function sendTurn(
   }
   if (r.ok || r.status === 202) return null;
   const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  // A 409 is either this chat's own turn or another holder of the session; only
+  // the second carries `held_by`, and its message says who.
+  if (r.status === 409 && d.held_by) return String(d.error);
   if (r.status === 409) return "A turn is already running. Wait for it, or cancel it.";
   return String(d.error || `send failed (${r.status})`);
 }

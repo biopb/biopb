@@ -1,7 +1,7 @@
 """Label sets are tensors of their image (biopb/biopb#1059 step 2).
 
-A source answers for them through the base API -- ``label_sets``,
-``resolve_tensor``, ``resolve_chunk_adapter`` -- so the format's own listing
+The registry answers for them -- ``attached_to(...).listed``,
+``resolve_tensor`` -- so the format's own listing
 and routing stay untouched, the catalog lists them after the image tensors, and
 the serve path reaches them by ``array_id`` like any tensor. Two origins here:
 an OME-Zarr's NGFF ``labels/`` group (read by the format) and a finished
@@ -11,7 +11,6 @@ Whatever the origin, a set is listed only if it spans the image it binds to.
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,27 +18,28 @@ import zarr
 from biopb_tensor_server.adapters.labels import (
     LabelSetAdapter,
     open_label_set,
-    sidecar_attacher,
     sidecar_attrs,
     sidecar_dir,
+    sidecar_label_sets,
 )
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, with_upload_state
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
-from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedError
+from biopb_tensor_server.core.errors import (
+    AttachedTensorMismatch,
+    TensorNotFound,
+    WriteNotSupportedError,
+)
 from biopb_tensor_server.core.labels import (
-    RESERVED_PREFIX,
     extent_mismatch,
+    label_extent,
     label_field,
-    label_image_axes,
     split_label_field,
 )
-from biopb_tensor_server.core.normalize import NormalizingAdapter
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
-from tests import register_and_catalog
+from tests import catalog_server, register_and_catalog
 
 SHAPE = (64, 64)
 CHUNK = (32, 32)
@@ -57,10 +57,13 @@ def _write_label_group(
     array_attrs=None,
 ):
     """An NGFF label image at *group*: ``levels`` arrays plus its ``.zattrs``."""
-    g = zarr.open_group(str(group), mode="w")
+    g = zarr.open_group(str(group), mode="w", zarr_format=2)
     for i in range(levels):
-        arr = g.create_dataset(
-            str(i), shape=tuple(s >> i for s in shape), chunks=CHUNK, dtype=dtype
+        arr = g.create_array(
+            str(i),
+            shape=tuple(s >> i for s in shape),
+            chunks=(1,) * (len(shape) - len(CHUNK)) + CHUNK,
+            dtype=dtype,
         )
         arr[:] = fill if i == 0 else fill + i
         if array_attrs:
@@ -95,7 +98,7 @@ def _write_label_group(
 def image(tmp_path):
     """An OME-Zarr image with a ``labels/`` group: ``nuclei`` (two levels),
     ``flat`` (one level), ``xy`` (non-canonical axes), ``bad`` (float) and
-    ``small`` (does not span the image)."""
+    ``small`` (does not span the image): the file's own, all served as they are."""
     zarr_path, _, _ = create_multiresolution_ome_zarr(
         str(tmp_path / "img"), n_levels=2, base_shape=SHAPE, chunk_size=CHUNK
     )
@@ -120,11 +123,24 @@ def _adapter(root, source_id="oz1"):
 
 
 @pytest.fixture
-def registered(image):
-    return SourceRegistry().register("oz1", _adapter(image))
+def reg(image):
+    registry = SourceRegistry()
+    registry.register("oz1", _adapter(image))
+    return registry
 
 
-NATIVE = {"@labels/nuclei", "@labels/flat", "@labels/xy"}
+@pytest.fixture
+def registered(reg):
+    return reg.get("oz1")
+
+
+NATIVE = {
+    "@labels/nuclei",
+    "@labels/flat",
+    "@labels/xy",
+    "@labels/bad",
+    "@labels/small",
+}
 
 
 class TestTheFieldShape:
@@ -142,7 +158,8 @@ class TestTheFieldShape:
 
     def test_extent_mismatch_says_why(self):
         assert (
-            extent_mismatch(["y", "x"], [64, 64], ["c", "y", "x"], [3, 64, 64]) is None
+            extent_mismatch(["c", "y", "x"], [1, 64, 64], ["c", "y", "x"], [3, 64, 64])
+            is None
         )
         assert (
             extent_mismatch(
@@ -154,117 +171,124 @@ class TestTheFieldShape:
         assert "axes" in extent_mismatch(
             ["y", "x"], [64, 64], ["z", "y", "x"], [2, 64, 64]
         )
-        assert "axes" in extent_mismatch(
+        # The channel axis is a singleton in a set, not the image's length.
+        assert "shape" in extent_mismatch(
             ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
         )
 
-    def test_image_axes_states_what_the_extent_rule_implies(self):
-        # The mapping a client would otherwise re-derive. Matching by NAME gets
-        # t/z right and an unnamed axis wrong, which is the whole reason the
-        # server says it out loud (biopb/biopb#1059).
-        assert label_image_axes(["t", "z", "y", "x"], ["t", "c", "z", "y", "x"]) == [
-            0,
-            2,
-            3,
-            4,
-        ]
-        assert label_image_axes(["y", "x"], ["y", "x"]) == [0, 1]
-        # An interleaved samples axis is NOT dropped -- `label_extent` drops only
-        # the channel -- so it maps like any other axis.
-        assert label_image_axes(["t", "y", "x", "s"], ["t", "c", "y", "x", "s"]) == [
-            0,
-            2,
-            3,
-            4,
-        ]
-        # An unnamed axis keeps its place; the set's `a0` is the image's axis 0
-        # even though the image spells the same slider `a1`.
-        assert label_image_axes(["", "y", "x"], ["", "c", "y", "x"]) == [0, 2, 3]
+    def test_a_set_without_the_channel_axis_does_not_span(self):
+        # A native group may omit `c` and an older server wrote sidecars without
+        # it; neither is the image's rank.
+        image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        assert "axes" in extent_mismatch(["t", "z", "y", "x"], [5, 4, 64, 64], *image)
 
-    def test_image_axes_is_none_for_a_set_that_does_not_span(self):
-        # Nothing to state, and the same set `label_sets` drops.
-        assert label_image_axes(["z", "y", "x"], ["t", "c", "z", "y", "x"]) is None
+    def test_a_set_has_the_images_rank_with_a_singleton_channel(self):
+        image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        assert (
+            extent_mismatch(["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64], *image)
+            is None
+        )
+
+    def test_an_rgb_image_has_a_set_without_the_samples_axis(self):
+        # A mask indexes pixels, not a pixel's colour components, and a trailing
+        # singleton would shift the spatial axes of a right-aligned viewer.
+        rgb = (["y", "x", "s"], [64, 64, 3])
+        assert extent_mismatch(["y", "x"], [64, 64], *rgb) is None
+        assert "axes" in extent_mismatch(["y", "x", "s"], [64, 64, 3], *rgb)
+        assert label_extent(*rgb) == (["y", "x"], [64, 64])
+        # The aics shape, a singleton C beside the samples axis.
+        aics = (["t", "c", "z", "y", "x", "s"], [2, 1, 4, 64, 64, 3])
+        assert label_extent(*aics) == (["t", "c", "z", "y", "x"], [2, 1, 4, 64, 64])
+        # Only the size-3/4 axis is samples; another `s` is an ordinary axis.
+        assert label_extent(["y", "x", "s"], [64, 64, 5]) == (
+            ["y", "x", "s"],
+            [64, 64, 5],
+        )
 
 
 class TestANativeSetIsATensorOfItsImage:
-    def test_listed_after_the_image_and_readable_by_id(self, registered):
-        ids = [t.array_id for t in catalog_tensors(registered)]
+    def test_listed_after_the_image_and_readable_by_id(self, registered, reg):
+        ids = [t.array_id for t in reg.catalog_tensors("oz1", registered)]
         assert ids[0] == "oz1"
         assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE}
 
-        nuclei = registered.resolve_tensor("oz1/@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "oz1/@labels/nuclei")
         assert isinstance(nuclei, LabelSetAdapter)
         assert nuclei.array_id == "oz1/@labels/nuclei"
-        assert registered.resolve_tensor("@labels/nuclei") is nuclei
+        assert reg.resolve_tensor("oz1", "@labels/nuclei") is nuclei
         desc = nuclei.get_tensor_descriptor()
         assert (list(desc.shape), desc.dtype) == ([64, 64], "<u4")
 
-    def test_a_set_that_cannot_open_or_does_not_span_is_dropped(self, registered):
-        """``bad`` is a float (the reader skips it); ``small`` is 32x32 on a
-        64x64 image (the merge drops it). The image registers either way."""
-        assert set(registered.label_sets) == NATIVE
-        assert registered.resolve_tensor("oz1").array_id == "oz1"
+    def test_the_files_own_sets_are_served_unchecked(self, registered, reg):
+        """``bad`` is a float and ``small`` is 32x32 on a 64x64 image: the file
+        is the user's, so both are listed and read as they are."""
+        bad = reg.resolve_tensor("oz1", "@labels/bad")
+        assert bad.get_tensor_descriptor().dtype == "<f4"
+        small = reg.resolve_tensor("oz1", "@labels/small")
+        assert list(small.get_tensor_descriptor().shape) == [32, 32]
 
-    def test_an_unknown_set_is_the_formats_miss(self, registered):
+    def test_an_unknown_set_is_the_formats_miss(self, registered, reg):
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("@labels/nope")
+            reg.resolve_tensor("oz1", "@labels/nope")
 
     def test_the_formats_own_routing_is_untouched(self, image):
         raw = _adapter(image)
-        adapter = SourceRegistry().register("oz1", raw)
-        assert [t.array_id for t in raw.list_tensor_descriptors()] == ["oz1"]
-        assert adapter.resolve_tensor(None).array_id == "oz1"
-        assert adapter.resolve_chunk_adapter("1").array_id == "oz1/1"
+        reg = SourceRegistry()
+        reg.register("oz1", raw)
+        assert [t.array_id for t in raw.list_tensors()][0] == "oz1"
+        assert reg.resolve_tensor("oz1", None).array_id == "oz1"
+        assert reg.resolve_tensor("oz1", "1").array_id == "oz1/1"
 
-    def test_a_native_level_routes_under_the_set(self, registered):
+    def test_a_native_level_routes_under_the_set(self, registered, reg):
         """``nuclei``'s arrays carry their own ``.zattrs``, which used to stop
         the level-opening walk one directory too early."""
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
 
-        level = registered.resolve_chunk_adapter("@labels/nuclei/1")
+        level = reg.resolve_tensor("oz1", "@labels/nuclei/1")
         assert level.array_id == "oz1/@labels/nuclei/1"
         assert list(level.get_tensor_descriptor().shape) == [32, 32]
         assert level.content_version == nuclei.content_version
-        assert registered.resolve_chunk_adapter("@labels/nuclei") is nuclei
+        assert reg.resolve_tensor("oz1", "@labels/nuclei") is nuclei
 
-    def test_content_version_is_the_images_for_set_and_levels_alike(self, registered):
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+    def test_content_version_is_the_images_for_set_and_levels_alike(
+        self, registered, reg
+    ):
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
         assert nuclei.content_version == registered.content_version is not None
         # The image's own native levels share it too: one token per source.
         assert (
-            registered.resolve_chunk_adapter("1").content_version
-            == registered.content_version
+            reg.resolve_tensor("oz1", "1").content_version == registered.content_version
         )
 
-    def test_the_ladder_is_native_or_nearest_never_area(self, registered):
+    def test_the_ladder_is_native_or_nearest_never_area(self, registered, reg):
         cfg = PyramidConfig(reduction_method="area")
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
         native = nuclei._advertised_pyramid(nuclei.get_tensor_descriptor(), cfg)
         assert all(
             lvl.reduction_method == "precompute" and lvl.native for lvl in native
         )
 
-        flat = registered.resolve_tensor("@labels/flat")
+        flat = reg.resolve_tensor("oz1", "@labels/flat")
         computed = flat._advertised_pyramid(flat.get_tensor_descriptor(), cfg)
         assert computed and all(lvl.reduction_method == "nearest" for lvl in computed)
 
-    def test_metadata_names_the_image(self, registered):
-        meta = registered.resolve_tensor("@labels/nuclei").get_tensor_metadata()
+    def test_metadata_names_the_image(self, registered, reg):
+        meta = reg.resolve_tensor("oz1", "@labels/nuclei").get_tensor_metadata()
         assert meta["image-label"]["source"] == {"image": "oz1"}
         assert meta["image-label"]["colors"][0]["label-value"] == 7
         assert meta["multiscales"][0]["datasets"][1]["path"] == "1"
 
-    def test_a_set_is_read_only(self, registered):
+    def test_a_set_is_read_only(self, registered, reg):
         with pytest.raises(WriteNotSupportedError):
-            registered.resolve_tensor("@labels/nuclei").put_chunk(None, None, (), None)
+            reg.resolve_tensor("oz1", "@labels/nuclei").put_chunk(None, None, (), None)
 
-    def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered):
-        xy = registered.resolve_tensor("@labels/xy")
-        assert isinstance(xy, NormalizingAdapter)
+    def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered, reg):
+        xy = reg.resolve_tensor("oz1", "@labels/xy")
+        assert xy._axis_perm() is not None
         assert list(xy.get_tensor_descriptor().dim_labels) == ["y", "x"]
         assert [
             t.dim_labels[0]
-            for t in catalog_tensors(registered)
+            for t in reg.catalog_tensors("oz1", registered)
             if t.array_id.endswith("/xy")
         ] == ["y"]
 
@@ -301,24 +325,8 @@ class TestOverTheWire:
         ]
         meta = json.loads(desc.metadata_json)["metadata"]
         assert meta["image-label"]["source"] == {"image": "oz1"}
-        # Stated, not left to the client: which of the image's axes each of the
-        # set's own indexes. The NGFF block is a spec block and is left alone,
-        # so this rides beside it under `biopb`.
-        assert meta["biopb"]["labels"]["image_axes"] == [0, 1]
-        # ... and the SDK's reader parses that live descriptor. Asserted on the
-        # reader itself, not on the composed answer: the rule re-derives the
-        # same [0, 1] for this pair, so a reader that silently parsed nothing
-        # would pass the composed check. This is the wire shape a napari client
-        # reads (``biopb.tensor._labels``, one describe, no re-derivation).
-        from biopb.tensor._labels import _stated_image_axes
 
-        assert _stated_image_axes(desc) == [0, 1]
-
-    def test_an_image_is_not_given_a_label_axis_block(self, served, client):
-        desc = client.get_descriptor("oz1", with_metadata=True)
-        meta = json.loads(desc.metadata_json)["metadata"]
-        assert "labels" not in (meta.get("biopb") or {})
-
+    def test_a_computed_level_is_read_with_the_precompute_method(self, served, client):
         coarse = client.get_tensor(
             "oz1/@labels/nuclei", scale_hint=[2, 2], reduction_method="precompute"
         )
@@ -346,6 +354,18 @@ def _sidecar(
     )
 
 
+def _listed(reg):
+    """The fields of ``oz1`` the catalog lists."""
+    return {field for field, _ in reg.attached_to("oz1").listed()}
+
+
+def _adopting(labels_dir):
+    """A registry that took the finished sidecars of ``oz1`` at boot."""
+    registry = SourceRegistry()
+    registry.adopt({"oz1": sidecar_label_sets("oz1", labels_dir)})
+    return registry
+
+
 class TestASidecarIsAttachedAtRegistration:
     def test_a_ready_sidecar_is_a_set_a_pending_one_is_not(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -353,28 +373,33 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "oz1", "half", state=UPLOAD_PENDING)
         _sidecar(labels_dir, "other", "theirs")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        reg = _adopting(labels_dir)
+        reg.register("oz1", _adapter(image))
 
-        assert set(adapter.label_sets) == NATIVE | {"@labels/mine"}
-        mine = adapter.resolve_tensor("oz1/@labels/mine")
+        assert _listed(reg) == {"@labels/mine"}
+        mine = reg.resolve_tensor("oz1", "oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
         assert "biopb" not in mine.get_tensor_metadata()
 
-    def test_one_that_does_not_span_or_bind_is_dropped(self, image, tmp_path):
+    def test_one_that_does_not_span_or_bind_is_listed_and_refuses_to_be_read(
+        self, image, tmp_path
+    ):
         labels_dir = tmp_path / "labels"
         _sidecar(labels_dir, "oz1", "small", shape=(32, 32))
         _sidecar(labels_dir, "oz1", "extra", shape=(2, 64, 64), axes=("z", "y", "x"))
         _sidecar(labels_dir, "oz1", "orphan", image_field="Image:9")
         _sidecar(labels_dir, "oz1", "fits")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        reg = _adopting(labels_dir)
+        reg.register("oz1", _adapter(image))
 
-        assert set(adapter.label_sets) == NATIVE | {"@labels/fits"}
+        stale = {"@labels/small", "@labels/extra", "Image:9/@labels/orphan"}
+        assert _listed(reg) == ({"@labels/fits"} | stale)
+        for name in sorted(stale):
+            with pytest.raises(AttachedTensorMismatch):
+                reg.resolve_tensor("oz1", name)
+        assert reg.resolve_tensor("oz1", "@labels/fits") is not None
 
     def test_a_store_without_a_token_is_corrupt_and_skipped(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -383,33 +408,34 @@ class TestASidecarIsAttachedAtRegistration:
         del attrs["biopb"]["labels"]["content_version"]
         (group / ".zattrs").write_text(json.dumps(attrs))
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
-        assert "@labels/untokened" not in adapter.label_sets
+        reg = _adopting(labels_dir)
+        reg.register("oz1", _adapter(image))
+        assert "@labels/untokened" not in _listed(reg)
 
-    def test_no_hook_means_no_sidecars(self, image, tmp_path):
+    def test_nothing_adopted_means_no_sidecars(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
-        adapter = SourceRegistry().register("oz1", _adapter(image))
-        assert "@labels/mine" not in adapter.label_sets
+        reg = SourceRegistry()
+        reg.register("oz1", _adapter(image))
+        assert "@labels/mine" not in _listed(reg)
 
-    def test_attach_and_detach_by_hand(self, registered, tmp_path):
+    def test_attach_and_detach_by_hand(self, reg, tmp_path):
         group = _sidecar(tmp_path / "labels", "oz1", "late")
         late = open_label_set(
             group, source_id="oz1", image_field="", name="late", content_version=b"x"
         )
-        registered.attach_tensor("@labels/late", late)
-        assert registered.resolve_tensor("@labels/late").array_id == "oz1/@labels/late"
-        assert registered.detach_tensor("@labels/late") is not None
-        assert registered.detach_tensor("@labels/nuclei") is None  # the file's
+        reg.attach("oz1", "@labels/late", late)
+        assert reg.resolve_tensor("oz1", "@labels/late").array_id == "oz1/@labels/late"
+        assert reg.detach("oz1", "@labels/late") is not None
+        assert reg.detach("oz1", "@labels/nuclei") is None  # the file's
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("@labels/late")
+            reg.resolve_tensor("oz1", "@labels/late")
 
-    def test_the_server_wires_its_write_dir(self, writable_server, image, tmp_path):
+    def test_the_server_adopts_its_write_dir_at_boot(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
-        register_and_catalog(writable_server, "oz1", _adapter(image))
+        server = catalog_server("localhost:0", writable=True, write_dir=tmp_path)
+        register_and_catalog(server, "oz1", _adapter(image))
         ids = (
-            writable_server.metadata_db.query(
+            server.metadata_db.query(
                 "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t)"
             )
             .column(0)
@@ -418,97 +444,14 @@ class TestASidecarIsAttachedAtRegistration:
         assert "oz1/@labels/mine" in ids
 
 
-class TestTheSdkReadsTheSameRule:
-    """``biopb.tensor._labels`` is the client half of this module.
+class TestOwningField:
+    """Attached fields route by longest prefix, so a level rides with its tensor."""
 
-    Kept honest against the server's own rule rather than against a fixture:
-    a client that splits an ``array_id`` differently, or maps the axes
-    differently, reads a plane of the wrong frame and shows a picture rather
-    than raising. The SDK copy exists because biopb-tensor-server is not an
-    installable dependency of a client (nor on PyPI).
-    """
+    def test_the_longest_key_wins_and_a_prefix_must_end_at_a_slash(self):
+        from biopb_tensor_server.core.attached import owning_field as _owning_field
 
-    @staticmethod
-    def _sdk():
-        from biopb.tensor._labels import (
-            is_reserved_label_name,
-            label_image_axes,
-            split_label_array_id,
-        )
-
-        return split_label_array_id, label_image_axes, is_reserved_label_name
-
-    @staticmethod
-    def _desc(shape, dim_labels, metadata_json=""):
-        return SimpleNamespace(
-            shape=list(shape),
-            dim_labels=list(dim_labels),
-            metadata_json=metadata_json,
-        )
-
-    @pytest.mark.parametrize(
-        "array_id,expected",
-        [
-            ("src0/@labels/nuclei", ("src0", "nuclei", None)),
-            ("src0/A/1/@labels/nuclei", ("src0/A/1", "nuclei", None)),
-            ("src0/@labels/nuclei/2", ("src0", "nuclei", "2")),
-            # The last ``labels`` with a name after it wins, whatever the
-            # image's own field holds.
-            ("src0/@labels/a/@labels/b", ("src0/@labels/a", "b", None)),
-        ],
-    )
-    def test_splits_an_array_id_like_the_server_splits_a_field(
-        self, array_id, expected
-    ):
-        split, _, _ = self._sdk()
-        address = split(array_id)
-        assert (address.image_array_id, address.name, address.level) == expected
-        # ... and the server, handed the same id's field, agrees.
-        field = split_label_field(array_id.partition("/")[2])
-        assert (field.name, field.level) == expected[1:]
-
-    @pytest.mark.parametrize(
-        "array_id",
-        [
-            "src0",  # a plain tensor
-            "src0/labels",  # a trailing segment names no set
-            "@labels/nuclei",  # source_id is slash-free, so this is a source
-        ],
-    )
-    def test_names_no_set(self, array_id):
-        split, _, _ = self._sdk()
-        assert split(array_id) is None
-
-    def test_reserved_names_match(self):
-        _, _, reserved = self._sdk()
-        assert reserved("@ome") is True
-        assert reserved("nuclei") is False
-        assert RESERVED_PREFIX == "@"
-
-    def test_derives_the_same_axes_the_server_states(self):
-        _, sdk_axes, _ = self._sdk()
-        image_labels = ["t", "c", "z", "y", "x"]
-        label = self._desc([5, 4, 64, 64], ["t", "z", "y", "x"])
-        image = self._desc([5, 3, 4, 64, 64], image_labels)
-        assert sdk_axes(label, image) == label_image_axes(
-            label.dim_labels, image_labels
-        )
-        assert sdk_axes(label, image) == [0, 2, 3, 4]
-
-    def test_a_stated_mapping_wins_over_the_derivation(self):
-        # The point of the server stating it (biopb/biopb#1059): a client that
-        # re-derives cannot know about a binding the rule stops describing.
-        _, sdk_axes, _ = self._sdk()
-        stated = json.dumps(
-            {"metadata": {"biopb": {"labels": {"image_axes": [1, 2, 3, 4]}}}}
-        )
-        label = self._desc([3, 4, 64, 64], ["c", "z", "y", "x"], stated)
-        image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        assert sdk_axes(label, image) == [1, 2, 3, 4]
-
-    def test_a_set_that_spans_nothing_has_no_mapping(self):
-        _, sdk_axes, _ = self._sdk()
-        label = self._desc([4, 64, 64], ["z", "y", "x"])
-        image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        assert sdk_axes(label, image) is None
-        assert label_image_axes(label.dim_labels, image.dim_labels) is None
+        keys = ["@fields/raw", "@fields/raw/@labels/nuclei", "@fields/ra"]
+        assert _owning_field("@fields/raw", keys) == "@fields/raw"
+        assert _owning_field("@fields/raw/@labels/nuclei/1", keys) == keys[1]
+        assert _owning_field("@fields/raw/2", keys) == "@fields/raw"
+        assert _owning_field("@fields/rawx", keys) is None

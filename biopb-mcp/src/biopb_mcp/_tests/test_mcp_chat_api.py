@@ -9,12 +9,12 @@ import asyncio
 import json
 
 import pytest
-from biopb._credentials import remove_credential, write_credential
+from biopb._security.credentials import remove_credential, write_credential
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _model, _observe
+from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _lease, _model, _observe
 
 # The shape the launcher actually threads: `load_config()` returns a **dict**,
 # and every consumer reads it with `get_setting`, which falls back to
@@ -37,10 +37,12 @@ def configured(tmp_path, monkeypatch):
     write_credential("sk-x", _model.KEY_NAME)
     cfg = chat_config()
     cfg["chat"] = {"model": "test-model"}
-    _chat_api.configure(cfg, agentless=True)
+    _chat_api.configure(cfg, mode="durable")
     _chat.reset()
+    _lease._reset()
     yield cfg
     _chat.reset()
+    _lease._reset()
     remove_credential(_model.KEY_NAME)
 
 
@@ -78,6 +80,7 @@ class TestStatus:
             "ready": True,
             "reason": None,
             "busy": False,
+            "lease": {"holder": None},
             "model": "test-model",
             # Nothing folded yet. Reported because the pane renders every
             # message either way, so compaction would otherwise be invisible to
@@ -243,7 +246,27 @@ class TestTurn:
         # Nothing was recorded: the user's message is not half-accepted.
         assert _chat.history() == []
 
-    def test_a_busy_session_is_409_not_a_queue(self, client, monkeypatch):
+    def test_a_message_during_a_running_turn_is_queued(self, client, monkeypatch):
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                r = client.post("/chat/turn", json={"text": "also this"})
+                assert r.status_code == 202
+                assert r.json() == {"queued": True}
+                assert _chat.queued() == ["also this"]
+                assert client.get("/api/chat/history").json()["queued"] == ["also this"]
+                # Held, not stored: it is not in the thread until a boundary.
+                assert _chat.history() == []
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_busy_session_without_a_turn_is_409(self, client, monkeypatch):
         monkeypatch.setattr(_chat, "busy", lambda: True)
         reply = client.post("/chat/turn", json={"text": "hello"})
         assert reply.status_code == 409
@@ -519,7 +542,7 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # interpret.
     cfg = chat_config()
     cfg["observe"]["chat_enabled"] = False
-    assert _chat_api.configure(cfg, agentless=True) is False
+    assert _chat_api.configure(cfg, mode="durable") is False
 
 
 def test_chat_follows_the_page_it_lives_on():
@@ -527,26 +550,23 @@ def test_chat_follows_the_page_it_lives_on():
     # nothing that can reach them. Enforced rather than documented: the two
     # flags cannot be set to a combination that serves an unreachable surface.
     cfg = chat_config(enabled=False)
-    assert _chat_api.configure(cfg, agentless=True) is False
+    assert _chat_api.configure(cfg, mode="durable") is False
 
 
-def test_a_harness_driven_session_gets_no_chat():
-    # The loop is for users *without* an MCP harness. On a session an agent is
-    # already driving, a second one is not a feature: only one writer can hold
-    # the kernel claim, so the pane would answer questions and then refuse to
-    # run anything -- correct, and not what anyone opening it expects.
-    #
-    # Config alone cannot express this. Both switches are on here, and the
-    # surface is still withheld, because the deciding fact is how the session
-    # was launched rather than how it was configured.
+def test_a_direct_http_server_gets_no_chat():
+    # A `direct` http server is one an MCP client connects to by itself. Config
+    # alone cannot express this: both switches are on here, and the surface is
+    # still withheld, because the deciding fact is how the session was launched.
+    # A durable session serves it -- the lease, not the mode, keeps it off an
+    # attached agent.
     cfg = chat_config()
     cfg["chat"] = {"model": "test-model"}
-    assert _chat_api.configure(cfg, agentless=False) is False
-    assert _chat_api.configure(cfg, agentless=True) is True
+    assert _chat_api.configure(cfg, mode="direct") is False
+    assert _chat_api.configure(cfg, mode="durable") is True
 
 
 def test_chat_cannot_be_configured_on_by_accident():
-    # `agentless` is required, not defaulted: either default is wrong for one
+    # `mode` is required, not defaulted: either default is wrong for one
     # of the two callers, and the failure would be silent both ways -- chat on
     # every harness-driven session, or missing from the viewer it was built for.
     with pytest.raises(TypeError):
@@ -728,3 +748,85 @@ class TestProviderModelList:
 
         monkeypatch.setattr(_model.httpx, "AsyncClient", explode)
         assert asyncio.run(_model.list_models({"chat": {}})) == []
+
+
+class TestLease:
+    """Chat holds the session while it is working, and never beside an agent."""
+
+    def test_the_first_turn_takes_the_session(self, client, monkeypatch):
+        async def answer(messages, tools):
+            return {"role": "assistant", "content": "hi"}
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: answer)
+        assert _lease.snapshot()["holder"] is None
+        assert client.post("/chat/turn", json={"text": "hello"}).status_code == 202
+        assert _lease.snapshot()["holder"] == "chat"
+
+    def test_an_agent_holding_the_session_refuses_the_turn(self, client):
+        _lease.acquire("agent", "a")
+        r = client.post("/chat/turn", json={"text": "hello"})
+        assert r.status_code == 409
+        body = r.json()
+        assert body["held_by"] == "agent" and "busy" not in body
+        assert _chat.history() == []
+
+    def test_history_is_readable_while_an_agent_holds_it(self, client):
+        _lease.acquire("agent", "a")
+        r = client.get("/api/chat/history")
+        assert r.status_code == 200
+        assert r.json()["lease"]["holder"] == "agent"
+
+    def test_reading_history_does_not_take_or_renew_it(self, client):
+        client.get("/api/chat/history")
+        client.get("/api/chat/status")
+        assert _lease.snapshot()["holder"] is None
+
+    def test_reset_lets_go_of_the_session(self, client):
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        assert client.post("/chat/reset", json={}).status_code == 200
+        assert _lease.snapshot()["holder"] is None
+
+    def test_release_lets_go_and_says_so(self, client):
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        r = client.post("/chat/release", json={})
+        assert r.json() == {"released": True}
+        assert _lease.snapshot()["holder"] is None
+
+    def test_release_is_refused_mid_turn(self, client, monkeypatch):
+        async def pending():
+            task = asyncio.create_task(asyncio.sleep(5))
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            return task
+
+        loop = asyncio.new_event_loop()
+        task = loop.run_until_complete(pending())
+        try:
+            r = client.post("/chat/release", json={})
+        finally:
+            task.cancel()
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
+        assert r.status_code == 409 and r.json()["busy"] is True
+
+    def test_losing_the_session_drops_what_chat_had_queued(self, client):
+        _lease.on_change(_chat_api._on_lease_change)
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        _chat.queue_user("stale")
+        _lease.acquire("agent", "a", force=True)
+        assert _chat.queued() == []
+
+    def test_taking_the_session_mid_turn_cancels_the_turn(self, monkeypatch):
+        _lease.on_change(_chat_api._on_lease_change)
+
+        async def go():
+            task = asyncio.create_task(asyncio.sleep(5))
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            _lease.acquire("chat", _lease.CHAT_TOKEN)
+            _lease.acquire("agent", "a", force=True)
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert asyncio.run(go())

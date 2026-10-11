@@ -19,12 +19,6 @@ one belongs to whoever owns the layout (``adapters.fields.create_field_upload``,
 (``serving.upload_manager``) attaches the result to its source, keeps the
 catalog row in step, and translates exceptions. Nothing else about an upload
 lives there.
-
-Wrappers: ``SourceRegistry.register`` may wrap an adapter (``normalize_adapter``),
-and a wrapper forwards attributes rather than inheriting this class. Uploads are
-refused unless canonical, so today none is wrapped; a caller that needs the
-upload half should still reach it by attribute (``adapter.upload``,
-``adapter.put_chunk``) and not by ``isinstance``.
 """
 
 from __future__ import annotations
@@ -52,6 +46,7 @@ import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.attached import MARKER
 from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
@@ -63,6 +58,7 @@ from biopb_tensor_server.core.errors import (
     UploadNotPublishedError,
     UploadSealedError,
     UploadTransitionError,
+    WriteNotSupportedError,
 )
 
 logger = logging.getLogger(__name__)
@@ -527,7 +523,7 @@ class WritableSource:
             array_id=self.array_id,
             dim_labels=desc.dim_labels,
             shape=desc.shape,
-            chunk_shape=list(self.get_transfer_chunk_size()),
+            chunk_shape=list(transfer_chunk_size(self.get_tensor_descriptor())),
             dtype=desc.dtype,
         )
         remaining = self.remaining_ttl()
@@ -747,7 +743,20 @@ class WritableSource:
         expected_shape: Tuple[int, ...],
         dtype: Any,
     ) -> None:
-        """Store one chunk and count it, if this upload still accepts writes."""
+        """Store one chunk and count it, if this upload still accepts writes.
+
+        Refused for a non-canonical order: an upload carries its uploader's own
+        declared order, with ``physical_scale`` and ``chunk_shape`` aligned to
+        it, and reads would silently permute it (``core.normalize``).
+        ``UploadManager.add_tensor`` refuses the order up front, so this is the
+        backstop.
+        """
+        if self._axis_perm() is not None:
+            raise WriteNotSupportedError(
+                f"source {self.source_id!r} declares a non-canonical axis order "
+                f"and is therefore read-only; upload with axes in canonical "
+                f"[..., Z, Y, X, S] order instead (biopb/biopb#596)"
+            )
         self._refuse_write()
         self._store_chunk(bounds, data, expected_shape, dtype)
         self._mark_chunk(bounds)

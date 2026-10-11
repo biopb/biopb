@@ -1,6 +1,7 @@
 """The embedded tensor cache: a server returns large results through its own
 TensorFlight server, from a file-based cache with a TTL."""
 
+import importlib.util
 import logging
 import os
 import re
@@ -198,12 +199,11 @@ class EmbeddedTensorCache:
         """The adapter serving one result, by the id ``add_tensor`` answered.
 
         A result is a tensor *attached* to the scratch source rather than a
-        source of its own, so it is reached through its parent instead of
-        through the registry.
+        source of its own, so it is reached through the registry's
+        attachments for its source.
         """
         source_id, _, field = array_id.partition("/")
-        parent = self._server.sources.get(source_id)
-        adapter = parent.attached_tensor(field) if parent is not None else None
+        adapter = self._server.sources.attached(source_id, field)
         if adapter is None:
             raise ValueError(f"Result not found: {array_id}")
         return adapter
@@ -384,7 +384,7 @@ def _start_embedded_tensor_cache(
     CacheManager.initialize(cache_config)
 
     # Bind to specified host (0.0.0.0 for external access)
-    location = f"grpc://{tensor_host}:{tensor_port}"
+    location = f"{tensor_host}:{tensor_port}"
 
     # The server-wide token is minted and *kept*. It exists so ``_authorize``
     # fails closed on every action arm except ``health`` and ``chunk_locate``.
@@ -412,13 +412,13 @@ def _start_embedded_tensor_cache(
 
     # Start in background thread
     def _run_tensor_server():
-        logger.info(f"Embedded tensor cache server started at {location}")
+        logger.info(f"Embedded tensor cache server started at grpc://{location}")
         tensor_server.serve()
 
     thread = threading.Thread(target=_run_tensor_server, daemon=True)
     thread.start()
 
-    return tensor_server, location
+    return tensor_server, f"grpc://{location}"
 
 
 def start_embedded_cache(
@@ -432,9 +432,16 @@ def start_embedded_cache(
 ) -> Optional[EmbeddedTensorCache]:
     """Start the embedded tensor server a remote deployment returns results through.
 
-    Answers ``None`` where pyarrow cannot run, so the server serves inline
-    results only.
+    Answers ``None`` where pyarrow cannot run or ``biopb-tensor-server`` is not
+    installed, so the server serves inline results only.
     """
+    if importlib.util.find_spec("biopb_tensor_server") is None:
+        logger.warning(
+            "biopb-tensor-server is not installed; only eager image data is "
+            "supported and lazy (dask) input/output will be rejected."
+        )
+        return None
+
     if not _pyarrow_available():
         # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
         # unavailable. Do not start the tensor server -- it would crash. Lazy

@@ -21,7 +21,7 @@ Example config (explicit):
       "url": "/data/images.zarr",
       "alias": "my-image",
     },
-    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images/channel0" }
+    { "type": "ome-tiff", "url": "/data/scan.ome.tif" }
   ]
 }
 ```
@@ -31,13 +31,11 @@ Example config (relaxed auto-discovery):
 ```json
 {
   "sources": [
-    { "url": "/data/" },
-    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images" }
+    { "url": "/data/" }
   ]
 }
 ```
-A bare ``url`` with no ``type`` triggers recursive auto-discovery; HDF5 always
-needs an explicit ``type`` + ``dataset`` (it is not auto-detected).
+A bare ``url`` with no ``type`` triggers recursive auto-discovery.
 
 Example config (remote storage):
 ```json
@@ -77,7 +75,7 @@ from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from biopb._config_constraints import (
+from biopb._config.constraints import (
     PYRAMID_CONSTRAINTS,
     Enum as _Enum,
     Range as _Range,
@@ -86,23 +84,24 @@ from biopb._config_constraints import (
 # The one validation scheme, shared with biopb-mcp and the control's admin
 # endpoints: check at the read step, warn and fall back to the default, stay
 # strict only where a human submitted the value (biopb/biopb#34).
-from biopb._config_io import atomic_write_json
-from biopb._config_validate import (
-    MISSING,
-    Problem,
-    check_sections,
-    warn_and_clamp,
-)
+from biopb._config.io import atomic_write_json
 
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI shares one definition (both depend on `biopb`). Re-exported
 # for back-compat (`biopb_tensor_server.core.config.find_config` and the name
-# constants). See biopb._locations for the JSON-canonical rationale
+# constants). See biopb._config.locations for the JSON-canonical rationale
 # (biopb/biopb#34).
-from biopb._locations import (
+from biopb._config.locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
+    data_dir,
     find_config as find_config,
+)
+from biopb._config.validate import (
+    MISSING,
+    Problem,
+    check_sections,
+    warn_and_clamp,
 )
 
 # The constraint primitives and the shared pyramid-knob bounds live in the core
@@ -149,6 +148,15 @@ def _default_file_cache_dir() -> Path:
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 
 
+def default_write_dir() -> Path:
+    """Where a writable server puts uploads unless the config names a directory.
+
+    The data tree (``~/.local/share/biopb``), not the cache: uploaded tensors
+    are the user's results, and a cache janitor may empty a cache at any time.
+    """
+    return data_dir() / "tensor-server" / "uploads"
+
+
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
 #
 # Out-of-range / bad-enum values used to be accepted silently and blow up later:
@@ -156,12 +164,12 @@ DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 # <= 0 -> infinite loop in the precache worker; reduction_method="bogus" -> a
 # read-time ValueError; downscale_factor=1 -> a silently single-level pyramid.
 # The declarative fix is this table, checked at the read step (parse_config) by
-# the shared biopb._config_validate walker -- the same walker and the same policy
+# the shared biopb._config.validate walker -- the same walker and the same policy
 # biopb-mcp and the control's admin endpoints use, so a knob is judged identically
 # wherever it is met. The same table also feeds the JSON Schema emitter
 # (config_schema.py), so the constraints are declared exactly once.
 #
-# Policy: warn and use the default (never raise). See _config_validate's module
+# Policy: warn and use the default (never raise). See biopb._config.validate's module
 # docstring for why -- in short, this server is a control-plane child that is
 # restarted on crash with capped backoff, so refusing to load would turn one bad
 # number into a permanent restart loop whose real cause is buried in a log. The
@@ -190,7 +198,7 @@ _REDUCTION_METHODS = {
 # above the class definitions). full_rescan_interval is intentionally absent:
 # a value <= 0 *disables* the periodic full-scan backstop (documented sentinel).
 # `_Range`/`_Enum` and the pyramid rows (PYRAMID_CONSTRAINTS) come from
-# biopb._config_constraints so biopb-mcp validates the same knobs identically.
+# biopb._config.constraints so biopb-mcp validates the same knobs identically.
 _CONSTRAINTS = {
     "CacheConfig": {
         "file_max_segment_bytes": _Range(min=1),
@@ -232,15 +240,22 @@ _CONSTRAINTS = {
         "max_query_results": _Range(min=1),
         "query_timeout_ms": _Range(min=1),
     },
+    "CatalogConfig": {
+        "checkpoint_threshold_mb": _Range(min=1),
+    },
     "ServerConfig": {
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
         ),
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
+        "registration_workers": _Range(min=0),
+        "walk_threads": _Range(min=1),
         "handle_reaper_ttl": _Range(min=0),
+        "adapter_idle_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
         "scratch_ttl": _Range(min=0),
+        "seal_ttl": _Range(min=0),
     },
 }
 
@@ -305,7 +320,7 @@ def _dataclass_default(cls, key: str) -> Any:
 def _clamp_invalid(config: ServerConfig) -> None:
     """Warn about each violation and reset that field to its dataclass default.
 
-    The load-path policy (see :mod:`biopb._config_validate`): a bad knob must not
+    The load-path policy (see :mod:`biopb._config.validate`): a bad knob must not
     reach the request path, but must also not stop the server from coming up --
     it is supervised, and refusing would just be restarted into the same failure.
     Falling back to the *dataclass* default means "the default" is exactly what
@@ -331,7 +346,7 @@ class SourceConfig:
     """Configuration for a single data source.
 
     A source may contain multiple tensors (multifield support) - the adapter
-    handles tensor enumeration via list_tensor_descriptors() at runtime.
+    handles tensor enumeration via list_tensors() at runtime.
 
     Remote/cloud source features are EXPERIMENTAL: remote URLs, ``cloud = true``
     synced-folder roots, the ``tensor-server`` proxy type, its ``alias``, and
@@ -360,7 +375,6 @@ class SourceConfig:
     type: Optional[
         Literal[
             "zarr",
-            "hdf5",
             "ome-tiff",
             "ome-tiff-multifile",
             "tiff",
@@ -387,10 +401,6 @@ class SourceConfig:
             "help": "Deprecated and ignored: a source's id is derived from its "
             "resolved URL (biopb/biopb#308). Use `alias` for a display name."
         },
-    )
-    dataset: Optional[str] = field(
-        default=None,
-        metadata={"help": "HDF5 dataset path (required for HDF5 sources)."},
     )
     monitor: bool = field(
         default=False,
@@ -475,7 +485,7 @@ class SourceConfig:
         # it -- so whatever enters the hash becomes something a user cannot change
         # without detaching their data. Url-derivation's known cost is that `mv`
         # re-keys a local source. Supplying an id explicitly is how the
-        # tensor-server proxy opts out: `sources.resolve._namespaced_source_id`
+        # tensor-server proxy opts out: `sources.resolve.namespaced_source_id`
         # builds one from (alias, upstream_source_id) with no endpoint in it, so a
         # moved upstream keeps its cache and its annotations. Config never reaches
         # this branch -- `sources.source_id` is ignored with a warning
@@ -757,12 +767,34 @@ class CatalogConfig:
             "the server stops, and so are the cache's decode measurements."
         },
     )
+    restore: bool = field(
+        default=True,
+        metadata={
+            "help": "Keep the sources of the last run in the catalog across a "
+            "restart, so they are listed at once and registered as they are read "
+            "or as the pool reaches them, and the first scan only verifies them. "
+            "Off empties the catalog at every start and rebuilds it from the scan. "
+            "Needs catalog.persist."
+        },
+    )
     store_path: str = field(
         default="",
         metadata={
             "help": "Where the on-disk catalog lives. Empty derives it from the "
             "config file's path, which is what keeps two servers on two configs "
             "off each other's file."
+        },
+    )
+    checkpoint_threshold_mb: int = field(
+        default=1024,
+        metadata={
+            "help": "How much the catalog file's write-ahead log may grow before "
+            "DuckDB rewrites the database file (a checkpoint). Every source's "
+            "row is written through the log, and a checkpoint stalls every "
+            "writer behind it, so a scan of a large site checkpoints constantly "
+            "at DuckDB's own 16 MB default. A larger value trades log size on "
+            "disk, and log to replay after a crash, for a faster build. Has no "
+            "effect with persist off."
         },
     )
 
@@ -852,22 +884,20 @@ class ServerConfig:
             "third-party libraries (grpc, numpy, ...) at their defaults."
         },
     )
-    monitor_mode: str = field(
-        default="periodic",
-        metadata={
-            "help": "How monitored folders are watched: 'periodic' rescans, or "
-            "'off' to stop background rescans after initial discovery."
-        },
-    )
     rescan_interval: float = field(
-        default=30.0,
-        metadata={"help": "Seconds between background rescans of monitored folders."},
+        default=120.0,
+        metadata={
+            "help": "Seconds between background rescans of monitored folders. Each "
+            "rescan walks every monitored folder in full, so a very large folder "
+            "should not be monitored."
+        },
     )
     full_rescan_interval: float = field(
         default=3600.0,
         metadata={
-            "help": "Seconds between forced full rescans that bypass subtree "
-            "pruning (<= 0 disables this backstop)."
+            "help": "Seconds between full rescans, the only ones that walk a cloud "
+            "folder; every other rescan walks the non-cloud folders only "
+            "(<= 0 disables the full pass)."
         },
     )
     handle_reaper_ttl: float = field(
@@ -878,8 +908,21 @@ class ServerConfig:
             "kept warm before it is closed; the next read reopens it (0 disables "
             "reaping). A ceiling, not an assignment: each format keeps its own "
             "shorter value where reopening it is cheap, so raising this never "
-            "lengthens a pin. Adapters that reopen per read (hdf5, mrc, ...) are "
+            "lengthens a pin. Adapters that reopen per read (mrc, ...) are "
             "unaffected."
+        },
+    )
+    adapter_idle_ttl: float = field(
+        default=0.0,
+        metadata={
+            "help": "Seconds a registered source's adapter is kept after its last "
+            "read before it is let go (0 keeps every adapter). A source that is "
+            "read again is rebuilt from its catalog row, and its first read "
+            "reopens the file, so this trades memory for first-read latency on "
+            "a catalog far larger than what is in use. Checked once per rescan "
+            "tick, so the effective time is rounded up to the next one. Only "
+            "sources that can be rebuilt from their row are let go: uploads and "
+            "mirrored sources are always kept."
         },
     )
     upload_ttl: float = field(
@@ -901,20 +944,53 @@ class ServerConfig:
             "discards them."
         },
     )
+    seal_ttl: float = field(
+        default=86400.0,
+        metadata={
+            "help": "Seconds a sealed read ticket stays valid. A reference sent "
+            "off the machine reads its tensor with these instead of this "
+            "server's token, so this is how long such a reference works: set it "
+            "to cover your longest job, or the longest a session keeps a lazy "
+            "array open. The server's own token reads without a seal and is not "
+            "affected. 0 never expires. Takes effect at the next start; "
+            "deleting ticket-seal.key from the state directory revokes every "
+            "ticket outstanding."
+        },
+    )
     stability_window: float = field(
         default=30.0,
         metadata={
             "help": "Minimum quiet period before a path is eligible for discovery "
             "or removal (seconds). Raise it above the interval at which a slow "
             "acquisition touches its files, or a dataset can be claimed between "
-            "writes; it only ever delays, never drops."
+            "writes; it only ever delays, never drops. A directory touched within "
+            "the window is not entered, so a folder written to more often than "
+            "this is not catalogued until it goes quiet. 0 turns the gate off, "
+            "for removal and rebuild as well as discovery."
         },
     )
-    aggressive_dir_pruning: bool = field(
-        default=False,
+    walk_threads: int = field(
+        default=1,
         metadata={
-            "help": "Also prune unchanged monitored roots (faster scans; may "
-            "defer root-level file updates to a later scan)."
+            "help": "Threads that read and probe directories during a scan. One "
+            "reads them in turn, which is fine on a local disk; a network "
+            "filesystem answers one request at a time per thread, so listing a "
+            "large tree there takes as long as its round trips, and more threads "
+            "overlap them."
+        },
+    )
+    registration_workers: int = field(
+        default=4,
+        metadata={
+            "help": "Threads that register, in the background, the sources the "
+            "first scan finds. Registration opens and parses each source's file, "
+            "which is most of the time a large site takes to start; with this on, "
+            "the scan only claims them, every source is in the catalog at once "
+            "(unresolved, reason 'pending') and fills in as it is registered, and "
+            "resolving one registers it immediately. Raise it on storage "
+            "that serves many reads at once (network filesystems); 0 registers "
+            "each source as it is found, so the catalog is complete when the "
+            "first scan is."
         },
     )
     claim_generic_images: bool = field(
@@ -926,16 +1002,17 @@ class ServerConfig:
         },
     )
     writable: bool = field(
-        default=False,
-        metadata={"help": "Enable write mode: allow source creation and data upload."},
+        default=True,
+        metadata={"help": "Serve the write path: allow data upload."},
     )
     write_dir: Optional[Path] = field(
         default=None,
         metadata={
-            "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
-            "uploads). Keep it outside every source directory: an uploaded "
-            "store is registered by the upload path, and discovery walking it "
-            "too would catalog it a second time."
+            "help": "Directory for uploaded tensors. Unset, a writable server "
+            "uses ~/.local/share/biopb/tensor-server/uploads, and a "
+            "non-writable one has none. Keep it outside every source "
+            "directory: an uploaded store is registered by the upload path, "
+            "and discovery walking it too would catalog it a second time."
         },
     )
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -1321,13 +1398,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 
-    # monitor_mode: honor the value directly, else derive it from the legacy
-    # `watcher_type` alias; if neither is set, ServerConfig's default applies.
-    monitor_mode = server_data.get("monitor_mode")
-    if monitor_mode is None and "watcher_type" in server_data:
-        monitor_mode = "off" if server_data.get("watcher_type") == "off" else "periodic"
-    if monitor_mode is not None:
-        server_kwargs["monitor_mode"] = monitor_mode
+    # Monitoring is always on. `monitor_mode` (and its legacy alias `watcher_type`)
+    # is still accepted so an old config loads, but "off" no longer does anything.
+    for key in ("monitor_mode", "watcher_type"):
+        if server_data.get(key) == "off":
+            logger.warning(
+                "server.%s = 'off' is ignored: monitored folders are always "
+                "rescanned. Drop 'monitor' from a source to stop watching it.",
+                key,
+            )
 
     # rescan_interval: `poll_interval` is the legacy alias.
     _carry(server_kwargs, "rescan_interval", server_data, cast=float)
@@ -1338,10 +1417,13 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
 
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
+    _carry(server_kwargs, "adapter_idle_ttl", server_data, cast=float)
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
+    _carry(server_kwargs, "seal_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
-    _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
+    _carry(server_kwargs, "registration_workers", server_data, cast=int)
+    _carry(server_kwargs, "walk_threads", server_data, cast=int)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
     write_dir_str = server_data.get("write_dir")
@@ -1442,9 +1524,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     metadata_db_data = data.get("metadata_db", {})
     # `metadata_db.enabled` was removed (biopb/biopb#225): the metadata DB is now
     # mandatory (always on) because it is the canonical source-browsing surface --
-    # the biopb-mcp guide steers agents to `client.query(sql, ...)`
-    # (complete, server-side) over the capped `list_sources()`, and that SQL path
-    # only exists when the DB is present. A lingering flag in an old config is
+    # the biopb-mcp guide steers agents to `client.query(sql, ...)`, and that SQL
+    # path only exists when the DB is present. A lingering flag in an old config is
     # ignored (not honored) with a warning; `enabled = false` gets the stronger
     # message because the DB comes up ON regardless -- the opposite of what that
     # config asked for.
@@ -1484,6 +1565,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     catalog_kwargs: Dict[str, Any] = {}
     _carry(catalog_kwargs, "persist", catalog_data)
     _carry(catalog_kwargs, "store_path", catalog_data)
+    _carry(catalog_kwargs, "checkpoint_threshold_mb", catalog_data, cast=int)
     catalog_config = CatalogConfig(**catalog_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is
@@ -1531,7 +1613,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
                 "always maps to one catalog entry (dropping explicit ids closes "
                 "biopb/biopb#308). Use `alias` to give the source a display name."
             )
-        _carry(src_kwargs, "dataset", src_data)
         _carry(src_kwargs, "monitor", src_data)
         _carry(src_kwargs, "cloud", src_data)
         _carry(src_kwargs, "credentials_profile", src_data)

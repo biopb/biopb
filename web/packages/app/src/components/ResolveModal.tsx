@@ -2,7 +2,7 @@
 
 import type { SourceJobStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
-import { shortId } from "../utils/sourceTree";
+import { shortId, unresolvedKind } from "../utils/sourceTree";
 
 /**
  * Modal progress for an in-flight resolve, and the one place a failed resolve
@@ -10,8 +10,11 @@ import { shortId } from "../utils/sourceTree";
  *
  * Modal because resolving is the blocking, consenting step: it downloads the
  * whole source and nothing can be opened until it lands, so there is no useful
- * work to do behind it. Warming is the opposite -- background, concurrent,
- * several at once -- and lives in the tray at the foot of the catalog.
+ * work to do behind it.
+ *
+ * Only a cloud recall is that blocking step. A pending or failed local source
+ * is read from disk in moments, so while it runs its tree row pulses instead
+ * (see `SourceTree`); only its failure comes here.
  *
  * Shown for `running` and `error` only. A cancel is the user's own doing and
  * closes quietly; a completed resolve closes too, because the result is the
@@ -50,14 +53,14 @@ export function ResolveModalView({
         </p>
         {!failed && (
           <div
-            className="warm-bar indeterminate"
+            className="resolve-bar indeterminate"
             role="progressbar"
             // No aria-valuenow at all: the server reports elapsed time and the
             // target's size, never how much of it has landed, so any percentage
             // here would be invented.
             aria-label={`Resolving ${name}`}
           >
-            <div className="warm-bar-fill" style={{ width: "100%" }} />
+            <div className="resolve-bar-fill" style={{ width: "100%" }} />
           </div>
         )}
         <div className="admin-modal-actions">
@@ -85,14 +88,19 @@ export function ResolveModalView({
 
 export function ResolveModal() {
   const sourceJobs = useAppStore((s) => s.sourceJobs);
+  const sources = useAppStore((s) => s.sources);
   const cancelSourceJob = useAppStore((s) => s.cancelSourceJob);
   const dismissSourceJob = useAppStore((s) => s.dismissSourceJob);
 
   // First match, not all: resolves are started one at a time from the tree, and
   // stacking modals would be unusable even if two somehow overlapped.
-  const job = Object.values(sourceJobs).find(
-    (j) => j.kind === "resolve" && (j.state === "running" || j.state === "error"),
-  );
+  const job = Object.values(sourceJobs).find((j) => {
+    if (j.kind !== "resolve") return false;
+    if (j.state === "error") return true;
+    if (j.state !== "running") return false;
+    const src = sources.find((x) => x.source_id === j.source_id);
+    return !src || unresolvedKind(src) === "recall";
+  });
   if (!job) return null;
 
   return (

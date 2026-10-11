@@ -8,9 +8,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -97,8 +100,8 @@ public class TensorFlightClient implements AutoCloseable {
 
     /**
      * The segment that marks a label set under its image, in a wire id:
-     * {@code <image array_id>/@labels/<name>}. Mirrors the Python SDK's
-     * {@code _labels.LABELS_SEGMENT} and the server's {@code core.labels}.
+     * {@code <image array_id>/@labels/<name>}. Mirrors the server's
+     * {@code core.labels}.
      *
      * <p>The marker is on the id only -- an OME-Zarr store's own NGFF group
      * stays {@code labels/}. It is what stops an uploaded tensor's id from
@@ -175,9 +178,28 @@ public class TensorFlightClient implements AutoCloseable {
      * @param token      Bearer token for authentication (null disables auth)
      */
     public TensorFlightClient(Location location, long cacheBytes, String token) {
+        this(location, cacheBytes, token, TlsTrust.NONE);
+    }
+
+    /**
+     * Create a new TensorFlightClient for a {@code grpc+tls://} location whose
+     * certificate the JDK's default trust store does not know.
+     *
+     * <p>{@code trust} is what {@link TlsTrusts#resolve} returned for this
+     * location: a private CA, the server's own pinned leaf, or a verified
+     * fingerprint, with a hostname override when the certificate does not list
+     * the name dialed. Resolve once and pass it here; this constructor does no
+     * network I/O of its own for trust.
+     *
+     * @param location   Flight server location
+     * @param cacheBytes Maximum cache size in bytes
+     * @param token      Bearer token for authentication (null disables auth)
+     * @param trust      TLS trust for {@code location}, or {@link TlsTrust#NONE}
+     */
+    public TensorFlightClient(Location location, long cacheBytes, String token, TlsTrust trust) {
         LOGGER.info(
                 "Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
-        this.session = new FlightSession(location, token);
+        this.session = new FlightSession(location, token, trust);
         // Every RPC goes through the session; what is read back out of it here
         // is what this class answers to callers (location / token) and the
         // allocator its Arrow results are owned by.
@@ -220,6 +242,67 @@ public class TensorFlightClient implements AutoCloseable {
             "source_id, source_url, source_type, is_resolved, tensors";
 
     /**
+     * Why a source is not resolved: {@code pending} (registration queued; a read
+     * or {@link #resolveSource} registers it with no download), {@code failed}
+     * (registration raised; the error is in {@code metadata_json}) or
+     * {@code needs_recall} (a cloud placeholder). Null on a resolved source.
+     */
+    static final String UNRESOLVED_REASON = "unresolved_reason";
+
+    /** The {@code sources} table's columns, once known; null until asked. */
+    private volatile Set<String> catalogColumns;
+
+    /**
+     * The {@code sources} table's columns, so a projection can ask for one only a
+     * newer server has instead of a second query for it.
+     *
+     * <p>One {@code GetFlightInfo} on the table's path, the first time it is
+     * needed on this connection. Empty when the server will not say -- a
+     * capability token reads a source's pixels, not the catalog -- and a caller
+     * then projects the base columns only. A refusal is remembered; a dropped or
+     * timed-out call is not, so the next call asks again.
+     */
+    Set<String> catalogColumns() {
+        Set<String> known = catalogColumns;
+        if (known != null) {
+            return known;
+        }
+        try {
+            FlightInfo info = session.client().getInfo(
+                    FlightDescriptor.path("sources"), session.authOption());
+            known = new HashSet<>();
+            for (org.apache.arrow.vector.types.pojo.Field field : info.getSchema().getFields()) {
+                known.add(field.getName());
+            }
+        } catch (FlightRuntimeException error) {
+            LOGGER.log(Level.FINE, "could not read the sources schema", error);
+            switch (error.status().code()) {
+                case UNAVAILABLE:
+                case TIMED_OUT:
+                case CANCELLED:
+                    return Collections.emptySet();   // this call goes without; the next asks again
+                default:
+                    known = Collections.emptySet();  // a refusal would repeat
+            }
+        }
+        catalogColumns = known;
+        return known;
+    }
+
+    /**
+     * {@link #SOURCE_ROW_COLUMNS} as a SELECT list, plus {@code unresolved_reason}
+     * when this server's {@code sources} table has it. A row carries that column
+     * only then.
+     */
+    public String sourceRowColumns() {
+        return withReason(SOURCE_ROW_COLUMNS);
+    }
+
+    private String withReason(String columns) {
+        return catalogColumns().contains(UNRESOLVED_REASON) ? columns + ", " + UNRESOLVED_REASON : columns;
+    }
+
+    /**
      * One source's catalog row by id, or {@code null} when nothing answers to it.
      *
      * <p>One addressed catalog row, so a source past the browse cap still
@@ -228,7 +311,7 @@ public class TensorFlightClient implements AutoCloseable {
      */
     private VectorSchemaRoot fetchSourceRow(String sourceId) throws IOException {
         VectorSchemaRoot root = query(
-                "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources WHERE source_id = "
+                "SELECT " + sourceRowColumns() + " FROM sources WHERE source_id = "
                         + sqlLiteral(sourceId));
         if (root.getRowCount() == 0) {
             root.close();
@@ -410,34 +493,29 @@ public class TensorFlightClient implements AutoCloseable {
      * extras (an OME-Zarr HCS field's OME block, an EMD signal's
      * {@code original_metadata}) are per-tensor and are not merged in here.
      *
+     * <p>A source the server has found but not yet registered ({@code pending},
+     * or one whose registration {@code failed}) is registered first -- nothing is
+     * downloaded -- and then read; a failed one raises with the server's reason.
+     *
      * @param sourceId Source identifier
      * @return The source's metadata map, or an empty map if it carries none
      * @throws IllegalArgumentException if the source is unknown
-     * @throws IllegalStateException    if the source is unresolved (cloud /
-     *                                  synced-folder) -- call {@link #resolveSource}
-     *                                  first
+     * @throws IllegalStateException    if the source is a cloud placeholder or
+     *                                  the server cannot say why it is unresolved
+     *                                  -- call {@link #resolveSource} first
      */
     public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
         // The column IS the answer: the server calls the adapter's get_metadata()
         // once at registration to fill it and reads it back from the catalog on
         // the serve path rather than recomputing (biopb/biopb#253).
-        String metadataJson = null;
-        boolean found = false;
-        boolean resolved = false;
-        try (VectorSchemaRoot root = query(
-                "SELECT is_resolved, metadata_json FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
-            if (root.getRowCount() > 0) {
-                found = true;
-                Boolean isRes = nullableBool(root.getVector("is_resolved"), 0);
-                resolved = isRes == null || isRes;
-                FieldVector meta = root.getVector("metadata_json");
-                metadataJson = meta == null || meta.isNull(0) ? null : String.valueOf(meta.getObject(0));
-            }
+        MetadataRow row = readMetadataRow(sourceId);
+        if (!row.resolved && registersOnRead(row.reason)) {
+            // Nothing to download: the server registers it on the call. A failed
+            // registration raises here with its own reason.
+            closeQuietly(resolveSource(sourceId));
+            row = readMetadataRow(sourceId);
         }
-        if (!found) {
-            throw new IllegalArgumentException("Source not found: " + sourceId);
-        }
-        if (!resolved) {
+        if (!row.resolved) {
             // Unresolved (cloud / synced-folder) source: tensors are unknown until
             // resolve. Don't return {} -- that conflates "unresolved" with
             // "resolved, no metadata". Steer to the explicit, consented resolveSource().
@@ -445,7 +523,43 @@ public class TensorFlightClient implements AutoCloseable {
             // and hold nothing readable (biopb/biopb#1032).
             throw unresolvedSourceError(sourceId);
         }
-        return parseMetadataJson(metadataJson);
+        return parseMetadataJson(row.metadataJson);
+    }
+
+    /** What {@link #getSourceMetadata} reads off one catalog row. */
+    private static final class MetadataRow {
+        boolean resolved;
+        String reason;
+        String metadataJson;
+    }
+
+    private MetadataRow readMetadataRow(String sourceId) throws IOException {
+        MetadataRow row = new MetadataRow();
+        try (VectorSchemaRoot root = query(
+                "SELECT " + withReason("is_resolved, metadata_json")
+                        + " FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
+            if (root.getRowCount() == 0) {
+                throw new IllegalArgumentException("Source not found: " + sourceId);
+            }
+            Boolean isRes = nullableBool(root.getVector("is_resolved"), 0);
+            row.resolved = isRes == null || isRes;
+            row.metadataJson = nullableText(root.getVector("metadata_json"), 0);
+            row.reason = nullableText(root.getVector(UNRESOLVED_REASON), 0);
+        }
+        return row;
+    }
+
+    /**
+     * Whether a source unresolved for this reason registers without a download.
+     * A server that does not say why (no reason column, or a capability token)
+     * gets the old refusal: the safe reading is a cloud placeholder.
+     */
+    private static boolean registersOnRead(String reason) {
+        return "pending".equals(reason) || "failed".equals(reason);
+    }
+
+    private static String nullableText(FieldVector vector, int index) {
+        return vector == null || vector.isNull(index) ? null : String.valueOf(vector.getObject(index));
     }
 
     /** Quote a string for the catalog's SQL surface, which takes no parameters. */
@@ -474,10 +588,8 @@ public class TensorFlightClient implements AutoCloseable {
      *         returns, which the <b>caller must close</b>. A row, not a type
      *         this SDK picked: every client can already decode one, and what
      *         you decode it into stays yours (biopb/biopb#1032).
-     *         <p>Unlike {@link #warmSource}, which returns a status because residency
-     *         is not a durable catalog fact and its file counts exist nowhere
-     *         else, this returns the result: resolving is defined by what it
-     *         writes to the row.
+     *         <p>Resolving is defined by what it writes to the row, so this
+     *         returns that row.
      * @throws IOException If the action fails or the server returns no row
      */
     public VectorSchemaRoot resolveSource(String sourceId) throws IOException {
@@ -588,69 +700,6 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    /**
-     * Hydrate-ahead: ask the server to recall all of a resolved multi-file
-     * source's member files, so later reads are warm and never stall.
-     *
-     * <p>{@link #resolveSource} populates a source's metadata but, for a multi-file
-     * cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
-     * leaves the bulk pixel data dehydrated -- each member file then recalls
-     * one-at-a-time, slowly, the first time a read touches it. This walks the
-     * source directory server-side and reads every file to force the sync
-     * engine's recall; no pixels cross the wire, only progress. It is idempotent
-     * (already-resident files are cheap local reads) and a no-op for a
-     * single-file source (resolveSource already recalled it). A remote-url source --
-     * an object store, or a {@code grpc://} mirror -- fails instead: nothing on
-     * the serving machine can be made resident (biopb/biopb#1035).
-     *
-     * @param sourceId The (already-resolved) source to warm.
-     * @return The terminal {@link WarmProgress} snapshot (files/bytes made
-     *         resident). {@code filesTotal == 0} means the source was local and
-     *         had nothing to warm, i.e. single-file; "not applicable" raises.
-     * @throws IOException If the action fails or it returns no terminal status
-     * @throws UnsupportedOperationException If the server predates the
-     *         {@code warm} action
-     */
-    public WarmProgress warmSource(String sourceId) throws IOException {
-        return warmSource(sourceId, null, null);
-    }
-
-    /**
-     * Warm a source with optional progress and cancellation hooks.
-     *
-     * @param sourceId source to warm
-     * @param onProgress receives non-terminal warm progress, or null
-     * @param shouldCancel polled once per action message, or null
-     * @return the terminal progress snapshot
-     */
-    public WarmProgress warmSource(
-            String sourceId,
-            Consumer<WarmProgress> onProgress,
-            BooleanSupplier shouldCancel) throws IOException {
-        WarmProgress[] done = { null };
-        streamAction("warm", sourceId.getBytes(StandardCharsets.UTF_8),
-                WarmStreamMessage.parser(),
-                message -> {
-                    if (shouldCancel != null && shouldCancel.getAsBoolean()) {
-                        throw new TensorOperationCancelledException("warmSource", sourceId);
-                    }
-                    if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.PROGRESS) {
-                        if (onProgress != null) {
-                            onProgress.accept(message.getProgress());
-                        }
-                    } else if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
-                        done[0] = message.getDone();
-                    }
-                    return true;
-                },
-                "Hydrate-ahead is unavailable");
-        if (done[0] == null) {
-            throw new IOException("warmSource('" + sourceId
-                    + "') returned no terminal status (server closed the stream without a 'done')");
-        }
-        return done[0];
-    }
-
     // ---- source lifecycle -------------------------------------------------
 
     /**
@@ -696,16 +745,42 @@ public class TensorFlightClient implements AutoCloseable {
      *         registered path REBUILDS it against the file as it is now -- that
      *         is what {@code refreshed} reports, and it is how a source picks up
      *         an in-place edit. Registration wrote each source's catalog row, so
-     *         anything beyond the ids is one {@link #query} away.
+     *         anything beyond the ids is one {@link #query} away. A non-zero
+     *         {@code skippedOffline} means the import is incomplete: offline
+     *         placeholders were skipped because this was not a cloud folder, and
+     *         resending with {@code cloud} set registers them.
      */
     public AddSourceResult registerLocalPath(
             String url,
             String sourceType,
             Consumer<AddSourceProgress> onProgress,
             BooleanSupplier shouldCancel) throws IOException {
+        return registerLocalPath(url, sourceType, false, onProgress, shouldCancel);
+    }
+
+    /**
+     * Register a path on the server, saying whether it is a cloud / synced folder.
+     *
+     * <p>{@code cloud} registers the folder's offline placeholders (OneDrive,
+     * Dropbox, iCloud "Files On-Demand") as unresolved sources instead of
+     * skipping them; the result's {@code skippedOffline} counts what was skipped
+     * when it was not set. Set it only with the user's consent: a wrong guess
+     * turns off multi-file grouping (OME-TIFF and the like). A path already under
+     * a configured cloud root is cloud whatever this says.
+     *
+     * @param cloud treat {@code url} as a cloud / synced folder
+     * @see #registerLocalPath(String, String, Consumer, BooleanSupplier)
+     */
+    public AddSourceResult registerLocalPath(
+            String url,
+            String sourceType,
+            boolean cloud,
+            Consumer<AddSourceProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
         AddSourceRequest request = AddSourceRequest.newBuilder()
                 .setUrl(url)
                 .setSourceType(sourceType == null ? "" : sourceType)
+                .setCloud(cloud)
                 .build();
         AddSourceResult[] result = { null };
         streamAction("add_source", request.toByteArray(), AddSourceStreamMessage.parser(),
@@ -761,43 +836,14 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    // ---- label sets -------------------------------------------------------
-
-    /**
-     * The {@code array_id}s of the label sets served under an image.
-     *
-     * <p>A label set is an ordinary tensor of its image, named
-     * {@code <image array_id>/@labels/<name>}, so this is a catalog query over
-     * the path and nothing more -- {@link #getTensor} / {@link #getDescriptor}
-     * read one like any other tensor.
-     *
-     * @param imageArrayId the image's array_id
-     * @return the sets' array_ids, sorted; empty when the image has none
-     */
-    public List<String> getLabelSets(String imageArrayId) throws IOException {
-        List<String> sets = new ArrayList<>();
-        try (VectorSchemaRoot root = query(
-                "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, "
-                        + sqlLiteral(imageArrayId + "/" + LABELS_SEGMENT + "/")
-                        + ") ORDER BY t.array_id")) {
-            FieldVector ids = root.getVector("array_id");
-            for (int row = 0; row < root.getRowCount(); row++) {
-                if (ids != null && !ids.isNull(row)) {
-                    sets.add(String.valueOf(ids.getObject(row)));
-                }
-            }
-        }
-        return sets;
-    }
-
     // ---- ROI annotations --------------------------------------------------
 
     /**
      * Fetch a tensor's ROI annotations.
      *
      * <p>There is no plane or bbox filter: a client hit-tests and re-renders
-     * from the resident set. Annotations are private data, gated by the
-     * tensor's source like its pixels, so they are not on the SQL surface.
+     * from the resident set. Reads are gated by the tensor's source like its
+     * pixels; the {@code rois} table in a catalog query is full-access only.
      *
      * @param arrayId unversioned array_id of the tensor
      * @return the annotations, a {@code truncated} flag, and {@code sets} --
@@ -817,14 +863,24 @@ public class TensorFlightClient implements AutoCloseable {
      * @return the annotations, a {@code truncated} flag, and the tensor's sets
      */
     public RoiListResult listRois(String arrayId, String setName) throws IOException {
-        TensorTicket ticket = TensorTicket.newBuilder()
-                .setRoiRead(RoiRead.newBuilder()
-                        .setArrayId(arrayId)
-                        .setSetName(setName == null ? "" : setName)
-                        .build())
-                .build();
+        return listRois(arrayId, setName, null);
+    }
+
+    /**
+     * Fetch one layer of a tensor's ROI annotations through a sealed ticket.
+     *
+     * @param arrayId unversioned array_id of the tensor
+     * @param setName restrict to one layer; empty means the client-owned sets
+     * @param roiTicket the sealed ticket a reference carried
+     *        ({@link #roiTicketOf}), to read through a connection that holds no
+     *        token of its own; null reads with this connection's own
+     * @return the annotations, a {@code truncated} flag, and the tensor's sets
+     */
+    public RoiListResult listRois(String arrayId, String setName, byte[] roiTicket)
+            throws IOException {
         RoiListResult.Builder result = RoiListResult.newBuilder();
-        try (FlightStream stream = session.getStream(new Ticket(ticket.toByteArray()))) {
+        try (FlightStream stream = session.getStream(
+                new Ticket(roiReadTicket(arrayId, setName, roiTicket)))) {
             // `truncated` and the tensor's `sets` ride the stream's schema
             // metadata, so they are read before the first batch.
             Map<String, String> metadata = stream.getSchema().getCustomMetadata();
@@ -1028,7 +1084,36 @@ public class TensorFlightClient implements AutoCloseable {
      * @return The TensorDescriptor for that tensor
      */
     public TensorDescriptor getDescriptor(String arrayId) {
-        return describe(arrayId, readMask("pyramid"));
+        return getDescriptor(arrayId, DescribeOptions.defaults());
+    }
+
+    /**
+     * {@link #getDescriptor(String)} with the optional parts of the response
+     * chosen by the caller: the full OME metadata, the read plan, residency, the
+     * upload status, or no pyramid. Each costs what {@link DescribeOptions}
+     * says it does.
+     *
+     * @param arrayId Globally-unique tensor id
+     * @param options which optional parts to fill
+     * @return The TensorDescriptor for that tensor
+     */
+    public TensorDescriptor getDescriptor(String arrayId, DescribeOptions options) {
+        return describe(arrayId, readMask((options == null ? DescribeOptions.defaults() : options)
+                .paths().toArray(new String[0])));
+    }
+
+    /**
+     * The address the server says it is reachable at ({@code
+     * health.external_location}), or null if it published none.
+     *
+     * <p>Nothing in the SDK dials it for you. Pass it as the {@code
+     * exportLocation} of {@link #getTensorAsPb(String, SliceHint, long[], String,
+     * String)} when the result goes to a process that cannot reach this
+     * connection's own address. Reading it runs the one {@code health} check if
+     * no call has yet.
+     */
+    public String getAdvertisedLocation() {
+        return session.advertisedLocation();
     }
 
     /**
@@ -1135,7 +1220,7 @@ public class TensorFlightClient implements AutoCloseable {
         // descriptor.shape may be larger than the requested extent.
         if (sliceHint != null && context.descriptor.hasSliceHint()) {
             rai = RegionCrop.cropToRequest(rai, sliceHint, context.descriptor.getSliceHint(),
-                    context.descriptor.getScaleHintList());
+                    PlanRequest.of(context.info).getScaleHintList());
         }
 
         // Preserve source compatibility while externalizing only the v2 handle.
@@ -1173,23 +1258,100 @@ public class TensorFlightClient implements AutoCloseable {
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
+        return getTensorAsPb(arrayId, sliceHint, scaleHint, reductionMethod, null);
+    }
+
+    /**
+     * {@link #getTensorAsPb(String, SliceHint, long[], String)} naming the
+     * address to bake into the result's {@code location} instead of this
+     * connection's own dial address.
+     *
+     * <p>Set it when the result leaves this process and the dial address is not
+     * reachable from there; {@link #getAdvertisedLocation} is the server's own
+     * answer for that. The result carries the trust anchor this connection
+     * verified the server with, not a resolved trust: whoever dials the new
+     * address applies it to that name, so a leaf-pinned certificate that omits
+     * the name still connects (a CA keeps its SAN check).
+     *
+     * @param exportLocation the address to export, or null for this connection's own
+     */
+    public SerializedTensor getTensorAsPb(
+            String arrayId,
+            SliceHint sliceHint,
+            long[] scaleHint,
+            String reductionMethod,
+            String exportLocation) {
 
         LOGGER.fine("getTensorAsPb: arrayId=" + arrayId);
         RequestContext context = planRead(arrayId, sliceHint, scaleHint, reductionMethod);
 
         // The plan is Arrow's own FlightInfo, carried whole; only where and as
         // whom to read it is ours to add.
-        return serializedTensorOf(context.info);
+        return serializedTensorOf(context.info, exportLocation);
     }
 
     private SerializedTensor serializedTensorOf(FlightInfo info) {
+        return serializedTensorOf(info, null);
+    }
+
+    private SerializedTensor serializedTensorOf(FlightInfo info, String exportLocation) {
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
-                .setLocation(location.getUri().toString())
+                .setLocation(exportLocation == null ? location.getUri().toString() : exportLocation)
                 .setFlightInfo(ByteString.copyFrom(info.serialize()));
-        if (token != null && !token.isEmpty()) {
+        // A plan the server sealed names what it reads and needs no credential
+        // to read it, so the reference leaves without this connection's token
+        // (biopb/biopb#1112). Anything unsealed still carries it: the reader has
+        // nothing else to read with.
+        if (token != null && !token.isEmpty() && !isSealed(info)) {
             builder.setAuthToken(token);
         }
+        // The anchor the plan was read under, so the consumer trusts the same
+        // certificate instead of the first one it sees.
+        byte[] anchor = session.trust().rootCerts();
+        if (anchor != null) {
+            builder.setTlsAnchor(ByteString.copyFrom(anchor));
+        }
         return builder.build();
+    }
+
+    /** Did the server seal this plan: endpoints that are indices under a stub? */
+    static boolean isSealed(FlightInfo info) {
+        return !info.getEndpoints().isEmpty()
+                && !TensorChunkCodec.descriptorOf(info).getTicketStub().isEmpty();
+    }
+
+    /**
+     * The sealed ticket for reading a SerializedTensor's annotations, or null if
+     * its sender issued none. The server seals it into the plan it answers, so a
+     * reference that carries no token can still read its tensor's ROI sets: pass
+     * it to {@link #listRois(String, String, byte[])}.
+     */
+    public static byte[] roiTicketOf(SerializedTensor pb) {
+        ByteString ticket = descriptorOf(pb).getRoiTicket();
+        return ticket.isEmpty() ? null : ticket.toByteArray();
+    }
+
+    /**
+     * The ticket for one read of the {@code roi} flight. A sealed {@code roiTicket}
+     * reads every set; naming one merges a {@code RoiRead{set_name}} onto it, the
+     * way protobuf merges concatenated messages.
+     */
+    static byte[] roiReadTicket(String arrayId, String setName, byte[] roiTicket) {
+        String set = setName == null ? "" : setName;
+        if (roiTicket == null || roiTicket.length == 0) {
+            return TensorTicket.newBuilder()
+                    .setRoiRead(RoiRead.newBuilder().setArrayId(arrayId).setSetName(set).build())
+                    .build()
+                    .toByteArray();
+        }
+        if (set.isEmpty()) {
+            return roiTicket;
+        }
+        byte[] named = TensorTicket.newBuilder()
+                .setRoiRead(RoiRead.newBuilder().setSetName(set).build())
+                .build()
+                .toByteArray();
+        return ByteString.copyFrom(roiTicket).concat(ByteString.copyFrom(named)).toByteArray();
     }
 
     /** The plan a SerializedTensor carries: its serialized Arrow FlightInfo. */
@@ -1346,8 +1508,9 @@ public class TensorFlightClient implements AutoCloseable {
      *        the file's own tensors, so a bare {@code "<source_id>/<field>"}
      *        is a native tensor id and is refused here. The one other form is
      *        {@code "zarr://<image array_id>/@labels/<name>"}, a label set of an
-     *        image the server already serves. A set is unsigned-integer, spans
-     *        its image's non-channel axes at full length, and its all-zero
+     *        image the server already serves. A set is unsigned-integer, has
+     *        its image's axes at the image's lengths (a channel axis is a
+     *        singleton, an RGB samples axis is left out), and its all-zero
      *        chunks are skipped by {@link #uploadArray}. The scheme names the
      *        store format and nothing else: the answered id carries none
      * @param shape the tensor's shape
@@ -1439,6 +1602,10 @@ public class TensorFlightClient implements AutoCloseable {
      * the store's fill value already reads as background, so one labelled frame
      * of a thousand costs one frame (biopb/biopb#1059).
      *
+     * <p>Chunks are put {@value TensorUploads#DEFAULT_CONCURRENCY} at a time; see
+     * {@link #uploadArray(TensorDescriptor, RandomAccessibleInterval, int)} to
+     * say otherwise.
+     *
      * @param descriptor the descriptor {@link #setupArrayUpload} returned
      * @param array the array to upload
      * @param <T> the pixel type
@@ -1451,6 +1618,30 @@ public class TensorFlightClient implements AutoCloseable {
     public <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
             TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
         return uploads.uploadArray(descriptor, array);
+    }
+
+    /**
+     * {@link #uploadArray(TensorDescriptor, RandomAccessibleInterval)} with the
+     * number of chunk puts in flight set by the caller.
+     *
+     * <p>Each in-flight chunk holds one encoded block in memory, so the width is
+     * also the memory bound. The chunks are read out of {@code array} from
+     * several threads at once, each through its own {@code RandomAccess}; an
+     * array whose reads are not safe to share (a view over a stateful source)
+     * wants {@code concurrency} of 1, which puts every chunk on the calling
+     * thread in plan order.
+     *
+     * <p>A refusal on any one stream fails the whole upload -- still an
+     * {@link UploadRefusedException} -- and stops chunks not yet started; the
+     * source is not sealed. Any other failure of a chunk put does the same.
+     *
+     * @param concurrency chunk puts in flight at once, at least 1
+     * @throws IllegalArgumentException if {@code concurrency} is below 1, or
+     *         as the two-argument form
+     */
+    public <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
+            TensorDescriptor descriptor, RandomAccessibleInterval<T> array, int concurrency) {
+        return uploads.uploadArray(descriptor, array, concurrency);
     }
 
     /**
@@ -1501,7 +1692,7 @@ public class TensorFlightClient implements AutoCloseable {
      * down the ladder is refused.
      *
      * @param arrayId what {@link #setupArrayUpload} answered with, or a label set's
-     *        array_id as {@link #getLabelSets} reports it
+     *        array_id
      * @param state {@code READY} or {@code DISCARDED}
      * @param reason why, for {@code DISCARDED}; it is what a poller waiting on
      *        this result reads back, so write it for them
@@ -1527,7 +1718,7 @@ public class TensorFlightClient implements AutoCloseable {
      * Consume a streaming action, handing each non-empty message to
      * {@code onMessage}; returning false from it stops consuming.
      *
-     * <p>The loop shared by {@link #resolveSource} / {@link #warmSource} /
+     * <p>The loop shared by {@link #resolveSource} /
      * {@link #registerLocalPath}: the {@code doAction} call, the empty-body heartbeat
      * skip, the envelope parse, and the old-server {@code "Unknown action"}
      * remap, applied only when {@code unavailableHint} is given.
@@ -1538,7 +1729,7 @@ public class TensorFlightClient implements AutoCloseable {
      * Python gets by closing its generator, and what lets a server stop a walk
      * it is halfway through rather than finish it for nobody. It happens on
      * every exit, so a caller that throws out of {@code onMessage}
-     * (resolveSource/warmSource raise on cancel) also releases the server.
+     * (resolveSource raises on cancel) also releases the server.
      *
      * <p>A message that does not parse as {@code M} is skipped. Python can call
      * that harmless because its SDK refuses a pre-v2 server at connect; this
@@ -1548,7 +1739,7 @@ public class TensorFlightClient implements AutoCloseable {
      * {@code protocol} check is ported.
      *
      * <p>Cancellation policy is deliberately NOT decided here: its semantics
-     * differ per caller (resolveSource/warmSource raise, registerLocalPath returns what it has),
+     * differ per caller (resolveSource raises, registerLocalPath returns what it has),
      * and the poll must run relative to a consumed message, which only the
      * caller knows the right side of.
      */
@@ -1641,9 +1832,14 @@ public class TensorFlightClient implements AutoCloseable {
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
+        // Ask for the sealed stub when the server issues one, so the plan carries
+        // an index per chunk instead of a ticket per chunk and can leave the
+        // machine without this connection's token (biopb/biopb#1112).
         TensorReadOption.Builder read = TensorReadOption.newBuilder()
                 .setArrayId(arrayId)
-                .setFields(readMask("endpoints"));
+                .setFields(session.ticketStubs()
+                        ? readMask("endpoints", "ticket_stub")
+                        : readMask("endpoints"));
         if (sliceHint != null) {
             read.setSliceHint(sliceHint);
         }

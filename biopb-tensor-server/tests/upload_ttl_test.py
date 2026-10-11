@@ -28,7 +28,6 @@ from biopb_tensor_server.adapters.fields import fields_root, source_fields_dir
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.members import MEMBER_DESCRIPTOR
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.attached import attached_field
 
 from tests import catalog_server
@@ -128,7 +127,7 @@ class TestTheSweepEnforcesIt:
         assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
         assert "lifetime" in client.get_upload_status(desc.array_id)["reason"]
         assert not store.exists()
-        assert catalog_tensors(writable_server.sources.get(source)) == []
+        assert writable_server.sources.catalog_tensors(source) == []
 
     def test_one_without_a_deadline_survives(self, uploads, client, source):
         """A published result with no lifetime is its reader's, not the
@@ -153,11 +152,11 @@ class TestTheSweepEnforcesIt:
         wall = time.time() + 601
         assert uploads.reap(wall_now=wall) == (1, 0)
 
-        parent = writable_server.sources.get(source)
-        assert attached_field("temp") in parent.attached_tensors
+        writable_server.sources.get(source)
+        assert attached_field("temp") in writable_server.sources.attachments(source)
 
         assert uploads.reap(now=time.monotonic() + 2 * TTL, wall_now=wall) == (0, 1)
-        assert attached_field("temp") not in parent.attached_tensors
+        assert attached_field("temp") not in writable_server.sources.attachments(source)
         assert client.get_upload_status(desc.array_id)["state"] == "UNKNOWN"
 
     def test_a_zero_ttl_disables_deadlines_too(self, uploads, client, source):
@@ -225,7 +224,8 @@ class TestALabelSetIsAnUploadedTensorToo:
 
         assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
         assert "lifetime" in client.get_upload_status(desc.array_id)["reason"]
-        assert desc.array_id not in writable_server.sources.get(source).label_sets
+        listed = writable_server.sources.attached_to(source).listed()
+        assert desc.array_id not in [t.array_id for _, t in listed]
 
     def test_the_deadline_is_recorded_in_the_sidecar(
         self, client, source, writable_server, tmp_path
@@ -270,7 +270,7 @@ class TestItSurvivesARestart:
     @staticmethod
     def _serve(tmp_path):
         server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
@@ -290,8 +290,8 @@ class TestItSurvivesARestart:
         try:
             second.uploads.stop_sweep()
             second.uploads.ttl = TTL
-            adopted = second.sources.get(source)
-            assert [d.array_id for d in catalog_tensors(adopted)] == [
+            second.sources.get(source)
+            assert [d.array_id for d in second.sources.catalog_tensors(source)] == [
                 f"{source}/@fields/temp"
             ]
 
@@ -327,8 +327,8 @@ class TestItSurvivesARestart:
 
             second.uploads.reap(wall_now=wall)
 
-            parent = second.sources.get(source)
-            assert attached_field("temp") not in parent.attached_tensors
+            second.sources.get(source)
+            assert attached_field("temp") not in second.sources.attachments(source)
             # ...and the sweep is done with it: no re-expiring it forever.
             assert second.uploads.reap(
                 now=time.monotonic() + 100 * TTL, wall_now=wall
@@ -357,7 +357,7 @@ class TestItSurvivesARestart:
         second = self._serve(tmp_path)
         try:
             assert not store.exists()
-            assert catalog_tensors(second.sources.get(source)) == []
+            assert second.sources.catalog_tensors(source) == []
         finally:
             second.shutdown()
             CacheManager.reset()

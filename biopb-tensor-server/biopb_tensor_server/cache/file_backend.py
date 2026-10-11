@@ -181,7 +181,6 @@ class ArrowFileBackend:
         # ourselves -- otherwise the write handle lingers until GC and (on
         # Windows) blocks segment unlink during eviction/cleanup. See issue #5.
         self._pool_sinks: Dict[int, pa.OSFile] = {}
-        self._pool_paths: Dict[int, Path] = {}
 
         # Pool tracking: (schema_key, size_class) -> segment_id for open segments
         self._open_pools: Dict[Tuple[RetentionClass, SizeClass], int] = {}
@@ -479,8 +478,6 @@ class ArrowFileBackend:
                     segment_id=segment_id,
                     offset=record.offset,  # entry index for the sequential reader
                     size_bytes=record.size_bytes,
-                    created_at=segment_created,
-                    last_access_time=segment_created,
                     byte_offset=record.byte_offset,
                     byte_length=record.byte_length,
                 ),
@@ -494,7 +491,6 @@ class ArrowFileBackend:
             SieveKSegmentInfo(
                 segment_id=segment_id,
                 size_bytes=st.st_size,
-                created_at=segment_created,
                 last_access_time=segment_created,
                 entry_count=len(records),
             ),
@@ -589,7 +585,6 @@ class ArrowFileBackend:
             SieveKSegmentInfo(
                 segment_id=segment_id,
                 size_bytes=0,
-                created_at=time.time(),
                 last_access_time=time.time(),
                 entry_count=0,
             ),
@@ -599,7 +594,6 @@ class ArrowFileBackend:
         # Register in pool tracking
         self._pool_writers[segment_id] = writer
         self._pool_sinks[segment_id] = sink
-        self._pool_paths[segment_id] = segment_path
         self._open_pools[pool_key] = segment_id
         self._segment_pool_key[segment_id] = pool_key
 
@@ -622,7 +616,12 @@ class ArrowFileBackend:
         stream but leaves the OSFile sink open, so the write handle would linger
         and block unlink on Windows (issue #5).
         """
-        writer, sink, _path = self._detach_open_segment(segment_id)
+        self._close_handles(*self._detach_open_segment(segment_id))
+
+    @staticmethod
+    def _close_handles(writer, sink) -> None:
+        """Close a detached segment's writer, then its sink. Both must close:
+        ``close()`` leaves the OSFile sink open (issue #5)."""
         if writer is not None:
             writer.close()
         if sink is not None:
@@ -630,7 +629,7 @@ class ArrowFileBackend:
 
     def _detach_open_segment(self, segment_id: int):
         """Pop every open-segment structure for ``segment_id`` and return its
-        ``(writer, sink, path)`` for the caller to close.
+        ``(writer, sink)`` for the caller to close.
 
         The one place that knows which maps track an open segment, so adding or
         retiring one is a single edit rather than four. Purely in-memory --
@@ -639,11 +638,10 @@ class ArrowFileBackend:
         """
         writer = self._pool_writers.pop(segment_id, None)
         sink = self._pool_sinks.pop(segment_id, None)
-        path = self._pool_paths.pop(segment_id, None)
         self._open_pools = {
             k: v for k, v in self._open_pools.items() if v != segment_id
         }
-        return writer, sink, path
+        return writer, sink
 
     def _open_segment_ids(self) -> list:
         """Segment ids with an open writer (the still-unsealed segments)."""
@@ -657,22 +655,19 @@ class ArrowFileBackend:
         bytes (a blocking disk op), so it runs with ``self._lock`` released and
         the lock is taken only for the surrounding in-memory index mutations.
         """
-        # Detach writer/sink/path from the index under the lock (in-memory only).
+        # Detach writer/sink from the index under the lock (in-memory only).
         with self._lock:
-            writer, sink, path = self._detach_open_segment(segment_id)
+            writer, sink = self._detach_open_segment(segment_id)
 
-        # Flush + close the handles WITHOUT self._lock (this is the blocking I/O;
-        # both must close -- close() leaves the OSFile sink open, issue #5).
-        if writer is not None:
-            writer.close()
-        if sink is not None:
-            sink.close()
+        # Flush + close the handles WITHOUT self._lock (this is the blocking I/O).
+        self._close_handles(writer, sink)
+        path = self._segment_path(segment_id)
 
         # Reopen read-only (mmap is a non-blocking read map) and drop redundant
         # in-memory copies, under the lock.
         records = None
         with self._lock:
-            if path and path.exists():
+            if path.exists():
                 self._open_segment_mmap(segment_id, path)
 
                 # The segment is now re-readable, so the in-memory RecordBatch
@@ -932,10 +927,7 @@ class ArrowFileBackend:
         the same way. Caller holds ``_write_lock`` (which keeps the segment's
         writer/sink state stable), not ``_lock``.
         """
-        path = self._pool_paths.get(segment_id)
-        if path is None:
-            return 0, 0
-        return bracket_message(path, write_start, write_end)
+        return bracket_message(self._segment_path(segment_id), write_start, write_end)
 
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
         """Return the on-disk location of a cached chunk, or None.
@@ -1334,14 +1326,11 @@ class ArrowFileBackend:
                         # the eviction budget and size class below, which is
                         # in-session state a walk never reconstructs.
                         size_bytes=estimate_batch_bytes(data),
-                        created_at=now,
-                        last_access_time=now,
                         byte_offset=byte_offset,
                         byte_length=byte_length,
                     ),
                 )
-                if entry.state == EntryState.PENDING:
-                    entry.set_ready(data, size_bytes)
+                entry.set_ready(data, size_bytes)
                 need_close = bool(
                     seg_info and seg_info.size_bytes >= self._config.max_segment_bytes
                 )
@@ -1543,8 +1532,6 @@ class ArrowFileBackend:
             self._write_segment_sidecar(segment_id, records)
 
         with self._lock:
-            self._open_pools.clear()
-
             # Close all mmap handles
             for segment_id in list(self._segment_mmaps):
                 self._forget_segment_mmap(segment_id)

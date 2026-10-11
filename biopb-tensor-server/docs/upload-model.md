@@ -42,17 +42,18 @@ catalog. It holds no bytes **and no tensors** of its own: what is added to it
 is an uploaded field like any other, under `<write_dir>/fields/scratch/`
 (Uploaded fields).
 
-`write_dir`, not `writable`, is the switch: `writable` serves the Flight write
-verbs, and an in-process producer wants the scratch source without them. That
-is `biopb-image-base`'s embedded result cache, which calls `add_tensor`
-directly and leaves `add_tensor`, `set_upload_status` and DoPut refused on the
-wire.
+`write_dir`, not `writable`, is the switch: `writable` (on by default) serves
+the Flight write verbs, and an in-process producer wants the scratch source
+without them. That is `biopb-image-base`'s embedded result cache, which calls
+`add_tensor` directly and leaves `add_tensor`, `set_upload_status` and DoPut
+refused on the wire. A writable server that names no `write_dir` uses
+`~/.local/share/biopb/tensor-server/uploads`; a non-writable one has none
+unless it names one.
 
 - **The id is fixed, which is the point.** A producer writes
   `zarr://scratch/@fields/<name>` without a round trip first -- nothing to
   mint, nothing for a client to remember, and nothing to adopt at boot. Its
-  tensors come back through the `on_register` hook that gives every source
-  its uploaded fields (`fields_attacher`).
+  tensors come back with the registry's boot scan like any source's.
 - **It keeps no directory of its own**, so there is nothing under
   `write_dir` naming it and nothing to sweep. `content_version` is None,
   the base's word for content this adapter does not serve; every member
@@ -108,15 +109,20 @@ segment and writes its sidecar -- no segment is open on a READY member.
 `<write_dir>/fields/<source_id>/<name>/` -- a member directory in either
 store format -- whatever kind the source is. One layout, because neither
 kind has anywhere of its own to put it: a discovered source's bytes are the
-user's, and the scratch source holds none. It is attached by the same
-`on_register` hook that attaches label sidecars, and listed after the
+user's, and the scratch source holds none. It is adopted by the registry's boot scan with the label sidecars, and listed after the
 format's own tensors (of which the scratch source has none).
 
-A field and a label set are both **attached tensors**: `SourceAdapter`
-holds one `field -> adapter` index (`_attached_tensors`), and `label_sets`,
-`label_uploads` and `attached_fields` are checked views over it --
-`label_sets` is the attached tensors whose field parses as a set, each
-checked against `label_binding_error`. A field differs from a label set in
+A field and a label set are both **attached tensors**. `SourceRegistry` owns
+one `Attachments` per source id (`core/attachments.py`), scanned from disk once
+at boot and independent of the adapter, so an adapter rebuilt by a refresh
+leaves the tensors and an upload in flight where they were. Adapters know
+nothing of them: the registry resolves a tensor id (`resolve_tensor`), lists a source (`catalog_tensors`) and answers the
+capability token. A label set is checked once per change, not per
+read: `rebind` (which `SourceRegistry.register` calls on every registration of
+the source, so a refresh and a rebuild after eviction pass through it) snapshots
+the parent's images and judges every set against them, and attaching, detaching
+or publishing a field judges them again. A set must bind to an image of the
+source and span it; one that does not stays listed and raises on read. A field differs from a label set in
 binding to nothing, decoding nothing, and mapping to no axes.
 
 A set may bind to an uploaded field, since a field is a tensor of its

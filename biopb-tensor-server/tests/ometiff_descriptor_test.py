@@ -167,7 +167,7 @@ class TestFastPathParity:
         adapter = OmeTiffAdapter(path, "noparse")
         adapter._bio_image = _Tripwire()
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert len(descriptors) == 1
         assert descriptors[0].array_id == "noparse/Image:0"
@@ -175,10 +175,9 @@ class TestFastPathParity:
         assert list(descriptors[0].dim_labels) == list("TCZYX")
         # Structural entry: the transfer grid is the scene adapter's to answer
         # (biopb/biopb#812).
-        assert list(descriptors[0].chunk_shape) == []
         # Cached, and still served from cache without parsing.
         assert adapter._cached_descriptors == adapter._scene_descriptors()
-        assert adapter.list_tensor_descriptors() == descriptors
+        assert adapter.list_tensors() == descriptors
 
 
 class TestClaim:
@@ -235,7 +234,7 @@ class TestPageAlignedChunkShape:
     def test_chunk_shape_is_aligned_to_the_page_grid(self, tmp_path):
         path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(3, 64, 64))
         source = OmeTiffAdapter(path, "pg")
-        scene_id = source.list_tensor_descriptors()[0].array_id
+        scene_id = source.list_tensors()[0].array_id
         desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
         page = self._za_page_chunks_canonical(path, list(desc.dim_labels))
         grid = list(desc.chunk_shape)
@@ -258,7 +257,7 @@ class TestPageAlignedChunkShape:
             tile=(32, 32),
         )
         source = OmeTiffAdapter(str(p), "tl")
-        scene_id = source.list_tensor_descriptors()[0].array_id
+        scene_id = source.list_tensors()[0].array_id
         desc = source.get_tensor_adapter(scene_id).get_tensor_descriptor()
         # Whole planes despite the 32x32 internal tiling (chunkmode="page"): the
         # grid is built from pages, so Y/X stay whole and never fall back to the
@@ -304,7 +303,7 @@ class TestRgbSamplesDescriptor:
 
     aicsimageio folds interleaved samples into a trailing ``S`` axis, so it
     reports dims.order "TCZYXS" (6) with dask shape ``(1,1,1,H,W,3)``. The
-    OME-metadata fast path in ``list_tensor_descriptors`` builds a canonical 5-D
+    OME-metadata fast path in ``list_tensors`` builds a canonical 5-D
     TCZYX shape from ``Pixels`` -- if it paired that 5-D shape with the 6 labels
     the descriptor would be malformed and ``get_flight_info`` would reject every
     slice as a dimensionality mismatch (an RGB sample dataset failing to open in
@@ -339,7 +338,7 @@ class TestRgbSamplesDescriptor:
         path = self._write_rgb_ome_tiff(tmp_path)
         adapter = OmeTiffAdapter(path, "rgb")
 
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         assert len(descriptors) == 1
         d = descriptors[0]
@@ -359,7 +358,7 @@ class TestRgbSamplesDescriptor:
 
         path = self._write_rgb_ome_tiff(tmp_path)
         adapter = OmeTiffAdapter(path, "rgb")
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("rgb", adapter)
         server.mark_ready()
         try:
@@ -378,7 +377,7 @@ class TestSceneResolutionAndReads:
     def test_scene_index_resolves_from_cache(self, tmp_path):
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
         adapter = OmeTiffAdapter(path, "idx")
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         fields = [d.array_id.split("/", 1)[1] for d in descriptors]
 
         for i, field in enumerate(fields):
@@ -394,7 +393,7 @@ class TestSceneResolutionAndReads:
             str(tmp_path), n_series=3, series_shape=(2, 32, 32)
         )
         adapter = OmeTiffAdapter(path, "reads")
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         from biopb.tensor.ticket_pb2 import ChunkBounds
 
@@ -628,7 +627,7 @@ class TestFastMetadata:
                 return None
 
         adapter._bio_image = Recorder()
-        md = adapter.get_metadata()
+        md = adapter.registration_record([], import_rois=False).metadata
 
         assert hits == [], f"AICSImage accessed in get_metadata: {hits}"
         assert "images" in md and md["images"][0]["pixels"]["planes"] == []
@@ -640,7 +639,7 @@ class TestFastMetadata:
         adapter = OmeTiffAdapter(path, "cache")
         assert adapter._raw_ome_xml_probed is False
 
-        adapter.list_tensor_descriptors()  # descriptor fast path
+        adapter.list_tensors()  # descriptor fast path
         assert adapter._raw_ome_xml_probed is True
         assert adapter._raw_ome_xml  # the embedded OME-XML string
         assert adapter._local_ome_xml() == adapter._raw_ome_xml
@@ -653,7 +652,7 @@ class TestFastMetadata:
 
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=2)
         source = OmeTiffAdapter(path, "scene-share")
-        field = source.list_tensor_descriptors()[0].array_id.split("/", 1)[1]
+        field = source.list_tensors()[0].array_id.split("/", 1)[1]
         scene = source.get_tensor_adapter(field)
 
         assert scene._raw_ome_xml_probed is True  # inherited from the source
@@ -669,7 +668,9 @@ class TestFastMetadata:
             return real_tifffile(*a, **k)
 
         monkeypatch.setattr(tifffile, "TiffFile", _counting)
-        assert scene.get_metadata()  # served from the inherited OME-XML
+        assert scene.registration_record(
+            [], import_rois=False
+        ).metadata  # served from the inherited OME-XML
         scene._physical_scale()  # value or None; must not open either
         assert opens == [], f"scene re-opened the TIFF for OME-XML: {opens}"
 
@@ -710,7 +711,7 @@ class TestReadPathTifffileAuthoritative:
     def _scene(self, path, source_id, field="Image:0"):
         """Registered source adapter + its scene adapter for ``field``."""
         adapter = OmeTiffAdapter(path, source_id)
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert descriptors, "expected tifffile descriptors for a local OME-TIFF"
         scene = adapter.get_tensor_adapter(field)
         assert scene._tifffile_descriptor is not None
@@ -753,7 +754,7 @@ class TestReadPathTifffileAuthoritative:
             str(tmp_path), n_series=3, series_shape=(2, 32, 32)
         )
         adapter = OmeTiffAdapter(path, "consist")
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
 
         for k, desc in enumerate(descriptors):
             field = desc.array_id.split("/", 1)[1]
@@ -777,7 +778,7 @@ class TestReadPathTifffileAuthoritative:
 
         path, present = self._write_sparse_multifile_ome_tiff(str(tmp_path))
         adapter = OmeTiffAdapter(path, "ragged")
-        descriptors = adapter.list_tensor_descriptors()
+        descriptors = adapter.list_tensors()
         assert descriptors
 
         desc = descriptors[0]

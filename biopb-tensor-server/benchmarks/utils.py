@@ -24,6 +24,14 @@ S3_TEST_DATA_URL = os.environ.get(
 NFS_TEST_DATA_DIR = os.environ.get("NFS_TEST_DATA_DIR", "/data/microscopy")
 
 
+def percentile(values: List[float], q: float) -> float:
+    """The *q*-quantile (0-1) of *values*, nearest rank; 0.0 when empty."""
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    return ordered[round((len(ordered) - 1) * q)]
+
+
 # =============================================================================
 # Cache utilities
 # =============================================================================
@@ -124,7 +132,7 @@ def generate_synthetic_hcs_plate(
     zarr_path = Path(path) / "plate.ome.zarr"
     zarr_path.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
     well_names = []
 
     # Create plate metadata
@@ -240,7 +248,7 @@ def generate_multiresolution_zarr(
     zarr_path = Path(path) / "pyramid.ome.zarr"
     zarr_path.mkdir(parents=True, exist_ok=True)
 
-    root = zarr.open_group(str(zarr_path), mode="w")
+    root = zarr.open_group(str(zarr_path), mode="w", zarr_format=2)
     level_shapes = []
     datasets = []
 
@@ -316,35 +324,6 @@ def generate_synthetic_tiff(
     tifffile.imwrite(str(tiff_path), data, photometric="minisblack", tile=tile)
 
     return str(tiff_path)
-
-
-def generate_synthetic_hdf5(
-    path: str,
-    shape: Tuple[int, int] = (256, 256),
-    chunks: Tuple[int, int] = (128, 128),
-    dtype: str = "uint16",
-) -> str:
-    """Generate synthetic HDF5 dataset for adapter tests.
-
-    Args:
-        path: Directory to create the HDF5
-        shape: Dataset shape
-        chunks: Chunk size
-        dtype: Data type string
-
-    Returns:
-        HDF5 file path
-    """
-    import h5py
-
-    h5_path = Path(path) / "synthetic.h5"
-    np.random.seed(42)
-    data = np.random.randint(0, 1000, size=shape, dtype=np.dtype(dtype))
-
-    with h5py.File(str(h5_path), "w") as f:
-        f.create_dataset("data", data=data, chunks=chunks)
-
-    return str(h5_path)
 
 
 # =============================================================================

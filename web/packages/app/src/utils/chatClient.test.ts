@@ -11,6 +11,7 @@ import {
   fetchChatStatus,
   fetchHistory,
   fetchModels,
+  sendTurn,
   setModel,
 } from "./chatClient";
 
@@ -43,6 +44,16 @@ describe("fetchChatStatus", () => {
 });
 
 describe("fetchHistory", () => {
+  it("reads the messages queued behind a running turn", async () => {
+    answering({ messages: [], full: false, busy: true, queued: ["also B", 3] });
+    expect((await fetchHistory("/s", null))!.queued).toEqual(["also B"]);
+  });
+
+  it("reads no queue from an older child", async () => {
+    answering({ messages: [], full: false, busy: false });
+    expect((await fetchHistory("/s", null))!.queued).toEqual([]);
+  });
+
   it("keeps whether the page is the whole thread", async () => {
     // Without it a view cannot tell a reset from a delta, and appends the new
     // conversation to the cleared one.
@@ -130,5 +141,26 @@ describe("setModel", () => {
   it("is null when it took", async () => {
     answering({ model: "x" });
     expect(await setModel("/s", "x")).toBe(null);
+  });
+});
+
+describe("sendTurn", () => {
+  const refusing = (status: number, body: unknown) =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(body), { status })),
+    );
+
+  it("reads a 409 with no holder as the chat's own running turn", async () => {
+    refusing(409, { busy: true });
+    expect(await sendTurn("/s", "hi")).toContain("turn is already running");
+  });
+
+  it("says who holds the session when an agent does", async () => {
+    refusing(409, {
+      held_by: "agent",
+      error: "this session is held by its agent (for 12s)",
+    });
+    expect(await sendTurn("/s", "hi")).toContain("held by its agent");
   });
 });

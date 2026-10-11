@@ -100,7 +100,10 @@ moves it. The ladder only climbs:
 **`"READY"` publishes and seals in one move.** Once a consumer can read it, it
 takes no more chunks — so a partial upload is published by declaring it done,
 not by leaving it open. A chunk you never sent reads back as zeros, which is
-how a sparse result (one labelled frame of a thousand) costs one frame.
+how a sparse result (one labelled frame of a thousand) costs one frame —
+when a frame is at least a transfer chunk (~64 MB). The server grows a smaller
+`chunk_shape` toward that size, so a small frame shares its chunk with its
+neighbours.
 
 The reason the two are one moment: **a chunk already read is not read again.**
 A `chunk_id` names fixed bytes everywhere else in this system, so both the
@@ -142,14 +145,15 @@ A label set names the image it belongs to rather than a source, so it lands
 beside an image the server **discovered** just as readily as beside one on
 scratch — and it inherits that image's axes and scale.
 
-A set is **unsigned-integer**, spans its image's non-channel axes at full
-length, and its all-zero chunks are skipped by `upload_array` — so a sparse mask
+A set is **unsigned-integer**, has its image's axes at the image's lengths
+(a channel axis is a singleton, an RGB samples axis is left out), and its
+all-zero chunks are skipped by `upload_array` — so a sparse mask
 is cheap to send.
 
 Its `array_id` is the request's own minus the scheme, and its descriptor
 carries an NGFF `image-label` block naming the image it belongs to.
 
-- `client.get_label_sets(image_array_id)` lists what an image has, sorted.
+- `client.query("SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, '<image>/@labels/')")` lists what an image has.
 - `client.get_tensor(set_id)` reads one back like any other tensor.
 - `client.set_upload_status(set_id, "DISCARDED", "replaced")` removes an
   *uploaded* set and its sidecar. It leaves alone a set the image's own file
@@ -170,6 +174,9 @@ client.put_rois(image_id, [
 ])
 ```
 
+- **`image_id` is the tensor's `array_id` from the catalog.** A bare source_id
+  is taken for the source's default tensor and filed under that id; an id that
+  names no registered source is refused.
 - **Level-0 pixel coordinates.** A shape measured on a downsampled level has to
   be scaled up first; nothing does it for you.
 - **The 2-D vector arms only**: point, rectangle, ellipse, polygon, polyline
@@ -185,8 +192,9 @@ filter, since a client hit-tests the resident set — and drop them with
 `delete_rois(array_id, roi_ids=(), set_name="")`, which without ids deletes
 every annotation on the tensor, narrowed by `set_name` when given.
 
-ROIs are private data gated by their tensor's source, so they are **not** on the
-SQL browse surface; `list_rois` is the only way to read them.
+`list_rois` reads one tensor's annotations. The `rois` table is also on the SQL
+browse surface (`SELECT set_name, count(*) FROM rois GROUP BY set_name`), for
+questions that span tensors.
 
 ## Then show it
 
@@ -201,6 +209,5 @@ session.
 
 ## Related
 
-- [[tensor-server-client]] — the read side: browsing the catalog and loading a tensor.
-- [[tensor-server-client]] — what an `array_id` addresses, and the axis order an
-  upload expects.
+- [[tensor-server-client]] — the read side: browsing the catalog and loading a
+  tensor, what an `array_id` addresses, and the axis order an upload expects.

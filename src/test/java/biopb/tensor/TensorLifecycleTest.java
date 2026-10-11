@@ -83,6 +83,22 @@ public class TensorLifecycleTest {
     }
 
     @Test
+    public void testRegisterLocalPathCarriesCloudOnlyWhenSet() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                AddSourceResult plain = client.registerLocalPath("/data/plate", "", null, null);
+                Assert.assertFalse(server.producer.lastAddSource.getCloud());
+                // The only sign a plain add left placeholders behind.
+                Assert.assertEquals(3, plain.getSkippedOffline());
+
+                AddSourceResult cloud = client.registerLocalPath("/data/plate", "", true, null, null);
+                Assert.assertTrue(server.producer.lastAddSource.getCloud());
+                Assert.assertEquals(0, cloud.getSkippedOffline());
+            }
+        }
+    }
+
+    @Test
     public void testRegisterLocalPathCancelKeepsWhatRegistered() throws Exception {
         // A cancel is intentional, so it reports an empty tally rather than an
         // error -- and the sources already registered stay registered.
@@ -186,21 +202,6 @@ public class TensorLifecycleTest {
                         UnsupportedOperationException.class,
                         () -> client.deregisterLocalPath("dnd://drop-1"));
                 Assert.assertTrue(error.getMessage().contains("Source removal is unavailable"));
-            }
-        }
-    }
-
-    // ---- label sets -------------------------------------------------------
-
-    @Test
-    public void testGetLabelSetsIsACatalogQueryOverThePath() throws Exception {
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Assert.assertEquals(
-                        Arrays.asList("src_ab12/@labels/@ome", "src_ab12/@labels/nuclei"),
-                        client.getLabelSets("src_ab12"));
-                // The prefix is the image's own path, quoted for the SQL surface.
-                Assert.assertTrue(server.producer.lastSql.contains("'src_ab12/@labels/'"));
             }
         }
     }
@@ -402,10 +403,15 @@ public class TensorLifecycleTest {
                 Map<String, Object> status = client.uploadArray(descriptor, array);
 
                 Assert.assertEquals(4, server.producer.chunks.size());
-                Chunk first = server.producer.chunks.get(0);
+                // Chunks go up concurrently, so arrival order is not grid order.
+                List<Chunk> byStart = new ArrayList<>(server.producer.chunks);
+                byStart.sort((a, b) -> Long.compare(
+                        a.bounds.getStart(0) * 100 + a.bounds.getStart(1),
+                        b.bounds.getStart(0) * 100 + b.bounds.getStart(1)));
+                Chunk first = byStart.get(0);
                 Assert.assertEquals(Arrays.asList(0L, 0L), first.bounds.getStartList());
                 Assert.assertEquals(Arrays.asList(3L, 2L), first.bounds.getStopList());
-                Chunk last = server.producer.chunks.get(3);
+                Chunk last = byStart.get(3);
                 Assert.assertEquals(Arrays.asList(3L, 2L), last.bounds.getStartList());
                 Assert.assertEquals(Arrays.asList(6L, 4L), last.bounds.getStopList());
 
@@ -522,7 +528,14 @@ public class TensorLifecycleTest {
                 Assert.assertEquals(4, server.producer.chunks.size());
                 // Chunk (0,0) of the tensor is the crop's own first block --
                 // (6,4) of the underlying image, which holds 6*1 + 12*4 + 1.
-                Assert.assertEquals(Integer.valueOf(55), server.producer.chunks.get(0).values.get(0));
+                Chunk origin = null;
+                for (Chunk chunk : server.producer.chunks) {
+                    if (chunk.bounds.getStart(0) == 0 && chunk.bounds.getStart(1) == 0) {
+                        origin = chunk;
+                    }
+                }
+                Assert.assertNotNull(origin);
+                Assert.assertEquals(Integer.valueOf(55), origin.values.get(0));
                 assertReassembles(crop, server.producer.chunks, 6, 4);
             }
         }
@@ -572,6 +585,87 @@ public class TensorLifecycleTest {
                         "registered_abc123/mine", UploadStatus.State.READY, "");
                 Assert.assertEquals("registered_abc123/mine", status.get("source_id"));
                 Assert.assertEquals("READY", status.get("state"));
+            }
+        }
+    }
+
+    private static TensorDescriptor gridOf16() {
+        // 8x8 on a 2x2 grid: sixteen chunks.
+        return TensorDescriptor.newBuilder()
+                .setArrayId("registered_abc123/mine")
+                .addAllShape(Arrays.asList(8L, 8L))
+                .addAllChunkShape(Arrays.asList(2L, 2L))
+                .setDtype("<u2")
+                .build();
+    }
+
+    @Test
+    public void testUploadArrayPutsChunksConcurrentlyAndSealsAfterTheLastAck() throws Exception {
+        try (TestServer server = new TestServer()) {
+            server.producer.chunkDelayMillis = 100;
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorDescriptor descriptor = gridOf16();
+                server.producer.plannedTensor = descriptor;
+                Map<String, Object> status = client.uploadArray(
+                        descriptor, ArrayImgs.unsignedShorts(new short[64], 8, 8), 4);
+
+                Assert.assertEquals(16, server.producer.chunks.size());
+                Assert.assertTrue("puts never overlapped: " + server.producer.maxPutsInFlight.get(),
+                        server.producer.maxPutsInFlight.get() >= 2);
+                Assert.assertTrue("more in flight than asked: " + server.producer.maxPutsInFlight.get(),
+                        server.producer.maxPutsInFlight.get() <= 4);
+                // The seal saw every chunk: it came after the last ack, not
+                // while some were still on the wire.
+                Assert.assertEquals(16.0d, status.get("uploaded_chunks"));
+                Assert.assertEquals("READY", status.get("state"));
+            }
+        }
+    }
+
+    @Test
+    public void testUploadArrayWithConcurrencyOnePutsOneChunkAtATime() throws Exception {
+        try (TestServer server = new TestServer()) {
+            server.producer.chunkDelayMillis = 20;
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorDescriptor descriptor = gridOf16();
+                server.producer.plannedTensor = descriptor;
+                client.uploadArray(descriptor, ArrayImgs.unsignedShorts(new short[64], 8, 8), 1);
+                Assert.assertEquals(16, server.producer.chunks.size());
+                Assert.assertEquals(1, server.producer.maxPutsInFlight.get());
+            }
+        }
+    }
+
+    @Test
+    public void testUploadArrayRejectsAConcurrencyBelowOne() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorDescriptor descriptor = gridOf16();
+                Assert.assertThrows(IllegalArgumentException.class, () -> client.uploadArray(
+                        descriptor, ArrayImgs.unsignedShorts(new short[64], 8, 8), 0));
+            }
+        }
+    }
+
+    @Test
+    public void testARefusalOnOneStreamFailsTheWholeUploadWithoutSealing() throws Exception {
+        try (TestServer server = new TestServer()) {
+            server.producer.chunkDelayMillis = 30;
+            server.producer.refuseNth = 5;
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorDescriptor descriptor = gridOf16();
+                server.producer.plannedTensor = descriptor;
+                UploadRefusedException error = Assert.assertThrows(UploadRefusedException.class,
+                        () -> client.uploadArray(
+                                descriptor, ArrayImgs.unsignedShorts(new short[64], 8, 8), 4));
+                // What the refusal carried survives the thread hop.
+                Assert.assertEquals("DISCARDED", error.getState());
+                Assert.assertEquals("registered_abc123/mine", error.getSourceId());
+                Assert.assertEquals("producer gave up", error.getDetail());
+                // Not sealed, and chunks that had not started were not sent.
+                Assert.assertNull(server.producer.lastSetStatus);
+                Assert.assertTrue("every chunk was still sent: " + server.producer.chunks.size(),
+                        server.producer.chunks.size() < 15);
             }
         }
     }
@@ -724,6 +818,16 @@ public class TensorLifecycleTest {
         final java.util.concurrent.atomic.AtomicInteger emitted =
                 new java.util.concurrent.atomic.AtomicInteger();
         volatile boolean refuseChunks = false;
+        /** Refuse only the Nth chunk to arrive (1-based); 0 leaves it to {@code refuseChunks}. */
+        volatile int refuseNth = 0;
+        /** How long each chunk put holds its stream open, so overlap is observable. */
+        volatile long chunkDelayMillis = 0;
+        final java.util.concurrent.atomic.AtomicInteger putsInFlight =
+                new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger maxPutsInFlight =
+                new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicInteger chunkArrivals =
+                new java.util.concurrent.atomic.AtomicInteger();
         /**
          * The tensor {@code getFlightInfo} plans. A write asks the server what
          * a chunk is, so a test that uploads has to say what it declared --
@@ -846,7 +950,10 @@ public class TensorLifecycleTest {
                     .setResult(AddSourceResult.newBuilder()
                             .addAllAdded(Arrays.asList("plate_a", "plate_b"))
                             .addAlreadyPresent("plate_c")
-                            .addRefreshed("plate_c"))
+                            .addRefreshed("plate_c")
+                            // Offline placeholders are skipped unless the request
+                            // said the folder is a cloud one.
+                            .setSkippedOffline(lastAddSource.getCloud() ? 0 : 3))
                     .build().toByteArray()));
         }
 
@@ -1029,6 +1136,17 @@ public class TensorLifecycleTest {
             // The ticket is this fake's own: the chunk's absolute bounds.
             ChunkBounds bounds = ChunkBounds.parseFrom(
                     TensorTicket.parseFrom(ticketBytes.toByteArray()).getChunkId());
+            int arrival = chunkArrivals.incrementAndGet();
+            int now = putsInFlight.incrementAndGet();
+            maxPutsInFlight.accumulateAndGet(now, Math::max);
+            try {
+                acceptChunkBody(bounds, arrival, stream);
+            } finally {
+                putsInFlight.decrementAndGet();
+            }
+        }
+
+        private void acceptChunkBody(ChunkBounds bounds, int arrival, FlightStream stream) {
             List<Integer> values = new ArrayList<>();
             while (stream.next()) {
                 UInt2Vector data = (UInt2Vector) stream.getRoot().getVector("data");
@@ -1038,7 +1156,14 @@ public class TensorLifecycleTest {
                     values.add((int) data.get(row));
                 }
             }
-            if (refuseChunks) {
+            if (chunkDelayMillis > 0) {
+                try {
+                    Thread.sleep(chunkDelayMillis);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            if (refuseChunks || arrival == refuseNth) {
                 org.apache.arrow.flight.ErrorFlightMetadata metadata =
                         new org.apache.arrow.flight.ErrorFlightMetadata();
                 // No `code`, exactly as upload_manager._refused sends it: both

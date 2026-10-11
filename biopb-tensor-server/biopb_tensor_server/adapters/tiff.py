@@ -7,6 +7,7 @@ OME-TIFF files are handled by OmeTiffAdapter (pure-tifffile).
 import json
 import logging
 import math
+import os
 import re
 import threading
 from pathlib import Path
@@ -24,6 +25,8 @@ from biopb_tensor_server.adapters._scale import (
 )
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
     catalog_entry,
 )
 from biopb_tensor_server.core.chunk import (
@@ -35,6 +38,12 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     _is_offline_placeholder,
 )
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
+from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -155,7 +164,7 @@ def _natural_key(name: str) -> List[Tuple[int, Any]]:
     position and int/str never compare directly (no ``TypeError`` on names of
     differing structure). Gives the stacked file axis a sensible *default* order;
     the authoritative interpretation of that axis is the agent's, via
-    :meth:`TiffSequenceAdapter.get_metadata`.
+    :meth:`TiffSequenceAdapter.registration_record`.
     """
     return [
         (0, int(t)) if t.isdigit() else (1, t.lower())
@@ -368,6 +377,7 @@ class _PerFileTiffLockMixin:
 # =============================================================================
 
 
+@canonical_axes
 class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
@@ -386,7 +396,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     is stacked along an opaque file axis (label ``i``); the axis's semantic
     structure (channel / time / site / z -- e.g. MetaMorph ``_w/_s/_t`` or
     ``_red/_green/_blue``) is deliberately NOT inferred here. Instead the per-file
-    names are exposed via ``get_metadata`` so a downstream agent can parse them
+    names are exposed via ``registration_record`` so a downstream agent can parse them
     and reshape / relabel. Differing dtype and spatial size are normalized into
     the stack (#198: widest dtype, zero-pad to the max plane); only a differing
     page count (or an unreadable file) is left out, and listed as a sibling. This
@@ -522,24 +532,13 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         """
         import tifffile
 
-        self.directory = Path(directory)
-        self.source_id = source_id
-        self._source_url = str(directory)
-        # Cheap content_version from the directory's stat signature (#178): O(1)
-        # dir mtime, which flips on member add/remove/rename -- the right signal
-        # for a multi-file sequence. None (unresolved url) leaves it unversioned.
-        self._content_version = content_version_from_path(self._source_url)
-        self._source_type = "tiff-sequence"
-        # Per-file read locks (see _PerFileTiffLockMixin): reads of the same TIFF
-        # serialize while reads of different files run in parallel, so one slow
-        # read can't freeze every other frame.
-        self._init_file_locks()
+        self._init_identity(directory, source_id)
         # Gather every TIFF in the claimed directory. Unlike claim(), read does
         # NOT exclude OME names: the OME exclusion is a claim-time ownership
         # decision; by now the directory is claimed and its subtree pruned, so
         # every TIFF here is a member. Natural-sort for a stable, numeric-aware
         # default order (``img_2`` before ``img_10``); what that order *means* is
-        # the agent's to decide (see get_metadata), not ours.
+        # the agent's to decide (see registration_record), not ours.
         all_tiffs = sorted(
             (
                 p
@@ -560,7 +559,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # member's values clip) and the per-axis max plane (smaller frames
         # zero-pad in get_data). So we bucket only by page count; files with a
         # different page count are not stacked but are surfaced via
-        # get_metadata(), as are unreadable ones. We do not parse what the file
+        # registration_record, as are unreadable ones. We do not parse what the file
         # axis means (channel / time / site / z): that is delegated to the agent,
         # which gets the per-file names alongside the array.
         #
@@ -696,7 +695,87 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # Total IFDs for coordinate mapping
         self._total_ifds = sum(n for _, n in self._file_ifd_map)
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _init_identity(self, directory: str, source_id: str) -> None:
+        """What is known of the sequence before any file is opened."""
+        self.directory = Path(directory)
+        self.source_id = source_id
+        self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file sequence. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
+        self._source_type = "tiff-sequence"
+        # Per-file read locks (see _PerFileTiffLockMixin): reads of the same TIFF
+        # serialize while reads of different files run in parallel, so one slow
+        # read can't freeze every other frame.
+        self._init_file_locks()
+
+    #: ``(scale, unit)`` read when the sequence was registered, for a restored one
+    #: that has not opened ``members[0]``; ``_scale_restored`` says it is held.
+    _scale_restored = False
+    _restored_scale: Optional[Tuple[List[float], List[str]]] = None
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The stacked and unstacked files and the geometry probed from them.
+
+        Opening every member is what building the sequence does; this keeps what it
+        learned, so a restart opens none. The physical scale is read off
+        ``members[0]`` here, once, for the same reason. The transfer grid is not
+        stored: it is derived from the per-page block (``spatial_chunk``) and the
+        shape, with the server's current target. ``None`` for a remote directory.
+        """
+        if is_remote_url(self._source_url):
+            return None
+        scale = self._physical_scale()
+        return {
+            "files": [p.name for p in self._tiff_files],
+            "unstacked": [p.name for p in self._unstacked_files],
+            "pages": self._file_ifd_map[0][1],
+            "dtype": self._dtype,
+            "full_shape": [int(s) for s in self.full_shape],
+            "dim_labels": list(self.dim_labels),
+            "tiled": bool(self.is_tiled),
+            "tile": [self.tile_length, self.tile_width] if self.is_tiled else None,
+            "strile": [int(s) for s in self._strile],
+            "spatial_chunk": [int(s) for s in self._spatial_chunk],
+            "scale": None if scale is None else [list(scale[0]), list(scale[1])],
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "TiffSequenceAdapter":
+        """Rebuild from the stored file lists and geometry: no member is opened."""
+        adapter = cls.__new__(cls)
+        adapter._init_identity(str(source.url), source.source_id or "")
+        directory = adapter.directory
+        adapter._tiff_files = [directory / name for name in payload["files"]]
+        adapter._unstacked_files = [directory / name for name in payload["unstacked"]]
+        pages = int(payload["pages"])
+        adapter._file_ifd_map = [(p, pages) for p in adapter._tiff_files]
+        adapter._total_ifds = pages * len(adapter._tiff_files)
+        adapter._dtype = payload["dtype"]
+        adapter.full_shape = list(payload["full_shape"])
+        adapter.dim_labels = list(payload["dim_labels"])
+        adapter.is_tiled = bool(payload["tiled"])
+        if adapter.is_tiled:
+            adapter.tile_length, adapter.tile_width = payload["tile"]
+        adapter._strile = list(payload["strile"])
+        adapter._spatial_chunk = list(payload["spatial_chunk"])
+        native = [1] * (len(adapter.full_shape) - 2) + adapter._spatial_chunk
+        adapter.chunk_shape = default_transfer_chunk_shape(
+            adapter.full_shape, adapter._dtype, adapter.dim_labels, native=native
+        )
+        scale = payload["scale"]
+        adapter._restored_scale = None if scale is None else (scale[0], scale[1])
+        adapter._scale_restored = True
+        return adapter
+
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -705,8 +784,8 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     def _read_padded_plane(
         self,
@@ -773,7 +852,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; only the per-file read below is
         # synchronized, and per file -- so a slow read of one frame no longer
@@ -869,7 +948,10 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
 
         The parent ``TensorAdapter`` memoizes the result when it fills a read
         descriptor. See :meth:`_compute_physical_scale` for the projection itself.
+        A restored sequence answers from the scale it stored.
         """
+        if self._scale_restored:
+            return self._restored_scale
         return self._compute_physical_scale()
 
     def _compute_physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
@@ -913,7 +995,9 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             )
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Expose per-file provenance so the agent can interpret the file axis.
 
         The file axis (label ``i``) is an opaque stack of every uniformly-shaped
@@ -930,7 +1014,7 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         md: Dict[str, Any] = {"files": [p.name for p in self._tiff_files]}
         if self._unstacked_files:
             md["unstacked_files"] = [p.name for p in self._unstacked_files]
-        return md
+        return metadata_record(md)
 
 
 # =============================================================================
@@ -938,12 +1022,14 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
 # =============================================================================
 
 
+@canonical_axes
 class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
     Handles MicroManager v1 v2 datasets with metadata.txt containing:
     - Summary: IntendedDimensions, AxisOrder, Channels, Slices, Frames, Positions
     - Coords-Default/<filename>: PositionIndex, TimeIndex, ChannelIndex, SliceIndex
+      (or, in older datasets, FrameKey-<frame>-<channel>-<slice>: FileName)
     - Metadata-Default/<filename>: UUID, Width, Height
 
     This adapter supports full 5D/6D datasets: (position, time, channel, z, y, x).
@@ -1027,7 +1113,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             data = json.loads(content)
 
             # Check for MicroManager v1 format markers
-            has_coords = any(k.startswith("Coords-") for k in data)
+            has_coords = any(k.startswith(("Coords-", "FrameKey-")) for k in data)
             has_summary = "Summary" in data
 
             if not (has_coords or has_summary):
@@ -1068,6 +1154,32 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             source_type="micromanager-legacy",
             primary_path=ctx.path_str,
         )
+
+    @staticmethod
+    def _frame_entries(raw: Dict[str, Any]):
+        """``(file path as written, position, time, channel, slice)`` per frame.
+
+        Two metadata generations name the files: ``Coords-<path>`` entries carry
+        the four indices (Micro-Manager 1.4+), and the older
+        ``FrameKey-<frame>-<channel>-<slice>`` entries carry them in the key with
+        the file in ``FileName``, no position axis.
+        """
+        for key, entry in raw.items():
+            if key.startswith("Coords-"):
+                yield (
+                    key[len("Coords-") :],
+                    entry.get("PositionIndex", 0),
+                    entry.get("TimeIndex", 0),
+                    entry.get("ChannelIndex", 0),
+                    entry.get("SliceIndex", 0),
+                )
+            elif key.startswith("FrameKey-"):
+                try:
+                    frame, channel, slice_idx = (int(n) for n in key.split("-")[1:4])
+                except ValueError:
+                    continue
+                if entry.get("FileName"):
+                    yield entry["FileName"], 0, frame, channel, slice_idx
 
     @staticmethod
     def _find_metadata_file(directory: Path) -> Optional[Path]:
@@ -1120,17 +1232,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
 
         import tifffile
 
-        self.directory = Path(directory)
-        self.source_id = source_id
-        self._source_url = str(directory)
-        # Cheap content_version from the directory's stat signature (#178): O(1)
-        # dir mtime, which flips on member add/remove/rename -- the right signal
-        # for a multi-file dataset. None (unresolved url) leaves it unversioned.
-        self._content_version = content_version_from_path(self._source_url)
-        self._source_type = "micromanager-legacy"
-        # Per-file read locks (see _PerFileTiffLockMixin): a stalled read of one
-        # plane holds only its own file's lock, not every plane's.
-        self._init_file_locks()
+        self._init_identity(directory, source_id)
 
         # Find and parse metadata file
         metadata_file = self._find_metadata_file(self.directory)
@@ -1154,41 +1256,33 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self._coord_map: Dict[Tuple[int, int, int, int], Path] = {}
         self._file_list: List[Path] = []
 
-        for key in self._raw_metadata:
-            if key.startswith("Coords-"):
-                coords = self._raw_metadata[key]
-                # Extract path from key (Coords-Default/<filename> or Coords-<filename>)
-                coords_prefix_len = len("Coords-")
-                filepath_in_key = key[coords_prefix_len:]
-
-                # Get indices
-                pos_idx = coords.get("PositionIndex", 0)
-                time_idx = coords.get("TimeIndex", 0)
-                chan_idx = coords.get("ChannelIndex", 0)
-                slice_idx = coords.get("SliceIndex", 0)
-
-                # The Coords key path is written relative to the acquisition
-                # *parent*, so for a "separate image files" acquisition it carries
-                # a leading position-folder segment (e.g. "Default/img_...").
-                # Which directory this source was claimed at decides how that
-                # resolves: at the acquisition root (a DisplaySettings.json fired
-                # the v2 claim there) the leading segment is real, but with no
-                # DisplaySettings.json the root is invisible and the position
-                # folder's own metadata.txt claims it directly -- so self.directory
-                # *is* that folder and the segment doubles it (biopb/biopb#314).
-                # Try the path as-is, then retry after stripping a leading segment
-                # equal to this directory's own name, so both rootings land on the
-                # same file. (v1 keys carry no prefix and resolve as-is.)
-                file_path = self.directory / filepath_in_key
-                if not file_path.exists():
-                    parts = Path(filepath_in_key).parts
-                    if len(parts) > 1 and parts[0] == self.directory.name:
-                        file_path = self.directory.joinpath(*parts[1:])
-                if file_path.exists():
-                    self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = (
-                        file_path
-                    )
-                    self._file_list.append(file_path)
+        for (
+            filepath_in_key,
+            pos_idx,
+            time_idx,
+            chan_idx,
+            slice_idx,
+        ) in self._frame_entries(self._raw_metadata):
+            # The Coords key path is written relative to the acquisition
+            # *parent*, so for a "separate image files" acquisition it carries
+            # a leading position-folder segment (e.g. "Default/img_...").
+            # Which directory this source was claimed at decides how that
+            # resolves: at the acquisition root (a DisplaySettings.json fired
+            # the v2 claim there) the leading segment is real, but with no
+            # DisplaySettings.json the root is invisible and the position
+            # folder's own metadata.txt claims it directly -- so self.directory
+            # *is* that folder and the segment doubles it (biopb/biopb#314).
+            # Try the path as-is, then retry after stripping a leading segment
+            # equal to this directory's own name, so both rootings land on the
+            # same file. (v1 keys carry no prefix and resolve as-is.)
+            file_path = self.directory / filepath_in_key
+            if not file_path.exists():
+                parts = Path(filepath_in_key).parts
+                if len(parts) > 1 and parts[0] == self.directory.name:
+                    file_path = self.directory.joinpath(*parts[1:])
+            if file_path.exists():
+                self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = file_path
+                self._file_list.append(file_path)
 
         if not self._file_list:
             raise ValueError(f"No MicroManager TIFF files found in {directory}")
@@ -1279,6 +1373,95 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # Build index for efficient lookups
         self._build_file_index()
 
+    def _init_identity(self, directory: str, source_id: str) -> None:
+        """What is known of the dataset before any file is opened."""
+        self.directory = Path(directory)
+        self.source_id = source_id
+        self._source_url = str(directory)
+        # Cheap content_version from the directory's stat signature (#178): O(1)
+        # dir mtime, which flips on member add/remove/rename -- the right signal
+        # for a multi-file dataset. None (unresolved url) leaves it unversioned.
+        self._content_version = content_version_from_path(self._source_url)
+        self._source_type = "micromanager-legacy"
+        # Per-file read locks (see _PerFileTiffLockMixin): a stalled read of one
+        # plane holds only its own file's lock, not every plane's.
+        self._init_file_locks()
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """Which file holds each (position, time, channel, z) plane, and the geometry
+        probed from the first one. The ``_metadata.txt`` is the row's metadata.
+
+        What building the adapter reads the metadata file for and opens a plane
+        for; a restart does neither. Paths are relative to the directory. The
+        transfer grid is derived from the per-page block and the shape.
+        ``None`` for a remote directory.
+        """
+        if is_remote_url(self._source_url):
+            return None
+        return {
+            "counts": [self._n_positions, self._n_times, self._n_channels, self._n_z],
+            "coords": [
+                [*coord, os.path.relpath(path, self.directory)]
+                for coord, path in sorted(self._coord_map.items())
+            ],
+            "dtype": self._dtype,
+            "height": int(self._height),
+            "width": int(self._width),
+            "tile": [self.tile_length, self.tile_width] if self.is_tiled else None,
+            "strile": [int(s) for s in self._strile],
+            "axis_order": list(self._axis_order),
+            "shape_axes": list(self._shape_axes),
+            "full_shape": [int(s) for s in self.full_shape],
+            "dim_labels": list(self.dim_labels),
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> Optional["MicroManagerLegacyAdapter"]:
+        """Rebuild from the stored plane map and the row's metadata: no file is
+        opened. ``None`` (so it is parsed) when the row holds no metadata."""
+        if not metadata:
+            return None
+        adapter = cls.__new__(cls)
+        adapter._init_identity(str(source.url), source.source_id or "")
+        adapter._raw_metadata = metadata
+        (
+            adapter._n_positions,
+            adapter._n_times,
+            adapter._n_channels,
+            adapter._n_z,
+        ) = payload["counts"]
+        adapter._coord_map = {
+            (p, t, c, z): adapter.directory / rel
+            for p, t, c, z, rel in payload["coords"]
+        }
+        adapter._file_list = sorted(set(adapter._coord_map.values()))
+        adapter._dtype = payload["dtype"]
+        adapter._height = payload["height"]
+        adapter._width = payload["width"]
+        adapter.is_tiled = payload["tile"] is not None
+        if adapter.is_tiled:
+            adapter.tile_length, adapter.tile_width = payload["tile"]
+            adapter._spatial_chunk = [adapter.tile_length, adapter.tile_width]
+        else:
+            adapter._spatial_chunk = [adapter._height, adapter._width]
+        adapter._strile = list(payload["strile"])
+        adapter._axis_order = list(payload["axis_order"])
+        adapter._shape_axes = list(payload["shape_axes"])
+        adapter.full_shape = list(payload["full_shape"])
+        adapter.dim_labels = list(payload["dim_labels"])
+        native = [1] * (len(adapter.full_shape) - 2) + adapter._spatial_chunk
+        adapter.chunk_shape = default_transfer_chunk_shape(
+            adapter.full_shape, adapter._dtype, adapter.dim_labels, native=native
+        )
+        adapter._build_file_index()
+        return adapter
+
     def _build_file_index(self) -> None:
         """Build index mapping for efficient coordinate lookups."""
         # Create reverse lookup: global_index -> file_path
@@ -1298,7 +1481,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
                     idx = chan * self._n_z + z
                     self._index_to_file[idx] = file_path
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -1307,8 +1490,8 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self) -> List[TensorEntry]:
+        return [catalog_entry(self._native_descriptor())]
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -1340,95 +1523,27 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         import zarr
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         # Slice math (no I/O) needs no lock; all state read below is immutable
         # after __init__. Only the per-file read is synchronized, and per file --
         # so a slow read of one plane no longer blocks reads of other planes.
-        ndim = len(self.full_shape)
-
         # Extract spatial slices (last 2 axes)
         y_slice = slices[-2] if len(slices) >= 2 else slice(None)
         x_slice = slices[-1] if len(slices) >= 1 else slice(None)
 
-        # Determine coordinate ranges based on shape
-        if ndim == 3:
-            # (channels, y, x)
-            chan_slice = slices[0]
-            pos_range = [0]
-            time_range = [0]
-            chan_range = range(
-                chan_slice.start or 0, chan_slice.stop or self._n_channels
-            )
-            z_range = [0]
-        elif ndim == 4:
-            # (channels, z, y, x) or (time, channels, y, x) depending on axis_order
-            if "z" in self.dim_labels[:2]:
-                # (channels, z, y, x) format
-                chan_slice = slices[0]
-                z_slice = slices[1]
-                pos_range = [0]
-                time_range = [0]
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            else:
-                # (time, channels, y, x) format
-                time_slice = slices[0]
-                chan_slice = slices[1]
-                pos_range = [0]
-                time_range = range(
-                    time_slice.start or 0, time_slice.stop or self._n_times
-                )
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = [0]
-        elif ndim == 5:
-            # (time, channels, z, y, x) or (position, channels, z, y, x)
-            if "p" in self.dim_labels:
-                pos_slice = slices[0]
-                chan_slice = slices[1]
-                z_slice = slices[2]
-                pos_range = range(
-                    pos_slice.start or 0, pos_slice.stop or self._n_positions
-                )
-                time_range = [0]
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            else:
-                time_slice = slices[0]
-                chan_slice = slices[1]
-                z_slice = slices[2]
-                pos_range = [0]
-                time_range = range(
-                    time_slice.start or 0, time_slice.stop or self._n_times
-                )
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-        elif ndim == 6:
-            # (position, time, channels, z, y, x)
-            pos_slice = slices[0]
-            time_slice = slices[1]
-            chan_slice = slices[2]
-            z_slice = slices[3]
-            pos_range = range(pos_slice.start or 0, pos_slice.stop or self._n_positions)
-            time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
-            chan_range = range(
-                chan_slice.start or 0, chan_slice.stop or self._n_channels
-            )
-            z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-        else:
-            # Fallback - assume all dimensions except last 2 are 1
-            pos_range = [0]
-            time_range = [0]
-            chan_range = [0]
-            z_range = [0]
+        # The requested range on each coordinate axis. An axis dropped from
+        # full_shape for being singleton is the one plane, 0.
+        counts = {
+            "position": self._n_positions,
+            "time": self._n_times,
+            "channel": self._n_channels,
+            "z": self._n_z,
+        }
+        ranges = {axis: range(1) for axis in counts}
+        for axis, axis_slice in zip(self._shape_axes, slices, strict=False):
+            ranges[axis] = range(axis_slice.start or 0, axis_slice.stop or counts[axis])
+        pos_range, time_range, chan_range, z_range = (ranges[a] for a in counts)
 
         # Collect data for each coordinate
         result_pages = []
@@ -1483,41 +1598,18 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         if not result_pages:
             return np.array([])
 
-        # Stack pages and reshape to match the expected shape
-        n_pos = len(pos_range)
-        n_time = len(time_range)
-        n_chan = len(chan_range)
-        n_z = len(z_range)
-
-        h = result_pages[0].shape[0] if result_pages else 0
-        w = result_pages[0].shape[1] if result_pages else 0
-
-        # Stack all pages and reshape
-        result = np.stack(result_pages, axis=0)
-
-        # Reshape to (pos, time, chan, z, h, w) based on actual ranges
-        if ndim == 2:
-            # Genuine 2-D [y, x] dataset (all non-spatial axes singleton and
-            # dropped from full_shape). result_pages holds exactly one page,
-            # so drop the leading stack axis to match the descriptor rank.
-            result = result.reshape(h, w)
-        elif ndim == 3:
-            result = result.reshape(n_chan, h, w)
-        elif ndim == 4:
-            result = result.reshape(n_chan * n_z, h, w)
-            if "z" in self.dim_labels[:2]:
-                result = result.reshape(n_chan, n_z, h, w)
-            else:
-                result = result.reshape(n_time, n_chan, h, w)
-        elif ndim == 5:
-            if "p" in self.dim_labels:
-                result = result.reshape(n_pos, n_chan, n_z, h, w)
-            else:
-                result = result.reshape(n_time, n_chan, n_z, h, w)
-        elif ndim == 6:
-            result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
-
-        return result
+        # Stack the planes (loop order: position, time, channel, z), then lay the
+        # axes out as full_shape orders them: the kept axes in their order, the
+        # dropped singletons folded away.
+        h, w = result_pages[0].shape
+        coord_axes = list(counts)
+        block = np.stack(result_pages, axis=0).reshape(
+            *(len(ranges[a]) for a in coord_axes), h, w
+        )
+        kept = [coord_axes.index(a) for a in self._shape_axes]
+        dropped = [i for i in range(len(coord_axes)) if i not in kept]
+        block = block.transpose(*kept, *dropped, len(coord_axes), len(coord_axes) + 1)
+        return block.reshape(*(len(ranges[a]) for a in self._shape_axes), h, w)
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the MicroManager ``Summary`` metadata.
@@ -1528,6 +1620,8 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         summary = self._raw_metadata.get("Summary", {})
         return mm_summary_scale(summary, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return parsed MicroManager metadata."""
-        return self._raw_metadata
+        return metadata_record(self._raw_metadata)

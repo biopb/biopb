@@ -15,8 +15,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from biopb import _fs_detect as fs_detect
-from biopb._fs_detect import (
+from biopb.tensor import _fs_detect as fs_detect
+from biopb.tensor._fs_detect import (
     _classify_fstype,
     _cloud_path_hint,
     _is_unc,

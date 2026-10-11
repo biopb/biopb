@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 import pytest
-from biopb import _algorithms
 
+from biopb_control import _registry
 from biopb_control._algorithm_plane import AlgorithmPlane
 
 _FAKE_UV = """
@@ -108,7 +108,7 @@ def plane(tmp_path, registry, monkeypatch):
 def _crash(entry) -> None:
     """Kill an entry's uv and server at once, as an OOM kill would."""
     if os.name == "nt":
-        from biopb.lifecycle import winjob
+        from biopb._lifecycle import winjob
 
         winjob.terminate_job(entry._winjob)
     else:
@@ -143,8 +143,8 @@ def test_ensure_starts_the_server_with_its_token(plane, registry):
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up", row["error"]
     assert row["url"].startswith("grpc://127.0.0.1:")
-    assert _algorithms.probe(row["url"], timeout=5)["state"] == "error"
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    assert _registry.probe(row["url"], timeout=5)["state"] == "error"
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert answer["state"] == "up"
     # It was told where the data plane is.
     assert "tensor plane: grpc://127.0.0.1:8815" in "\n".join(
@@ -159,11 +159,11 @@ def test_an_edit_takes_effect_on_ensure(plane, registry):
     path.write_text(_server(["alpha", "gamma"]))
     row = plane.ensure("seg", wait=30.0)
     # The old server went with its uv.
-    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
+    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
     assert row["state"] == "up", row["error"]
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     assert row["url"] != first["url"] or row["token"] != first["token"]
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
 
@@ -186,14 +186,13 @@ def test_an_edit_is_stale_until_refresh_ensures_it(plane, registry):
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     # The old process is untouched and still answering.
     assert (
-        _algorithms.probe(first["url"], token=first["token"], timeout=5)["state"]
-        == "up"
+        _registry.probe(first["url"], token=first["token"], timeout=5)["state"] == "up"
     )
 
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up", row["error"]
-    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
 
@@ -254,7 +253,7 @@ def test_stop_and_logs(plane, registry):
     (registry / "seg.py").write_text(_server())
     url = plane.ensure("seg", wait=30.0)["url"]
     assert plane.stop("seg")["state"] == "stopped"
-    assert _algorithms.probe(url, timeout=2)["state"] == "unreachable"
+    assert _registry.probe(url, timeout=2)["state"] == "unreachable"
     logs = plane.logs("seg", 100)
     assert logs["exists"] and any(
         "starting algorithm seg" in line for line in logs["lines"]
@@ -269,7 +268,7 @@ def test_a_removed_file_stops_its_server(plane, registry):
     path.unlink()
     assert plane.rows(probe=False) == []
     # The server itself is gone, not only uv.
-    assert _algorithms.probe(row["url"], timeout=2)["state"] == "unreachable"
+    assert _registry.probe(row["url"], timeout=2)["state"] == "unreachable"
 
 
 def test_url_entries_are_not_managed(plane, registry):
@@ -345,7 +344,7 @@ def control(plane, tmp_path, monkeypatch):
 
 
 def test_client_verbs_over_http(control, registry):
-    import biopb as client
+    from biopb import _control as client
 
     (registry / "seg.py").write_text(_server())
     (registry / "remote.json").write_text(json.dumps({"url": "grpc://127.0.0.1:1"}))
@@ -367,7 +366,7 @@ def test_client_verbs_over_http(control, registry):
 
 
 def test_no_control_is_none(monkeypatch):
-    import biopb as client
+    from biopb import _control as client
 
     monkeypatch.setattr(
         "biopb._control._client.control_base_url", lambda: "http://127.0.0.1:1"
@@ -375,3 +374,97 @@ def test_no_control_is_none(monkeypatch):
     assert client.algorithms(timeout=1) is None
     with pytest.raises(RuntimeError, match="no control"):
         client.ensure_algorithm("x", timeout=1)
+
+
+# --------------------------------------------------------------------------- #
+# Adding and removing entries
+# --------------------------------------------------------------------------- #
+
+
+def test_register_url_writes_an_entry(registry):
+    name = _registry.register_url("grpc://host:50051", directory=registry)
+    assert name == "host-50051"
+    assert json.loads((registry / "host-50051.json").read_text()) == {
+        "url": "grpc://host:50051"
+    }
+    assert _registry.entries(registry)[0]["url"] == "grpc://host:50051"
+
+
+@pytest.mark.parametrize("url", ["http://host:1", "host:1", "grpc://", ""])
+def test_register_url_rejects_a_bad_url(registry, url):
+    with pytest.raises(ValueError, match="grpc"):
+        _registry.register_url(url, directory=registry)
+
+
+def test_register_refuses_a_taken_or_reserved_name(registry):
+    (registry / "seg.py").write_text(_server())
+    with pytest.raises(ValueError, match="already exists"):
+        _registry.register_url("grpc://h:1", "seg", directory=registry)
+    with pytest.raises(ValueError, match="name"):
+        _registry.register_url("grpc://h:1", "_x", directory=registry)
+
+
+def test_deregister_deletes_a_url_entry(registry):
+    name = _registry.register_url("grpc://h:1", directory=registry)
+    _registry.deregister(name, directory=registry)
+    assert list(registry.iterdir()) == []
+    with pytest.raises(KeyError):
+        _registry.deregister(name, directory=registry)
+
+
+def test_deregister_refuses_a_script_entry(registry):
+    (registry / "seg.py").write_text(_server())
+    with pytest.raises(ValueError, match="local server file"):
+        _registry.deregister("seg", directory=registry)
+    assert (registry / "seg.py").exists()
+
+
+def test_deregister_knows_no_reserved_name(registry):
+    (registry / "_x.py").write_text(_server())
+    with pytest.raises(KeyError):
+        _registry.deregister("_x", directory=registry)
+
+
+def _post_json(path, body):
+    import urllib.error
+    import urllib.request
+
+    from biopb._control import _client
+
+    req = urllib.request.Request(
+        _client.control_base_url() + path,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_register_and_deregister_over_http(control, registry):
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"}) == (
+        200,
+        {"name": "h-1"},
+    )
+    assert _post_json(
+        "/api/algorithms/register", {"url": "grpc://h:2", "name": "mine"}
+    ) == (
+        200,
+        {"name": "mine"},
+    )
+    assert _post_json("/api/algorithms/register", {"url": "http://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"path": "/x/seg.py"})[0] == 400
+    assert _post_json("/api/algorithms/register", {})[0] == 400
+
+    from biopb import _control as client
+
+    (registry / "seg.py").write_text(_server())
+    assert {r["name"] for r in client.algorithms()} == {"h-1", "mine", "seg"}
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 200
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 404
+    assert _post_json("/api/algorithms/deregister?name=seg", {})[0] == 400
+    assert {r["name"] for r in client.algorithms()} == {"mine", "seg"}

@@ -5,6 +5,7 @@ import {
   groupTensors,
   isEmptySource,
   isUnresolved,
+  unresolvedKind,
   recentNode,
   sourceLabel,
 } from "./sourceTree";
@@ -13,7 +14,6 @@ const source = (over: Partial<DataSourceDescriptor> = {}): DataSourceDescriptor 
   source_id: "zarr_a3f2",
   source_url: "file:///data/experiment/plate1.zarr",
   source_type: "zarr",
-  metadata_json: null,
   is_resolved: true,
   tensors: [],
   ...over,
@@ -120,12 +120,29 @@ describe("recentNode", () => {
   });
 });
 
+describe("unresolvedKind", () => {
+  const kind = (reason?: DataSourceDescriptor["unresolved_reason"]) =>
+    unresolvedKind(source({ is_resolved: false, unresolved_reason: reason }));
+
+  it("reads the server's reason", () => {
+    expect(kind("pending")).toBe("pending");
+    expect(kind("failed")).toBe("failed");
+    expect(kind("needs_recall")).toBe("recall");
+  });
+
+  it("is the cloud case when the row has no reason", () => {
+    // Every unresolved row was a cloud placeholder before the field existed, and
+    // a server that predates it still sends none.
+    expect(kind()).toBe("recall");
+    expect(kind(null)).toBe("recall");
+  });
+});
+
 describe("isUnresolved", () => {
   const tensor = {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -155,7 +172,6 @@ describe("isEmptySource", () => {
     array_id: "a",
     dim_labels: ["y", "x"],
     shape: [4, 4],
-    chunk_shape: [],
     dtype: "uint16",
   };
 
@@ -181,7 +197,6 @@ function labelTensor(arrayId: string): TensorDescriptor {
     array_id: arrayId,
     dim_labels: ["y", "x"],
     shape: [64, 64],
-    chunk_shape: [],
     dtype: "uint16",
   };
 }

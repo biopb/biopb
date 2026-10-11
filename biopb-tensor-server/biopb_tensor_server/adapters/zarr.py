@@ -9,7 +9,9 @@ import os
 import shutil
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -18,13 +20,22 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
+    bounds_to_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.errors import SourceUnresolvedError
+from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
+from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -42,6 +53,46 @@ logger = logging.getLogger(__name__)
 UPLOAD_ATTR = "biopb"
 UPLOAD_PENDING = "pending"
 UPLOAD_READY = "ready"
+
+
+def _store_filesystem_path(store) -> str:
+    """Resolve a zarr store to the local filesystem path it is rooted at.
+
+    One definition, one caller (biopb/biopb#530): ``__init__`` walks up from here
+    to find the group/plate ``.zattrs`` and keeps the root it lands on, which is
+    what ``_open_level_array`` then hangs a pyramid level off. Two callers each
+    enumerating store shapes was the original bug -- a store carrying ``root``
+    but not ``path`` resolved correctly in one and degraded to ``str(store)``, a
+    repr rather than a path, in the other -- and the second derivation is gone.
+
+    A ``LocalStore`` carries ``root`` and no ``path``; an ``FsspecStore`` carries
+    ``path``. Either beats parsing ``str(store)``, a ``file://`` URL that loses
+    the drive letter on Windows.
+    """
+    for attr in ("path", "root"):
+        value = getattr(store, attr, None)
+        if value is not None:
+            return str(value)
+    store_str = str(store)
+    if store_str.startswith("file://"):
+        return url2pathname(urlparse(store_str).path)
+    return store_str
+
+
+def remote_zarr_store(store):
+    """A read-only zarr store over a :class:`RemoteStore`'s filesystem.
+
+    zarr 3 stores are async; a synchronous fsspec filesystem is wrapped. Remote
+    zarr is experimental and has no test against a real object store.
+    """
+    from zarr.storage import FsspecStore
+
+    fs = store.fs
+    if not getattr(fs, "async_impl", False):
+        from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
+
+        fs = AsyncFileSystemWrapper(fs, asynchronous=True)
+    return FsspecStore(fs, read_only=True, path=store.path)
 
 
 def read_zattrs(store: Path) -> Optional[dict]:
@@ -152,11 +203,70 @@ def _biopb_block(ctx: ClaimContext) -> dict:
     return block if isinstance(block, dict) else {}
 
 
+class _LazyStore:
+    """The one thing of a store the adapters read before a read: where it is."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __str__(self) -> str:
+        return self.path
+
+
+class _LazyZarrArray:
+    """A zarr array's structure, standing in for it until something reads or writes.
+
+    A restored source knows its shape, chunks and dtype from its row, which is all
+    a descriptor is made of, so the store is not opened to list or describe it. The
+    first ``__getitem__`` (or any other attribute) opens the array, once, exactly as
+    ``create_from_config`` would have: read-only, at the same path.
+    """
+
+    def __init__(self, path: str, shape, chunks, dtype, key: str = ""):
+        self._path = path
+        #: Where the array sits in the store at ``path`` ("" for the store root).
+        self.path = key
+        self.shape = tuple(int(s) for s in shape)
+        self.chunks = tuple(int(c) for c in chunks)
+        self.dtype = np.dtype(dtype)
+        self.ndim = len(self.shape)
+        self.store = _LazyStore(path)
+        self._opened = None
+        self._open_lock = threading.Lock()
+
+    def _array(self):
+        arr = self._opened
+        if arr is None:
+            with self._open_lock:
+                if self._opened is None:
+                    import zarr
+
+                    self._opened = zarr.open_array(
+                        self._path, path=self.path or None, mode="r"
+                    )
+                arr = self._opened
+        return arr
+
+    def __getitem__(self, key):
+        return self._array()[key]
+
+    def __setitem__(self, key, value):
+        self._array()[key] = value
+
+    def __getattr__(self, name):
+        # Only reached for what is not set above; a private name must not open
+        # the store (copy / pickle probe for them before __init__ has run).
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._array(), name)
+
+
+@canonical_axes
 class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
-    For remote storage, uses zarr.FSStore with fsspec filesystem.
+    For remote storage, uses zarr's FsspecStore (untested; zarr 3 only).
 
     Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
     minted as an upload (``adapters.fields.create_field_upload``,
@@ -248,8 +358,50 @@ class ZarrAdapter(WritableSource, TensorAdapter):
 
         return None
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The array's structure: everything a descriptor is made of.
+
+        ``None`` for a remote store, which no restart restores. The transfer grid
+        is not stored: it is a function of these and the server's transfer target,
+        and is derived where it is asked for.
+        """
+        if self._tensor_name is not None or is_remote_url(self._source_url):
+            return None
+        return self._array_payload()
+
+    def _array_payload(self) -> Dict[str, Any]:
+        arr = self.zarr_array
+        return {
+            "shape": [int(s) for s in arr.shape],
+            "chunks": [int(c) for c in arr.chunks],
+            "dtype": arr.dtype.str,
+            "dim_labels": list(self.dim_labels),
+            "source_url": self._source_url,
+            "key": getattr(arr, "path", "") or "",
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "ZarrAdapter":
+        """Rebuild from the stored structure; the store opens on the first read."""
+        arr = _LazyZarrArray(
+            payload["source_url"],
+            payload["shape"],
+            payload["chunks"],
+            payload["dtype"],
+            payload.get("key", ""),
+        )
+        return cls(arr, source.source_id, payload["dim_labels"])
 
     # get_tensor_adapter: inherit the total single-tensor base -- it returns self
     # for the source's sole tensor and raises TensorNotFound for an unknown
@@ -272,7 +424,6 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             ZarrAdapter instance
         """
         import zarr
-        from zarr.storage import FSStore
 
         from biopb_tensor_server.core.remote import RemoteStore
 
@@ -283,11 +434,14 @@ class ZarrAdapter(WritableSource, TensorAdapter):
                 credentials_config=credentials_config,
                 profile_name=source.credentials_profile,
             )
-            zarr_store = FSStore(store.path, fs=store.fs)
-            arr = zarr.open_array(zarr_store, mode="r")
+            arr = zarr.open_array(remote_zarr_store(store), mode="r")
         else:
             # Local filesystem
             path = Path(source.url)
+            if not path.exists():
+                # zarr 3 raises FileNotFoundError, an OSError, which the
+                # reconciler retries as a cloud recall; a missing store is not one.
+                raise SourceUnresolvedError(f"{path} does not exist")
             arr = zarr.open_array(str(path), mode="r")
 
         return cls(arr, source.source_id)
@@ -309,11 +463,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         self.dim_labels = dim_labels or [f"dim{i}" for i in range(zarr_array.ndim)]
 
         # Source-level metadata for DataSourceDescriptor
-        self._source_url = str(
-            zarr_array.store.path
-            if hasattr(zarr_array.store, "path")
-            else str(zarr_array.store)
-        )
+        self._source_url = _store_filesystem_path(zarr_array.store)
         # Cheap content_version from the store directory's stat signature (#178):
         # O(1) dir mtime, which flips on member add/remove/rename. A remote store
         # path (S3/GCS) can't be stat'd -> None -> the source stays unversioned.
@@ -329,7 +479,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         # around refuse-and-store, so a write that passed ``_refuse_write``
         # lands before ``_dispose_store`` removes the directory, and a write
         # arriving after is refused -- rather than recreating the directory a
-        # moment after it was deleted (zarr's DirectoryStore makes parents on
+        # moment after it was deleted (zarr's LocalStore makes parents on
         # write). Ordered before ``progress.lock``; disposal never holds that.
         self._write_lock = threading.Lock()
 
@@ -366,7 +516,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             ValueError: If bounds exceed array shape
         """
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
     def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
@@ -440,7 +590,15 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             )
         ] = arr
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """Itself for its own name, as well as for the source's."""
+        if self._tensor_name is not None and (
+            strip_source_prefix(self.source_id, tensor_id) == self._tensor_name
+        ):
+            return self
+        return super().get_tensor_adapter(tensor_id)
+
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -459,5 +617,5 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             dtype=self.zarr_array.dtype.str,
         )
 
-    def list_tensor_descriptors(self):
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def list_tensors(self):
+        return [catalog_entry(self._native_descriptor())]

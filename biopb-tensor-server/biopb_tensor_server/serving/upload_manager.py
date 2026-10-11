@@ -48,7 +48,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -78,22 +78,27 @@ from biopb_tensor_server.adapters.zarr import (
 )
 from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
-from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
+from biopb_tensor_server.core.chunk import (
+    MAX_ARROW_BATCH_BYTES,
+    estimate_chunk_bytes,
+    get_bounds_from_chunk_id,
+)
 from biopb_tensor_server.core.errors import (
+    SourceUnresolvedError,
+    TensorResolutionError,
     UploadClosedError,
     UploadDiscardedError,
     UploadTransitionError,
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.labels import LABELS_SEGMENT, split_label_field
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 __all__ = [
     "DEFAULT_UPLOAD_TTL",
     "UploadManager",
     "UploadStatus",
-    "write_dir_under_root",
 ]
 
 logger = logging.getLogger(__name__)
@@ -115,29 +120,6 @@ _ID_GRAMMAR = (
 )
 
 
-def write_dir_under_root(
-    write_dir: Optional[Path], roots: Iterable[Path]
-) -> Optional[Path]:
-    """The discovery root that contains *write_dir*, if any.
-
-    A store minted under ``write_dir`` is registered by the upload path under
-    its own id. If discovery also walks that directory, a finished store is
-    claimed a second time under discovery's id -- listed twice, served twice --
-    and an unfinished one is only kept out by the claims checking the upload
-    marker. So ``write_dir`` belongs outside every discovered directory; the
-    launcher warns when it is not (biopb/biopb#1059). Compared resolved, so a
-    symlinked root still matches.
-    """
-    if write_dir is None:
-        return None
-    target = write_dir.resolve()
-    for root in roots:
-        resolved = root.resolve()
-        if target == resolved or resolved in target.parents:
-            return root
-    return None
-
-
 def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     """An upload-closed error as the wire sees it.
 
@@ -154,20 +136,6 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
         "detail": getattr(exc, "reason", ""),
     }
     return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
-
-
-def _attached(adapter: Any) -> Dict[str, Any]:
-    """The tensors the upload path put on *adapter*, or none.
-
-    By attribute, like :func:`upload_of`: the registry also holds adapters from
-    outside this package, and one that knows nothing about the upload path has
-    none of them.
-
-    One index for both kinds -- uploaded field and label set -- so this
-    boundary locates, publishes, unlists and reaps them alike
-    (``SourceAdapter.attached_tensors``).
-    """
-    return getattr(adapter, "attached_tensors", None) or {}
 
 
 def _reap_step(
@@ -247,13 +215,13 @@ class UploadManager:
 
     # -- lookup ----------------------------------------------------------------
 
-    def _locate(self, upload_id: str) -> Tuple[Any, Any, Optional[str]]:
-        """The adapter tracking upload *upload_id*, its source, and its field.
+    def _locate(self, upload_id: str) -> Tuple[Any, Optional[str], Optional[str]]:
+        """The adapter tracking upload *upload_id*, its source id, and its field.
 
         Every upload is a tensor of a source that already exists, so this is
         one lookup in two halves: the source from the registry, then the field
         from that source's attachment index, whatever kind of tensor it is.
-        Returns ``(adapter, parent, field)``, with *adapter* None when nothing
+        Returns ``(adapter, parent_id, field)``, with *adapter* None when nothing
         holds the id, which every caller already has to handle.
 
         A bare ``source_id`` answers ``(the source, None, None)``: it is a real
@@ -263,10 +231,9 @@ class UploadManager:
         source_id, _, field = upload_id.partition("/")
         if not field:
             return self._registry.get(upload_id), None, None
-        parent = self._registry.get(source_id)
-        if parent is None:
+        if source_id not in self._registry:
             return None, None, None
-        return _attached(parent).get(field), parent, field
+        return self._registry.attached(source_id, field), source_id, field
 
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
@@ -294,14 +261,14 @@ class UploadManager:
         reads UNKNOWN rather than raising, so a retry after the tombstone is
         gone is not an error.
         """
-        adapter, parent, field = self._locate(array_id)
+        adapter, parent_id, field = self._locate(array_id)
         if upload_of(adapter) is None:
             return self._delete_adopted_tensor(array_id)
         status = adapter.discard(reason)
-        if parent is None:
+        if parent_id is None:
             self._drop_catalog_row(adapter, array_id)
         else:
-            self._unlist(parent, field)
+            self._unlist(parent_id, field)
         self._forget_rois(array_id)
         return status
 
@@ -326,7 +293,7 @@ class UploadManager:
         """
         if state is UploadStatus.DISCARDED:
             return self.discard(array_id, reason)
-        adapter, parent, field = self._locate(array_id)
+        adapter, parent_id, field = self._locate(array_id)
         progress = upload_of(adapter)
         if progress is None:
             raise flight.FlightServerError(
@@ -345,8 +312,8 @@ class UploadManager:
             raise flight.FlightServerError(
                 f"set_upload_status: could not publish {array_id} on disk: {e}"
             ) from e
-        if parent is not None and not was_readable and progress.is_readable:
-            self._publish(parent, field, adapter)
+        if parent_id is not None and not was_readable and progress.is_readable:
+            self._registry.attachment_changed(parent_id)
         return status
 
     def _delete_adopted_tensor(self, array_id: str) -> Dict[str, Any]:
@@ -363,53 +330,28 @@ class UploadManager:
         else is a no-op, and answers UNKNOWN like the rest of :meth:`discard`.
         """
         source_id, _, field = array_id.partition("/")
-        parent = self._registry.get(source_id) if field else None
-        if parent is None:
+        if not field or source_id not in self._registry:
             return unknown_upload_status(array_id)
-        adapter = parent.detach_tensor(field)
+        adapter = self._registry.detach(source_id, field)
         if adapter is None:
             return unknown_upload_status(array_id)
         adapter.delete_store()
-        self._sync_parent_row(parent)
         self._forget_rois(array_id)
         logger.info(f"Deleted tensor {array_id}")
         return unknown_upload_status(array_id)
 
     # -- listing ---------------------------------------------------------------
 
-    def _sync_parent_row(self, parent: Any) -> None:
-        """Re-publish a parent's catalog row after its sets changed.
-
-        ``sync_source_added`` is an upsert and ``catalog_tensors`` reads the
-        sets off the adapter, so re-registering the parent is the whole of it
-        (the ROI re-import it triggers is idempotent).
-        """
-        self._sync_row(parent.source_id, parent)
-
-    def _publish(self, parent: Any, field: Optional[str], adapter: Any) -> None:
-        """List a tensor that has just become readable, under its source.
-
-        Every kind was attached at ``add_tensor`` -- that is what routes its own
-        writes -- and becomes *listed* by becoming readable, which its own
-        upload record answers. So what is owed is the stale views and the row.
-        """
-        parent.attachment_changed()
-        self._sync_parent_row(parent)
-
-    def _unlist(self, parent: Any, field: Optional[str]) -> None:
+    def _unlist(self, source_id: str, field: Optional[str]) -> None:
         """Take a tensor out of its source's listing, if it was in it.
 
         Nothing is detached: a tensor leaves the listing by ceasing to be
         readable, and stays reachable as the tombstone a straggler polls until
         the reclaim sweep drops it.
         """
-        if parent is None or field is None:
+        if field is None or self._registry.attached(source_id, field) is None:
             return
-        adapter = _attached(parent).get(field)
-        if adapter is None:
-            return
-        parent.attachment_changed()
-        self._sync_parent_row(parent)
+        self._registry.attachment_changed(source_id)
 
     def _add_label_set(
         self, parent: Any, field: str, req_desc: TensorDescriptor
@@ -418,7 +360,7 @@ class UploadManager:
 
         The set is attached to its source, which routes its own writes and its
         status polls; it is not *listed* until it reaches READY
-        (``SourceAdapter.label_sets``). No catalog write at create: the row the
+        (``Attachments.listed``). No catalog write at create: the row the
         source already has still describes what a reader may see.
 
         It takes a deadline the same way a field does: a set is an uploaded
@@ -435,12 +377,13 @@ class UploadManager:
                 field,
                 req_desc,
                 labels_dir=labels_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 metadata=metadata,
                 expires_at=self._deadline_for(parent, req_desc),
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
-        parent.attach_tensor(field, adapter)
+        self._registry.attach(parent.source_id, field, adapter)
         logger.info(f"Added label set {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
@@ -631,6 +574,30 @@ class UploadManager:
             f"uploading."
         )
 
+    @staticmethod
+    def _require_bounded_grid(req_desc: TensorDescriptor) -> None:
+        """Reject an upload whose write grid exceeds the Arrow batch ceiling.
+
+        The write grid is the transfer grid: a read plans on the chunks that
+        were stored, and a chunk above ``MAX_ARROW_BATCH_BYTES`` cannot be
+        streamed whole nor re-split into chunks no upload stored. Splitting it
+        before upload is the client-side fix.
+        """
+        shape = [int(dim) for dim in req_desc.shape]
+        if not shape or len(req_desc.chunk_shape) != len(shape):
+            return
+        grid = tuple(
+            min(max(1, int(chunk)), dim)
+            for chunk, dim in zip(req_desc.chunk_shape, shape, strict=True)
+        )
+        nbytes = estimate_chunk_bytes(grid, req_desc.dtype)
+        if nbytes > MAX_ARROW_BATCH_BYTES:
+            raise flight.FlightServerError(
+                f"add_tensor: chunk_shape {list(grid)} is {nbytes} bytes, above "
+                f"the {MAX_ARROW_BATCH_BYTES}-byte limit of one chunk; "
+                f"upload in smaller chunks."
+            )
+
     def add_tensor(self, req_desc: TensorDescriptor) -> TensorDescriptor:
         """Add a tensor to a source that already exists; answer its descriptor.
 
@@ -656,6 +623,7 @@ class UploadManager:
         tensor that is no longer its own with nothing to tell it so.
         """
         self._require_canonical_axes(req_desc)
+        self._require_bounded_grid(req_desc)
         if self._write_dir is None:
             raise flight.FlightServerError(
                 "add_tensor: write_dir is not configured, so there is nowhere "
@@ -668,7 +636,10 @@ class UploadManager:
             raise flight.FlightServerError(
                 f"add_tensor: {req_desc.array_id!r} names no tensor. Use {_ID_GRAMMAR}."
             )
-        parent = self._registry.get(source_id)
+        try:
+            parent = self._registry.get_registered(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise flight.FlightServerError(f"add_tensor: {exc}") from exc
         if parent is None:
             raise flight.FlightServerError(
                 f"add_tensor: {req_desc.array_id!r} names no source "
@@ -676,6 +647,12 @@ class UploadManager:
                 f"already serves; it does not create one. Use "
                 f"{SCRATCH_SOURCE_ID!r} for a result that belongs to no source "
                 f"of yours."
+            )
+        if parent.source_type == "tensor-server":
+            raise flight.FlightServerError(
+                f"add_tensor: {source_id!r} is a mirror of another server's source, "
+                f"which owns its tensors. Upload to that server, or use "
+                f"{SCRATCH_SOURCE_ID!r} for a result of your own."
             )
 
         if split_label_field(field) is not None:
@@ -701,7 +678,7 @@ class UploadManager:
         # published gate keeps it out of the source's tensors until READY. So no
         # catalog write is owed -- the row the source has still describes what a
         # reader may see.
-        parent.attach_tensor(field, adapter)
+        self._registry.attach(parent.source_id, field, adapter)
         logger.info(f"Added {scheme} tensor: {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
@@ -727,6 +704,7 @@ class UploadManager:
                 scheme,
                 desc,
                 fields_dir=fields_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 expires_at=expires_at,
             )
         except ValueError as e:
@@ -737,8 +715,7 @@ class UploadManager:
 
         Neither half is a walk: the id is fixed, and the source keeps no
         directory of its own -- its tensors come back through the
-        ``on_register`` hook that gives every source its uploaded fields
-        (``fields.fields_attacher``).
+        registry's attachments, adopted from ``fields`` at boot.
 
         *max_ttl* caps every upload added here, an unset one included; None
         leaves them undated. Returns the id, or None on a server with no
@@ -749,27 +726,20 @@ class UploadManager:
         fields_dir = source_fields_dir(fields_root(self._write_dir), SCRATCH_SOURCE_ID)
         adapter = ScratchSource(max_ttl, fields_dir=fields_dir)
         registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
-        self._sync_row(SCRATCH_SOURCE_ID, registered)
+        # Best-effort, as every catalog write on this path is: the row is how a
+        # source is *browsable*, and it must not be able to fail the registration
+        # that made it *readable*. A leaked row is the worst case, and the boot
+        # sweep is what collects those.
+        if self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_added(SCRATCH_SOURCE_ID, registered)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to sync {SCRATCH_SOURCE_ID} to the catalog "
+                    f"(readable by id, not listed): {e}"
+                )
         logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
         return SCRATCH_SOURCE_ID
-
-    def _sync_row(self, source_id: str, adapter: Any) -> None:
-        """Put *source_id* in the catalog; the one best-effort catalog write.
-
-        Best-effort for the reason every catalog write on this path is: the
-        row is how a source is *browsable*, and it must not be able to fail the
-        registration that made it *readable*. A leaked row is the worst case,
-        and the boot sweep is what collects those.
-        """
-        if self._metadata_db is None:
-            return
-        try:
-            self._metadata_db.sync_source_added(source_id, adapter)
-        except Exception as e:
-            logger.warning(
-                f"Failed to sync {source_id} to the catalog "
-                f"(readable by id, not listed): {e}"
-            )
 
     def write_chunk(
         self,
@@ -889,20 +859,11 @@ class UploadManager:
                     self._registry.unregister(source_id)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded upload {source_id}")
-            # ...and every tensor attached to it -- uploaded field or label
-            # set -- tracked on the source rather than in the registry,
-            # and taking the identical step.
+        # ...and every tensor attached to a source -- uploaded field or label
+        # set -- held by the registry and taking the identical step.
+        for source_id, tensors in self._registry.attachment_snapshot():
             tensor_expired, tensor_reclaimed = self._reap_tensors(
-                adapter,
-                source_id,
-                _attached(adapter),
-                # Lazy: an adapter with none to reap may not define this at all
-                # ("outside this package", per _attached). Bound as a default so
-                # the callable doesn't chase the loop's own name.
-                lambda field, adapter=adapter: adapter.detach_tensor(field),
-                now,
-                ttl,
-                wall_now,
+                source_id, tensors, now, ttl, wall_now
             )
             expired += tensor_expired
             reclaimed += tensor_reclaimed
@@ -910,24 +871,22 @@ class UploadManager:
 
     def _reap_tensors(
         self,
-        adapter: Any,
         source_id: str,
         tensors: Dict[str, Any],
-        detach: Any,
         now: float,
         ttl: float,
         wall_now: float,
     ) -> Tuple[int, int]:
-        """One reap pass over *adapter*'s attachment index."""
+        """One reap pass over *source_id*'s attachments."""
         expired = reclaimed = 0
-        for field, tensor in list(tensors.items()):
+        for field, tensor in tensors.items():
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             if expired_now:
-                self._unlist(adapter, field)
+                self._unlist(source_id, field)
                 self._forget_rois(tensor.array_id)
                 expired += 1
             if stale:
-                detach(field)
+                self._registry.detach(source_id, field)
                 reclaimed += 1
                 logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
         return expired, reclaimed

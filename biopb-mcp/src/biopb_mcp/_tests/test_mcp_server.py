@@ -18,6 +18,7 @@ import pytest
 
 from biopb_mcp._tests.conftest import ScriptedJobs, call_tool as _tool, rpc_reply
 from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
+from biopb_mcp.mcp._kernel_env import ViewerMode
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):
@@ -132,8 +133,7 @@ def mock_kernel_host():
     }
     host.execute.return_value = _result()
     host.jobs = ScriptedJobs()
-    host.virtual_display = None  # real display unless a test says otherwise
-    host.no_viewer_reason = None  # a viewer unless a test says otherwise
+    host.viewer = ViewerMode.real()  # a real viewer unless a test says otherwise
     return host
 
 
@@ -225,6 +225,73 @@ class TestTheReferenceDocs:
 # -----------------------------------------------------------------------
 
 
+class TestShowView:
+    def test_returns_the_page_png_for_the_view_as_given(self, monkeypatch):
+        seen = {}
+
+        def fake(view, image, max_edge):
+            seen["args"] = (view, image, max_edge)
+            return {"visible": True, "png": "UE5H", "partial": False, "notes": []}
+
+        monkeypatch.setattr(_server._control_client, "show_view", fake)
+        result = _tool(_server.show_view, "id=a&z=2", True, 256)
+        assert seen["args"] == ("id=a&z=2", True, 256)
+        assert [c.type for c in result] == ["image"]
+        assert result[0].data == "UE5H"
+
+    def test_presenting_without_an_image_is_a_short_ack(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "show_view",
+            lambda *a: {"visible": True, "png": None, "partial": False, "notes": []},
+        )
+        result = _tool(_server.show_view, "id=a")
+        assert [c.type for c in result] == ["text"]
+        assert "Shown" in result[0].text
+
+    def test_a_hidden_viewer_is_said_so_and_returns_no_image(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "show_view",
+            lambda *a: {"visible": False, "png": None, "partial": False, "notes": []},
+        )
+        result = _tool(_server.show_view, "id=a", True)
+        assert [c.type for c in result] == ["text"]
+        assert "not visible" in result[0].text and "no image" in result[0].text
+
+    def test_a_partial_image_says_so(self, monkeypatch):
+        monkeypatch.setattr(
+            _server._control_client,
+            "show_view",
+            lambda *a: {
+                "visible": True,
+                "png": "x",
+                "partial": True,
+                "notes": ["timed out"],
+            },
+        )
+        result = _tool(_server.show_view, "id=a", True)
+        assert result[1].type == "text"
+        assert "incomplete" in result[1].text and "timed out" in result[1].text
+
+    def test_a_refusal_is_text_with_the_controls_reason(self, monkeypatch):
+        def refuse(*a):
+            raise _server._control_client.ShowError("no viewer page is connected")
+
+        monkeypatch.setattr(_server._control_client, "show_view", refuse)
+        result = _tool(_server.show_view, "id=a")
+        assert [c.type for c in result] == ["text"]
+        assert "no viewer page" in result[0].text
+
+    def test_no_control_is_text_not_a_crash(self, monkeypatch):
+        def down(*a):
+            raise ConnectionRefusedError("refused")
+
+        monkeypatch.setattr(_server._control_client, "show_view", down)
+        result = _tool(_server.show_view, "id=a")
+        assert "Not shown" in result[0].text and "refused" in result[0].text
+
+
 class TestTakeScreenshot:
     def test_returns_error_when_no_host(self):
         _app._kernel_host = None
@@ -269,7 +336,7 @@ class TestTakeScreenshot:
         assert "restart_kernel" in result[0].text
 
     def test_no_viewer_refuses_without_a_kernel_round_trip(self, server_with_host):
-        server_with_host.no_viewer_reason = "napari is not installed"
+        server_with_host.viewer = ViewerMode.none("napari is not installed")
         result = _tool(_server.take_screenshot)
         assert result[0].type == "text"
         assert "no napari viewer" in result[0].text
@@ -1152,7 +1219,7 @@ class TestStartKernel:
         # Xvfb is a silent degradation -- every downstream tool still works --
         # so the only thing that reaches the user is the agent relaying it (#892).
         server_with_host.ensure_started.return_value = {"state": "ready"}
-        server_with_host.virtual_display = ":2"
+        server_with_host.viewer = ViewerMode.virtual(":2")
         result = _tool(_server.start_kernel)
         assert "Kernel ready" in result  # still the success path
         assert ":2" in result
@@ -1163,7 +1230,7 @@ class TestStartKernel:
 
     def test_no_viewer_says_why_and_names_the_web_viewer(self, server_with_host):
         server_with_host.ensure_started.return_value = {"state": "ready"}
-        server_with_host.no_viewer_reason = "no display detected"
+        server_with_host.viewer = ViewerMode.none("no display detected")
         result = _tool(_server.start_kernel)
         assert "Kernel ready" in result
         assert "no napari viewer (no display detected)" in result
@@ -1177,7 +1244,7 @@ class TestStartKernel:
             "state": "error",
             "error": "no Qt platform",
         }
-        server_with_host.virtual_display = ":2"
+        server_with_host.viewer = ViewerMode.virtual(":2")
         assert "TELL THE USER" not in _tool(_server.start_kernel)
 
     def test_execute_code_when_not_started_points_to_start_kernel(
@@ -1657,6 +1724,7 @@ class TestToolReturnShape:
         ("read_doc", {"id": "index"}, True),
         ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
+        ("show_view", {"view": "id=a"}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("verify_workflow", {"document": "```python\n1\n```"}, True),
         ("poll_job", {"job_id": "job-1"}, True),
@@ -1674,6 +1742,13 @@ class TestToolReturnShape:
         # None so a stray MagicMock host from another test cannot reach a code
         # path that formats one.
         monkeypatch.setattr(_app, "_kernel_host", None)
+
+        # show_view reaches the control, not the kernel: keep it off the
+        # developer's real one.
+        def no_page(*args):
+            raise _server._control_client.ShowError("no viewer page is connected")
+
+        monkeypatch.setattr(_server._control_client, "show_view", no_page)
 
     def test_every_tool_is_covered(self):
         """A new tool must land in the table above, with its shape chosen."""

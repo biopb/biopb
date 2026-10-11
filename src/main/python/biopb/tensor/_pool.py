@@ -43,7 +43,6 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
 from biopb.tensor import _diskcache
-from biopb.tensor._labels import split_label_array_id
 from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust, concrete_trust
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -482,12 +481,29 @@ def _clear_view_cache(location: str, token: Optional[str]) -> None:
     _get_view_cache(location, token).clear()
 
 
+def _chunk_ticket(chunk_id: bytes, grant: Optional[bytes]) -> bytes:
+    """The ticket bytes that read one chunk.
+
+    *chunk_id* is the chunk's key -- stable, so it is also what the caches key
+    on. Without a *grant* it is a chunk_id the server minted, and the ticket
+    wraps it. With one it is the identity-and-index half of a ``chunk_ref``, and
+    the grant is the other half: serialized protobuf messages merge when
+    concatenated, so joining them is the whole composition and needs no codec
+    (biopb/biopb#1112). The grant carries an expiry and a seal that change with
+    every plan, which is why it stays out of the key.
+    """
+    if grant is None:
+        return TensorTicket(chunk_id=chunk_id).SerializeToString()
+    return chunk_id + grant
+
+
 def _try_cachefile_transfer(
     client: flight.FlightClient,
     location: str,
     token: Optional[str],
     chunk_id: bytes,
     call_options: flight.FlightCallOptions,
+    grant: Optional[bytes] = None,
 ) -> Optional[Tuple[np.ndarray, bool]]:
     """Attempt the cache-file fast path for a chunk.
 
@@ -501,8 +517,7 @@ def _try_cachefile_transfer(
     over-budget owned copy (private RAM: strong-cache it) -- or None to fall back
     to do_get (server too old, chunk not cached/locatable, or any read failure).
     """
-    ticket = TensorTicket(chunk_id=chunk_id)
-    action = flight.Action("chunk_locate", ticket.SerializeToString())
+    action = flight.Action("chunk_locate", _chunk_ticket(chunk_id, grant))
 
     try:
         results = client.do_action(action, options=call_options)
@@ -801,13 +816,18 @@ def _get_shared_cache(
 WIRE_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="zstd")
 
 
+def is_label_set(array_id: str) -> bool:
+    """Whether *array_id* names a label set: the last ``@labels`` segment, past
+    the source_id, with a name after it."""
+    parts = array_id.split("/")
+    return any(parts[i] == "@labels" and parts[i + 1] for i in range(1, len(parts) - 1))
+
+
 def wants_wire_compression(location: str, array_id: str) -> bool:
     """Whether a write of *array_id* to *location* goes compressed: a label set,
     on a server that is not this machine. Pixel data barely compresses, and
     compressing it costs the zero-copy path for nothing."""
-    return split_label_array_id(array_id) is not None and not _is_localhost_location(
-        location
-    )
+    return is_label_set(array_id) and not _is_localhost_location(location)
 
 
 def _build_call_options(
@@ -937,6 +957,7 @@ def _fetch_chunk_distributed(
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust] = None,
+    grant: Optional[bytes] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
 
@@ -954,6 +975,8 @@ def _fetch_chunk_distributed(
         bounds_start: Chunk start coordinates as tuple
         bounds_stop: Chunk stop coordinates as tuple
         cache_bytes: Cache size for worker-local cache
+        grant: The plan's sealed half of the ticket, when ``chunk_id`` is the
+            identity-and-index half of a ``chunk_ref`` (see :func:`_chunk_ticket`)
 
     Returns:
         numpy array with chunk data
@@ -986,7 +1009,7 @@ def _fetch_chunk_distributed(
     # Try the localhost cache-file fast path if all conditions met (issue #9)
     if _should_try_cachefile(location):
         result = _try_cachefile_transfer(
-            client, location, token, chunk_id, call_options
+            client, location, token, chunk_id, call_options, grant
         )
         if result is not None:
             arr, is_view = result
@@ -1003,9 +1026,8 @@ def _fetch_chunk_distributed(
 
     # Fallback to do_get if neither cache had it
     if arr is None:
-        ticket = TensorTicket(chunk_id=chunk_id)
         reader = client.do_get(
-            flight.Ticket(ticket.SerializeToString()), options=call_options
+            flight.Ticket(_chunk_ticket(chunk_id, grant)), options=call_options
         )
         # do_get returns a single-row unified binary batch [data, shape, dtype];
         # decode it exactly like the cache-file fast path (raw bytes reinterpreted
@@ -1053,6 +1075,7 @@ def _fetch_chunk_block(
     token: Optional[str],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust] = None,
+    grant: Optional[bytes] = None,
 ) -> np.ndarray:
     """Single-``Blockwise``-layer callback that fetches one block.
 
@@ -1074,6 +1097,7 @@ def _fetch_chunk_block(
         tuple(bounds_stop),
         cache_bytes,
         tls_trust,
+        grant,
     )
 
 
@@ -1169,6 +1193,7 @@ def _build_dask_array_from_chunk_map(
     token: Optional[str],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust] = None,
+    grant: Optional[bytes] = None,
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
@@ -1222,6 +1247,7 @@ def _build_dask_array_from_chunk_map(
             token,
             cache_bytes,
             tls_trust,
+            grant,
         )
 
     # Fallback: ragged/sparse grid -> one delayed task per chunk.
@@ -1239,6 +1265,7 @@ def _build_dask_array_from_chunk_map(
                 tuple(bounds.stop),
                 cache_bytes,
                 tls_trust,
+                grant,
             ),
             shape=chunk_shape,
             dtype=dtype,
@@ -1255,6 +1282,7 @@ def _regular_blockwise_array(
     token: Optional[str],
     cache_bytes: int,
     tls_trust: Optional[TlsTrust] = None,
+    grant: Optional[bytes] = None,
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
 
@@ -1277,6 +1305,8 @@ def _regular_blockwise_array(
         cache_bytes,
         None,
         tls_trust,
+        None,
+        grant,
         None,
         numblocks={},
     )

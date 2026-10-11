@@ -9,6 +9,10 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -30,21 +34,20 @@ class _CatalogAdapter:
     def is_resident(self):
         return True
 
-    def is_resolved(self):
-        return True
-
-    def list_tensor_descriptors(self):
+    def list_tensors(self):
         return [
             TensorDescriptor(
                 array_id=self.source_id,
                 shape=[10, 10],
-                chunk_shape=[10, 10],  # stripped by catalog_tensors (#812)
+                chunk_shape=[10, 10],  # stripped by the catalog projection (#812)
                 dtype="uint8",
             )
         ]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class _Context:
@@ -60,9 +63,7 @@ class _Context:
 
 
 def _server(db, token=None):
-    return TensorFlightServer(
-        location="grpc://localhost:0", metadata_db=db, token=token
-    )
+    return TensorFlightServer(location="localhost:0", metadata_db=db, token=token)
 
 
 def test_one_flight_per_public_table_with_its_schema():
@@ -72,8 +73,8 @@ def test_one_flight_per_public_table_with_its_schema():
 
     infos = list(server.list_flights(_Context(), b""))
     by_path = {"/".join(p.decode() for p in i.descriptor.path): i for i in infos}
-    assert set(by_path) == set(db.allowed_tables) == {"sources", "decode_rates"}
-    assert "rois" not in by_path  # private data is not a catalog flight
+    assert set(by_path) == set(db.allowed_tables) == {"sources", "decode_rates", "rois"}
+    assert "source_catalog" not in by_path  # a physical table, not a public one
 
     sources = by_path["sources"]
     assert sources.schema.names[:3] == ["source_id", "source_url", "source_type"]
@@ -112,14 +113,16 @@ def test_a_path_descriptor_names_a_table():
     )
     assert info.schema.names[:1] == ["source_id"]
     with pytest.raises(flight.FlightServerError, match="unknown catalog table"):
-        server.get_flight_info(_Context(), flight.FlightDescriptor.for_path("rois"))
+        server.get_flight_info(
+            _Context(), flight.FlightDescriptor.for_path("source_catalog")
+        )
 
 
 def test_a_catalog_less_server_serves_its_sources_but_lists_nothing():
     """``metadata_db=None`` is the embedded in-process cache's shape: the source
     registers and is addressable by id, and every catalog surface refuses with
     Unavailable rather than pretending the catalog is empty."""
-    server = TensorFlightServer(location="grpc://localhost:0")
+    server = TensorFlightServer(location="localhost:0")
     server.register_source("x", _CatalogAdapter("x"))
     assert server.metadata_db is None
     assert server.sources.get("x") is not None  # addressable by source_id
@@ -134,7 +137,7 @@ def test_registration_and_cataloguing_are_two_steps():
     """``register_source`` is the registry; the row is the registering caller's
     own second call, and ``unregister_source`` mirrors it."""
     db = MetadataDatabase()
-    server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer(location="localhost:0", metadata_db=db)
     registered = server.register_source("x", _CatalogAdapter("x"))
     paths = {tuple(i.descriptor.path) for i in server.list_flights(_Context(), b"")}
     assert (b"sources",) in paths
@@ -158,4 +161,4 @@ def test_the_catalog_tier_is_the_server_token():
         list(server.list_flights(_Context(), b""))
     with pytest.raises(flight.FlightUnauthenticatedError):
         list(server.list_flights(_Context("wrong"), b""))
-    assert len(list(server.list_flights(_Context("secret"), b""))) == 2
+    assert len(list(server.list_flights(_Context("secret"), b""))) == 3

@@ -1,7 +1,7 @@
 """Backend adapters for tensor storage formats.
 
 This module provides a consistent interface for reading chunked multi-dimensional
-arrays from various storage backends (Zarr, HDF5, OME-TIFF, TileDB).
+arrays from various storage backends (Zarr, OME-TIFF, TileDB).
 
 Each adapter maps storage-specific chunk layouts to Arrow Flight endpoints:
 - chunk_id: Opaque bytes identifying a chunk in the backend
@@ -23,13 +23,12 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
     List,
-    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -43,7 +42,6 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.attached import is_published, split_attached_field
 from biopb_tensor_server.core.cache_source import cache_sourced_units
 from biopb_tensor_server.core.chunk import (
     ChunkEndpoint,
@@ -55,6 +53,7 @@ from biopb_tensor_server.core.chunk import (
     decode_chunk_id,
     decode_reduction_method,
     decode_scale_info,
+    encode_grid_identity,
     is_scaled_chunk,
     mint_chunk_id,
     normalized_scale_hint,
@@ -63,7 +62,6 @@ from biopb_tensor_server.core.chunk import (
     split_chunk_version as _split_chunk_version,
 )
 from biopb_tensor_server.core.chunk_batch import (
-    CHUNK_WIRE_SCHEMA,
     pack_chunk_batch,
 )
 from biopb_tensor_server.core.downsample import (
@@ -78,13 +76,14 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     WriteNotSupportedError,
 )
-from biopb_tensor_server.core.labels import (
-    extent_mismatch,
-    join_fields,
-    label_image_axes,
-    split_label_field,
+from biopb_tensor_server.core.normalize import (
+    permutation_of,
+    permute_descriptor,
+    to_canonical,
+    to_native,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
+from biopb_tensor_server.core.registration import RegistrationRecord
 from biopb_tensor_server.core.retention import (
     computed_ladder,
     record_decode,
@@ -166,64 +165,78 @@ def strip_source_prefix(source_id: str, array_id: Optional[str]) -> Optional[str
     return array_id
 
 
-def catalog_entry(desc: TensorDescriptor) -> TensorDescriptor:
-    """Project a descriptor onto the **structural catalog entry** a source lists.
-
-    The catalog surface and the serving surface are different facts about a
-    tensor, and only one of them a *source* can answer (biopb/biopb#812):
-
-    * Structural -- ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype``. Stable
-      per tensor, derivable from the container's own index, and what
-      ``ListFlights`` and the DuckDB ``sources.tensors`` rows carry.
-    * Serving -- above all the transfer ``chunk_shape``, plus the pyramid and the
-      physical scale. These belong to the *tensor-bound* adapter that will
-      actually serve the read: the grid can depend on the bound scene's Dask
-      chunks, its own backend block, its native pyramid level, and the request's
-      scale. A source-level adapter that answers for them is guessing on behalf
-      of a scene it has not selected, and the guess is published as fact.
-
-    So a source lists this projection, and ``GetFlightInfo`` -- which resolves
-    the tensor adapter first -- is the one place a grid is published. Keeping
-    ``TensorDescriptor`` as the wire type for both (rather than splitting the
-    proto message) makes the invariant "``chunk_shape`` is empty on every
-    catalog entry", enforced here and re-applied by :func:`catalog_tensors`.
-    """
-    return TensorDescriptor(
-        array_id=desc.array_id,
-        dim_labels=desc.dim_labels,
-        shape=desc.shape,
-        dtype=desc.dtype,
+def bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
+    """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``."""
+    return tuple(
+        slice(int(s), int(e)) for s, e in zip(bounds.start, bounds.stop, strict=True)
     )
 
 
-def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
-    """A source's tensors as the catalog stores them.
+def bounds_to_strided_slices(
+    bounds: ChunkBounds, step: Tuple[int, ...]
+) -> Tuple[slice, ...]:
+    """:func:`bounds_to_slices` with a per-axis stride, for a decimated read.
 
-    The catalog invariant's enforcement point: the one path into the DuckDB
-    ``sources.tensors`` column goes through here, so a listing that still
-    carries a serving field cannot reach a client (biopb/biopb#812). Re-applies
-    :func:`catalog_entry` even though implementations are asked to, because a
-    source that forgets must not be able to publish a grid it guessed.
-
-    Duck-typed on ``list_tensor_descriptors`` alone, like the rest of the
-    registration surface ``sync_source_added`` reads -- plus what the upload
-    path attached, listed **after** the format's own tensors: a source's first
-    tensor is the one every listing reads as its picture -- the browser groups
-    on it, and SQL reaches for ``tensors[1]`` -- and neither a label set
-    (biopb/biopb#1059) nor an uploaded field may ever be that.
-
-    A registered source has no tensors of its own, so its whole listing comes
-    from ``attached_fields`` -- which is the same path a discovered source's
-    uploaded fields take, and why nothing here needs to know which kind it has.
+    Kept next to its unstrided sibling so the two index a store identically
+    apart from the step -- which is the whole of what makes a fused
+    ``nearest`` bit-identical to reading the extent and slicing it.
     """
-    tensors = [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
-    attached = getattr(adapter, "attached_fields", None) or {}
-    for field in attached.values():
-        tensors.append(catalog_entry(field.get_tensor_descriptor()))
-    sets = getattr(adapter, "label_sets", None) or {}
-    for label_set in sets.values():
-        tensors.append(catalog_entry(label_set.get_tensor_descriptor()))
-    return tensors
+    return tuple(
+        slice(int(s), int(e), max(1, int(size)))
+        for s, e, size in zip(bounds.start, bounds.stop, step, strict=True)
+    )
+
+
+def validate_bounds(bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
+    """Validate that bounds are within array shape.
+
+    Args:
+        bounds: Chunk bounds (start, stop coordinates)
+        shape: Array shape
+
+    Raises:
+        ValueError: If bounds are out-of-bounds or invalid
+    """
+    ndim = len(shape)
+    if len(bounds.start) != ndim or len(bounds.stop) != ndim:
+        raise ValueError(
+            f"Bounds dimensionality mismatch: expected {ndim}, "
+            f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
+        )
+    for ax, (s, e, dim) in enumerate(
+        zip(bounds.start, bounds.stop, shape, strict=True)
+    ):
+        if s < 0:
+            raise ValueError(f"Bounds start[{ax}]={s} is negative")
+        if e > dim:
+            raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
+        if s >= e:
+            raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
+
+
+@dataclass(frozen=True)
+class TensorEntry:
+    """What a *source* lists about one of its tensors: the **structural** facts.
+
+    ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype`` -- stable per tensor,
+    derivable from the container's own index, and what the DuckDB
+    ``sources.tensors`` rows carry.
+    """
+
+    array_id: str
+    dim_labels: Tuple[str, ...] = ()
+    shape: Tuple[int, ...] = ()
+    dtype: str = ""
+
+
+def catalog_entry(desc: Any) -> TensorEntry:
+    """Project a descriptor (or anything shaped like one) onto a :class:`TensorEntry`."""
+    return TensorEntry(
+        array_id=desc.array_id,
+        dim_labels=tuple(str(label) for label in desc.dim_labels),
+        shape=tuple(int(dim) for dim in desc.shape),
+        dtype=desc.dtype,
+    )
 
 
 @dataclass
@@ -232,6 +245,13 @@ class TensorReadPlan:
 
     descriptor: TensorDescriptor
     chunk_endpoints: List[ChunkEndpoint]
+    #: What every endpoint shares, when the plan is one regular grid of one
+    #: tensor: the identity ``expand_identity`` completes with each endpoint's
+    #: ``index``. None for a plan that is not (it can only be issued as full
+    #: tickets).
+    identity: Optional[bytes] = None
+    #: The plan's window on that grid, ``(start, stop)`` per axis, stop exclusive.
+    window: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
 
 
 def require_resolved(desc: TensorDescriptor) -> None:
@@ -239,7 +259,7 @@ def require_resolved(desc: TensorDescriptor) -> None:
 
     A descriptor is "resolved" iff it carries a concrete shape and dtype. An
     unresolved one (e.g. a not-yet-hydrated cloud source) would otherwise crash
-    deep in the planner -- ``np.dtype("")`` in ``get_arrow_schema`` or the
+    deep in the planner -- ``np.dtype("")`` in the planner or the
     pyramid/ndim logic in ``chunk`` -- with raw, illegible errors. Fail here
     with a clean ``SourceUnresolvedError`` instead.
     """
@@ -253,185 +273,59 @@ def require_resolved(desc: TensorDescriptor) -> None:
 class SourceAdapter(ABC):
     """Abstract base class for source-level adapters.
 
-    Each adapter handles a specific storage format (Zarr, HDF5, OME-TIFF, etc.)
+    Each adapter handles a specific storage format (Zarr, OME-TIFF, etc.)
     and provides methods to discover tensors and read metadata.
 
     Adapters that participate in filesystem auto-discovery override the claim()
     classmethod to detect whether they handle a given path; it is not abstract
-    (the default claims nothing) so a config-only format like HDF5 can opt out.
+    (the default claims nothing) so a config-only format like a remote
+    tensor-server can opt out.
     """
 
     # Required fields
     source_id: str  # Data source identifier
     _source_url: Optional[str] = None  # URL/path to the data source
     _source_type: Optional[str] = None  # Source type identifier
-    _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
     # Optional content-version token (biopb/biopb#178), folded into every
     # chunk_id this adapter mints and hence into the cache key, so a
     # re-registered source with new bytes gets a fresh cache namespace instead
-    # of serving stale chunks. None means unversioned: no header, and an adapter
-    # opts in only when it has a cheap, reliable change signal (a local file's
-    # stat signature). Opaque -- the codec namespaces by it, never reads it.
-    #
-    # Declared on the source because a source is the usual owner of a content
-    # lifetime, but the value is per TENSOR. A tensor whose bytes live elsewhere
-    # carries its own (an uploaded label set, ``adapters/labels.py``); one
-    # reading out of the source file keeps the source's (a discovered NGFF set).
-    # Read it off the adapter that serves the bytes, not off the source the
-    # array_id happens to name.
+    # of serving stale chunks. None means unversioned. Opaque -- the codec
+    # namespaces by it, never reads it.
+    # Declared on the source because the value is per TENSOR. A tensor whose bytes
+    # live elsewhere carries its own (e.g., uploaded label set).
     _content_version: Optional[bytes] = None
 
-    # Display-only override for the catalog ``source_url`` (the descriptor field
-    # the tensor-browser / web viewer group the tree by). Normally None, so the
-    # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
-    # The drag-drop runtime-add path sets it to a re-rooted url so each drop
+    # Display-only override for the catalog ``source_url``. Optional, because the
+    # adapter could use the path string, ``_source_url``.
+    # The ``register_local_path`` path sets it to a re-rooted url so each drop
     # renders as its own top-level root instead of nesting deep under the shared
-    # absolute-path tree (see SourceManager._drop_catalog_url). It never touches
-    # ``_source_url`` (filesystem ops) or ``source_id`` (path hash), so it is
-    # purely cosmetic and needs no re-index.
+    # absolute-path tree (see SourceManager._drop_catalog_url).
     _catalog_url: Optional[str] = None
-
-    # Whether the server may bring this source into canonical axis order by
-    # *permuting* it -- wrapping the adapter in a ``NormalizingAdapter``
-    # (biopb/biopb#596). True for every adapter that reads its own bytes: the
-    # server owns the whole read path for those, so it can transpose them.
-    #
-    # False when the axis order is owned by ANOTHER party who has aligned the
-    # rest of their state to it -- today only the remote proxy, whose upstream
-    # mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
-    # Permuting behind such an owner is the same desynchronization the write path
-    # already refuses at ``add_tensor``, so those sources are validated and
-    # refused at their read boundary instead. See ``core.normalize`` and
-    # ``core.axes.noncanonical_order``.
-    _normalizable_axes: bool = True
 
     @property
     def source_url(self) -> Optional[str]:
         """The source's real, addressable URL/path: a filesystem path this
         adapter reads bytes from, or the dial address of an upstream it
-        proxies. Every filesystem op (warm's recall walk, residency checks)
-        and the remote check (``is_remote_url``) trust this to be genuine.
-
-        Wraps the backing ``_source_url``; None when the adapter never set one.
-        An adapter that wants a different, cosmetic identity in the catalog
-        (grouping, a cleaner display name) sets :attr:`_catalog_url` instead --
-        never repurpose this field for display, or every filesystem consumer
-        silently breaks (biopb/biopb#1139).
+        proxies.
         """
         return self._source_url
 
     @property
     def source_type(self) -> Optional[str]:
-        """Format/source-type identifier (e.g. ``"ome_zarr"``).
-
-        Wraps the backing ``_source_type``; None when the adapter never set one.
-        """
+        """Format/source-type identifier (e.g. ``"ome_zarr"``)."""
         return self._source_type
 
     @property
     def catalog_url(self) -> str:
-        """The URL the catalog row carries -- what clients group the tree by.
-
-        The display form of :attr:`source_url`: a ``_catalog_url`` override when
-        one was set (drag-drop re-rooting), else the raw path normalized by
-        :func:`to_catalog_url`. Never used for filesystem ops.
-        """
+        """The display URL the catalog row carries -- what clients group the tree by."""
         return self._catalog_url or to_catalog_url(self._source_url)
-
-    def tensor_capability_token(self, array_id: Optional[str]) -> Optional[str]:
-        """The grant the tensor *array_id* carries, or None. The only reader of
-        :attr:`TensorAdapter.capability_token`.
-
-        Only an **attached** tensor can carry one: a format's own tensors are
-        the source's, while what the upload path put here was produced by one
-        caller and may be readable by that caller alone. Nothing consults a
-        *source's* own token, so a source cannot gate what is attached to it --
-        the tensors on one scratch source have different producers.
-
-        Read off the routable index (:meth:`_attached_for`) rather than through
-        :meth:`resolve_tensor`, so the auth path asks no format to resolve
-        anything and a tensor still uploading is gated exactly as a published
-        one is.
-
-        Checked on every read through :meth:`TensorFlightServer._grants`, so a
-        source with nothing attached (the common case) skips the field parse
-        below rather than paying it on every chunk.
-        """
-        if not self._attached_tensors:
-            return None
-        attached = self._attached_for(self._within_source_field(array_id))
-        return attached.capability_token if attached is not None else None
-
-    @property
-    def content_version(self) -> Optional[bytes]:
-        """Opaque content-version token folded into this adapter's chunk_ids, or
-        None when its content is unversioned (see ``_content_version``).
-
-        The version of the bytes THIS adapter serves, which for a multi-tensor
-        source is not always the source's own -- see ``_content_version``.
-
-        The content signal alone. A chunk_id also carries the server's
-        serving-semantics epoch, framed separately (``core.chunk``); a cache
-        misses on either, while a consumer asking "did the data change?" -- an
-        ROI's ``drawn_against_version``, the descriptor field -- wants this one.
-        """
-        return self._content_version
 
     def check_readable(self) -> None:  # noqa: B027 - concrete no-op default
         """Raise if this source cannot answer a pixel read right now.
 
-        A no-op for everything that reads a file: a store on disk is readable
-        whenever it is registered. An upload is not -- it is published by its
-        producer, and refuses until then (``WritableSource.check_readable``).
-
-        Asked by every read path that can serve bytes: ``resolve_chunk_data``
-        and, because it answers a warm chunk without calling it, the localhost
-        locate path (``server._handle_chunk_locate``). Pure in-memory, like
-        :meth:`check_chunk_version` beside it, so both are cheap enough to run
-        on every read.
+        Usually a noop. An unfinished upload is a notable exception.
         """
-
-    def check_chunk_version(self, chunk_id: bytes) -> None:
-        """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
-
-        Pure in-memory comparison of the chunk_id's framed versions against
-        this source's and this server's -- no adapter I/O -- so a caller can run it as a
-        cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
-        well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
-        without paying for a second adapter lookup or (for a native-pyramid
-        adapter) forcing a lazy level open just to validate. A legacy
-        unversioned chunk_id (``held_version`` None) always passes, matching the
-        byte-identical-format backward-compat promise in ``chunk.py``.
-
-        :class:`RemoteTensorAdapter` overrides this to compare the proxy
-        envelope's own version instead -- it never mints a plain (non-envelope)
-        chunk_id, so this base implementation would misparse one of its chunk_ids.
-        """
-        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
-        stale_content = (
-            held_version is not None and held_version != self.content_version
-        )
-        if stale_content or held_epoch != current_epoch():
-            raise StaleChunkError(
-                f"chunk_id for {self.array_id!r} was minted against a "
-                "version this source no longer serves; re-request the "
-                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
-                reason="stale_content_version",
-            )
-
-    @property
-    def array_id(self) -> str:
-        """Tensor identifier used in chunk encoding.
-
-        For single-tensor adapters: returns source_id
-        For multi-tensor adapters: returns source_id/tensor_name
-
-        This is used in chunk_id encoding to identify which tensor the chunk belongs to.
-        """
-        if self._tensor_name is None:
-            return self.source_id
-        return f"{self.source_id}/{self._tensor_name}"
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: DiscoveryState) -> Optional[SourceClaim]:
@@ -471,510 +365,69 @@ class SourceAdapter(ABC):
         """
 
     @abstractmethod
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def list_tensors(self) -> List[TensorEntry]:
         """List this source's tensors as **structural catalog entries**.
 
-        The source-listing/discovery surface: what the DuckDB catalog stores and
-        what ``ListFlights`` publishes. It returns lightweight entries without
-        expensive operations like scene switching or chunk-layout computation.
+        The source-listing/discovery surface: what the DuckDB catalog stores in
+        ``sources.tensors``. It returns lightweight entries without expensive
+        operations like scene switching or chunk-layout computation.
+
+        **The listing is static for the life of the adapter.** Once the adapter
+        is built, every call answers the same ``array_id`` / ``dim_labels`` /
+        ``shape`` / ``dtype`` set; a source whose tensors change is a *new*
+        adapter, registered in place of this one (a refresh, a rebuild after
+        eviction). Callers rely on it: ``Attachments`` snapshots this listing
+        when the registry registers the adapter and judges the label sets
+        against that snapshot until the next registration, so an adapter that
+        discovers tensors lazily, or whose shape changes under it, would leave
+        sets bound to a stale image. Computing it lazily is fine so long as
+        every call answers the same.
+
+        **The one exception is a mirror** (``RemoteTensorAdapter``): its catalog
+        is re-seeded in place when the upstream re-registers
+        (``seed_catalog``), and until it is seeded it asks the upstream on each
+        call. That is safe only because a mirror carries no attached tensors --
+        ``add_tensor`` refuses it -- so nothing is judged against its listing.
+        A new adapter whose listing can move must either be registered anew
+        when it does, or never hold attachments.
 
         Returns:
-            List of TensorDescriptor, each a :func:`catalog_entry` projection:
+            List of :class:`TensorEntry`, each a :func:`catalog_entry` projection:
 
-            Required fields:
-            - array_id: Unique tensor identifier (for single-tensor: source_id;
-              for multi-tensor: source_id/tensor_name)
-            - shape: Tensor shape as list of ints
-
-            Optional fields:
-            - dtype: Data type string. Can be omitted if expensive to compute.
-              Must be populated by get_tensor_descriptor() for actual reads.
-
-            Recommended optional fields:
-            - dim_labels: Dimension labels (cheap to include)
-
-            Required to be EMPTY:
-            - chunk_shape: the transfer grid is a *serving* fact owned by the
-              tensor-bound adapter (:meth:`TensorAdapter.get_tensor_descriptor`),
-              not a catalog one. A source lists every tensor without binding any
-              of them, so any grid it names here is a guess about a scene it has
-              not selected -- published as fact to every client
-              (biopb/biopb#812). ``GetFlightInfo`` resolves the tensor adapter
-              first and is the one place a grid is answered.
-            - pyramid / physical_scale / metadata_json: likewise open-time only.
-
-        Implementations return :func:`catalog_entry` of whatever they have (the
-        single-tensor idiom is ``[catalog_entry(self.get_tensor_descriptor())]``);
-        :func:`catalog_tensors` re-applies it so the invariant holds for the
-        catalog even if an implementation forgets.
+        A single-tensor source returns ``[catalog_entry(self._native_descriptor())]``.
         """
 
     @abstractmethod
-    def get_metadata(self) -> dict:
-        """Return the source-level metadata as a dict. Usually OME metadata.
-
-        Called **once at registration** to populate the catalog's
-        ``sources.metadata_json`` row (:meth:`MetadataDatabase.sync_source_added`);
-        the serve path reads it back from the catalog, never by recomputing here
-        (biopb/biopb#253). It must therefore be a pure producer -- do not memoize
-        the result across calls (the catalog is the cache). Genuinely per-tensor
-        metadata that the source row cannot represent is exposed on the tensor
-        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
-        """
-
-    def get_embedded_rois(
+    def registration_record(
         self,
-        metadata: Mapping[str, Any],
         tensors: Sequence[Tuple[str, Sequence[str]]],
         *,
-        max_per_tensor: Optional[int] = None,
-    ) -> Tuple[Dict[str, List[Any]], Any]:
-        """ROIs this source's own file carries, keyed by ``array_id``.
+        import_rois: bool = True,
+        max_rois_per_tensor: Optional[int] = None,
+    ) -> RegistrationRecord:
+        """Everything this source contributes to its catalog entry, built once.
 
-        Some formats store annotations beside their pixels -- OME-XML ``<ROI>``
-        elements, ImageJ overlays, a GeoJSON sidecar. Those land in the reserved
-        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951), and
-        this is where a format says how to read its own.
+        Called by :meth:`MetadataDatabase.sync_source_added`, which writes it in
+        one transaction with the row. *tensors* are the ``(array_id, dim_labels)``
+        the catalog lists, to key ROIs by; *import_rois* is false on a server that
+        does not serve annotations, so the file's are not parsed at all.
 
-        Default ``({}, None)``: no source carries annotations unless it says so.
-        That is the safe default rather than a conservative one -- the server
-        does not police what :meth:`get_metadata` returns, so a ``rois`` key in
-        an EMD's ``original_metadata`` or an OME-Zarr's ``.zattrs`` means
-        whatever that format meant by it, and reading it as OME-XML would invent
-        annotations. It is deliberately not keyed on ``source_type`` either:
-        that is a name, and it lies in both directions -- ``ome-zarr`` carries
-        NGFF, while ``zeiss`` / ``leica`` / ``nikon`` and the rest are ome-types
-        dumps through bioio.
+        A format that stores annotations beside its pixels -- OME-XML ``<ROI>``
+        elements -- returns them in ``rois``, which land in the read-only reserved
+        set (biopb/biopb#951), and the metadata without them. Failing to read them
+        is not fatal and not silent: the source is its pixels first, so the
+        metadata is kept whole and the next registration retries.
 
-        ``metadata`` is what this adapter just returned from
-        :meth:`get_metadata` and ``tensors`` is ``(array_id, dim_labels)`` per
-        tensor -- both passed in rather than recomputed, since the caller holds
-        them and ``get_metadata`` is a pure producer that would re-parse.
+        The record is built from the adapter and held by no one, so an adapter
+        that parked an intermediate to produce it drops it here. A re-seeded
+        mirror and a rolled-back replace sync the same adapter again, so that
+        must be recoverable.
 
-        Returns:
-            ``(rois_by_array_id, report)``. The report is opaque to the caller
-            beyond having a ``summary()`` for the log, and may be ``None``.
-
-        Raising is not fatal but IS a bug: the caller runs this inside source
-        registration and swallows failures, because a source is its pixels first
-        and an imported set is rebuilt on the next registration anyway.
+        Source-level metadata is the format's own business: ``metadata`` is what
+        ``sources.metadata_json`` holds, and the serve path reads that row back,
+        never the adapter (biopb/biopb#253). Genuinely per-tensor metadata the
+        row cannot represent is :meth:`TensorAdapter.get_tensor_metadata`.
         """
-        return {}, None
-
-    # -- attached tensors (biopb/biopb#1059) -----------------------------------
-    # A tensor of this source the format did not produce: a label set the
-    # server minted for an upload, or a field uploaded onto the source. Not
-    # chained through __init__ (adapters set their own attributes), so the
-    # slots are class-level None, materialized on use.
-    #
-    # One index whatever the kind, keyed by within-source field, holding every
-    # such tensor from ``add_tensor`` until the reclaim sweep detaches it.
-    # Whether one may be *listed* is its own upload record's answer
-    # (:func:`~biopb_tensor_server.core.attached.is_published`), so an upload in
-    # flight and the tombstone of one that was discarded stay routable here: a
-    # status poll and a straggler's write both have to find their adapter.
-    _attached_tensors: Optional[Dict[str, TensorAdapter]] = None
-    # The sets the source's own file carries, kept apart because only these are
-    # the file's: a native set cannot be detached, an attached one can.
-    _embedded_label_sets: Optional[Dict[str, TensorAdapter]] = None
-    # The validated, normalized merge of both label origins; None means rebuild.
-    _label_sets_view: Optional[Dict[str, TensorAdapter]] = None
-
-    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
-        """Label sets this source's own file carries, keyed by within-source field.
-
-        The pixel counterpart of :meth:`get_embedded_rois`: a format that stores
-        labels beside its image -- an OME-Zarr's NGFF ``labels/`` group -- says
-        here how to read them. Called once and memoized by :attr:`label_sets`.
-        Default: none. Keys are ``[<image field>/]labels/<name>``
-        (:func:`~biopb_tensor_server.core.labels.label_field`); values are
-        tensor adapters bound to the set, in the format's own axis order --
-        the base normalizes them.
-        """
-        return {}
-
-    @property
-    def label_sets(self) -> Dict[str, TensorAdapter]:
-        """Every label set of this source, keyed by within-source field.
-
-        The file's own (:meth:`get_embedded_labels`, read once) and the
-        published label sets of :attr:`attached_tensors`, each normalized like
-        any registered tensor and each checked -- whatever its origin -- against
-        the image it binds to: that image must be a tensor of this source, and
-        the set must span it (:func:`~biopb_tensor_server.core.labels.extent_mismatch`).
-        A set that fails is dropped with a warning rather than served
-        misaligned. Empty until the source is resolved, since its tensors are
-        unknown before that; rebuilt after every attach or detach.
-
-        This is the *published* view -- what the catalog lists and what a read
-        resolves first. A set still being uploaded is in :attr:`label_uploads`
-        instead, and joins this one when its upload reaches READY.
-        """
-        view = self._label_sets_view
-        if view is not None:
-            return view
-        if not self.is_resolved():
-            return {}
-        from biopb_tensor_server.core.normalize import normalize_adapter
-
-        if self._embedded_label_sets is None:
-            self._embedded_label_sets = dict(self.get_embedded_labels())
-        images = self._normalized_tensors()
-        candidates = {
-            **self._embedded_label_sets,
-            **self._attached_label_sets(published=True),
-        }
-        view = {}
-        for field, adapter in candidates.items():
-            normalized = normalize_adapter(adapter)
-            why = self.label_binding_error(
-                field, normalized.get_tensor_descriptor(), images=images
-            )
-            if why is not None:
-                logger.warning(f"labels: {self.source_id}/{field} dropped: {why}")
-                continue
-            view[field] = normalized
-        self._label_sets_view = view
-        return view
-
-    def _normalized_tensors(self) -> Dict[str, TensorDescriptor]:
-        """This source's tensors by ``array_id``, in canonical axis order.
-
-        What a label set is checked against, and read once per check rather
-        than per set -- ``list_tensor_descriptors`` re-derives on an HCS plate.
-        The uploaded fields are in it because a set may bind to one: a field is
-        a tensor of this source like any other, and only its bytes live
-        elsewhere.
-        """
-        from biopb_tensor_server.core.normalize import _normalize_descriptor
-
-        descs = list(self.list_tensor_descriptors())
-        descs += [a.get_tensor_descriptor() for a in self.attached_fields.values()]
-        return {d.array_id: _normalize_descriptor(d) for d in descs}
-
-    def label_binding_error(
-        self,
-        field: str,
-        desc: TensorDescriptor,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
-    ) -> Optional[str]:
-        """Why a set of *desc* cannot be served at label *field*, or None.
-
-        One rule, checked at both ends: the upload kind calls it before it
-        mints a sidecar, and :attr:`label_sets` calls it again for every
-        origin when the sets are listed -- a native NGFF group and a sidecar
-        from an earlier server life never passed through the upload. *desc* is
-        in canonical order (both callers normalize first), and *images* is
-        :meth:`_normalized_tensors` when the caller already holds it.
-        """
-        if split_label_field(field) is None:
-            return f"{field!r} does not name a label set"
-        image = self.label_image_descriptor(field, images=images)
-        if image is None:
-            return "binds to no tensor of the source"
-        why = extent_mismatch(
-            desc.dim_labels, desc.shape, image.dim_labels, image.shape
-        )
-        return f"does not span its image: {why}" if why is not None else None
-
-    def label_image_axes(
-        self,
-        field: str,
-        desc: TensorDescriptor,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
-    ) -> Optional[List[int]]:
-        """Which of the image's axes each axis of the set at *field* indexes.
-
-        The mapping the extent rule already implies, stated so a client reads
-        it instead of re-deriving it. Re-deriving is not hypothetical: the two
-        tensors do not number their axes alike, so a client matching them by
-        name gets `t`/`z` right and an unnamed axis wrong -- which is frame 0
-        of a timelapse where frame 40 was asked for, a picture rather than an
-        error.
-
-        Answered here rather than by the set's adapter because the mapping is
-        a fact about the *pair*, and only the source holds both -- in canonical
-        order, which is what makes the answer meaningful when a native set had
-        to be permuted to get there. ``None`` when the set does not span its
-        image, which is the same set :attr:`label_sets` drops.
-        """
-        image = self.label_image_descriptor(field, images=images)
-        if image is None:
-            return None
-        return label_image_axes(desc.dim_labels, image.dim_labels)
-
-    def label_image_descriptor(
-        self,
-        field: str,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
-    ) -> Optional[TensorDescriptor]:
-        """The image a label *field* binds to, normalized, or None if it has none.
-
-        What the extent is measured against, and what the upload kind reads to
-        fill in the axes of a request that named none.
-        """
-        parsed = split_label_field(field)
-        if parsed is None or parsed.level is not None:
-            return None
-        if images is None:
-            images = self._normalized_tensors()
-        return images.get(join_fields(self.source_id, parsed.image_field))
-
-    @property
-    def attached_tensors(self) -> Dict[str, TensorAdapter]:
-        """Every tensor the upload path put on this source, keyed by field.
-
-        The **routable** set -- published, still filling, or a tombstone --
-        handed out as attached rather than normalized, because an upload refuses
-        a non-canonical order at create and the boundary needs the writable
-        adapter itself (``put_chunk``, ``set_status``).
-
-        What may be *read* is the checked views over this: :attr:`label_sets`
-        and :attr:`attached_fields`.
-        """
-        return dict(self._attached_tensors or {})
-
-    def attached_tensor(self, field: str) -> Optional[TensorAdapter]:
-        """The tensor attached at *field*, whatever its state, or None."""
-        return (self._attached_tensors or {}).get(field)
-
-    def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
-        """Make *adapter* answer for *field* on this source.
-
-        Every kind arrives here: ``add_tensor`` attaches an upload the moment
-        it mints one -- that is what routes the tensor's own writes -- and the
-        registration hooks attach what an earlier life left on disk.
-        Handed over in its own axis order and checked when the source's tensors
-        are next listed, not here: an unresolved source has no tensors to check
-        a set against yet, and the upload kinds validate at create anyway.
-
-        Attaching is not listing (:meth:`attachment_changed`).
-        """
-        self._attach("_attached_tensors", field, adapter)
-
-    def detach_tensor(self, field: str) -> Optional[TensorAdapter]:
-        """Stop answering for *field*; returns what was attached, or None.
-
-        Only what was attached: a set the file carries is the file's.
-        """
-        return self._detach("_attached_tensors", field)
-
-    def attachment_changed(self) -> None:
-        """Rebuild the checked views: an attached tensor's state moved.
-
-        Attaching and detaching say so themselves; this is for the transition
-        that changes what may be listed without touching the index -- an upload
-        reaching READY, or discarded into a tombstone that stays routable.
-        """
-        self._label_sets_view = None
-
-    def _attach(self, attr: str, field: str, adapter: TensorAdapter) -> None:
-        """Set *field* -> *adapter* in the dict named *attr*, lazily created."""
-        d = getattr(self, attr)
-        if d is None:
-            d = {}
-            setattr(self, attr, d)
-        d[field] = adapter
-        self.attachment_changed()
-
-    def _detach(self, attr: str, field: str) -> Optional[TensorAdapter]:
-        """Pop *field* from the dict named *attr*; returns it, or None."""
-        d = getattr(self, attr)
-        if not d:
-            return None
-        removed = d.pop(field, None)
-        if removed is not None:
-            self.attachment_changed()
-        return removed
-
-    def _attached_label_sets(self, *, published: bool) -> Dict[str, TensorAdapter]:
-        """The attached label sets on one side of the published gate."""
-        return {
-            field: adapter
-            for field, adapter in (self._attached_tensors or {}).items()
-            if split_label_field(field) is not None
-            and is_published(adapter) is published
-        }
-
-    @property
-    def label_uploads(self) -> Dict[str, TensorAdapter]:
-        """Label sets of this source the upload path is still filling, by field.
-
-        Plus the tombstones of ones it gave up on: routable, so a status poll
-        and a straggler's write both find their adapter, but never listed --
-        nobody may read them yet, or the bytes are gone. A set reaches
-        :attr:`label_sets` by becoming readable, not by being moved.
-        """
-        return self._attached_label_sets(published=False)
-
-    @property
-    def attached_fields(self) -> Dict[str, TensorAdapter]:
-        """The published fields uploaded onto this source, keyed by field.
-
-        A tensor of this source whose bytes the upload path owns, under the
-        marked segment that keeps its id off a native one
-        (:mod:`~biopb_tensor_server.core.attached`). Listed after the format's
-        own (:func:`catalog_tensors`) and unchecked, unlike a label set: a field
-        binds to nothing, so there is nothing for it to fail to span.
-        """
-        return {
-            field: adapter
-            for field, adapter in (self._attached_tensors or {}).items()
-            if split_attached_field(field) is not None and is_published(adapter)
-        }
-
-    def resolve_tensor(self, tensor_id: Optional[str]) -> TensorAdapter:
-        """The adapter bound to *tensor_id*: an attached tensor of this source,
-        else whatever :meth:`get_tensor_adapter` answers.
-
-        The one lookup the serve path uses (``get_flight_info``, the precache),
-        so an attached tensor is reachable by its ``array_id`` like any other
-        while the format's own routing is untouched. An id under a marked
-        segment that names nothing attached here is handed to the format anyway
-        rather than refused: a proxy's upstream may serve it, and a format that
-        cannot raises its own ``TensorNotFound``.
-        """
-        attached = self._attached_for(self._within_source_field(tensor_id))
-        if attached is not None:
-            return attached
-        return self.get_tensor_adapter(tensor_id)
-
-    def _attached_for(self, field: Optional[str]) -> Optional[TensorAdapter]:
-        """The attached tensor answering for within-source *field*, or None.
-
-        Only a **marked** field reaches one: a label set through its
-        right-to-left parse, an uploaded field through the whole of its
-        ``@fields/<name>``. Everything else is the format's own routing, which
-        is the whole of the rule -- the upload path mints no bare field.
-        """
-        parsed = split_label_field(field)
-        if parsed is not None:
-            if parsed.level is not None:
-                return None
-            return self._label_set_for(parsed.set_field)
-        if field is None or split_attached_field(field) is None:
-            return None
-        return self.attached_tensor(field)
-
-    def _label_set_for(self, set_field: str) -> Optional[TensorAdapter]:
-        """The adapter answering for label field *set_field*, listed or in flight.
-
-        A set being uploaded is addressable from ``add_tensor`` onwards --
-        that is how its producer polls it to READY (biopb/biopb#1048) -- so
-        both views are consulted, the published one first.
-        """
-        label_set = self.label_sets.get(set_field)
-        if label_set is not None:
-            return label_set
-        return self.label_uploads.get(set_field)
-
-    def resolve_chunk_adapter(self, field: Optional[str]) -> TensorAdapter:
-        """The adapter that serves a chunk whose route carries *field*.
-
-        A within-source suffix on a chunk names either a native pyramid level
-        (OME-Zarr / QPTIFF precompute) or a tensor field, and for a label set
-        either of those *under* the set: ``labels/nuclei/1`` is level ``1`` of
-        set ``nuclei``. A native-pyramid adapter answers the level's backend
-        from :meth:`get_level_adapter`; every other adapter (and a bare
-        suffix) answers None and the read routes to the tensor.
-        """
-        parsed = split_label_field(field)
-        label_set = (
-            self._label_set_for(parsed.set_field) if parsed is not None else None
-        )
-        if label_set is not None:
-            level = label_set.get_level_adapter(parsed.level) if parsed.level else None
-            return level or label_set
-        attached = self._attached_for(field)
-        if attached is not None:
-            return attached
-        level = self.get_level_adapter(field) if field is not None else None
-        return level or self.get_tensor_adapter(field)
-
-    def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
-        """Backend adapter for native pyramid level ``path``, or ``None``.
-
-        Declared here -- rather than sniffed with ``hasattr`` in the chunk
-        dispatch -- for the same reason :meth:`close` and :meth:`put_chunk`
-        are: an optional capability the dispatch drives on every registered
-        source belongs in the interface, where a delegating wrapper's author
-        can see it (biopb/biopb#557). On the source role because the chunk
-        route is source-scoped: ``source_id/<field>`` is split before the
-        lookup, and every registered source answers it (``UnresolvedSourceAdapter``
-        forwards it). The default ``None`` means "no native levels," so
-        :meth:`resolve_chunk_adapter` falls back to :meth:`get_tensor_adapter`.
-        A native-pyramid adapter overrides this to return the level's own
-        backend adapter, whose ``array_id`` is ``source_id/{level}`` -- the
-        value a precompute chunk_id carries, so ``DoGet`` routes the level's
-        chunks straight back here.
-        """
-        return None
-
-    def is_resolved(self) -> bool:
-        """Deterministic: is there a hydrated adapter backing this source?
-
-        True by default; only ``UnresolvedSourceAdapter`` overrides it. Unlike
-        ``is_resident()``, this never flips back to False once True in a
-        process (a source isn't un-resolved by re-dehydrating) -- the signal
-        for "should a client offer to resolve this".
-        """
-        return True
-
-    def resolve(self) -> None:
-        """Hydrate this source if needed.
-
-        This is the ONE consented entry point that may perform an extended,
-        blocking recall (e.g. downloading a whole cloud / synced-folder file).
-        It is the sole resolution trigger: the serve paths (get_tensor_adapter ->
-        GetFlightInfo / DoGet) never resolve on their own -- they raise
-        SourceUnresolvedError on an unresolved source so the only thing that
-        downloads is an explicit ``resolve``.
-
-        For an already-resident source this is a cheap no-op (idempotent), so
-        the server's ``resolve`` action works uniformly across all source kinds.
-        ``UnresolvedSourceAdapter`` overrides it to actually hydrate.
-
-        Returns nothing: what the caller wants afterwards is the source's now-
-        concrete catalog row, which resolution writes (``on_resolved`` ->
-        ``sync_source_added``) and the server reads back.
-        """
-        return None  # a resident source is already resolved
-
-    def is_resident(self) -> bool:
-        """Best-effort, recall-free: is this source's content local and cheap to
-        read right now?
-
-        Remote (fsspec) sources are never resident until their pixels are
-        materialized into a local copy (a later phase); a local source is
-        resident unless it is an offline cloud placeholder. This is the
-        authoritative, point-in-time residency gate -- VOLATILE, so evaluate it
-        at the moment of use and never cache the result. Nothing stores the
-        answer: the catalog has no residency column and the ``is_resident``
-        action re-asks this on every call (biopb/biopb#1035).
-        """
-        # Lazy import: base <-> discovery only cross-import under TYPE_CHECKING,
-        # so importing these at module scope would be circular.
-        from pathlib import Path
-
-        from biopb_tensor_server.core.discovery import (
-            _is_offline_placeholder,
-            directory_is_resident,
-        )
-        from biopb_tensor_server.core.remote import is_remote_url
-
-        if is_remote_url(self._source_url):
-            return False
-        path = Path(self._source_url)
-        # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
-        # -- discovery only consults it for files (see should_skip_walk_entry,
-        # which gates it on `not is_dir`). A directory-based source (zarr,
-        # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
-        # (e.g. macOS APFS), so applying the file check to the directory path
-        # itself would wrongly flag an entirely local store as non-resident.
-        # `directory_is_resident` instead samples files *inside* the directory.
-        if path.is_dir():
-            return directory_is_resident(path)
-        return not _is_offline_placeholder(path)
 
     def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
@@ -983,20 +436,9 @@ class SourceAdapter(ABC):
         Single-tensor adapters return self with tensor context set -- sound
         because they are ``TensorAdapter`` subclasses, i.e. sources that also
         fill the tensor role (see :class:`TensorAdapter`). A source that does
-        *not* (``UnresolvedSourceAdapter``) must override this; the default
-        below would otherwise hand back a self that cannot serve pixels.
+        not must override this; the default below would otherwise hand back a
+        self that cannot serve pixels.
         Multi-tensor adapters override this to return a new adapter for the tensor.
-
-        Total by contract: a single-tensor source has exactly one tensor, so any
-        *unknown nonempty* field is rejected with a typed ``TensorNotFound`` (gRPC
-        NOT_FOUND) -- the miss is representable rather than silently returning the
-        base tensor under the wrong ``array_id``. Three inputs still resolve to
-        that sole tensor (reduced to a within-source field by
-        ``_within_source_field``): an empty/``None`` id, the source's own id (a
-        bare ``source_id`` or the full ``source_id`` array_id -> falsy or
-        ``== source_id``), and -- for a source whose one tensor carries a name --
-        that ``_tensor_name`` (a single-scene aicsimageio file names its lone
-        tensor, e.g. ``"Image:0"``, so ``source_id/Image:0`` is a valid read).
 
         Args:
             tensor_id: Identifier for the specific tensor within this source
@@ -1005,14 +447,122 @@ class SourceAdapter(ABC):
         Raises:
             TensorNotFound: ``tensor_id`` names a field this source does not have.
         """
-        field = self._within_source_field(tensor_id)
-        if field and field != self.source_id and field != self._tensor_name:
+        field = strip_source_prefix(self.source_id, tensor_id)
+        if field and field != self.source_id:
             raise TensorNotFound(
                 f"tensor {tensor_id!r} not found in source {self.source_id!r} "
                 f"(single-tensor source has no field {field!r})",
                 reason="unknown_field",
             )
         return self
+
+    def close(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
+        """Release any long-lived OS handles this source holds.
+
+        **An in-flight read is this method's problem, not its caller's.** An override
+        holding a handle that a read is decoding through must deal with it itself.
+        """
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: SourceConfig,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> Optional[SourceAdapter]:
+        """Rebuild the adapter a restart finds a row for, without parsing its file.
+
+        The inverse of :meth:`catalog_payload`: *payload* is what that returned,
+        *metadata* the row's ``metadata_json``. The caller has checked that the
+        file is as it was when the row was written. ``None`` (the default) means
+        this adapter has no such path, and the source is built from its claim.
+        """
+        return None
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """What a restart needs to rebuild this adapter without parsing its file.
+
+        The payload carries the serve path's derived state, such as descriptors
+        with their transfer grid. Adding a key needs no version bump; changing
+        the meaning of one bumps ``SOURCE_CATALOG_FORMAT``. Optional.
+        """
+        return None
+
+
+class TensorAdapter(SourceAdapter):
+    """Abstract base class for tensor-level adapters.
+
+    This interface provides methods to read specific tensors, get chunk layouts,
+    and read chunk data. It is returned by get_tensor_adapter() on the source adapter.
+
+    **A tensor adapter is a source adapter that can also serve pixels.** The two
+    roles nest rather than sit side by side, because every tensor adapter in this
+    codebase is in fact a full source object. The role *scopes* stay disjoint at the
+    point of declaration -- see the role-scope guard below -- so a tensor-scoped method
+    still can never be declared on ``SourceAdapter``.
+    """
+
+    # The grant this tensor carries of its own. When set, reading it takes
+    # either this or the server-wide token
+    # (``TensorFlightServer._authorize_read``); None = no gate here, and the
+    # server-wide rule alone.
+    _capability_token: Optional[str] = None
+    # Set on a tensor that is one of several in its source; None for the sole
+    # tensor. ``array_id`` is minted from it.
+    _tensor_name: Optional[str] = None
+
+    @property
+    def capability_token(self) -> Optional[str]:
+        """The grant this tensor carries, or None for the server-wide rule."""
+        return self._capability_token
+
+    @capability_token.setter
+    def capability_token(self, value: Optional[str]) -> None:
+        self._capability_token = value
+
+    #: Whether the values are ids, not measurements -- a label set. Averaging
+    #: ids produces ids that exist nowhere, so a categorical tensor's computed
+    #: pyramid is ``nearest`` whatever the server is configured to.
+    categorical: bool = False
+
+    @property
+    def array_id(self) -> str:
+        """This tensor's identifier, the one chunk ids are minted from:
+        ``source_id``, or ``source_id/<tensor name>`` for a multi-tensor source.
+        """
+        if self._tensor_name is None:
+            return self.source_id
+        return f"{self.source_id}/{self._tensor_name}"
+
+    @property
+    def content_version(self) -> Optional[bytes]:
+        """This tensor's content-version token, folded into the chunk_ids it
+        mints, or None when its content is unversioned (see ``_content_version``).
+        """
+        return self._content_version
+
+    def check_chunk_version(self, chunk_id: bytes) -> None:
+        """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
+
+        Pure in-memory comparison and a cheap guard ahead of an actual read.
+        A unversioned chunk_id (``held_version`` None) always passes.
+
+        :class:`RemoteTensorAdapter` overrides this to compare the proxy
+        envelope's own version instead -- it never mints a plain (non-envelope)
+        chunk_id, so this base implementation would misparse one of its chunk_ids.
+        """
+        held_epoch, held_version, _inner = _split_chunk_version(chunk_id)
+        stale_content = (
+            held_version is not None and held_version != self.content_version
+        )
+        if stale_content or held_epoch != current_epoch():
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted against a "
+                "version this source no longer serves; re-request the "
+                "read plan (GetFlightInfo) rather than retrying this chunk_id.",
+                reason="stale_content_version",
+            )
 
     def put_chunk(
         self,
@@ -1039,163 +589,51 @@ class SourceAdapter(ABC):
             f"source {self.source_id!r} ({self._source_type}) does not support writes"
         )
 
-    def close(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
-        """Release any long-lived OS handles this source holds.
-
-        Declared here, rather than sniffed with ``getattr(adapter, "close",
-        None)``, for the same reason :meth:`put_chunk` is: an optional capability
-        the registry drives on every adapter belongs in the interface, where a
-        delegating wrapper's author can see it. ``UnresolvedSourceAdapter``
-        forwarding everything *except* ``close`` is precisely what a duck-typed
-        hook could not catch (biopb/biopb#71).
-
-        Most adapters hold nothing between reads -- see the file-handle policy in
-        ARCHITECTURE.md -- so the default is a no-op and only the persistent-handle
-        adapters override it. An override must be safe to call twice.
-
-        **An in-flight read is this method's problem, not its caller's.** Nothing
-        drains before calling: ``SourceRegistry.unregister`` and ``close_all``
-        close on the spot, and a replace closes the displaced adapter as soon as
-        the swap has committed (``SourceRegistry.swap``). So an override holding
-        a handle that a read is decoding through must deal with it itself --
-        drain on ``_active_reads`` under a deadline (``OmeTiffAdapter``), decline
-        and leave the release to the idle reaper (mrc / dv / qptiff), or release
-        under ``_io_lock`` (czi / nd2 / ndtiff / bioio).
-        """
-
-    def release_registration_cache(  # noqa: B027 - concrete no-op default
-        self,
-    ) -> None:
-        """Drop whatever was held only to answer registration, keeping derived state.
-
-        Called by :meth:`MetadataDatabase.sync_source_added` once the catalog row
-        is committed -- the moment the catalog, not the adapter, owns this
-        source's metadata (biopb/biopb#253). An adapter that parked a bulky
-        intermediate on itself to build that row may release it here; anything
-        the serve path still needs must survive.
-
-        Declared on the interface rather than sniffed with ``getattr`` for the
-        same reason :meth:`close` is: a delegating wrapper's author has to see it
-        (biopb/biopb#71). Default no-op -- only adapters with something big to
-        drop override it. Like ``close``, an override must be safe to call twice,
-        and must not make the released state unrecoverable: ``sync_source_added``
-        runs again when an unresolved source resolves.
-
-        A server with no catalog (the embedded image-base cache builds its
-        ``TensorFlightServer`` with ``metadata_db=None``) never calls this, so
-        nothing is released out from under a source whose metadata has nowhere
-        else to live.
-        """
-
-    def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
-        """Reduce a source-qualified array_id to its within-source field, for the
-        multi-tensor ``get_tensor_adapter`` overrides.
-
-        A caller may legitimately hand them the full array_id ("a tensor is
-        identifiable by array_id alone"); this strips the ``source_id/`` prefix
-        (pure reduction -- see :func:`strip_source_prefix`), leaving a bare field
-        unchanged. This layer never invents ``None``: "default tensor" is decided
-        upstream at the server chokepoint, not here.
-        """
-        return strip_source_prefix(self.source_id, tensor_id)
-
-
-class TensorAdapter(SourceAdapter):
-    """Abstract base class for tensor-level adapters.
-
-    This interface provides methods to read specific tensors, get chunk layouts,
-    and read chunk data. It is returned by get_tensor_adapter() on the source adapter.
-
-    Tensor-level adapters are created for specific tensors within a source, allowing
-    them to maintain tensor-specific state (e.g., current scene in multi-scene files).
-
-    **A tensor adapter is a source adapter that can also serve pixels.** The two
-    roles nest rather than sit side by side, because every tensor adapter in this
-    codebase is in fact a full source object: single-tensor formats return ``self``
-    from ``get_tensor_adapter``, the multi-tensor ones (bioio / OME-TIFF / EMD)
-    return a clone of their own class with tensor context set, and the OME-Zarr /
-    QPTIFF level and HCS-field adapters are plain ``ZarrAdapter`` instances. The
-    serve path relies on it -- an HCS field's per-field metadata comes from the
-    tensor adapter's :meth:`get_tensor_metadata`, which the plate's source-level
-    catalog row cannot represent (biopb/biopb#253). Nesting types that reality
-    instead of contradicting it (biopb/biopb#380).
-
-    The converse does not hold: ``UnresolvedSourceAdapter`` is a source that has no
-    tensors until it resolves, and stays a plain ``SourceAdapter``. So "source" is
-    the general role and "tensor" the specialization, which is the direction this
-    inheritance encodes.
-
-    The role *scopes* stay disjoint at the point of declaration -- see the
-    role-scope guard below -- so a tensor-scoped method still can never be declared
-    on ``SourceAdapter``.
-    """
-
-    # The grant this tensor carries of its own. When set, reading it takes
-    # either this or the server-wide token
-    # (``TensorFlightServer._authorize_read``); None = no gate here, and the
-    # server-wide rule alone. Declared at tensor scope because that is the only
-    # scope that is read: ``SourceAdapter.tensor_capability_token`` answers off
-    # the attachment index, so a token set on an adapter serving as a *source*
-    # gates nothing.
-    _capability_token: Optional[str] = None
-
-    @property
-    def capability_token(self) -> Optional[str]:
-        """The grant this tensor carries, or None for the server-wide rule.
-
-        A *narrow grant*, never a replacement: it opens this tensor's pixels
-        and annotations to a holder with no server-wide token, and the
-        server-wide token still opens them (``_authorize_read``). Reads only --
-        writes, ``resolve`` and ``warm`` take full access, because their cost
-        is not scoped to one tensor. The catalog row stays public either way.
-
-        Per tensor rather than per source, because a source is shared: an
-        uploaded result has one producer and lands beside everyone else's on
-        the scratch source, so a grant covering the source would open theirs
-        too. The embedded result cache (``biopb-image-base``) mints one per
-        result through the setter below.
-
-        Assign via this property, never the backing ``_capability_token``
-        field: the typed seam is the whole point (#278E).
-        """
-        return self._capability_token
-
-    @capability_token.setter
-    def capability_token(self, value: Optional[str]) -> None:
-        self._capability_token = value
-
     # Whether timing ``get_data`` measures what re-producing the chunk would
     # cost -- the premise the measured retention rule rests on, since "cheap"
     # means "cheap to rebuild" (see ``core.retention``). True wherever the
     # adapter decodes its own bytes from a backend it can read again.
     #
     # False for the two kinds that would be measured wrong rather than not at
-    # all, in opposite directions. An upload has no backend: its cache entry is
-    # the only copy, so a local read times a memcpy out of the very cache being
-    # classified and a "cheap" stamp is data loss. A passthrough proxy has one,
-    # but a miss costs an upstream round trip that the local hand-off does not
-    # contain, so timing it clocks a LAN upstream as fast and evicts it first.
-    # Both are declined here rather than measured and ignored: a rate nobody may
-    # act on is a diagnostic that reads as fact.
-    #
-    # Both also override ``resolve_chunk_data`` today and so never reach the
-    # sample site, which is what makes this a guard rather than a live switch.
-    # It is declared because that structural exemption is invisible from either
-    # adapter -- neither file mentions retention -- so narrowing an override
-    # (biopb/biopb#265, to serve a cache source's scaled reads from the chunks
-    # it already holds) would otherwise enrol it silently.
+    # all, in opposite directions. An upload and a passthrough proxy.
     _decode_time_is_rebuild_cost: bool = True
 
-    @abstractmethod
-    def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the full **serving** descriptor for this bound tensor.
+    # --- canonical axis order (biopb/biopb#596) ---------------------------------
+    # A leaf adapter is written in whatever order its reader emits and carries
+    # ``@canonical_axes`` (``core.normalize``): the decorator wraps the leaf's
+    # ``get_data``, ``get_decimated_data``, ``read_block_shape``,
+    # ``get_native_pyramid_levels`` and ``list_tensors`` so the planner, the scaled
+    # and streamed reads and the pyramid -- all built on the public surface --
+    # never see a native axis. The leaf reads its own geometry through
+    # ``_native_descriptor()``, never the public descriptor.
 
-        The counterpart to :meth:`SourceAdapter.list_tensor_descriptors`, which
-        answers the structural half for every tensor without binding any of them.
-        This is called on an adapter that ``get_tensor_adapter(array_id)`` has
-        already bound to one tensor -- a bioio/CZI scene, an OME-Zarr HCS field,
-        a QPTIFF level -- so it can answer for facts that only exist once that
-        selection is made (biopb/biopb#812).
+    def _axis_perm(self) -> Optional[Tuple[int, ...]]:
+        """This tensor's native -> canonical permutation, or None for identity.
+
+        Derived from the native descriptor on every call, deliberately **not**
+        memoized: an adapter's advertised labels are not immutable -- a source can
+        be undescribable now and describable later, or differently later -- and a
+        cached permutation cannot notice. The permutation itself is O(ndim); the
+        cost is the ``_native_descriptor()`` call, which builds a proto for most
+        adapters -- small next to the read it precedes.
+        """
+        try:
+            return permutation_of(self, self._native_descriptor())
+        except Exception:
+            return None
+
+    def get_tensor_descriptor(self) -> TensorDescriptor:
+        """The full **serving** descriptor for this bound tensor -- canonical
+        axis order for a ``@canonical_axes`` class. Subclasses implement
+        :meth:`_native_descriptor`."""
+        desc = self._native_descriptor()
+        perm = permutation_of(self, desc)
+        return desc if perm is None else permute_descriptor(desc, perm)
+
+    @abstractmethod
+    def _native_descriptor(self) -> TensorDescriptor:
+        """Return the full **serving** descriptor for this bound tensor, in the
+        order the reader emits.
 
         Field must be populated:
             - array_id: Unique tensor identifier (for single-tensor: source_id;
@@ -1218,62 +656,19 @@ class TensorAdapter(SourceAdapter):
         it -- not by reading its own catalog listing back, which carries no grid.
         """
 
-    def get_transfer_chunk_size(self) -> Tuple[int, ...]:
-        """Return this tensor's transfer grid, clamped to the Arrow ceiling.
-
-        ``chunk_shape`` *is* the transfer grid and the adapter chose it
-        (biopb/biopb#809). The server sizes nothing on the adapter's behalf here
-        -- an adapter that knows its physical layout would only have its answer
-        undone, which is what made biopb/biopb#806 unfixable while the planner
-        ran on this seam -- and re-planning would also break the cache-backed
-        sources, which serve *only* the chunk_ids that were written, so a grid
-        that is not theirs asks for bounds that do not exist.
-
-        The one thing left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a
-        property of Arrow IPC, not of any format, so a declared grid above it is
-        re-split here rather than failing mid-transfer.
-
-        A descriptor may still reach here with an empty ``chunk_shape``: a
-        bulk-seeded remote proxy whose upstream is unreachable, or a
-        :func:`catalog_entry` handed in by a caller that should have bound the
-        tensor first. Handing the read planner a too-short tuple indexes out of
-        range against the full-rank shape (biopb/biopb#292), so fall back to the
-        whole tensor split under the ceiling -- a safe answer, never a good one,
-        which is why the catalog grid is not a fallback anyone may plan on.
-
-        An *unresolved* descriptor (empty shape/dtype -- a not-yet-hydrated
-        cloud/remote source) is rejected up front: the fallback would otherwise
-        reach ``np.dtype("")`` inside ``compute_safe_chunk_size`` and raise a raw,
-        illegible ``TypeError``. ``require_resolved`` converts it to a clean
-        ``SourceUnresolvedError`` at this read-planning boundary, exactly as
-        ``get_arrow_schema`` and ``_get_read_plan`` already do.
-        """
-        desc = self.get_tensor_descriptor()
-        require_resolved(desc)
-        shape = tuple(int(dim) for dim in desc.shape)
-        chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
-        if len(chunk_shape) != len(shape):
-            chunk_shape = shape
-        return compute_safe_chunk_size(
-            tuple(
-                min(max(1, chunk), dim)
-                for chunk, dim in zip(chunk_shape, shape, strict=True)
-            ),
-            desc.dtype,
-            list(desc.dim_labels),
-        )
-
     @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds from the backend.
-        Subclasses should call super().get_data(bounds) to validate bounds,
-        then read data from their backend.
+        """Read data within bounds from the backend. Subclasses call
+        super().get_data(bounds) to validate bounds, then read from their
+        backend. A ``@canonical_axes`` class implements this in its reader's own
+        order: ``bounds`` arrive native and the array is transposed to canonical
+        without a copy.
 
         The returned array's memory MUST NOT have its lifetime tied to a
         closable handle. A transpose or slice view over an array this adapter
         owns is fine; a view onto a reader-owned mmap that ``_handle_reaper``
         can close is not -- the caller may hold it well past the adapter's lock,
-        and ``core/normalize.py`` transposes it without copying. An adapter
+        and :func:`~.normalize.canonical_axes` transposes it without copying. An adapter
         reading through a mapping copies before returning.
 
         Args:
@@ -1283,42 +678,25 @@ class TensorAdapter(SourceAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
-        desc = self.get_tensor_descriptor()
+        desc = self._native_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
-        self._validate_bounds(bounds, shape)
+        validate_bounds(bounds, shape)
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """What this backend's reads are quantized to, or ``None`` for none.
 
-        A zarr chunk, an HDF5 chunk, a TIFF page: reading any part of one costs
-        the whole one. The streamed scaled read floors its tile here
+        **This is the ``native=`` seed the adapter passes to**
+        :func:`~.chunk.default_transfer_chunk_shape`.
+
+        The streamed scaled read floors its tile here
         (:func:`~.stream_reduce.streaming_unit`), because the transfer grid is
         derived from this same granularity by *dividing* it whenever it exceeds
-        the transfer target -- and a tile inside a block re-reads that block once
-        per tile. Unfloored that is 8-11x on a tiled 8192^2 OME-TIFF page and ~3x
-        on an OME-Zarr chunked at 4096^2.
-
-        **This is the ``native=`` seed the adapter already passes to**
-        :func:`~.chunk.default_transfer_chunk_shape`, not a second fact -- state
-        them from one expression so they cannot drift.
+        the transfer target.
 
         ``None`` claims something stronger than "unknown": that no part of a read
         is wasted, which is true of an mmap and of a backend that forwards
-        arbitrary bounds. Declaring it wrongly is silent -- every value stays
-        bit-identical, the read just costs more -- so ``adapter_read_block_test``
-        requires every adapter class to appear in one list or the other rather
-        than letting a new one default in.
-
-        Note the seed is an upper bound on granularity and a reader may beat it:
-        ``NikonAdapter`` seeds its grid with a whole C/Y/X ND2 frame (1.1 GiB on
-        a 14234^2 scene) that ``read_frame`` hands back as an mmap view, then
-        crops -- so it declares ``None`` and is right to.
-
-        A property rather than a class attribute because the answer is per
-        *instance* -- a tiled and a striped TIFF are the same adapter with
-        different answers -- and derived live rather than captured in
-        ``__init__`` because an adapter may not hold its store yet.
+        arbitrary bounds.
         """
         return None
 
@@ -1327,26 +705,10 @@ class TensorAdapter(SourceAdapter):
     ) -> Optional[np.ndarray]:
         """Every ``step``-th element of ``bounds``, or ``None`` to decline.
 
-        ``None`` is the default and means "read the extent and stride it", which
-        is what the caller does anyway. An adapter implements this only where a
-        strided read costs in proportion to what it *returns* rather than to the
-        extent it spans -- and that is exactly what a ``nearest`` reduction is:
-        ``data[::step]``, element 0 of every block, needing none of the elements
-        it skips.
-
-        The candidates are the backends that already report no
-        :attr:`read_block_shape`, and the two answers correlate for one reason:
-        a quantized backend has to decode a whole block to hand back any of it,
-        so skipping elements inside it saves no reading -- only a memcpy, which
-        the streamed path already bounds. Where nothing is quantized, the skipped
-        elements are never touched at all. That is the one reduction where fusing
-        removes *reads* and not just heap: ``area`` has to visit every source
-        element whatever it does with them.
-
-        Declaring this where the backend cannot honour it cheaply is silent in
-        the same way :attr:`read_block_shape` is -- every value stays
-        bit-identical, the read merely costs more -- so ``decimated_read_test``
-        requires every adapter class to appear in one list or the other.
+        ``None`` is the default and means "read the extent and stride it".
+        An adapter implements this if strided read costs in proportion to what
+        it *returns* rather than to the extent it spans. The candidates are the
+        backends that already report no :attr:`read_block_shape`.
 
         An implementation must hold to all of:
 
@@ -1377,10 +739,7 @@ class TensorAdapter(SourceAdapter):
 
         The default streams the extent in tiles of the transfer grid, floored at
         :attr:`read_block_shape`, reducing each tile as it arrives, so peak
-        residency is one tile rather than the extent (see
-        :mod:`~.stream_reduce`). An extent that is already one tile is read and
-        reduced whole, which is what every unscaled read and most small scaled
-        ones do.
+        residency is one tile.
 
         ``cache_manager`` lets the default source its units from the
         full-resolution chunks the cache already holds rather than decode them
@@ -1393,10 +752,7 @@ class TensorAdapter(SourceAdapter):
         apply there -- a decimated read already materialises exactly the output.
 
         An adapter whose reader can deliver the extent in pieces more cheaply
-        than ``get_data`` can (a CZI ``read(zoom=)``, a native pyramid level)
-        overrides this instead, so no view onto a reader-owned mapping ever
-        leaves the adapter's lock. Overriding to bound memory is no longer a
-        reason: the default already does.
+        than ``get_data`` can overrides this.
 
         An override must hold to all of:
 
@@ -1422,7 +778,7 @@ class TensorAdapter(SourceAdapter):
            loses the cache-sourced path.
 
         Args:
-            bounds: Chunk bounds, in this adapter's own axis order.
+            bounds: Chunk bounds, in canonical axis order.
             scale_hint: Per-axis reduction factor, same order as ``bounds``.
             reduction_method: Normalized method, decoded from the chunk_id.
             cache_manager: The chunk cache, when the caller has one.
@@ -1450,7 +806,7 @@ class TensorAdapter(SourceAdapter):
                 ChunkBounds(start=list(unit_start), stop=list(unit_stop))
             )
 
-        transfer = tuple(max(1, int(size)) for size in self.get_transfer_chunk_size())
+        transfer = tuple(max(1, int(size)) for size in transfer_chunk_size(descriptor))
         unit = streaming_unit(extent, transfer, self.read_block_shape, scale_hint)
         unit, fetch, borrowed = cache_sourced_units(
             cache_manager,
@@ -1493,95 +849,6 @@ class TensorAdapter(SourceAdapter):
             )
         finally:
             borrowed.release()
-
-    @staticmethod
-    def _bounds_to_slices(bounds: ChunkBounds) -> Tuple[slice, ...]:
-        """Per-axis ``slice`` tuple for indexing a backend array with ``bounds``.
-
-        The bounds->slices idiom every ``get_data`` needs to turn chunk bounds
-        into a numpy/zarr/h5py index; shared here so each adapter slices its
-        store the same way.
-        """
-        return tuple(
-            slice(int(s), int(e))
-            for s, e in zip(bounds.start, bounds.stop, strict=True)
-        )
-
-    @staticmethod
-    def _bounds_to_strided_slices(
-        bounds: ChunkBounds, step: Tuple[int, ...]
-    ) -> Tuple[slice, ...]:
-        """:meth:`_bounds_to_slices` with a per-axis stride, for a decimated read.
-
-        Kept next to its unstrided sibling so the two index a store identically
-        apart from the step -- which is the whole of what makes a fused
-        ``nearest`` bit-identical to reading the extent and slicing it.
-        """
-        return tuple(
-            slice(int(s), int(e), max(1, int(size)))
-            for s, e, size in zip(bounds.start, bounds.stop, step, strict=True)
-        )
-
-    def _validate_bounds(self, bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
-        """Validate that bounds are within array shape.
-
-        Args:
-            bounds: Chunk bounds (start, stop coordinates)
-            shape: Array shape
-
-        Raises:
-            ValueError: If bounds are out-of-bounds or invalid
-        """
-        ndim = len(shape)
-        if len(bounds.start) != ndim or len(bounds.stop) != ndim:
-            raise ValueError(
-                f"Bounds dimensionality mismatch: expected {ndim}, "
-                f"got start={len(bounds.start)}, stop={len(bounds.stop)}"
-            )
-        for ax, (s, e, dim) in enumerate(
-            zip(bounds.start, bounds.stop, shape, strict=True)
-        ):
-            if s < 0:
-                raise ValueError(f"Bounds start[{ax}]={s} is negative")
-            if e > dim:
-                raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
-            if s >= e:
-                raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
-
-    def get_arrow_schema(self, desc: Optional[TensorDescriptor] = None) -> pa.Schema:
-        """Get the Arrow schema for this tensor.
-
-        Schema format (the unified binary wire schema, biopb/biopb#293):
-        - data: binary - the chunk's raw C-contiguous bytes per row
-        - shape: list<int64> - shape tuple per chunk
-        - dtype: string - numpy dtype string (carries endianness) per chunk
-
-        Each RecordBatch has 1 row per chunk, making data self-describing. The
-        client reconstructs the array with ``np.frombuffer(data, dtype)``; see
-        ``CHUNK_WIRE_SCHEMA``.
-
-        Returns:
-            Arrow Schema with data, shape, and dtype fields
-        """
-        from biopb.tensor._wire_version import (
-            TENSOR_WIRE_PROTOCOL_VERSION,
-            WIRE_PROTOCOL_METADATA_KEY,
-        )
-
-        desc = desc or self.get_tensor_descriptor()
-        require_resolved(desc)
-
-        # One key, one contract: the wire-protocol version the client enforces
-        # (biopb/biopb#293). A `tensor_schema_version` release tag sat here too
-        # until biopb/biopb#1070 -- it stopped meaning anything when its one
-        # consumer (an shm feature probe) was replaced, and a release tag beside
-        # a byte-encoding gate reads like a second gate. It was: the Java client
-        # implemented it.
-        metadata = {
-            WIRE_PROTOCOL_METADATA_KEY: str(TENSOR_WIRE_PROTOCOL_VERSION),
-        }
-
-        return CHUNK_WIRE_SCHEMA.with_metadata(metadata)
 
     def _retention_for_chunk(
         self, chunk_id: bytes, *, array_id: Optional[str] = None
@@ -1658,11 +925,6 @@ class TensorAdapter(SourceAdapter):
                 :meth:`check_chunk_version`, called first, before any bytes
                 are read.
         """
-        # The two read gates, together and ahead of any I/O. Here rather than
-        # in a writable mixin's override because that made the gate depend on
-        # an adapter's base order, and on every override of this method
-        # remembering to call up; both defaults are no-ops, so every adapter
-        # is covered and a new one cannot forget.
         self.check_chunk_version(chunk_id)
         self.check_readable()
         array_id, bounds = decode_chunk_id(chunk_id)
@@ -1679,10 +941,6 @@ class TensorAdapter(SourceAdapter):
 
         def compute_fn():
             if is_scaled_chunk_flag:
-                # The requested reduction_method rides in the chunk_id (#578), so a
-                # do_get honors it; a byte-free (pre-#578) scaled chunk_id decodes
-                # to area. Read and reduce through one call so an adapter that can
-                # do both at once never materializes the full-resolution extent.
                 result_arr = self.get_scaled_data(
                     bounds,
                     decode_scale_info(chunk_id),
@@ -1690,12 +948,6 @@ class TensorAdapter(SourceAdapter):
                     cache_manager,
                 )
             else:
-                # The one read that is always a real decode: a scaled read may
-                # be sourced from the cache (#965) and would time the cache's
-                # own state instead. Measured here rather than inside
-                # ``get_data`` so no adapter has to cooperate, and so a
-                # delegating wrapper's transpose -- a view, materialized after
-                # this returns -- stays out of the number.
                 started = time.perf_counter()
                 result_arr = self.get_data(bounds)
                 if self._decode_time_is_rebuild_cost:
@@ -1704,17 +956,11 @@ class TensorAdapter(SourceAdapter):
                     )
 
             # Serialize into the unified binary wire schema: raw bytes + dtype
-            # string, wrapped zero-copy. This preserves the exact dtype including
-            # endianness (big-endian FITS '>i2' round-trips without conversion)
-            # and avoids the per-element typed-list encoding (biopb/biopb#293).
+            # string, wrapped zero-copy.
             result = pack_chunk_batch(result_arr)
             return result, result_arr.nbytes
 
         if should_cache:
-            # The method is part of the key, not advisory: since #578 the
-            # chunk_id carries a method byte and cache_key_for_chunk_id keeps
-            # it, so a nearest read cannot be served an area chunk (this
-            # reverses biopb/biopb#76).
             cache_key = cache_key_for_chunk_id(chunk_id)
             entry = cache_manager.get_or_acquire(
                 cache_key,
@@ -1749,10 +995,7 @@ class TensorAdapter(SourceAdapter):
         if reduction_method == "precompute" and scale_hint is not None:
             return self._plan_precomputed_read(request_desc, scale_hint)
 
-        chunk_size = self.get_transfer_chunk_size()
-        # content_version is a SourceAdapter property; every TensorAdapter is a
-        # SourceAdapter, so it is always present -- an unversioned source
-        # returns None. The epoch is the codec's to add.
+        chunk_size = transfer_chunk_size(base_desc)
         return _get_read_plan(
             base_desc,
             request_desc,
@@ -1761,12 +1004,7 @@ class TensorAdapter(SourceAdapter):
         )
 
     # ---- native-pyramid precompute routing ---------------------------------
-    # Turning a ``precompute`` read into a read against one on-disk level's store
-    # is shared here, so the native-pyramid adapters (OME-Zarr multiscales,
-    # QPTIFF) stop duplicating it near-verbatim (biopb/biopb#557). A leaf adapter
-    # supplies only the per-format level lookup + scale extraction:
-    # :meth:`_find_level_for_scale`, :meth:`_level_downsample_factors`, and
-    # :meth:`get_level_adapter`.
+    # Turning a ``precompute`` read into a read against one on-disk level's store.
 
     def _plan_precomputed_read(
         self, request_desc: TensorDescriptor, scale_hint: Tuple[int, ...]
@@ -1777,7 +1015,10 @@ class TensorAdapter(SourceAdapter):
         translate the request's slice into that level's coordinates, and plan the
         read against the level's own store.
         """
-        level = self._find_level_for_scale(scale_hint)
+        # The hint arrives canonical; the level lookup matches native factors.
+        perm = self._axis_perm()
+        native_hint = tuple(to_native(scale_hint, perm))
+        level = self._find_level_for_scale(native_hint)
         if level is None:
             raise ValueError(
                 f"No precomputed level matching scale_hint {tuple(scale_hint)}."
@@ -1785,9 +1026,8 @@ class TensorAdapter(SourceAdapter):
         slice_hint = (
             request_desc.slice_hint if request_desc.HasField("slice_hint") else None
         )
-        level_slice = _convert_slice_to_level(
-            slice_hint, self._level_downsample_factors(level)
-        )
+        factors = to_canonical(self._level_downsample_factors(level), perm)
+        level_slice = _convert_slice_to_level(slice_hint, factors)
         return self._plan_from_precomputed(level, level_slice)
 
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[Any]:
@@ -1796,7 +1036,7 @@ class TensorAdapter(SourceAdapter):
         Overridden by native-pyramid adapters. The key is opaque to the shared
         routing -- an OME-Zarr dataset path, a QPTIFF integer index -- and only
         round-trips through :meth:`_level_downsample_factors` and
-        :meth:`get_level_adapter`. The default advertises no native levels.
+        the pyramid adapter's level lookup. The default advertises no native levels.
         """
         return None
 
@@ -1816,10 +1056,10 @@ class TensorAdapter(SourceAdapter):
 
         The level adapter's descriptor carries ``array_id = source_id/{level}``, so
         the base planner encodes that into every chunk_id and ``DoGet`` dispatches
-        back through :meth:`get_level_adapter`. The returned descriptor's
+        back through :meth:`get_tensor_adapter`. The returned descriptor's
         ``array_id`` is reset to this tensor's, so the client still sees one tensor.
         """
-        level_adapter = self.get_level_adapter(str(level))
+        level_adapter = self.get_tensor_adapter(f"{self.array_id}/{level}")
         level_desc = level_adapter.get_tensor_descriptor()
         request = TensorDescriptor(
             array_id=level_desc.array_id,
@@ -1834,24 +1074,6 @@ class TensorAdapter(SourceAdapter):
         read_plan = level_adapter.get_read_plan(request)
         read_plan.descriptor.array_id = self.array_id
         return read_plan
-
-    @staticmethod
-    def _base_structural_descriptor(base_desc: TensorDescriptor) -> TensorDescriptor:
-        """The stable per-tensor facts alone: shape/dtype/dim_labels/chunk_shape.
-
-        Copies only the structural fields off ``base_desc``, deliberately dropping
-        any pyramid / physical_scale / metadata_json the adapter's own
-        ``get_tensor_descriptor`` may already carry -- ``plan_flight_info`` re-fills
-        those under the response field masks (biopb/biopb#563), so a straight
-        ``CopyFrom`` would leak an unmasked pyramid or scale into the response.
-        """
-        return TensorDescriptor(
-            array_id=base_desc.array_id,
-            dim_labels=base_desc.dim_labels,
-            shape=base_desc.shape,
-            chunk_shape=base_desc.chunk_shape,
-            dtype=base_desc.dtype,
-        )
 
     def plan_flight_info(
         self, read_opt: TensorReadOption, pyramid_config: PyramidConfig
@@ -1882,36 +1104,32 @@ class TensorAdapter(SourceAdapter):
         forward the upstream's authoritative plan instead (biopb/biopb#295).
         """
         base_desc = self.get_tensor_descriptor()
+        desc = TensorDescriptor(
+            array_id=base_desc.array_id,
+            dim_labels=base_desc.dim_labels,
+            shape=base_desc.shape,
+            chunk_shape=base_desc.chunk_shape,
+            dtype=base_desc.dtype,
+        )
 
         # Opt-in: an empty mask is a describe, and the O(chunks) plan is the
         # most expensive thing here, so it is never what saying nothing buys.
         mask = read_mask(read_opt)
-
         if ENDPOINTS in mask:
-            request_desc = self._base_structural_descriptor(base_desc)
             if read_opt.HasField("slice_hint"):
-                request_desc.slice_hint.CopyFrom(read_opt.slice_hint)
-            # scale_hint / reduction_method route the read to a downsampled level.
+                desc.slice_hint.CopyFrom(read_opt.slice_hint)
             if read_opt.scale_hint:
-                request_desc.scale_hint[:] = list(read_opt.scale_hint)
+                desc.scale_hint[:] = list(read_opt.scale_hint)
             if read_opt.reduction_method:
-                request_desc.reduction_method = read_opt.reduction_method
-            read_plan = self.get_read_plan(
-                request_desc,
-            )
+                desc.reduction_method = read_opt.reduction_method
+            read_plan = self.get_read_plan(desc)
         else:
-            # Describe-only still exposes the server's transfer grid, never the
-            # adapter's private file/dask read geometry (#684).
-            desc = self._base_structural_descriptor(base_desc)
-            desc.chunk_shape[:] = list(self.get_transfer_chunk_size())
+            desc.chunk_shape[:] = list(transfer_chunk_size(base_desc))
             read_plan = TensorReadPlan(
                 descriptor=desc,
                 chunk_endpoints=[],
             )
 
-        # Advertise the server-decided resolution pyramid (opt-in -- native-level
-        # sizing is the costly part), then the compact physical scale (cheap,
-        # always filled) -- both open-time only (never in list_flights).
         read_plan.descriptor.ClearField("pyramid")
         if PYRAMID in mask:
             read_plan.descriptor.pyramid.extend(
@@ -1968,6 +1186,8 @@ class TensorAdapter(SourceAdapter):
             levels = None
         if levels is None:
             cfg = pyramid_config
+            if self.categorical:
+                cfg = replace(cfg, reduction_method="nearest")
             levels = build_pyramid_plan(
                 list(base_desc.shape),
                 list(base_desc.dim_labels),
@@ -1980,7 +1200,7 @@ class TensorAdapter(SourceAdapter):
         """Per-tensor metadata fields the source-level catalog row does not carry.
 
         The serve path (``GetFlightInfo(with_metadata)``) reads a source's
-        metadata from the catalog row that :meth:`SourceAdapter.get_metadata`
+        metadata from the catalog row that :meth:`SourceAdapter.registration_record`
         produced once at registration -- the cache -- and **merges** this method's
         return over it (``row.update(get_tensor_metadata())``). So a tensor
         adapter returns only the *delta*: the cheap, per-tensor fields the
@@ -2006,7 +1226,7 @@ class TensorAdapter(SourceAdapter):
         Returns ``None`` when no physical sizes are known. This is the compact
         ~200-byte summary the tensor-load hot path needs (issue #31), so it must
         be **cheap** -- read it straight off the resident metadata model, never a
-        full ``get_metadata()`` dump. Default ``None``; format adapters that carry
+        full metadata dump. Default ``None``; format adapters that carry
         physical voxel sizes override it. There is no standalone public accessor:
         physical scale reaches clients only via the descriptor's
         ``physical_scale`` / ``physical_unit`` fields, filled by
@@ -2026,10 +1246,7 @@ class TensorAdapter(SourceAdapter):
         """
         descriptor.ClearField("physical_scale")
         descriptor.ClearField("physical_unit")
-        # Physical scale is constant for the lifetime of an adapter. Some format
-        # adapters derive it from expensive resident metadata, so cache both a
-        # value and a computed ``None`` result (there is no base __init__ shared
-        # by all adapters).
+
         if hasattr(self, "_physical_scale_cache"):
             phys = self._physical_scale_cache
         else:
@@ -2040,6 +1257,11 @@ class TensorAdapter(SourceAdapter):
             self._physical_scale_cache = phys
         if phys is not None:
             scale_vec, unit_vec = phys
+            perm = self._axis_perm()
+            scale_vec, unit_vec = (
+                to_canonical(scale_vec, perm),
+                to_canonical(unit_vec, perm),
+            )
             ndim = len(descriptor.dim_labels)
             if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
                 descriptor.physical_scale[:] = scale_vec
@@ -2047,66 +1269,35 @@ class TensorAdapter(SourceAdapter):
 
 
 # --- role-scope enforcement -------------------------------------------------
-# The two role interfaces must stay disjoint *as declared* and match their
-# declared scope, so a tensor-scoped method can never silently land on
-# SourceAdapter again (the past scramble that this split fixes). TensorAdapter
-# inherits SourceAdapter's methods, but must not re-declare or override any of
-# them -- _public_api reads `vars(cls)`, so the checks below are about where a
-# method is written, not what an instance can answer. Adding a public method to
-# either ABC without classifying it here fails the equality check; any overlap
-# fails the disjointness check. Underscore-private helpers are intentionally
-# excluded.
 _SOURCE_SCOPED_API = frozenset(
     {
-        "array_id",
         "source_url",
         "source_type",
-        "tensor_capability_token",
-        "content_version",
-        "check_chunk_version",
         "check_readable",
         "claim",
         "create_from_config",
-        "list_tensor_descriptors",
-        "get_metadata",
-        "get_embedded_rois",
+        "create_from_payload",
+        "list_tensors",
+        "registration_record",
         "catalog_url",
-        "resolve",
-        "is_resident",
-        "is_resolved",
         "get_tensor_adapter",
-        "put_chunk",
         "close",
-        "release_registration_cache",
-        # attached tensors (biopb/biopb#1059)
-        "get_embedded_labels",
-        "label_sets",
-        "label_uploads",
-        "attached_fields",
-        "attached_tensors",
-        "attached_tensor",
-        "attach_tensor",
-        "detach_tensor",
-        "attachment_changed",
-        "label_binding_error",
-        "label_image_axes",
-        "label_image_descriptor",
-        "resolve_tensor",
-        "resolve_chunk_adapter",
-        # the level lookup of the chunk route, which is source-scoped
-        "get_level_adapter",
+        "catalog_payload",
     }
 )
 _TENSOR_SCOPED_API = frozenset(
     {
         "capability_token",
+        "array_id",
+        "categorical",
+        "content_version",
+        "check_chunk_version",
+        "put_chunk",
         "get_tensor_descriptor",
-        "get_transfer_chunk_size",
         "read_block_shape",
         "get_data",
         "get_decimated_data",
         "get_scaled_data",
-        "get_arrow_schema",
         "resolve_chunk_data",
         "locate_chunk",
         "get_read_plan",
@@ -2116,6 +1307,35 @@ _TENSOR_SCOPED_API = frozenset(
         "plan_flight_info",
     }
 )
+
+
+def transfer_chunk_size(desc: TensorDescriptor) -> Tuple[int, ...]:
+    """The transfer grid a tensor is read on, from its *desc*riptor,, clamped to the Arrow ceiling.
+
+    ``chunk_shape`` *is* the transfer grid and the adapter chose it
+    (biopb/biopb#809); the server sizes nothing on its behalf. The one thing
+    left is the wire bound: ``MAX_ARROW_BATCH_BYTES`` is a property of Arrow
+    IPC, so a declared grid above it is re-split rather than failing mid-transfer.
+
+    An empty or short ``chunk_shape`` (a bulk-seeded remote proxy whose upstream
+    is unreachable, a :func:`catalog_entry` that was never bound) falls back to
+    the whole tensor under the ceiling: safe, never good (biopb/biopb#292). An
+    unresolved descriptor raises ``SourceUnresolvedError`` rather than a raw
+    ``TypeError`` out of ``np.dtype("")``.
+    """
+    require_resolved(desc)
+    shape = tuple(int(dim) for dim in desc.shape)
+    chunk_shape = tuple(int(dim) for dim in desc.chunk_shape)
+    if len(chunk_shape) != len(shape):
+        chunk_shape = shape
+    return compute_safe_chunk_size(
+        tuple(
+            min(max(1, chunk), dim)
+            for chunk, dim in zip(chunk_shape, shape, strict=True)
+        ),
+        desc.dtype,
+        list(desc.dim_labels),
+    )
 
 
 def _public_api(cls: type) -> frozenset:
@@ -2148,18 +1368,6 @@ def _convert_slice_to_level(
     so it is a module function, not a method: it reads no adapter state, and
     ``TensorAdapter._plan_precomputed_read`` supplies the level's downsample
     factors from the per-format hook.
-
-    Start floors and stop **ceils**, so the half-open range covers every level
-    pixel the base range touches. Flooring both -- which this did until
-    biopb/biopb#889 -- drops the partial pixel at a ragged end, and that is not
-    a rounding taste: it disagrees with the computed path, which decimates with
-    ``data[::s]`` and therefore returns ``ceil(extent / s)``. The two must
-    agree, because the same region at the same scale is served either way
-    depending only on whether the tensor happens to ship a pyramid. Worked
-    through, a level read of ``[a, b)`` at factor ``f`` then reduced by ``r``
-    yields ``ceil(ceil((b-a)/f)/r) == ceil((b-a)/(f*r))`` -- the computed count
-    exactly. With a floored stop the identity breaks, and where the last tile is
-    one pixel wide the result is empty rather than short.
     """
     if slice_hint is None:
         return None
@@ -2180,10 +1388,6 @@ def _get_read_plan(
 
     Plan try to maintain a uniform chunk grid aligned with the base chunk_size, but may adjust chunk size if raw chunks are too
     large to read in one go (e.g., due to Arrow IPC limits).
-
-    ``content_version`` (biopb/biopb#178), when set, is folded into every minted
-    chunk_id so the cache namespaces by it -- alongside the serving-semantics
-    epoch, which ``mint_chunk_id`` adds (biopb/biopb#1076).
     """
     require_resolved(base_desc)
     base_shape = tuple(int(dim) for dim in base_desc.shape)
@@ -2197,7 +1401,7 @@ def _get_read_plan(
     reduction_method = normalize_reduction_method(request_desc.reduction_method)
     ndim = len(base_shape)
 
-    # STEP 1 was performed by TensorAdapter.get_transfer_chunk_size(). This
+    # STEP 1 was performed by transfer_chunk_size(). This
     # helper receives the public transfer grid and leaves it unchanged.
     transfer_chunk_size = chunk_size
 
@@ -2260,6 +1464,12 @@ def _get_read_plan(
         for ax in range(ndim)
     )
 
+    # The plan on the tensor's own chunk grid: realized_start is a multiple of
+    # the virtual chunk size, so the first chunk's absolute index is exact.
+    grid_origin = tuple(
+        realized_start[ax] // virtual_chunk_size[ax] for ax in range(ndim)
+    )
+
     # Iterate over chunk grid
     for chunk_idx in np.ndindex(*n_chunks_per_axis):
         virtual_start = tuple(
@@ -2303,7 +1513,11 @@ def _get_read_plan(
         )
 
         logical_endpoints.append(
-            ChunkEndpoint(chunk_id=chunk_id, bounds=logical_bounds)
+            ChunkEndpoint(
+                chunk_id=chunk_id,
+                bounds=logical_bounds,
+                index=tuple(grid_origin[ax] + chunk_idx[ax] for ax in range(ndim)),
+            )
         )
 
     # Build descriptor
@@ -2329,4 +1543,16 @@ def _get_read_plan(
     return TensorReadPlan(
         descriptor=logical_desc,
         chunk_endpoints=logical_endpoints,
+        identity=encode_grid_identity(
+            base_desc.array_id,
+            virtual_chunk_size,
+            base_shape,
+            scale_hint,
+            reduction_method,
+            content_version,
+        ),
+        window=(
+            grid_origin,
+            tuple(grid_origin[ax] + n_chunks_per_axis[ax] for ax in range(ndim)),
+        ),
     )

@@ -16,6 +16,7 @@ on:
       - dev
     paths:
       - 'biopb-mcp/**'
+      - 'biopb-control/**'
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
@@ -30,6 +31,7 @@ on:
       - dev
     paths:
       - 'biopb-mcp/**'
+      - 'biopb-control/**'
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
@@ -56,11 +58,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            python-version: '3.10'
-          - os: ubuntu-latest
-            python-version: '3.11'
-          - os: ubuntu-latest
             python-version: '3.12'
+          - os: ubuntu-latest
+            python-version: '3.13'
+          - os: ubuntu-latest
+            python-version: '3.14'
           - os: macos-latest
             python-version: '3.12'
           - os: windows-latest
@@ -124,8 +126,12 @@ jobs:
       # Resolve the whole workspace so biopb[tensor] and biopb-tensor-server[web]
       # come from the in-tree members (the server is never on PyPI). uv is the
       # workspace-aware installer; this is why CI no longer uses tox+pip.
+      #
+      # biopb-control rides along: it is not a dependency of biopb-mcp, but the
+      # product installs them together and `attach new` asks the control for a
+      # session, so one test here runs the real chain -- shim, control, session.
       - name: Install (workspace, napari extra + testing group)
-        run: uv sync --package biopb-mcp --extra napari --group testing --python ${{ matrix.python-version }}
+        run: uv sync --package biopb-mcp --package biopb-control --extra napari --group testing --python ${{ matrix.python-version }}
 
       - name: Run tests
         env:
@@ -176,7 +182,7 @@ jobs:
           fetch-depth: 0  # setuptools_scm: the resolve builds biopb from here
 
       # `biopb`'s build generates the protobuf stubs, and it is installed below
-      # because biopb_mcp._config imports biopb._locations.
+      # because biopb_mcp._config imports biopb._config.locations.
       - name: Setup buf
         uses: bufbuild/buf-action@v1
         with:

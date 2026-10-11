@@ -30,7 +30,7 @@ class _Adapter:
 
 
 def _registry():
-    from biopb_tensor_server.core.source_registry import SourceRegistry
+    from biopb_tensor_server.sources.source_registry import SourceRegistry
 
     return SourceRegistry()
 
@@ -151,7 +151,7 @@ class TestClosingTwiceIsSafe:
     """
 
     def test_close_adapter_calls_through_every_time(self):
-        from biopb_tensor_server.core.source_registry import close_adapter
+        from biopb_tensor_server.sources.source_registry import close_adapter
 
         adapter = _Adapter("a")
 
@@ -163,7 +163,7 @@ class TestClosingTwiceIsSafe:
     def test_close_adapter_swallows_the_raise(self):
         """Never raises: unregister and shutdown must not fail on a balky
         adapter, and the registry also accepts non-inheriting test doubles."""
-        from biopb_tensor_server.core.source_registry import close_adapter
+        from biopb_tensor_server.sources.source_registry import close_adapter
 
         class _Balky:
             def close(self):
@@ -173,7 +173,7 @@ class TestClosingTwiceIsSafe:
 
     def test_close_adapter_of_nothing_is_a_no_op(self):
         """``unregister`` of an id that was never registered hands it None."""
-        from biopb_tensor_server.core.source_registry import close_adapter
+        from biopb_tensor_server.sources.source_registry import close_adapter
 
         close_adapter(None)
 

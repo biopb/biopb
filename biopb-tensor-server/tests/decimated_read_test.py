@@ -40,7 +40,6 @@ NOT_DECIMATING = {
     "ZarrMember": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "CacheMember": "inherits CachedSourceAdapter; chunks served as stored",
     "_QptiffLevelAdapter": "inherits ZarrAdapter",
-    "Hdf5Adapter": "h5py hyperslab still reads whole chunks",
     "OmeTiffAdapter": "a page decodes whole (aszarr chunkmode='page')",
     "_TifffileAdapterBase": "inherits OmeTiffAdapter",
     "TiffAdapter": "inherits OmeTiffAdapter",
@@ -146,8 +145,13 @@ class TestDecimatedEqualsReadThenStride:
         assert picked.shape == expected.shape
         assert picked.dtype == expected.dtype
         assert np.array_equal(picked, expected)
-        # Rule 3: owned. A view onto a mapping outlives nothing safely.
-        assert picked.base is None
+        # Rule 3: owned. A view onto a mapping outlives nothing safely. A
+        # transpose over an owned array (a non-canonical adapter's canonical
+        # view) is fine, so follow the chain of arrays to its owner.
+        owner = picked
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        assert owner.base is None
         return picked
 
     def test_mrc(self, tmp_path):
@@ -177,8 +181,8 @@ class TestDecimatedEqualsReadThenStride:
         create_synthetic_nifti(path, shape=(16, 12, 8), dtype=np.float32)
         adapter = NiftiAdapter(nib.load(str(path)), "nifti")
         try:
-            self._check(adapter, (0, 0, 0), (16, 12, 8), (4, 3, 2))
-            self._check(adapter, (3, 1, 0), (15, 12, 7), (5, 4, 3))
+            self._check(adapter, (0, 0, 0), (8, 12, 16), (2, 3, 4))
+            self._check(adapter, (0, 1, 3), (7, 12, 15), (3, 4, 5))
         finally:
             adapter.close()
 

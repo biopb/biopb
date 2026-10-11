@@ -10,7 +10,7 @@ plumbing a framework would not have known about either.
 ``mcp-config.json`` and not in the environment. The config file is served whole
 by the control's ``GET /api/mcp_config`` so the admin page can edit it — a key
 there would be rendered in a browser and cross the very channel it protects. An
-environment variable is worse still: ``biopb._credentials`` was written on the
+environment variable is worse still: ``biopb._security.credentials`` was written on the
 finding that env vars leak through ``/proc/<pid>/environ``, ``ps e`` and every
 inherited child, which is why the data-plane token moved out of one. The chat
 key gets the same treatment for a sharper reason: it is a *foreign* credential
@@ -33,7 +33,7 @@ identical metadata for both families.
 import logging
 
 import httpx
-from biopb._credentials import read_credential
+from biopb._security.credentials import read_credential
 
 from .. import _endpoint
 from .._message_shape import describe_messages
@@ -131,7 +131,7 @@ def check_ready(config):
             "model you did not choose."
         )
     if not api_key(config):
-        from biopb._credentials import credential_file
+        from biopb._security.credentials import credential_file
 
         raise ChatNotConfigured(
             "No provider key. Write it to "

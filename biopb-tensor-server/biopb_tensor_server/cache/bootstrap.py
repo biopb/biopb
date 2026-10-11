@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+from biopb._config.io import atomic_write_text
+
 from biopb_tensor_server.cache.recovery import ProcessLock, RecoveryStatus
 
 __all__ = [
@@ -171,12 +173,11 @@ def enforce_format_version(layout: CacheLayout) -> bool:
 
     _wipe_cache_contents(layout, stale_version=on_disk)
 
-    # Stamp the current version. Write to a temp file and atomically replace
-    # so a crash mid-write cannot leave a torn marker that spuriously wipes a
-    # good cache on the next boot.
-    tmp_path = layout.marker_path.with_suffix(".tmp")
-    tmp_path.write_text(f"{CACHE_FILE_FORMAT_VERSION}\n")
-    os.replace(tmp_path, layout.marker_path)
+    # Stamp the current version atomically, so a crash mid-write cannot leave a
+    # torn marker that spuriously wipes a good cache on the next boot.
+    atomic_write_text(
+        layout.marker_path, f"{CACHE_FILE_FORMAT_VERSION}\n", raise_on_error=True
+    )
     return True
 
 

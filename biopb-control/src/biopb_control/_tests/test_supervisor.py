@@ -12,7 +12,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from biopb.lifecycle import deathwatch as _deathwatch
+from biopb._lifecycle import deathwatch as _deathwatch
 
 from biopb_control._control import serve_control_api
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -257,6 +257,7 @@ def test_backoff_grows_then_resets_on_recovery(spec, monkeypatch):
 # --------------------------------------------------------------------------- #
 class _LiveFake:
     pid = 12345
+    stdout = None  # no pipe to pump
 
     def poll(self):
         return None  # alive

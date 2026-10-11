@@ -7,7 +7,7 @@
  *
  * Usage:
  *   const client = new TensorHttpClient("http://localhost:8816", token);
- *   const sources = await client.listSources();
+ *   const { sources } = await client.listSourcesPage(20000);
  *   const arr = await client.slice({ array_id: "my-source/tensor-0", ... });
  */
 
@@ -20,6 +20,7 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
+  SourceListing,
   SourceJobStatus,
   SliceRequest,
   TileInfo,
@@ -404,17 +405,25 @@ export class TensorHttpClient {
   // Sources
   // -------------------------------------------------------------------------
 
-  /** List all data sources registered with the server. */
-  async listSources(opts?: RequestOptions): Promise<DataSourceDescriptor[]> {
-    return this.fetchJson<DataSourceDescriptor[]>(
-      "/api/sources",
-      undefined,
+  /**
+   * List at most `limit` data sources, and whether that cut the catalog short.
+   * The server's own cap can cut a listing too, so `truncated` is the server's
+   * word, not a comparison against `limit`.
+   */
+  async listSourcesPage(limit: number, opts?: RequestOptions): Promise<SourceListing> {
+    return this.send(
+      `/api/sources?limit=${limit}`,
+      { headers: this.headers() },
       this.metadataTimeoutMs,
       opts,
+      async (res) => ({
+        sources: (await res.json()) as DataSourceDescriptor[],
+        truncated: res.headers.get("X-Truncated") === "true",
+      }),
     );
   }
 
-  // -- Resolve / warm jobs --------------------------------------------------
+  // -- Resolve jobs ---------------------------------------------------
   //
   // Start -> poll -> optionally cancel. Starting is idempotent per source: the
   // server keys jobs by (kind, source_id), so a double-click joins the recall
@@ -428,14 +437,9 @@ export class TensorHttpClient {
     return this.startJob("resolve", sourceId, opts);
   }
 
-  /** Begin (or join) a hydrate-ahead warm of a resolved source. */
-  async startWarm(sourceId: string, opts?: RequestOptions): Promise<SourceJobStatus> {
-    return this.startJob("warm", sourceId, opts);
-  }
-
   /** Poll a job. Rejects with a 404 `TensorApiError` if none was started. */
   async jobStatus(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {
@@ -449,7 +453,7 @@ export class TensorHttpClient {
 
   /** Ask a job to stop. A no-op on one that already finished, not an error. */
   async cancelJob(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {
@@ -462,23 +466,13 @@ export class TensorHttpClient {
   }
 
   private async startJob(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {
     return this.fetchJson<SourceJobStatus>(
       `/api/sources/${encodeURIComponent(sourceId)}/${kind}`,
       { method: "POST" },
-      this.metadataTimeoutMs,
-      opts,
-    );
-  }
-
-  /** Get a single DataSourceDescriptor by source_id. */
-  async getSource(sourceId: string, opts?: RequestOptions): Promise<DataSourceDescriptor> {
-    return this.fetchJson<DataSourceDescriptor>(
-      `/api/sources/${encodeURIComponent(sourceId)}`,
-      undefined,
       this.metadataTimeoutMs,
       opts,
     );

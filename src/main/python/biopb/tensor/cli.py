@@ -8,7 +8,7 @@ Commands:
     cache-stats  Show the server's cache hit/miss diagnostics
 
 Every command dials the *same* plane through the one resolver,
-:func:`biopb.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+:func:`biopb._control.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -27,13 +27,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb import (
+from biopb._control import (
     ENV_TENSOR_TOKEN,
     DataPlaneEndpoint,
     LocalTrustError,
     resolve_data_plane,
 )
-from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+from biopb.tensor._catalog_rows import reasons_for
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -75,13 +75,11 @@ _OPT_SLICE = typer.Option(
 def _browse(client) -> dict:
     """The catalog as ``{source_id: row}``.
 
-    ``query`` rather than the deprecated ``list_sources``: same rows
-    and the same server-side cap, but a row carries ``is_resolved``, which the
-    listing needs to tell "not resolved yet" from "nothing readable in it"
-    (biopb/biopb#1032).
+    Rows carry ``is_resolved``, which the listing needs to tell "not resolved
+    yet" from "nothing readable in it".
     """
     rows = client.query(
-        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
+        f"SELECT {client.source_row_columns()} FROM sources ORDER BY source_id",
         format="records",
     )
     return {row["source_id"]: row for row in rows}
@@ -282,13 +280,19 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
+        reasons = reasons_for(
+            sources.values(), lambda sql: client.query(sql, format="records")
+        )
         for source_id, row in sources.items():
             tensors = row.get("tensors") or []
             if not tensors:
                 # Two different states, and only one of them is actionable:
                 # an unresolved source has tensors the server has not looked
                 # for yet (biopb/biopb#1032).
-                why = "<no tensors>" if row.get("is_resolved", True) else "<unresolved>"
+                if row.get("is_resolved", True):
+                    why = "<no tensors>"
+                else:
+                    why = f"<{reasons.get(source_id) or 'unresolved'}>"
                 table.add_row(source_id, why, "-", "-")
                 continue
             for tensor in tensors:
@@ -560,14 +564,14 @@ def get(
                 )
 
         elif fmt == "zarr":
-            # Zarr format: realized array. Import lazily so that a missing or
-            # broken zarr/numcodecs install only affects this output format
-            # rather than the whole CLI.
+            # Zarr format: realized array. zarr is not a dependency of the SDK;
+            # import it here so a missing or broken install only affects this
+            # output format rather than the whole CLI.
             try:
                 import zarr
             except ImportError as exc:
                 raise typer.BadParameter(
-                    f"zarr output requires the 'zarr' package (install biopb[tensor]): {exc}"
+                    f"zarr output requires the 'zarr' package (pip install zarr): {exc}"
                 )
 
             arr = client.get_tensor(array_id, slice_hint=selection)

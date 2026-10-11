@@ -14,7 +14,12 @@ import biopb.image as proto
 import grpc
 import numpy as np
 import pytest
-from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import (
+    deserialize_image_data,
+    json_arg as _json,
+    json_value,
+    serialize_from_numpy_to_image_data,
+)
 from biopb_image_base import Tensor, op
 from biopb_image_base.ops import (
     _ambient_scheduler_configured,
@@ -24,7 +29,7 @@ from biopb_image_base.ops import (
     build_server,
     describe,
 )
-from google.protobuf import empty_pb2, json_format, struct_pb2
+from google.protobuf import empty_pb2
 
 
 @op(description="Mean intensity and area per label", labels=["measurement"])
@@ -148,14 +153,10 @@ def _eager(array, labels=None) -> proto.Arg:
     )
 
 
-def _json(value) -> proto.Arg:
-    return proto.Arg(json=json_format.ParseDict(value, struct_pb2.Value()))
-
-
 def _value(arg: proto.Arg):
     kind = arg.WhichOneof("kind")
     if kind == "json":
-        return json_format.MessageToDict(arg.json)
+        return json_value(arg.json)
     if kind == "eager":
         return deserialize_image_data(proto.ImageData(eager_data=arg.eager))
     from biopb.tensor.client import TensorFlightClient
@@ -249,21 +250,22 @@ def test_non_finite_default_is_just_text_in_the_schema():
 
 
 def test_non_finite_result_round_trips(server):
-    from biopb_image_base.ops import _undo_non_finite
-
     (event,) = server.call("non_finite_result")
-    restored = _undo_non_finite(_value(event.outputs["result"]))
+    restored = _value(event.outputs["result"])
     assert restored["a_nan"] != restored["a_nan"]  # nan != nan
     assert restored["an_inf"] == float("inf")
     assert restored["a_neg_inf"] == float("-inf")
 
 
-def test_non_finite_kwarg_is_restored_server_side(server):
-    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY, _undo_non_finite
+def test_non_finite_kwarg_reaches_the_op(server):
+    (event,) = server.call("echo_kwarg", value=_json(float("inf")))
+    assert _value(event.outputs["result"])["got"] == float("inf")
 
-    (event,) = server.call("echo_kwarg", value=_json({NON_FINITE_FLOAT_KEY: "inf"}))
-    restored = _undo_non_finite(_value(event.outputs["result"]))
-    assert restored["got"] == float("inf")
+
+def test_a_single_key_dict_is_data_not_an_encoding(server):
+    # The former sentinel's shape: it is an ordinary result now.
+    (event,) = server.call("echo_kwarg", value=_json({"__float__": "inf"}))
+    assert _value(event.outputs["result"])["got"] == {"__float__": "inf"}
 
 
 def test_two_tensor_arguments_and_json_result(server):
@@ -484,6 +486,7 @@ def test_gzip_only_integer_outputs_off_loopback():
 @pytest.fixture
 def plane(tmp_path: Path):
     """A writable tensor server with its scratch source, as the control runs."""
+    pytest.importorskip("biopb_tensor_server")
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
@@ -492,7 +495,7 @@ def plane(tmp_path: Path):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = TensorFlightServer(
-        location="grpc://localhost:0",
+        location="localhost:0",
         writable=True,
         write_dir=tmp_path,
         metadata_db=MetadataDatabase(),
@@ -568,6 +571,7 @@ def test_ambient_scheduler_detects_a_distributed_client():
 
 
 def test_embedded_sink(tmp_path: Path, monkeypatch):
+    pytest.importorskip("biopb_tensor_server")
     import biopb_image_base.ops as ops
     from biopb_image_base.server import start_embedded_cache
     from biopb_tensor_server.cache import CacheManager

@@ -194,10 +194,13 @@ def seed_manifest(store, monkeypatch, doc_id="one", body="# Old\n"):
     return path
 
 
-def seed_then_change(store, monkeypatch, doc_id="one"):
+def seed_then_change(store, monkeypatch, doc_id="one", before=None):
     """:func:`seed_manifest`, then edit the shipped text and bump to 1.1 --
-    the setup most manifest tests below need before their own assertion."""
+    the setup most manifest tests below need before their own assertion.
+    *before* runs at 1.0, ahead of the change (e.g. to make a local copy)."""
     path = seed_manifest(store, monkeypatch, doc_id)
+    if before is not None:
+        before()
     path.write_text("# New\n", encoding="utf-8")
     bump_version(monkeypatch, "1.1")
     return path
@@ -280,11 +283,73 @@ def test_a_shadowed_doc_whose_shipped_text_changed_is_flagged_in_the_index(
     store, monkeypatch
 ):
     ship(store, "index", "- one: hook\n")
-    seed_then_change(store, monkeypatch)
-    _docs.write_doc("one", body="# Mine\n")
+    seed_then_change(
+        store, monkeypatch, before=lambda: _docs.write_doc("one", body="# Mine\n")
+    )
     rendered = _docs.render_index()
     assert _docs._STALE_TAIL in rendered
     assert '- one: one — read_doc("one@diff")' in rendered
+
+
+def test_a_copy_made_from_the_current_shipped_text_is_not_behind(store, monkeypatch):
+    """The release changed the doc, but the copy was made after, from the new text."""
+    ship(store, "index", "- one: hook\n")
+    seed_then_change(store, monkeypatch)
+    _docs.write_doc("one", body="# Mine\n")
+    assert "behind on" not in _docs.render_index()
+
+
+def test_a_copy_stays_behind_through_a_release_that_left_the_doc_alone(
+    store, monkeypatch
+):
+    ship(store, "index", "- one: hook\n")
+    seed_then_change(
+        store, monkeypatch, before=lambda: _docs.write_doc("one", body="# Mine\n")
+    )
+    _docs.render_index()
+    bump_version(monkeypatch, "1.2")  # 1.2 ships one unchanged from 1.1
+    assert '- one: one — read_doc("one@diff")' in _docs.render_index()
+
+
+def test_writing_a_copy_that_was_behind_marks_it_current_and_says_so(
+    store, monkeypatch
+):
+    ship(store, "index", "- one: hook\n")
+    seed_then_change(
+        store, monkeypatch, before=lambda: _docs.write_doc("one", body="# Mine\n")
+    )
+    result = _docs.write_doc("one", old="# Mine", new="# Mine, merged")
+    assert "was behind the shipped text" in result
+    assert 'read_doc("one@diff")' in result
+    assert "behind on" not in _docs.render_index()
+
+
+def test_writing_a_current_copy_says_nothing_about_being_behind(store, monkeypatch):
+    seed_manifest(store, monkeypatch)
+    _docs.write_doc("one", body="# Mine\n")
+    assert "behind" not in _docs.write_doc("one", old="# Mine", new="# Mine too")
+
+
+def test_a_copy_with_no_recorded_base_falls_back_to_the_version_change_set(
+    store, monkeypatch
+):
+    """A copy written before bases existed: flagged by the release that changed it."""
+    ship(store, "index", "- one: hook\n")
+    _, local = store
+    seed_then_change(
+        store,
+        monkeypatch,
+        before=lambda: (local / "one.md").write_text("# Mine\n", encoding="utf-8"),
+    )
+    assert '- one: one — read_doc("one@diff")' in _docs.render_index()
+
+
+def test_a_reseed_on_a_version_bump_keeps_the_recorded_bases(store, monkeypatch):
+    seed_manifest(store, monkeypatch)
+    _docs.write_doc("one", body="# Mine\n")
+    bump_version(monkeypatch, "1.1")
+    _docs.changed_shipped_ids()
+    assert "one" in _docs._load_manifest()["bases"]
 
 
 def test_an_unshadowed_changed_doc_gets_no_stale_flag(store, monkeypatch):
@@ -448,9 +513,14 @@ def test_a_stale_doc_is_listed_with_the_shipped_description_not_the_copys(
     store, monkeypatch
 ):
     ship(store, "index", "- one: hook\n")
-    seed_then_change(store, monkeypatch)
+    seed_then_change(
+        store,
+        monkeypatch,
+        before=lambda: _docs.write_doc(
+            "one", body="---\ndescription: my text\n---\n\n# Mine\n"
+        ),
+    )
     ship(store, "one", "# New\n", description="the release's text")
-    _docs.write_doc("one", body="---\ndescription: my text\n---\n\n# Mine\n")
     rendered = _docs.render_index()
     assert "- one: the release's text" in rendered
     assert "my text" not in rendered

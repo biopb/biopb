@@ -288,6 +288,24 @@ def _ack_foreign_digest(host, digest, writer=None) -> None:
         host.jobs.ack_foreign_digest(ids)
 
 
+def _attribute_foreign(digest) -> tuple:
+    """``(who, listed)`` for a non-empty digest: who ran the cells, and which.
+
+    Older kernels' digest entries carry no origin; they could only ever have
+    been user cells, so a missing one reads as "user" rather than dropping the
+    attribution.
+    """
+    origins = {(d.get("origin") or "user") for d in digest}
+    if origins == {"user"}:
+        return "The user", ", ".join(
+            f"{d['job_id']} ({d.get('status')})" for d in digest
+        )
+    return "Another writer", ", ".join(
+        f"{d['job_id']} ({d.get('status')}, {d.get('origin') or 'user'})"
+        for d in digest
+    )
+
+
 def _render_foreign_note(digest) -> str:
     """The digest as a line appended to an agent-facing result, or ``""``.
 
@@ -306,19 +324,7 @@ def _render_foreign_note(digest) -> str:
     """
     if not digest:
         return ""
-    # Older kernels' digest entries carry no origin; they could only ever have
-    # been user cells, so read a missing one as "user" rather than dropping the
-    # attribution.
-    origins = {(d.get("origin") or "user") for d in digest}
-    if origins == {"user"}:
-        who = "The user"
-        listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
-    else:
-        who = "Another writer"
-        listed = ", ".join(
-            f"{d['job_id']} ({d.get('status')}, {d.get('origin') or 'user'})"
-            for d in digest
-        )
+    who, listed = _attribute_foreign(digest)
     return (
         f"\n\nⓘ {who} ran code in this kernel: "
         f"{listed}. A finished cell is reported once; a running one repeats "

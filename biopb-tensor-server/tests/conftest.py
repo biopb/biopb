@@ -3,6 +3,7 @@
 Imports fixture factory functions from fixtures module and wraps them as pytest fixtures.
 """
 
+import functools
 import os
 import tempfile
 import threading
@@ -32,7 +33,6 @@ from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
     create_5d_6d_micromanager_dataset,
     create_companion_ome_dataset,
-    create_hdf5_dataset,
     create_multi_series_ome_tiff,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
@@ -46,6 +46,82 @@ from tests import catalog_server
 # =============================================================================
 # pytest fixtures using the factory functions
 # =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _shut_down_what_a_test_started(monkeypatch):
+    """Shut down every server and catalog a test made, when it ends.
+
+    A ``TensorFlightServer`` keeps its gRPC threads, an upload reaper and the
+    DuckDB catalog behind it (one worker thread per core) alive until it is shut
+    down, and a test that does not leaks all of them for the rest of the run: the
+    suite ended with some 7,000 native threads, and a macOS runner, which caps a
+    process at a couple of thousand, aborted inside a gRPC call late in the run.
+
+    Only what the test itself made is shut down: anything a module- or
+    session-scoped fixture built was made before this fixture ran. Shutdown is
+    safe to repeat, so a test that shuts its own server down is unaffected.
+    """
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.server import TensorFlightServer
+
+    made = []
+
+    def track(cls, closer):
+        original = cls.__init__
+
+        @functools.wraps(original)
+        def tracking(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            made.append(getattr(self, closer))
+
+        monkeypatch.setattr(cls, "__init__", tracking)
+
+    track(TensorFlightServer, "shutdown")
+    track(MetadataDatabase, "close")
+    yield
+    for close in reversed(made):
+        try:
+            close()
+        except Exception:  # a test may have torn it down in its own way
+            pass
+
+
+@pytest.fixture(autouse=True)
+def _private_write_dir(monkeypatch, tmp_path_factory):
+    """Keep the default ``write_dir`` out of the real ``~/.local/share``.
+
+    Every ``ServerConfig`` now carries one, so a test that builds a server
+    without naming a ``write_dir`` would otherwise upload into the developer's
+    own data tree.
+    """
+    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path_factory.mktemp("data-home")))
+
+
+@pytest.fixture(autouse=True)
+def _private_state_dir(monkeypatch, tmp_path_factory):
+    """Keep the state tree out of the real ``~/.local/state``.
+
+    The CLI's server setup writes the ticket-seal key there, so a test that sets
+    one up would otherwise leave a key in the developer's own state tree.
+    """
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path_factory.mktemp("state-home")))
+
+
+@pytest.fixture(autouse=True)
+def _close_pooled_handles():
+    """Close the files the handle pools hold open after each test.
+
+    A pooled handle outlives the adapter that opened it, which is its purpose;
+    but a test's temp dir cannot be removed on Windows while one is open there
+    (WinError 32)."""
+    yield
+    from biopb_tensor_server.adapters._handle_pool import HandlePool
+    from biopb_tensor_server.adapters._handle_reaper import _configured_reapers
+
+    for pool in list(_configured_reapers):
+        if isinstance(pool, HandlePool):
+            pool.close_all()
 
 
 @pytest.fixture(autouse=True)
@@ -131,12 +207,6 @@ def companion_ome_dataset(temp_dir):
 
 
 @pytest.fixture
-def hdf5_dataset(temp_dir):
-    """HDF5 dataset with chunked array."""
-    return create_hdf5_dataset(temp_dir)
-
-
-@pytest.fixture
 def simple_zarr_array(temp_dir):
     """Simple Zarr array for basic tests."""
     return create_zarr_array(temp_dir)
@@ -160,6 +230,20 @@ def transfer_target(monkeypatch):
         return int(nbytes)
 
     return _set
+
+
+@pytest.fixture(autouse=True)
+def _baseline_epoch(monkeypatch):
+    """Run every test under epoch 0.
+
+    Tests build chunk_ids by hand (``encode_chunk_id``) and compare them with the
+    ones a planner mints; the epoch header the server really runs under would
+    make the two differ for a reason none of them is about. Tests of the epoch
+    itself set it through :func:`epoch`.
+    """
+    from biopb_tensor_server.core import chunk
+
+    monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", 0)
 
 
 @pytest.fixture
@@ -190,7 +274,7 @@ def writable_server(tmp_path):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+        location="localhost:0", writable=True, write_dir=Path(tmp_path)
     )
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()

@@ -55,7 +55,7 @@ BIOPB_PINNED_RELEASE=""
 # each release's versions.json as `install_schema`; a release declaring another,
 # or none, is refused with a pointer to the installer shipped alongside it. Bump
 # it when a change to the release makes an earlier installer wrong for it.
-INSTALL_SCHEMA=1
+INSTALL_SCHEMA=3
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -69,12 +69,12 @@ _cmd()  { printf "  ${CYAN}%s${RESET}\n" "$*"; }
 # BIOPB_DATA_HOME) and no longer reads XDG_* (biopb/biopb#790): an unrelated app
 # setting XDG_STATE_HOME used to relocate biopb's state tree along with its own.
 # A deployment that relocated via XDG would otherwise silently move back to the
-# default, so name the rename. Must stay in step with biopb._locations._tree and
+# default, so name the rename. Must stay in step with biopb._config.locations._tree and
 # biopb-engine.ps1's Get-BiopbTree, or installer and runtime disagree on paths.
 # A relative value resolves against each process's cwd, so the installer, the
 # control and the biopb-mcp shim would each place the tree somewhere different
 # (biopb/biopb#790). Refuse it here rather than install into one tree and have
-# the runtime read another. Mirrors biopb._locations._require_absolute.
+# the runtime read another. Mirrors biopb._config.locations._require_absolute.
 _require_absolute_trees() {
     local var val
     for var in BIOPB_CONFIG_HOME BIOPB_STATE_HOME BIOPB_DATA_HOME BIOPB_SESSIONS_DIR; do
@@ -431,11 +431,11 @@ _seed_algorithm_registry() {
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
 _setup_mcp() {
-    # Resolve the absolute biopb-mcp path for the canonical mcp.json fallback
+    # Resolve the absolute biopb-shim path for the canonical mcp.json fallback
     # (per-client registration resolves its own path inside `biopb agents`). GUI
     # agents don't inherit the shell PATH, so the absolute path is what works.
     local mcp_cmd
-    mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
+    mcp_cmd=$(_biopb_tool_bin biopb-shim || echo "biopb-shim")
 
     mkdir -p "$CONFIG_DIR"
 
@@ -447,7 +447,7 @@ _setup_mcp() {
     # them. Idempotent (never clobbers a user-edited file); best-effort so a
     # failure never aborts the install.
     local seed_cmd
-    seed_cmd=$(command -v biopb-mcp-seed-algorithms 2>/dev/null || true)
+    seed_cmd=$(_biopb_tool_bin biopb-mcp-seed-algorithms || true)
     if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
         _ok "Seeded bundled algorithm ops: $CONFIG_DIR/algorithms/"
     else
@@ -462,7 +462,7 @@ _setup_mcp() {
   "mcpServers": {
     "biopb": {
       "command": "$mcp_cmd",
-      "args": ["--transport", "stdio"]
+      "args": []
     }
   }
 }
@@ -470,14 +470,14 @@ EOF
     _ok "MCP definition written: $CONFIG_DIR/mcp.json"
 
     # Register with every detected client through the single source of truth:
-    # `biopb agents` (core biopb._agents), the same catalog + write logic the
-    # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
+    # `biopb agents` (core biopb._control._agents), the same catalog + write logic the
+    # control-plane dashboard uses. It resolves the absolute biopb-shim path and
     # writes each client's own config (Claude Code via its CLI, the rest via an
     # atomic JSON merge that preserves the user's other servers), so this installer
     # no longer carries a second copy. `|| true`: a per-client failure must never
     # abort the install (set -e). Its per-client results print directly.
     local biopb_cmd
-    biopb_cmd=$(command -v biopb 2>/dev/null || echo "biopb")
+    biopb_cmd=$(_biopb_tool_bin biopb || echo "biopb")
     "$biopb_cmd" agents register --all || true
 
     # Manual-fallback notice fires only if nothing ended up registered. Ask the
@@ -488,6 +488,31 @@ EOF
     else
         MCP_NEEDS_MANUAL=1
     fi
+}
+
+# Absolute path of one of biopb's console scripts (biopb, biopb-shim, ...) as
+# installed by THIS script's `uv tool install`; prints nothing (and fails) if it
+# isn't there. Looks in uv's tool bin dir rather than trusting `command -v`: a
+# shell with a dev venv active (or a UV_TOOL_BIN_DIR that isn't ~/.local/bin)
+# can put another biopb first on PATH, and the installer would then start the
+# control plane -- and point the Desktop launcher and agent configs -- at that
+# one instead of what it just installed. --allow-path falls back to PATH, for
+# the stop-before-replace calls where any biopb that reaches the running
+# control plane will do.
+_biopb_tool_bin() {
+    local name="$1" bin_dir=""
+    if command -v uv >/dev/null 2>&1; then
+        bin_dir=$(uv tool dir --bin 2>/dev/null) || bin_dir=""
+    fi
+    [ -n "$bin_dir" ] || bin_dir="$HOME/.local/bin"
+    if [ -x "$bin_dir/$name" ]; then
+        printf '%s\n' "$bin_dir/$name"
+        return 0
+    fi
+    if [ "${2:-}" = "--allow-path" ]; then
+        command -v "$name" 2>/dev/null && return 0
+    fi
+    return 1
 }
 
 # Ensure ~/.local/bin (uv's tool bin dir) is on the user's PATH.
@@ -767,10 +792,11 @@ _pid_is_biopb() {
 # pidfile locations are version-independent constants, so this works without
 # knowing which release wrote them. Best-effort throughout.
 _stop_all_biopb_services() {
-    if command -v biopb >/dev/null 2>&1; then
-        biopb control stop >/dev/null 2>&1 || true   # v0.11+ control plane
-        biopb server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
-        biopb mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
+    local biopb_stop
+    if biopb_stop=$(_biopb_tool_bin biopb --allow-path); then
+        "$biopb_stop" control stop >/dev/null 2>&1 || true   # v0.11+ control plane
+        "$biopb_stop" server stop  >/dev/null 2>&1 || true   # <=v0.10 data daemon
+        "$biopb_stop" mcp stop     >/dev/null 2>&1 || true   # <=v0.10 mcp daemon
     fi
 
     # Fallback: SIGTERM (then SIGKILL) any biopb PID still recorded in a known
@@ -827,8 +853,9 @@ _start_control_plane() {
         _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
-    if ! command -v biopb >/dev/null 2>&1; then
-        _warn "biopb not found on PATH; skipping control-plane start"
+    local biopb_cmd
+    if ! biopb_cmd=$(_biopb_tool_bin biopb); then
+        _warn "biopb not found in the uv tool bin dir; skipping control-plane start"
         _info "  start it later with: ${CYAN}biopb control start${RESET}"
         return 0
     fi
@@ -844,7 +871,7 @@ _start_control_plane() {
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     local start_out
-    if ! start_out=$(biopb control start 2>&1); then
+    if ! start_out=$("$biopb_cmd" control start 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
@@ -868,7 +895,7 @@ _start_control_plane() {
     # does no Flight health query, so no source_count here -- it climbs in the background).
     local out i=0
     while [ "$i" -lt 60 ]; do
-        out=$(biopb control status --json 2>/dev/null || echo "")
+        out=$("$biopb_cmd" control status --json 2>/dev/null || echo "")
         if printf '%s' "$out" | grep -q '"state"[[:space:]]*:[[:space:]]*"serving"'; then
             _ok "Control plane started — data plane serving; catalog + pre-cache building in the background"
             return 0
@@ -1105,7 +1132,7 @@ _install_desktop_shortcut() {
     fi
 
     local biopb_bin
-    biopb_bin=$(command -v biopb 2>/dev/null || echo "$HOME/.local/bin/biopb")
+    biopb_bin=$(_biopb_tool_bin biopb || echo "$HOME/.local/bin/biopb")
 
     # Only place an icon where a desktop already exists -- creating ~/Desktop on a
     # headless box (a compute node, a container) would leave a launcher nobody sees.
@@ -1173,7 +1200,7 @@ install_biopb() {
     # wants is the `release-v*` one, so the release fetch filters by this prefix
     # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
-    # On-disk trees follow XDG (matching biopb._locations): config in the
+    # On-disk trees follow XDG (matching biopb._config.locations): config in the
     # config tree, portable assets (webapp/samples) in the data tree, and logs /
     # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
     # conventional dirs, so writer (installer) and reader (code) never disagree.
@@ -1333,15 +1360,15 @@ install_biopb() {
     # ===== 2. Python =====
     _step "[2/7] Ensuring Python..."
 
-    # biopb-mcp (always installed) requires Python >= 3.10.
-    MIN_MINOR=10
+    # biopb-mcp (always installed) requires Python >= 3.12.
+    MIN_MINOR=12
 
-    # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
-    # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
-    # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
-    # libCZI), which fails on a fresh machine without a C++ toolchain. If the
-    # system Python is newer we fall back to a uv-managed 3.12 below.
+    # Upper bound: the packages run on 3.12-3.14, but this is the interpreter the
+    # installer is tested with, and the default `czi` extra pulls the CZI reader
+    # (aicspylibczi), which ships no cp314 wheel yet — on 3.14 pip would build it
+    # from source (cmake + libCZI), which fails on a fresh machine without a C++
+    # toolchain. If the system Python is newer we fall back to a uv-managed 3.12
+    # below.
     MAX_MINOR=12
 
     # PYTHON_SPEC is the interpreter we hand to `uv tool install` below via --python.
@@ -1371,7 +1398,7 @@ install_biopb() {
                     PYTHON_VERSION=""
                 fi
             elif [ "$MAJOR" -gt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -gt "$MAX_MINOR" ]; }; then
-                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (biopb requires Python <3.13; the CZI reader has no 3.13 wheel yet)"
+                _warn "System Python too new ($(python3 --version)); using a managed 3.$MAX_MINOR (the installer is tested with 3.$MAX_MINOR; the CZI reader has no 3.14 wheel yet)"
                 PYTHON_VERSION=""
             else
                 _warn "System Python too old ($(python3 --version)), need >= 3.$MIN_MINOR"
@@ -1390,10 +1417,6 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/7] Installing biopb packages..."
 
-    # The HDF5 reader ([hdf5] -> h5py) is NOT bundled by default: .h5 is a niche
-    # source format here, and h5py is cleanly gated behind its own opt-in extra
-    # (nothing else in this set pulls it), so a user who needs it installs
-    # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
     # [aics] (bioio + its plugins) is NOT in the default set: the native
     # adapters own every local vendor format, so what bioio would still add is
     # the Java bridge (its own [bioformats] opt-in) and remote vendor sources,
@@ -1498,7 +1521,7 @@ install_biopb() {
     # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
     # SDK is pinned exactly to its PyPI release.
     mcp_req="biopb-mcp[napari] @ file://$mcp_whl"
-    biopb_req="biopb[tensor]==$sdk_pin"
+    biopb_req="biopb[tensor,shim]==$sdk_pin"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
 

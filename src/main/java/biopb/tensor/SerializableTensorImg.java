@@ -22,18 +22,19 @@ import net.imglib2.type.numeric.RealType;
  * Compatibility adapter for Java serialization of a lazy tensor image.
  *
  * <p>The sole cross-process handle is {@link SerializedTensor}. This class is
- * only an imglib2 adapter: its externalized state is exactly a
- * {@code SerializedTensor} protobuf and a local cache budget. It never
+ * only an imglib2 adapter, and not part of the public API -- callers see a
+ * {@code RandomAccessibleInterval}, and pass {@link SerializedTensor} to hand a
+ * read to another process. Its externalized state is exactly a
+ * {@code SerializedTensor} protobuf and a local cache budget; it never
  * serializes source IDs, read options, descriptors, or a second bespoke ticket
- * format. New cross-process APIs should pass {@link SerializedTensor} directly.
+ * format.
  *
  * <p>Its Flight connection comes from {@link FlightSessions}, shared per
  * {@code (location, token)} across every image in the process, so
  * reconstructing many tensors from one server costs one channel rather than
  * one each.
  */
-@Deprecated
-public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
+class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         implements RandomAccessibleInterval<T>, Externalizable, AutoCloseable {
 
     private byte[] serializedTensorBytes;
@@ -128,49 +129,46 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         // Shared per (location, token): an image hands its session to an imglib2
         // cell cache that outlives every call here, so there is no point at
         // which this class could close one. See FlightSessions.
+        org.apache.arrow.flight.Location location = LocationUris.parse(handle.getLocation());
+        // The sender's anchor says which certificate; the name check is this
+        // process's, because it depends on the name dialed here.
         session = FlightSessions.shared(
-                LocationUris.parse(handle.getLocation()),
-                handle.getAuthToken().isEmpty() ? null : handle.getAuthToken());
+                location,
+                handle.getAuthToken().isEmpty() ? null : handle.getAuthToken(),
+                TlsTrusts.concrete(location, TlsTrusts.anchored(handle.getTlsAnchor().toByteArray())));
         if (plan.getEndpoints().isEmpty()) {
             plan = refreshEndpointlessPlan(plan);
         }
 
         RandomAccessibleInterval<T> image = new Imglib2TensorFactory(session, cacheBytes).create(plan);
-        SliceHint requested = requestedSlice(plan);
+        TensorReadOption request = PlanRequest.of(plan);
         TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
-        if (requested != null && descriptor.hasSliceHint()) {
-            image = RegionCrop.cropToRequest(image, requested, descriptor.getSliceHint(),
-                    descriptor.getScaleHintList());
+        if (request.hasSliceHint() && descriptor.hasSliceHint()) {
+            image = RegionCrop.cropToRequest(image, request.getSliceHint(), descriptor.getSliceHint(),
+                    request.getScaleHintList());
         }
         return image;
     }
 
     private FlightInfo refreshEndpointlessPlan(FlightInfo plan) {
         TensorDescriptor descriptor = TensorChunkCodec.descriptorOf(plan);
+        // Replay the request the handle recorded, for its endpoints; a handle
+        // that recorded none is rebuilt from the descriptor's realized slice.
+        TensorReadOption recorded = PlanRequest.of(plan);
         TensorReadOption.Builder read = TensorReadOption.newBuilder()
                 .setArrayId(descriptor.getArrayId())
                 .setFields(FieldMask.newBuilder().addPaths("endpoints").build());
-        if (descriptor.hasSliceHint()) {
+        if (recorded.hasSliceHint()) {
+            read.setSliceHint(recorded.getSliceHint());
+        } else if (descriptor.hasSliceHint()) {
             read.setSliceHint(descriptor.getSliceHint());
         }
-        read.addAllScaleHint(descriptor.getScaleHintList());
-        if (!descriptor.getReductionMethod().isEmpty()) {
-            read.setReductionMethod(descriptor.getReductionMethod());
+        read.addAllScaleHint(recorded.getScaleHintList());
+        if (!recorded.getReductionMethod().isEmpty()) {
+            read.setReductionMethod(recorded.getReductionMethod());
         }
         FlightRequest request = FlightRequest.newBuilder().setTensorRead(read.build()).build();
         return session.getInfo(FlightDescriptor.command(request.toByteArray()));
-    }
-
-    private static SliceHint requestedSlice(FlightInfo plan) {
-        byte[] metadata = plan.getAppMetadata();
-        if (metadata == null || metadata.length == 0) {
-            return null;
-        }
-        try {
-            return SliceHint.parseFrom(metadata);
-        } catch (InvalidProtocolBufferException error) {
-            throw new IllegalArgumentException("FlightInfo.app_metadata is not a SliceHint", error);
-        }
     }
 
     /**

@@ -8,6 +8,7 @@ Each class below is listed once, with the reason, and adding an adapter without
 touching this file fails.
 """
 
+import importlib.util
 import inspect
 
 import pytest
@@ -21,7 +22,6 @@ QUANTIZED = {
     "LabelSetAdapter": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "ZarrMember": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "_QptiffLevelAdapter": "inherits ZarrAdapter (the level's tile grid)",
-    "Hdf5Adapter": "the dataset's chunk, or None where contiguous",
     "OmeTiffAdapter": "one page: aszarr(chunkmode='page') decodes it whole",
     "_TifffileAdapterBase": "inherits OmeTiffAdapter",
     "TiffAdapter": "inherits OmeTiffAdapter",
@@ -89,6 +89,8 @@ def test_every_adapter_is_classified():
 def test_the_lists_are_disjoint_and_real():
     assert not (set(QUANTIZED) & set(UNQUANTIZED))
     stale = (set(QUANTIZED) | set(UNQUANTIZED)) - set(_adapters()) - {"TensorAdapter"}
+    if importlib.util.find_spec("pylibCZIrw") is None:
+        stale -= {"CziAdapter"}  # registered only where the [czi] extra installs
     assert not stale, f"listed but no longer present: {sorted(stale)}"
 
 

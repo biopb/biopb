@@ -38,14 +38,40 @@ final class WireVersions {
 
     private WireVersions() {}
 
-    /** The Flight protocol shape this client speaks. */
-    static final int FLIGHT_PROTOCOL_VERSION = 2;
+    /**
+     * The newest Flight protocol shape this client speaks. v3 moved what a plan
+     * says about its request: {@code FlightInfo.app_metadata} is the whole
+     * {@code TensorReadOption}, and the descriptor no longer echoes its scale
+     * and method (see {@link PlanRequest}).
+     */
+    static final int FLIGHT_PROTOCOL_VERSION = 3;
+
+    /** The oldest Flight protocol shape this client still reads. */
+    static final int MIN_FLIGHT_PROTOCOL_VERSION = 2;
+
+    /** Schema-metadata key carrying the protocol a plan was written under. */
+    static final String FLIGHT_PROTOCOL_METADATA_KEY = "flight_protocol";
+
+    /** Does this client speak the server's Flight protocol shape? */
+    static boolean supportsFlight(int serverVersion) {
+        return serverVersion >= MIN_FLIGHT_PROTOCOL_VERSION && serverVersion <= FLIGHT_PROTOCOL_VERSION;
+    }
 
     /** The chunk wire encoding this client can decode. */
     static final int TENSOR_WIRE_PROTOCOL_VERSION = 2;
 
     /** Schema-metadata key carrying the server's chunk encoding version. */
     static final String WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol";
+
+    /** The value stamped under {@code key} on the plan's schema metadata, or null. */
+    static String stamp(org.apache.arrow.flight.FlightInfo plan, String key) {
+        java.util.Optional<org.apache.arrow.vector.types.pojo.Schema> schema = plan.getSchemaOptional();
+        if (!schema.isPresent()) {
+            return null;
+        }
+        java.util.Map<String, String> metadata = schema.get().getCustomMetadata();
+        return metadata == null ? null : metadata.get(key);
+    }
 
     /**
      * A version stamp, or 1 when it is absent or unreadable.
@@ -62,6 +88,14 @@ final class WireVersions {
         } catch (NumberFormatException ignored) {
             return 1;
         }
+    }
+
+    /** The refusal a Flight protocol mismatch deserves, naming which side to upgrade. */
+    static String flightMismatch(int serverVersion, String detail) {
+        String stale = serverVersion < MIN_FLIGHT_PROTOCOL_VERSION ? "server" : "client";
+        return "Incompatible biopb Flight protocol: the server speaks v" + serverVersion
+                + ", this client speaks v" + MIN_FLIGHT_PROTOCOL_VERSION + "-v" + FLIGHT_PROTOCOL_VERSION
+                + ". " + detail + " Upgrade the " + stale + " so both sides match.";
     }
 
     /** The refusal a version mismatch deserves, naming which side to upgrade. */

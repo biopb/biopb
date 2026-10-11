@@ -19,7 +19,7 @@ import pytest
 
 from biopb_mcp import _config
 from biopb_mcp._tests.conftest import call_tool as _tool, rpc_reply
-from biopb_mcp.mcp import _app, _scratch, _server, _writers
+from biopb_mcp.mcp import _app, _kernel_env, _scratch, _server, _writers
 from biopb_mcp.mcp._job_log import JobLog
 
 
@@ -715,11 +715,11 @@ class TestTheScratchKernelIsMarkedForTheBootstrap:
     """
 
     def test_the_launcher_and_the_kernel_agree_on_the_name(self, monkeypatch):
-        from biopb_mcp.mcp import _bootstrap, _kernel
+        from biopb_mcp.mcp import _bootstrap
 
-        monkeypatch.delenv(_kernel.ENV_SCRATCH, raising=False)
+        monkeypatch.delenv(_kernel_env.ENV_SCRATCH, raising=False)
         assert not _bootstrap.is_scratch_kernel()
-        monkeypatch.setenv(_kernel.ENV_SCRATCH, "1")
+        monkeypatch.setenv(_kernel_env.ENV_SCRATCH, "1")
         assert _bootstrap.is_scratch_kernel()
 
     def test_a_watchdog_interval_of_zero_starts_no_watchdog(self):

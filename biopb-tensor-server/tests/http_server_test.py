@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
 from biopb.tensor._session import ResolveCancelled
@@ -140,6 +141,18 @@ def _source_row(desc) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _answer(rows, format, **schema_metadata):  # noqa: A002 - mirrors the real kwarg
+    """What ``query`` returns for *rows*: a table, or the records of one."""
+    if format == "records":
+        return rows
+    table = pa.Table.from_pylist(rows)
+    if schema_metadata:
+        table = table.replace_schema_metadata(
+            {k: str(v) for k, v in schema_metadata.items()}
+        )
+    return table
+
+
 def _build_mock_client(src_desc=None) -> MagicMock:
     """Return a MagicMock that satisfies the TensorFlightClient interface."""
     mc = MagicMock()
@@ -149,14 +162,13 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     # query() over `sources`. The fake answers the two shapes the
     # routes ask for -- the whole listing, and one `WHERE source_id = '...'`.
     def query(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
-        assert format == "records", sql
         rows = [_source_row(src)]
         if "WHERE source_id = " in sql:
             wanted = sql.split("WHERE source_id = ", 1)[1].strip().strip("'")
             rows = [r for r in rows if r["source_id"] == wanted]
         if sql.startswith("SELECT tensors "):
-            return [{"tensors": r["tensors"]} for r in rows]
-        return rows
+            rows = [{"tensors": r["tensors"]} for r in rows]
+        return _answer(rows, format)
 
     mc.query.side_effect = query
 
@@ -188,17 +200,15 @@ def _build_mock_client(src_desc=None) -> MagicMock:
         "full_scan_in_progress": False,
     }
 
-    # get_tensor → lazy array whose .compute() returns a numpy array. A
-    # tensorless source (an unresolved one) has nothing to read, so the stub
-    # raises the way the real client would rather than inventing an array.
+    # get_array → a numpy array. A tensorless source (an unresolved one) has
+    # nothing to read, so the stub raises the way the real client would rather
+    # than inventing an array.
     if src.tensors:
-        lazy = MagicMock()
-        lazy.compute.return_value = np.zeros(
+        mc.get_array.return_value = np.zeros(
             src.tensors[0].shape, dtype=src.tensors[0].dtype
         )
-        mc.get_tensor.return_value = lazy
     else:
-        mc.get_tensor.side_effect = flight.FlightServerError("no tensors")
+        mc.get_array.side_effect = flight.FlightServerError("no tensors")
 
     return mc
 
@@ -283,6 +293,35 @@ class TestHealthEndpoints:
         tc, _ = dev_client
         r = tc.get("/readyz")
         assert r.json()["dev_mode"] is True
+
+
+class TestProbeAccessFilter:
+    @staticmethod
+    def _keeps(path, status):
+        import logging
+
+        from biopb_tensor_server.serving.http_server import _ProbeAccessFilter
+
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:1", "GET", path, "1.1", status),
+            None,
+        )
+        return _ProbeAccessFilter().filter(record)
+
+    @pytest.mark.parametrize("path", ["/livez", "/readyz", "/healthz", "/healthz?x=1"])
+    def test_a_successful_probe_is_not_logged(self, path):
+        assert not self._keeps(path, 200)
+
+    def test_a_failing_probe_is_logged(self):
+        assert self._keeps("/readyz", 503)
+
+    def test_other_requests_are_logged(self):
+        assert self._keeps("/api/tile_info", 200)
 
 
 class TestReadyzTracksBackend:
@@ -461,6 +500,8 @@ class TestSourcesEndpoints:
         assert body[0]["source_id"] == "src0"
         assert body[0]["source_url"] == "/data/src0"
         assert isinstance(body[0]["tensors"], list)
+        # Source metadata is its own route, not a column of the row.
+        assert "metadata_json" not in body[0]
 
     def test_list_sources_tensor_fields(self, auth_client):
         tc, _ = auth_client
@@ -471,15 +512,10 @@ class TestSourcesEndpoints:
         assert tensor["dtype"] == "uint16"
         assert tensor["dim_labels"] == ["z", "y", "x"]
 
-    def test_get_single_source(self, auth_client):
+    def test_there_is_no_single_source_route(self, auth_client):
+        # A source is addressed by a catalog query (or its array_id), not a route.
         tc, _ = auth_client
         r = tc.get("/api/sources/src0", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()["source_id"] == "src0"
-
-    def test_get_missing_source_returns_404(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources/does-not-exist", headers=_bearer(_TOKEN))
         assert r.status_code == 404
 
     def test_get_source_metadata(self, auth_client):
@@ -505,6 +541,46 @@ class TestSourcesEndpoints:
                 r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is False
 
+    def test_list_sources_carries_why_a_source_is_unresolved(self, auth_client):
+        tc, mock_fc = auth_client
+        row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+
+        def query(sql, format="arrow"):  # noqa: A002
+            if "unresolved_reason" in sql:
+                return [{"source_id": "src0", "unresolved_reason": "pending"}]
+            return _answer([row], format)
+
+        mock_fc.query.side_effect = query
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.json()[0]["unresolved_reason"] == "pending"
+
+    def test_list_sources_still_lists_against_a_server_without_the_column(
+        self, auth_client
+    ):
+        # The reason is a second, narrow query: a server older than the column
+        # refuses it, and the listing must not go with it.
+        tc, mock_fc = auth_client
+        row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+
+        def query(sql, format="arrow"):  # noqa: A002
+            if "unresolved_reason" in sql:
+                raise RuntimeError("Binder Error: column not found")
+            return _answer([row], format)
+
+        mock_fc.query.side_effect = query
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert r.json()[0]["is_resolved"] is False
+        assert "unresolved_reason" not in r.json()[0]
+
+    def test_a_resolved_source_carries_no_reason(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
+            [_source_row(_make_source_desc())], format
+        )
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert "unresolved_reason" not in r.json()[0]
+
     def test_list_sources_is_resolved_defaults_true_on_missing_column(
         self, auth_client
     ):
@@ -512,21 +588,129 @@ class TestSourcesEndpoints:
         # all; the default reads as resolved, the correct answer for every
         # pre-existing source.
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": [  # noqa: A006
-            {
-                "source_id": "src0",
-                "source_url": "/data/src0",
-                "source_type": "zarr",
-                "tensors": [],
-            }
-        ]
+        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
+            [
+                {
+                    "source_id": "src0",
+                    "source_url": "/data/src0",
+                    "source_type": "zarr",
+                    "tensors": [],
+                }
+            ],
+            format,
+        )
         r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is True
+
+    @staticmethod
+    def _catalog_of(mock_fc, n, **schema_metadata):
+        """A catalog of *n* sources that honours the LIMIT it is asked for."""
+        asked = []
+
+        def query(sql, format="arrow"):  # noqa: A002
+            asked.append(sql)
+            rows = [
+                {**_source_row(_make_source_desc()), "source_id": f"s{i:04d}"}
+                for i in range(n)
+            ]
+            if " LIMIT " in sql:
+                rows = rows[: int(sql.rsplit(" LIMIT ", 1)[1])]
+            return _answer(rows, format, **schema_metadata)
+
+        mock_fc.query.side_effect = query
+        return asked
+
+    def test_limit_cuts_the_listing_and_says_so(self, auth_client):
+        tc, mock_fc = auth_client
+        asked = self._catalog_of(mock_fc, 10)
+        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
+        assert [s["source_id"] for s in r.json()] == [
+            "s0000",
+            "s0001",
+            "s0002",
+            "s0003",
+        ]
+        assert r.headers["X-Truncated"] == "true"
+        # One row past the limit is how it learns the catalog is longer.
+        assert asked[0].endswith("ORDER BY source_id LIMIT 5")
+
+    def test_a_catalog_within_the_limit_is_not_truncated(self, auth_client):
+        tc, mock_fc = auth_client
+        self._catalog_of(mock_fc, 4)
+        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 4
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_without_a_limit_the_listing_is_whole(self, auth_client):
+        tc, mock_fc = auth_client
+        asked = self._catalog_of(mock_fc, 10)
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 10
+        assert r.headers["X-Truncated"] == "false"
+        assert "LIMIT" not in asked[0]
+
+    def test_the_servers_own_cap_is_reported_too(self, auth_client):
+        # max_query_results cuts a listing the caller never limited; the flag
+        # rides on the table's schema metadata.
+        tc, mock_fc = auth_client
+        self._catalog_of(mock_fc, 3, truncated=True, total_rows=9, returned_rows=3)
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert len(r.json()) == 3
+        assert r.headers["X-Truncated"] == "true"
+
+    @pytest.mark.parametrize("limit", ["0", "-1", "abc"])
+    def test_a_bad_limit_is_refused(self, auth_client, limit):
+        tc, _ = auth_client
+        r = tc.get(f"/api/sources?limit={limit}", headers=_bearer(_TOKEN))
+        assert r.status_code == 422
 
 
 # ===========================================================================
 # Unit tests — slice endpoint
 # ===========================================================================
+
+
+class TestResolveJob:
+    def _wait_done(self, tc, sid):
+        import time
+
+        for _ in range(100):
+            body = tc.get(
+                f"/api/sources/{sid}/resolve/status", headers=_bearer(_TOKEN)
+            ).json()
+            if body["state"] != "running":
+                return body
+            time.sleep(0.02)
+        raise AssertionError("resolve job never finished")
+
+    def test_a_finished_resolve_carries_the_catalog_row(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.return_value = _source_row(_make_source_desc())
+        r = tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        assert r.status_code == 202
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "done"
+        assert body["source"]["source_id"] == "src0"
+        assert body["source"]["is_resolved"] is True
+        assert body["source"]["tensors"]
+
+    def test_a_running_or_failed_resolve_carries_no_row(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.side_effect = RuntimeError("download failed")
+        tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "error"
+        assert "source" not in body
+
+    def test_a_row_that_cannot_be_rendered_still_finishes_done(self, auth_client):
+        # The source is resolved either way; the client just re-reads the
+        # listing. And the poll must settle, not hang on "running".
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.return_value = {"no_source_id": 1}
+        tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "done"
+        assert "source" not in body
 
 
 class TestSliceEndpoint:
@@ -611,9 +795,7 @@ class TestSliceEndpoint:
         )
         # Simulate an adapter that returns big-endian uint16 payloads.
         be_arr = expected.astype(">u2", copy=False)
-        lazy = MagicMock()
-        lazy.compute.return_value = be_arr
-        mock_fc.get_tensor.return_value = lazy
+        mock_fc.get_array.return_value = be_arr
 
         r = self._post_slice(tc)
         assert r.status_code == 200
@@ -626,9 +808,9 @@ class TestSliceEndpoint:
         tc, _ = auth_client
         r = self._post_slice(tc, slice_start=[0, 0, 0], slice_stop=[2, 4, 8])
         assert r.status_code == 200
-        # get_tensor should have been called with slice_hint
+        # get_array should have been called with slice_hint
         _, mock_fc = auth_client
-        call_kwargs = mock_fc.get_tensor.call_args
+        call_kwargs = mock_fc.get_array.call_args
         assert call_kwargs is not None
 
     def test_slice_mismatched_start_stop_returns_422(self, auth_client):
@@ -638,12 +820,12 @@ class TestSliceEndpoint:
 
     def test_slice_flight_error_returns_502(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.get_tensor.side_effect = RuntimeError("Flight connection lost")
+        mock_fc.get_array.side_effect = RuntimeError("Flight connection lost")
         payload = {"array_id": "src0"}
         r = tc.post("/api/slice", json=payload, headers=_bearer(_TOKEN))
         assert r.status_code == 502
         # Reset side effect for subsequent tests
-        mock_fc.get_tensor.side_effect = None
+        mock_fc.get_array.side_effect = None
 
     def test_slice_without_auth_returns_401(self, auth_client):
         tc, _ = auth_client
@@ -655,16 +837,13 @@ class TestSliceEndpoint:
         tc, mock_fc = auth_client
 
         # Create a mock dask array
-        mock_dask = MagicMock()
-        mock_dask.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
-
-        mock_fc.get_tensor.return_value = mock_dask
+        mock_fc.get_array.return_value = np.zeros((2, 4, 8), dtype="uint16")
 
         r = self._post_slice(tc, slice_start=[0, 0, 0], slice_stop=[2, 4, 8])
         assert r.status_code == 200
 
-        # Verify get_tensor was called with slice_hint (server-side slicing)
-        call_kwargs = mock_fc.get_tensor.call_args.kwargs
+        # Verify get_array was called with slice_hint (server-side slicing)
+        call_kwargs = mock_fc.get_array.call_args.kwargs
         assert call_kwargs.get("slice_hint") is not None
         assert call_kwargs["slice_hint"] == (slice(0, 2), slice(0, 4), slice(0, 8))
 
@@ -847,14 +1026,12 @@ class TestSliceAddressing:
 
     def test_it_reads_the_array_id_the_descriptor_came_from(self, auth_client):
         tc, mock_fc = auth_client
-        lazy = MagicMock()
-        lazy.compute.return_value = np.zeros((2, 4, 8), dtype="uint16")
-        mock_fc.get_tensor.return_value = lazy
+        mock_fc.get_array.return_value = np.zeros((2, 4, 8), dtype="uint16")
 
         r = tc.post("/api/slice", json={"array_id": "src0"}, headers=_bearer(_TOKEN))
 
         assert r.status_code == 200
-        call = mock_fc.get_tensor.call_args
+        call = mock_fc.get_array.call_args
         assert call.args[0] == "src0"
         assert "source_id" not in call.kwargs
         assert "tensor_id" not in call.kwargs
@@ -883,7 +1060,7 @@ class TestSliceAddressing:
                 r = tc.post("/api/slice", json={"array_id": "multi"})
 
         assert r.status_code == 200
-        assert mock_fc.get_tensor.call_args.args[0] == "multi/a"
+        assert mock_fc.get_array.call_args.args[0] == "multi/a"
 
     def test_the_old_pair_is_rejected_rather_than_guessed_at(self, auth_client):
         # 422 from the model: a body without array_id names no tensor, and
@@ -895,7 +1072,7 @@ class TestSliceAddressing:
             headers=_bearer(_TOKEN),
         )
         assert r.status_code == 422
-        mock_fc.get_tensor.assert_not_called()
+        mock_fc.get_array.assert_not_called()
 
 
 # ===========================================================================
@@ -936,7 +1113,7 @@ class TestIntegration:
 
         # Bind to port 0 so the OS assigns a free port, avoiding flaky
         # "Address already in use" collisions when the suite runs back-to-back.
-        server = catalog_server("grpc://127.0.0.1:0")
+        server = catalog_server("127.0.0.1:0")
         # Register under the same name as the adapter's array_id so that
         # the source_id returned by the server matches the tensor_id.
         register_and_catalog(server, "int-tensor", adapter)
@@ -973,6 +1150,38 @@ class TestIntegration:
         # source_id comes from DataSourceDescriptor returned by the server
         assert body[0]["source_id"] is not None
         assert body[0]["tensors"][0]["shape"] == list(self._shape)
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_integration_list_sources_with_a_limit(self):
+        # The real metadata DB has to accept the LIMIT the route appends.
+        with self._make_tc() as tc:
+            r = tc.get("/api/sources?limit=1", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert len(r.json()) == 1
+        assert r.headers["X-Truncated"] == "false"
+
+    def test_integration_a_search_row_is_the_listed_descriptor(self):
+        # The viewer's server-side search selects the descriptor columns with the
+        # catalog query and renders from them, so a row has to say what the
+        # listing says -- including the column a newer server adds.
+        columns = "source_id, source_url, source_type, is_resolved, tensors"
+        with self._make_tc() as tc:
+            (listed,) = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": f"SELECT {columns}, unresolved_reason FROM sources"},
+                headers=_bearer(_TOKEN),
+            )
+        assert r.status_code == 200
+        (row,) = r.json()
+        for key in ("source_id", "source_url", "source_type", "is_resolved"):
+            assert row[key] == listed[key]
+        assert [t["array_id"] for t in row["tensors"]] == [
+            t["array_id"] for t in listed["tensors"]
+        ]
+        assert row["tensors"][0]["shape"] == listed["tensors"][0]["shape"]
+        assert row["tensors"][0]["dtype"] == listed["tensors"][0]["dtype"]
+        assert "unresolved_reason" in row
 
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
@@ -1162,7 +1371,7 @@ class TestQuerySourcesEndpoint:
 
         r = tc.post(
             "/api/sources/query",
-            json={"sql": "INSERT INTO sources VALUES ('evil')"},
+            json={"sql": "INSERT INTO source_catalog VALUES ('evil')"},
             headers=_bearer(_TOKEN),
         )
         assert r.status_code == 400
@@ -1184,7 +1393,7 @@ class TestWindowsShutdownListener:
     """The graceful-stop listener the control supervisor drives on Windows."""
 
     def test_sentinel_path_matches_stop_side_contract(self):
-        from biopb import _locations
+        from biopb._config import locations as _locations
         from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
         # Both this poller and DataPlaneSupervisor._win_stop_sentinel (the control
@@ -1271,6 +1480,61 @@ class TestAdminConfigRoutes:
         assert body["path"] == str(config_path)
         assert body["config"]["server"]["port"] == 8815
         assert "properties" in body["schema"]
+
+    def test_the_seal_ttl_is_on_the_admin_form_and_saves(self, admin_client):
+        """The form is the published schema, so a new server key reaches it with
+        its help text and its bound, and a save round-trips."""
+        tc, config_path = admin_client
+        schema = tc.get("/api/config").json()["schema"]
+        prop = schema["properties"]["server"]["properties"]["seal_ttl"]
+        assert prop["minimum"] == 0
+        assert "sealed read ticket" in prop["description"]
+
+        ok = tc.put(
+            "/api/config",
+            json={"server": {"seal_ttl": 7200}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert ok.status_code == 200, ok.text
+        assert tc.get("/api/config").json()["config"]["server"]["seal_ttl"] == 7200
+
+        before = config_path.read_text()
+        bad = tc.put(
+            "/api/config",
+            json={"server": {"seal_ttl": -1}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert bad.status_code == 422
+        assert any(e["path"] == ["server", "seal_ttl"] for e in bad.json()["errors"])
+        assert config_path.read_text() == before
+
+    def test_the_admin_page_sees_the_adapter_idle_setting(self, admin_client):
+        """The page renders what the schema lists, and a value it saves reaches
+        the file the server reads at start."""
+        import json
+
+        tc, config_path = admin_client
+        field = tc.get("/api/config").json()["schema"]["properties"]["server"][
+            "properties"
+        ]["adapter_idle_ttl"]
+        assert field["type"] == "number" and field["minimum"] == 0
+        assert "rebuilt from its catalog row" in field["description"]
+
+        r = tc.put(
+            "/api/config",
+            json={"server": {"adapter_idle_ttl": 300}},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 200
+        assert json.loads(config_path.read_text())["server"]["adapter_idle_ttl"] == 300
+        assert (
+            tc.put(
+                "/api/config",
+                json={"server": {"adapter_idle_ttl": -5}},
+                headers={"Sec-Fetch-Site": "same-origin"},
+            ).status_code
+            == 422
+        )
 
     def test_put_rejects_invalid_value_with_422_and_field_path(self, admin_client):
         tc, config_path = admin_client
@@ -1646,41 +1910,12 @@ def _tile_source_desc(
     )
 
 
-def _label_set_desc(image_axes=(0, 2, 3, 4)) -> SimpleNamespace:
-    """The T Z Y X set of the T C Z Y X image above, as GetFlightInfo serves it.
-
-    ``metadata_json`` is the wrapped form the wire carries, with the axis
-    mapping under ``biopb.labels`` beside the NGFF ``image-label`` block.
-    """
-    meta = {
-        "image-label": {"version": "0.4", "source": {"image": "tiled/Image:0"}},
-    }
-    if image_axes is not None:
-        meta["biopb"] = {"labels": {"image_axes": list(image_axes)}}
-    return SimpleNamespace(
-        array_id="tiled/Image:0/@labels/nuclei",
-        shape=[1, 16, 1024, 1024],
-        chunk_shape=[1, 1, 512, 512],
-        dtype="uint32",
-        dim_labels=["t", "z", "y", "x"],
-        physical_scale=[],
-        physical_unit=[],
-        content_version=None,
-        pyramid=[],
-        metadata_json=json.dumps(
-            {"type": "zarr", "dim_label": ["t", "z", "y", "x"], "metadata": meta}
-        ),
-    )
-
-
 @pytest.fixture()
 def tile_client():
     """TestClient over a tiled tensor; compute() yields one 512x512 plane."""
     src = _tile_source_desc()
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_array.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -1835,77 +2070,6 @@ class TestTileInfoEndpoint:
         assert tc.get("/api/tile_info/src0").status_code == 401
 
 
-class TestTileInfoStatesALabelSetsAxes:
-    """Which of its image's axes a label set indexes, read rather than derived.
-
-    The two tensors do not number their axes alike (a set spans the image's
-    *non-channel* extent), so a client matching them by name gets `t`/`z` right
-    and an unnamed axis wrong -- frame 0 of a timelapse where frame 40 was
-    asked for. The server states the mapping; this is the route that carries it.
-    """
-
-    @pytest.fixture()
-    def labelled(self):
-        def build(image_axes=(0, 2, 3, 4)):
-            src = _tile_source_desc()
-            src.tensors.append(_label_set_desc(image_axes))
-            mock_fc = _build_mock_client(src)
-            # The real GetFlightInfo fills metadata_json only when the mask asks
-            # for it. Without modelling that, a route that forgot to ask would
-            # still be handed the metadata and this whole class would pass.
-            served = mock_fc.get_descriptor.side_effect
-
-            def masked(array_id, **kwargs):
-                td = served(array_id, **kwargs)
-                if kwargs.get("with_metadata"):
-                    return td
-                return SimpleNamespace(**{**vars(td), "metadata_json": None})
-
-            mock_fc.get_descriptor.side_effect = masked
-            with patch(
-                "biopb_tensor_server.serving.http_server.TensorFlightClient",
-                return_value=mock_fc,
-            ):
-                app = create_app(token=None)
-                with TestClient(app, raise_server_exceptions=True) as tc:
-                    yield tc, mock_fc
-
-        return contextmanager(build)
-
-    def test_carries_the_mapping_the_server_states(self, labelled):
-        with labelled() as (tc, _):
-            body = tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei").json()
-            assert body["image_axes"] == [0, 2, 3, 4]
-
-    def test_an_image_carries_none(self, labelled):
-        # Absent, not null: an image has no image to map onto, and a client
-        # reading the field is asking a question only a set can answer.
-        with labelled() as (tc, _):
-            assert "image_axes" not in tc.get("/api/tile_info/tiled/Image:0").json()
-
-    def test_a_server_predating_the_block_simply_omits_it(self, labelled):
-        with labelled(None) as (tc, _):
-            body = tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei").json()
-            assert "image_axes" not in body
-
-    def test_metadata_is_fetched_only_for_a_set(self, labelled):
-        # The mapping rides in the metadata, and a source's metadata row can be
-        # a whole OME-XML: paying for it on every image's grid would be a real
-        # cost for a field only a set has.
-        with labelled() as (tc, mock_fc):
-            tc.get("/api/tile_info/tiled/Image:0")
-            assert all(
-                not call.kwargs.get("with_metadata")
-                for call in mock_fc.get_descriptor.call_args_list
-            )
-            mock_fc.get_descriptor.reset_mock()
-            tc.get("/api/tile_info/tiled/Image:0/@labels/nuclei")
-            assert any(
-                call.kwargs.get("with_metadata")
-                for call in mock_fc.get_descriptor.call_args_list
-            )
-
-
 class TestTileEndpoint:
     def test_raw_tile_returns_bytes_and_shape_headers(self, tile_client):
         tc, _ = tile_client
@@ -1919,7 +2083,7 @@ class TestTileEndpoint:
     def test_neighbouring_tiles_ask_for_adjacent_world_bounds(self, tile_client):
         tc, mock_fc = tile_client
         tc.get("/api/tile/tiled", params={"level": 0, "col": 1, "row": 0})
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         # Bounds are full-resolution world coords: col 1 starts one tile in.
         assert kwargs["slice_hint"][4] == slice(512, 1024)
         assert kwargs["slice_hint"][3] == slice(0, 512)
@@ -1930,7 +2094,7 @@ class TestTileEndpoint:
     def test_a_coarser_level_covers_more_world(self, tile_client):
         tc, mock_fc = tile_client
         tc.get("/api/tile/tiled", params={"level": 1, "col": 0, "row": 0})
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         # World bounds come from the level addressed, whatever level is read.
         assert kwargs["slice_hint"][4] == slice(0, 1024)
         assert kwargs["slice_hint"][3] == slice(0, 1024)
@@ -1941,7 +2105,7 @@ class TestTileEndpoint:
         # scale 2 happens here, off the one warmed level (precache-policy.md 4.2).
         tc, mock_fc = tile_client
         r = tc.get("/api/tile/tiled", params={"level": 1, "col": 0, "row": 0})
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         assert kwargs["scale_hint"][3] == 1 and kwargs["scale_hint"][4] == 1
         # The mock answers 512x512 whatever it is asked; halving it is the proof
         # the in-process reduction ran.
@@ -1960,7 +2124,7 @@ class TestTileEndpoint:
         assert r.status_code == 410
         assert "POST /api/slice" in r.json()["detail"]
         # Refused before any backend call, like `fmt`.
-        mock_fc.get_tensor.assert_not_called()
+        mock_fc.get_array.assert_not_called()
 
     @pytest.mark.parametrize("spelling", ["nearest", "decimate", "stride", "NEAREST"])
     def test_the_kernel_that_tiles_already_use_is_still_accepted(
@@ -1975,20 +2139,20 @@ class TestTileEndpoint:
     def test_full_resolution_is_read_directly(self, tile_client):
         tc, mock_fc = tile_client
         r = tc.get("/api/tile/tiled", params={"level": 0, "col": 0, "row": 0})
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         assert kwargs["scale_hint"][3] == 1 and kwargs["scale_hint"][4] == 1
         assert r.headers["X-Shape"] == "1,1,1,512,512"
 
     def test_edge_tile_is_clipped_to_the_plane(self, tile_client):
         tc, mock_fc = tile_client
         tc.get("/api/tile/tiled", params={"level": 0, "col": 1, "row": 1})
-        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        hint = mock_fc.get_array.call_args.kwargs["slice_hint"]
         assert hint[3].stop == 1024 and hint[4].stop == 1024
 
     def test_selection_indexes_the_labelled_axis(self, tile_client):
         tc, mock_fc = tile_client
         tc.get("/api/tile/tiled", params={"c": 2, "z": 7})
-        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        hint = mock_fc.get_array.call_args.kwargs["slice_hint"]
         assert hint[1] == slice(2, 3)  # c
         assert hint[2] == slice(7, 8)  # z
 
@@ -2022,13 +2186,13 @@ class TestTileEndpoint:
         its input up to a multiple of the scale factor. Level 17 on a 512px
         plane therefore asks the data plane to allocate and write a 65536x65536
         array -- measured: level 13 already pads to 8192x8192, and the cost
-        scales with the square. Rejecting before `get_tensor` is what keeps one
+        scales with the square. Rejecting before `get_array` is what keeps one
         query parameter from sizing an allocation in a shared backend process.
         """
         tc, mock_fc = tile_client
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         assert tc.get("/api/tile/tiled", params={"level": 17}).status_code == 404
-        assert mock_fc.get_tensor.call_count == before
+        assert mock_fc.get_array.call_count == before
 
     def test_the_advertised_grid_is_exactly_what_is_servable(self, tile_client):
         """tile_info and /api/tile must agree; they used to derive it twice."""
@@ -2115,11 +2279,11 @@ class TestTileEndpoint:
     def test_matching_etag_revalidates_to_304_without_reading(self, tile_client):
         tc, mock_fc = tile_client
         etag = tc.get("/api/tile/tiled").headers["ETag"]
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         r = tc.get("/api/tile/tiled", headers={"If-None-Match": etag})
         assert r.status_code == 304
         assert r.content == b""
-        assert mock_fc.get_tensor.call_count == before  # no backend read
+        assert mock_fc.get_array.call_count == before  # no backend read
 
     def test_etag_distinguishes_tiles(self, tile_client):
         tc, _ = tile_client
@@ -2143,12 +2307,12 @@ class TestTileEndpoint:
         # that asked for a PNG is the silent-wrong-content failure `sel` exists
         # to prevent.
         tc, mock_fc = tile_client
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         for bad in ("png", "jpeg"):
             r = tc.get("/api/tile/tiled", params={"fmt": bad})
             assert r.status_code == 410, r.text
             assert "fmt=raw" in r.json()["detail"]
-        assert mock_fc.get_tensor.call_count == before
+        assert mock_fc.get_array.call_count == before
 
 
 # ===========================================================================
@@ -2165,19 +2329,19 @@ class TestCancellation:
 
     def test_tile_skips_the_read_and_answers_499(self, tile_client):
         tc, mock_fc = tile_client
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         with patch("starlette.requests.Request.is_disconnected", _disconnected):
             r = tc.get("/api/tile/tiled")
         assert r.status_code == 499
-        assert mock_fc.get_tensor.call_count == before
+        assert mock_fc.get_array.call_count == before
 
     def test_slice_skips_the_read_and_answers_499(self, dev_client):
         tc, mock_fc = dev_client
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         with patch("starlette.requests.Request.is_disconnected", _disconnected):
             r = tc.post("/api/slice", json={"array_id": "src0"})
         assert r.status_code == 499
-        assert mock_fc.get_tensor.call_count == before
+        assert mock_fc.get_array.call_count == before
 
     def test_cancellations_are_counted_in_diagnostics(self, tile_client):
         tc, _ = tile_client
@@ -2192,9 +2356,9 @@ class TestCancellation:
 
     def test_a_connected_client_is_unaffected(self, tile_client):
         tc, mock_fc = tile_client
-        before = mock_fc.get_tensor.call_count
+        before = mock_fc.get_array.call_count
         assert tc.get("/api/tile/tiled").status_code == 200
-        assert mock_fc.get_tensor.call_count == before + 1
+        assert mock_fc.get_array.call_count == before + 1
 
 
 # ===========================================================================
@@ -2211,9 +2375,7 @@ def _tile_client_for(dim_labels, shape):
     src = _make_source_desc(source_id="s", tensors=[td])
     mock_fc = _build_mock_client(src)
     plane = np.zeros([1] * (len(shape) - 2) + [8, 8], dtype=np.uint16)
-    lazy = MagicMock()
-    lazy.compute.return_value = plane
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_array.return_value = plane
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2224,7 +2386,7 @@ def _tile_client_for(dim_labels, shape):
 
 def _slice_hint_bounds(mock_fc):
     """The (start, stop) vectors of the last backend read, per axis."""
-    hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+    hint = mock_fc.get_array.call_args.kwargs["slice_hint"]
     return [sl.start for sl in hint], [sl.stop for sl in hint]
 
 
@@ -2286,9 +2448,9 @@ class TestTileSelectionValidation:
 
     def test_a_rejected_selection_never_reaches_the_backend(self):
         with _tile_client_for(["y", "x"], [512, 512]) as (tc, mock_fc):
-            before = mock_fc.get_tensor.call_count
+            before = mock_fc.get_array.call_count
             assert tc.get("/api/tile/s", params={"c": 4}).status_code == 422
-            assert mock_fc.get_tensor.call_count == before
+            assert mock_fc.get_array.call_count == before
 
 
 class TestTileInfoUnnamedAxes:
@@ -2390,9 +2552,9 @@ class TestTilePositionalSelection:
 
     def test_a_rejected_sel_never_reaches_the_backend(self):
         with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, mock_fc):
-            before = mock_fc.get_tensor.call_count
+            before = mock_fc.get_array.call_count
             assert tc.get("/api/tile/s", params={"sel": "0:999"}).status_code == 422
-            assert mock_fc.get_tensor.call_count == before
+            assert mock_fc.get_array.call_count == before
 
     def test_the_etag_follows_the_plane_not_the_spelling(self):
         with _tile_client_for(["i", "y", "x"], [155, 1024, 1344]) as (tc, _):
@@ -2437,9 +2599,7 @@ def _multi_tensor_client():
     ]
     src = _make_source_desc(source_id="multi", tensors=tensors)
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_array.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2501,7 +2661,7 @@ class TestTileGridComesFromTheDescribedTensor:
                 (source,) = tc.get("/api/sources").json()
 
         assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
-        assert source["tensors"][0]["chunk_shape"] == []
+        assert "chunk_shape" not in source["tensors"][0]
 
 
 class TestTileArrayIdAddressing:
@@ -2569,7 +2729,7 @@ class TestTileArrayIdAddressing:
         """
         with _multi_tensor_client() as (tc, mock_fc):
             assert tc.get("/api/tile/multi/Image:1").status_code == 200
-            assert mock_fc.get_tensor.call_args.args[0] == "multi/Image:1"
+            assert mock_fc.get_array.call_args.args[0] == "multi/Image:1"
 
     def test_no_tensor_id_parameter_is_accepted_any_more(self):
         # A stale caller passing the old pair must not silently address
@@ -2588,9 +2748,7 @@ class TestTileArrayIdAddressing:
 def _versioned_tile_client(content_version):
     """A tile client whose source publishes *content_version* (or None)."""
     mock_fc = _build_mock_client(_tile_source_desc(content_version))
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_array.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -2704,10 +2862,10 @@ class TestVersionedTileRequests:
             stale = _published_array_id(tc)
         # Same source, re-indexed: the token it published is no longer current.
         with _versioned_tile_client(b"1700009999:5120") as (tc, mock_fc):
-            before = mock_fc.get_tensor.call_count
+            before = mock_fc.get_array.call_count
             r = tc.get(f"/api/tile/{stale}")
             assert r.status_code == 404, r.text
-            assert mock_fc.get_tensor.call_count == before
+            assert mock_fc.get_array.call_count == before
             # The 404 still names what does exist, as every other one does.
             assert "tiled/Image:0" in r.json()["detail"]
 
@@ -2749,9 +2907,9 @@ class TestVersionedTileRequests:
             mock_fc = _build_mock_client(_tile_source_desc(listing_cv))
             fresh = _tile_source_desc(descriptor_cv).tensors[0]
             mock_fc.get_descriptor.side_effect = lambda aid, **k: fresh
-            lazy = MagicMock()
-            lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-            mock_fc.get_tensor.return_value = lazy
+            mock_fc.get_array.return_value = np.zeros(
+                (1, 1, 1, 512, 512), dtype=np.uint16
+            )
             return mock_fc
 
         def serve(mock_fc, fn):
@@ -2892,7 +3050,7 @@ class TestIntegrationLoneQualifiedTensor:
         # One tensor, carrying a name: array_id becomes "lone/Image:0".
         adapter._tensor_name = "Image:0"
 
-        server = catalog_server("grpc://127.0.0.1:0")
+        server = catalog_server("127.0.0.1:0")
         register_and_catalog(server, "lone", adapter)
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(0.5)
@@ -3133,9 +3291,7 @@ class TestScalePolicyOnSlice:
             dim_labels=["z", "y", "x"],
         )
         mock_fc = _build_mock_client(_make_source_desc(source_id="big", tensors=[td]))
-        lazy = MagicMock()
-        lazy.compute.return_value = np.zeros((256, 256, 256), dtype=np.uint16)
-        mock_fc.get_tensor.return_value = lazy
+        mock_fc.get_array.return_value = np.zeros((256, 256, 256), dtype=np.uint16)
         with patch(
             "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
@@ -3147,7 +3303,7 @@ class TestScalePolicyOnSlice:
                     json={"array_id": "big/Image:0", "scale_policy": "volume"},
                 )
         assert r.status_code == 200, r.text
-        assert mock_fc.get_tensor.call_args.kwargs["scale_hint"] == [4, 4, 4]
+        assert mock_fc.get_array.call_args.kwargs["scale_hint"] == [4, 4, 4]
         # Echoed, because the caller did not choose it: this header is the only
         # statement of what it got.
         assert r.headers["X-Scale-Hint"] == "4,4,4"
@@ -3156,7 +3312,7 @@ class TestScalePolicyOnSlice:
         tc, mock_fc = tile_client
         r = self._post(tc, scale_hint=[1, 1, 1, 2, 2])
         assert r.status_code == 200, r.text
-        assert mock_fc.get_tensor.call_args.kwargs["scale_hint"] == [1, 1, 1, 2, 2]
+        assert mock_fc.get_array.call_args.kwargs["scale_hint"] == [1, 1, 1, 2, 2]
         assert r.headers["X-Scale-Hint"] == "1,1,1,2,2"
 
     def test_an_unscaled_read_still_says_so(self, tile_client):
@@ -3171,14 +3327,14 @@ class TestScalePolicyOnSlice:
         r = self._post(tc, scale_policy="volume", scale_hint=[1, 1, 1, 2, 2])
         assert r.status_code == 422
         assert "one scale" in r.json()["detail"]
-        mock_fc.get_tensor.assert_not_called()
+        mock_fc.get_array.assert_not_called()
 
     def test_an_unknown_policy_names_the_ones_that_exist(self, tile_client):
         tc, mock_fc = tile_client
         r = self._post(tc, scale_policy="coarsest")
         assert r.status_code == 422
         assert "volume" in r.json()["detail"]
-        mock_fc.get_tensor.assert_not_called()
+        mock_fc.get_array.assert_not_called()
 
     def test_a_tensor_with_no_volume_gets_the_same_reason_tile_info_gives(self):
         td = _make_tensor_desc(
@@ -3196,7 +3352,7 @@ class TestScalePolicyOnSlice:
                 )
         assert r.status_code == 422
         assert "at least 3" in r.json()["detail"]
-        mock_fc.get_tensor.assert_not_called()
+        mock_fc.get_array.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -3246,9 +3402,7 @@ def native_tile_client():
     """The tile fixture, but shipping a real 3-level on-disk pyramid."""
     src = _native_source_desc()
     mock_fc = _build_mock_client(src)
-    lazy = MagicMock()
-    lazy.compute.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
-    mock_fc.get_tensor.return_value = lazy
+    mock_fc.get_array.return_value = np.zeros((1, 1, 1, 512, 512), dtype=np.uint16)
     with patch(
         "biopb_tensor_server.serving.http_server.TensorFlightClient",
         return_value=mock_fc,
@@ -3339,7 +3493,7 @@ class TestNativeLevelsOnTheTileRoute:
         tc, mock_fc = native_tile_client
         r = tc.get("/api/tile/native", params={"level": 2, "col": 0, "row": 0})
         assert r.status_code == 200
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         # Both halves of the address: an exact scale AND `precompute`. Either
         # one alone lands on a computed read of level 0.
         assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
@@ -3350,7 +3504,7 @@ class TestNativeLevelsOnTheTileRoute:
     ):
         tc, mock_fc = native_tile_client
         r = tc.get("/api/tile/native", params={"level": 3, "col": 0, "row": 0})
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
         # The mock answers 512x512 whatever it is asked; halving it is the proof
         # the in-process residual ran.
@@ -3359,7 +3513,7 @@ class TestNativeLevelsOnTheTileRoute:
     def test_world_bounds_still_come_from_the_rung_addressed(self, native_tile_client):
         tc, mock_fc = native_tile_client
         tc.get("/api/tile/native", params={"level": 2, "col": 0, "row": 0})
-        hint = mock_fc.get_tensor.call_args.kwargs["slice_hint"]
+        hint = mock_fc.get_array.call_args.kwargs["slice_hint"]
         # Level 2 at edge 512 spans 2048 world units, whatever level is read.
         assert hint[3] == slice(0, 2048) and hint[4] == slice(0, 2048)
 
@@ -3432,7 +3586,7 @@ class TestNativeLevelsOnTheVolumePath:
             json={"array_id": "native/Image:0", "scale_policy": "volume"},
         )
         assert r.status_code == 200, r.text
-        kwargs = mock_fc.get_tensor.call_args.kwargs
+        kwargs = mock_fc.get_array.call_args.kwargs
         assert kwargs["scale_hint"] == [1, 1, 1, 4, 4]
         assert kwargs["reduction_method"] == "precompute"
         assert r.headers["X-Scale-Hint"] == "1,1,1,4,4"
@@ -3576,12 +3730,11 @@ class TestVolumeStaysWithinTheBudget:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestSingleSourceIsNotCappedByTheListing:
-    """A source past the listing's row cap is unbrowsable but readable.
+class TestListingCap:
+    """A source past the listing's row cap is unlisted but still addressable.
 
-    Real Flight server, real sidecar. `/api/sources/{id}` used to look the id up
-    in the listing, so it inherited the browse cap and answered 404 for a source
-    that reads perfectly well -- purely because of where the id sorted.
+    Real Flight server, real sidecar. The listing says it was cut, and a catalog
+    query keyed on the id still finds the source the cap clipped.
     """
 
     @pytest.fixture(autouse=True)
@@ -3593,7 +3746,7 @@ class TestSingleSourceIsNotCappedByTheListing:
         # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
         # clipped from the listing (which is a catalog query).
         db = MetadataDatabase(max_query_results=1)
-        server = TensorFlightServer("grpc://127.0.0.1:0", metadata_db=db)
+        server = TensorFlightServer("127.0.0.1:0", metadata_db=db)
         for sid in ("a", "b", "c"):
             z = zarr.open_array(
                 str(tmp_path / f"{sid}.zarr"),
@@ -3624,22 +3777,22 @@ class TestSingleSourceIsNotCappedByTheListing:
             raise_server_exceptions=True,
         )
 
-    def test_the_listing_is_still_capped(self):
+    def test_the_listing_is_capped_and_says_so(self):
         with self._tc() as tc:
             r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.status_code == 200
         assert [s["source_id"] for s in r.json()] == ["a"]
+        assert r.headers["X-Truncated"] == "true"
 
-    def test_the_clipped_source_still_answers_by_id(self):
+    def test_the_clipped_source_still_answers_a_query_by_id(self):
         with self._tc() as tc:
-            r = tc.get("/api/sources/c", headers=_bearer(_TOKEN))
+            r = tc.post(
+                "/api/sources/query",
+                json={"sql": "SELECT source_id FROM sources WHERE source_id = 'c'"},
+                headers=_bearer(_TOKEN),
+            )
         assert r.status_code == 200
-        assert r.json()["source_id"] == "c"
-
-    def test_an_id_nothing_holds_is_still_a_404(self):
-        with self._tc() as tc:
-            r = tc.get("/api/sources/nope", headers=_bearer(_TOKEN))
-        assert r.status_code == 404
+        assert [row["source_id"] for row in r.json()] == ["c"]
 
 
 # ===========================================================================
@@ -3670,9 +3823,7 @@ class TestResolveWarmJobs:
         assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
         mock_fc.resolve_source.assert_called_once()
 
-    def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
-        # /api/sources/{source_id:path} is greedy: without this route ordering
-        # the status GET reads as a source whose id is "cloud0/resolve/status".
+    def test_status_reports_the_job(self, auth_client):
         tc, _ = auth_client
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "done")
@@ -3756,60 +3907,11 @@ class TestResolveWarmJobs:
         body = _await_state(tc, "resolve", "cloud0", "error")
         assert "offline" in body["error"]
 
-    def test_warm_reports_the_terminal_counts_not_the_last_heartbeat(self, auth_client):
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=12,
-            files_done=12,
-            bytes_total=2048,
-            bytes_done=2048,
-            current_name="",
-            elapsed_seconds=3.0,
-        )
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        body = _await_state(tc, "warm", "cloud0", "done")
-        assert body["progress"]["files_done"] == 12
-        assert body["progress"]["bytes_total"] == 2048
-
-    def test_warm_on_a_single_file_source_reports_nothing_to_do(self, auth_client):
-        # files_total == 0 is how a client tells single-file from multi-file
-        # without keeping its own list of source types.
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=0,
-            files_done=0,
-            bytes_total=0,
-            bytes_done=0,
-            current_name="",
-            elapsed_seconds=0.0,
-        )
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        body = _await_state(tc, "warm", "cloud0", "done")
-        assert body["progress"]["files_total"] == 0
-
-    def test_resolve_and_warm_are_separate_jobs_on_one_source(self, auth_client):
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=1,
-            files_done=1,
-            bytes_total=8,
-            bytes_done=8,
-            current_name="",
-            elapsed_seconds=0.1,
-        )
-        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        _await_state(tc, "resolve", "cloud0", "done")
-        _await_state(tc, "warm", "cloud0", "done")
-
     def test_every_route_requires_the_token(self, auth_client):
         tc, _ = auth_client
         for method, path in [
             ("post", "/api/sources/c/resolve"),
             ("get", "/api/sources/c/resolve/status"),
             ("post", "/api/sources/c/resolve/cancel"),
-            ("post", "/api/sources/c/warm"),
-            ("get", "/api/sources/c/warm/status"),
-            ("post", "/api/sources/c/warm/cancel"),
         ]:
             assert getattr(tc, method)(path).status_code == 401, path

@@ -15,6 +15,9 @@ from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_image_base.server import RESULT_TTL_S, EmbeddedTensorCache
 
+# The embedded cache is an optional runtime piece: the tests need the server.
+pytest.importorskip("biopb_tensor_server")
+
 
 def _free_tcp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -39,7 +42,7 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
     # Production's shape: the Flight write path refused, a write_dir anyway --
     # that is what gives the server the scratch source results are added to.
     tensor_server = TensorFlightServer(
-        location="grpc://0.0.0.0:0",
+        location="0.0.0.0:0",
         writable=False,
         write_dir=tmp_path / "uploads",
         scratch_ttl=RESULT_TTL_S,
@@ -77,7 +80,7 @@ def served_embedded_cache(tmp_path: Path):
     # token nobody is given -- there so `_authorize` fails closed.
     server_token = secrets.token_urlsafe(16)
     tensor_server = TensorFlightServer(
-        location=location,
+        location=location.removeprefix("grpc://"),
         token=server_token,
         writable=False,
         write_dir=tmp_path / "uploads",
@@ -227,13 +230,13 @@ def test_a_restart_does_not_adopt_the_last_run_s_results(tmp_path: Path):
             np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
         )
         field = array_id.partition("/")[2]
-        assert first.sources.get("scratch").attached_tensor(field) is not None
+        assert first.sources.attached("scratch", field) is not None
     finally:
         first.shutdown()
 
     second = _run(_free_tcp_port())
     try:
-        assert second.sources.get("scratch").attached_tensors == {}
+        assert second.sources.attachments("scratch") == {}
     finally:
         second.shutdown()
         CacheManager.reset()
@@ -330,7 +333,7 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     # caller that merely reaches the port cannot enumerate anything.
     location = served_embedded_cache._external_location
     with pytest.raises(flight.FlightUnauthenticatedError):
-        TensorFlightClient(location).list_sources()
+        TensorFlightClient(location).query("SELECT 1")
 
     # And behind it, this server is catalog-less (metadata_db=None): a result
     # is reachable only through the array_id its SerializedTensor carries. The
@@ -338,7 +341,7 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     with pytest.raises(flight.FlightError, match="no catalog"):
         TensorFlightClient(
             location, token=served_embedded_cache._server._server_token
-        ).list_sources()
+        ).query("SELECT 1")
 
 
 def test_finish_seals_the_result_and_refuses_later_writes(

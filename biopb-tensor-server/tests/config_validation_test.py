@@ -2,7 +2,7 @@
 surfaces (biopb/biopb#34).
 
 Out-of-range / bad-enum knobs are caught where a config is *read* -- the shared
-``biopb._config_validate`` checker biopb-mcp and the control use too -- and
+``biopb._config.validate`` checker biopb-mcp and the control use too -- and
 replaced with their defaults, with a warning naming the key. They never reach the
 request path (the actual bug: ``downscale_factor=0`` -> ZeroDivisionError in
 GetFlightInfo), and they never stop a supervised server from starting either.
@@ -16,6 +16,7 @@ import pytest
 from biopb_tensor_server.core.config import (
     AnnotationsConfig,
     CacheConfig,
+    CatalogConfig,
     MetadataDbConfig,
     PrecacheConfig,
     PyramidConfig,
@@ -42,6 +43,7 @@ def _default_of(section, field):
         "precache": PrecacheConfig,
         "metadata_db": MetadataDbConfig,
         "annotations": AnnotationsConfig,
+        "catalog": CatalogConfig,
     }
     return getattr(defaults[section](), field)
 
@@ -107,7 +109,15 @@ def _default_of(section, field):
             "annotations",
             "prune_unseen_days",
         ),
+        # A zero threshold would checkpoint after every commit.
+        (
+            {"catalog": {"checkpoint_threshold_mb": 0}},
+            "catalog",
+            "checkpoint_threshold_mb",
+        ),
         ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
+        # A negative lifetime is not "never": 0 is.
+        ({"server": {"seal_ttl": -1}}, "server", "seal_ttl"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
 )
@@ -120,6 +130,12 @@ def test_bad_value_is_clamped_with_a_warning(raw, section, field, caplog):
     assert f"{section}.{field}" in msgs[0]
     # ...and the value in force is the default, not the rejected one.
     assert getattr(_section_of(config, section), field) == _default_of(section, field)
+
+
+def test_the_checkpoint_threshold_is_read_from_the_catalog_section():
+    assert parse_config({}).catalog.checkpoint_threshold_mb == 1024
+    raw = {"catalog": {"checkpoint_threshold_mb": 256}}
+    assert parse_config(raw).catalog.checkpoint_threshold_mb == 256
 
 
 def test_warning_describes_accepted_range_and_enum_and_the_default_used(caplog):
@@ -472,3 +488,47 @@ def test_per_upstream_tls_trust_survives_the_parse():
     profile = cfg.credentials.profiles[0]
     assert profile.tls_ca_file == "/etc/biopb/lab-ca.pem"
     assert profile.tls_fingerprint == "AB:CD:EF"
+
+
+def test_uploads_are_on_by_default():
+    cfgobj = parse_config({})
+    assert cfgobj.writable is True
+    assert cfgobj.write_dir is None  # the default is resolved at startup
+
+
+def _write_dir_of(config, **kw):
+    from biopb_tensor_server import cli
+
+    server, _, _ = cli._setup_flight_server(config, port=0, **kw)
+    try:
+        return server.uploads.write_dir
+    finally:
+        server.shutdown()
+
+
+def test_a_writable_server_defaults_its_write_dir_to_the_data_tree(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path))
+    cfg = parse_config({"cache": {"file_cache_dir": str(tmp_path / "c")}})
+    assert _write_dir_of(cfg) == tmp_path / "biopb" / "tensor-server" / "uploads"
+
+
+def test_a_server_that_is_not_writable_has_no_default_write_dir(tmp_path):
+    cfg = parse_config(
+        {"server": {"writable": False}, "cache": {"file_cache_dir": str(tmp_path)}}
+    )
+    assert _write_dir_of(cfg) is None
+    # the flag overrides the config the same way
+    cfg = parse_config({"cache": {"file_cache_dir": str(tmp_path)}})
+    assert _write_dir_of(cfg, writable=False) is None
+
+
+def test_a_named_write_dir_is_honored_even_when_not_writable(tmp_path):
+    cfg = parse_config(
+        {
+            "server": {"writable": False, "write_dir": str(tmp_path / "w")},
+            "cache": {"file_cache_dir": str(tmp_path / "c")},
+        }
+    )
+    assert _write_dir_of(cfg) == tmp_path / "w"

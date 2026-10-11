@@ -2,12 +2,34 @@ import type { StateCreator } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { withBase } from "../base";
+import { catalogIsFilling } from "../utils/catalogHealth";
 import type { AppState } from "./types";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
-// Internal timer storage (non-reactive, module-level)
-let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
+/** Most sources one listing carries. A tree of more is slow to draw and a poll
+ *  of more slow to parse; the server says when the catalog is longer. */
+export const CATALOG_LIMIT = 20_000;
+
+/** Delays between catalog polls: a quiet catalog is asked about less and less. */
+export const POLL_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000];
+
+/** The backoff step after a poll: back to the start while the catalog is
+ *  changing or still being indexed, one further out while it is not. */
+export function nextPollStep(step: number, active: boolean): number {
+  return active ? 0 : Math.min(step + 1, POLL_BACKOFF_MS.length - 1);
+}
+
+/** One listing, ordered by `source_url` for display and comparison. */
+async function fetchCatalog(client: TensorFlightClient) {
+  const { sources, truncated } = await client.listSourcesPage(CATALOG_LIMIT);
+  return { sorted: sources.sort((a, b) => a.source_url.localeCompare(b.source_url)), truncated };
+}
+
+// Internal timer storage (non-reactive, module-level). The generation tells a
+// poll still in flight that the loop it belonged to was stopped.
+let _pollingTimerId: ReturnType<typeof setTimeout> | undefined;
+let _pollingGeneration = 0;
 
 /**
  * Everything about a catalog listing the tree renders off, as one string.
@@ -15,8 +37,8 @@ let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
  * The poll used to diff the `source_url` set alone, which is blind to every
  * in-place change: a cloud source that resolves was already listed under that
  * url, it just gained its tensors and flipped its flags, so the tree kept
- * showing it as unresolved until a manual reload (biopb/biopb#1030). Warming
- * and eviction are invisible the same way. `JSON.stringify` covers every
+ * showing it as unresolved until a manual reload (biopb/biopb#1030). Eviction
+ * is invisible the same way. `JSON.stringify` covers every
  * field of `DataSourceDescriptor` by construction, so a field added later
  * can't go silently blind to the poll the way the url-only check did.
  *
@@ -52,8 +74,9 @@ export interface ConnectionSlice {
   // running. Lets the source list show "Indexing…" instead of "No sources" when
   // the catalog is briefly empty at startup. Refreshed from /readyz.
   scanning: boolean;
-  // Catalog polling
-  pollingInterval: number;
+  // The server held back sources past `CATALOG_LIMIT`: `sources` is a prefix of
+  // the catalog, not all of it.
+  catalogTruncated: boolean;
   initClient: (apiBase: string, token: string | null, devMode: boolean) => void;
   loadSources: () => Promise<void>;
   querySources: (sql: string) => Promise<QuerySourcesResult>;
@@ -72,8 +95,7 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
   sources: [],
   sourcesLoading: false,
   scanning: false,
-
-  pollingInterval: 60000,
+  catalogTruncated: false,
 
   initClient(apiBase, token, devMode) {
     set({
@@ -90,10 +112,13 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
     if (!client) return;
     set({ sourcesLoading: true });
     try {
-      const sources = await client.listSources();
-      // Sort sources by source_url for consistent display and comparison
-      const sorted = sources.sort((a, b) => a.source_url.localeCompare(b.source_url));
-      set({ sources: sorted, sourcesLoading: false, connectionState: "connected" });
+      const { sorted, truncated } = await fetchCatalog(client);
+      set({
+        sources: sorted,
+        catalogTruncated: truncated,
+        sourcesLoading: false,
+        connectionState: "connected",
+      });
     } catch (err) {
       set({
         sourcesLoading: false,
@@ -117,55 +142,72 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
   },
 
   startCatalogPolling() {
-    const pollingTimerId = setInterval(async () => {
+    get().stopCatalogPolling();
+    const generation = ++_pollingGeneration;
+    let step = 0;
+
+    // One poll. True when the next one should come soon: the catalog moved, is
+    // still being indexed, or no answer was had (not connected, or a failure --
+    // a backoff must not widen while the server is the thing that is wrong).
+    const poll = async (): Promise<boolean> => {
       const { client } = get();
-      if (!client || get().connectionState !== "connected") return;
+      if (!client || get().connectionState !== "connected") return true;
 
+      // The listing and the scan-in-progress flag are independent. The flag
+      // clears the "Indexing…" hint once the background catalog scan finishes
+      // (best-effort; a readyz blip just leaves the previous value).
+      const [{ sorted, truncated }, readyz] = await Promise.all([
+        fetchCatalog(client),
+        client.http.readyz().catch(() => null),
+      ]);
+      // Stopped, or pointed at another server, while this was in flight: what
+      // it fetched belongs to the old one.
+      if (generation !== _pollingGeneration || get().client !== client) return true;
+      if (readyz) set({ scanning: catalogIsFilling(readyz.backend_health) });
+
+      // Read after the awaits: a tensor opened while the listing was in
+      // flight is the one to protect, not the one that was open when it began.
+      const { sources, catalogTruncated, scanning, activeSourceId, target, openTensor } = get();
+      const changed =
+        truncated !== catalogTruncated || catalogFingerprint(sources) !== catalogFingerprint(sorted);
+      if (changed) {
+        set({ sources: sorted, catalogTruncated: truncated });
+
+        // A catalog response is a listing, not proof that an unlisted source
+        // is gone: it may be cut at the limit, still scanning, or temporarily
+        // failed. In particular, retain a source selected from a shared URL,
+        // which deliberately does not need to be present in the listing.
+        if (
+          activeSourceId &&
+          !truncated &&
+          !target.linked &&
+          !sorted.find((s) => s.source_id === activeSourceId)
+        ) {
+          openTensor(null);
+        }
+      }
+      return changed || scanning;
+    };
+
+    const tick = async () => {
+      let active = true;
       try {
-        const newSources = await client.listSources();
-        const sorted = newSources.sort((a, b) => a.source_url.localeCompare(b.source_url));
-
-        // Refresh the scan-in-progress flag so the "Indexing…" hint clears once
-        // the background catalog scan finishes (best-effort; a readyz blip just
-        // leaves the previous value).
-        try {
-          const readyz = await client.http.readyz();
-          set({ scanning: !!readyz.backend_health?.full_scan_in_progress });
-        } catch {
-          // ignore transient readyz errors
-        }
-
-        // Read after the awaits: a tensor opened while the listing was in
-        // flight is the one to protect, not the one that was open when it began.
-        const { sources, activeSourceId, target, openTensor } = get();
-        if (catalogFingerprint(sources) !== catalogFingerprint(sorted)) {
-          set({ sources: sorted });
-
-          // A catalog response is a listing, not proof that an unlisted source
-          // is gone: it may be capped, still scanning, or temporarily failed.
-          // In particular, retain a source selected from a shared URL, which
-          // deliberately does not need to be present in the listing.
-          if (
-            activeSourceId &&
-            !target.linked &&
-            !sorted.find((s) => s.source_id === activeSourceId)
-          ) {
-            openTensor(null);
-          }
-        }
+        active = await poll();
       } catch (err) {
         // Silent failure - don't change connection state for transient errors
         console.warn("Catalog polling error:", err);
       }
-    }, get().pollingInterval);
-
-    // Store timer ID for cleanup
-    _pollingTimerId = pollingTimerId;
+      if (generation !== _pollingGeneration) return;
+      step = nextPollStep(step, active);
+      _pollingTimerId = setTimeout(tick, POLL_BACKOFF_MS[step]);
+    };
+    _pollingTimerId = setTimeout(tick, POLL_BACKOFF_MS[0]);
   },
 
   stopCatalogPolling() {
+    _pollingGeneration++;
     if (_pollingTimerId) {
-      clearInterval(_pollingTimerId);
+      clearTimeout(_pollingTimerId);
       _pollingTimerId = undefined;
     }
   },
