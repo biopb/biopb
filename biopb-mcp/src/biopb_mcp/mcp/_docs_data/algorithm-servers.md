@@ -1,5 +1,5 @@
 ---
-description: Add an op by writing one server file — the header, `@op` and its keywords, input modes, and a GPU torch.
+description: Add an op by writing one server file — the header, `@op` and its keywords, input modes — and running a server elsewhere (a url entry, a Slurm job).
 ---
 
 # Writing an algorithm server
@@ -92,6 +92,61 @@ must be size 1 — slice before calling. Only `"blocks"` maps over them.
 A function that `yield`s is a streaming op, for work that carries state frame
 to frame (tracking, localization): a yielded string is progress, anything else
 one item's result, and what it `return`s is the final result.
+
+## A server someone runs
+
+The control runs only `.py` entries. A server running elsewhere — another machine,
+a cluster job, a container — is named by `~/.config/biopb/algorithms/<name>.json`:
+
+```json
+{"url": "grpc://host:50051"}
+```
+
+`grpcs://` for TLS. Then `ops.refresh()` binds its ops. The control probes it
+with `Describe` and never starts, stops or restarts it: `ops.restart` and
+`ops.logs` refuse it, and its lifecycle belongs to whoever runs it. A `.json`
+with no url, or one sharing a name with a `.py`, is `invalid`; the states are in
+[[ops]]. The entry has no other fields.
+
+**Running the file yourself.** The same file serves on its own:
+`uv run --script server.py --host <host> --port <port>`. `serve()` takes `--host`
+(default `127.0.0.1`), `--port` (default 50051), `--workers`, `--cache-dir` and
+`--describe`, which prints the op list as JSON and exits without binding: run it
+first to check the file on the machine that will serve it.
+
+**No token for a url entry.** A server bound off loopback requires a bearer token
+(`$BIOPB_ALGORITHM_TOKEN`, or one it mints and prints), and a url entry carries
+none, so the control cannot probe it and the kernel cannot call it. Leave it bound
+to loopback and reach it through a tunnel (below).
+
+**Where large results go** is the server's deployment, not the call's:
+
+| deployment | a large result goes to |
+|---|---|
+| `--cache-dir` | the server's own embedded tensor server |
+| `$BIOPB_TENSOR_URL` (and `$BIOPB_TENSOR_TOKEN`) set | that data plane's scratch source |
+| neither | back inline, up to 128 MiB |
+
+**Data crosses the kernel.** A remote server cannot read this machine's plane, so
+an `array_id` input is read here and sent inline (2 GiB cap) unless the plane
+advertises an external address ([[ops]] has the table). Slice first, or run the
+server next to the data.
+
+**A Slurm job, reached by a tunnel.**
+
+```bash
+# job.sbatch
+#SBATCH --cpus-per-task=2 --mem=4G --time=01:00:00
+uv run --script ~/algos/server.py --host 127.0.0.1 --port 50061
+```
+
+1. `sbatch job.sbatch`, then `squeue -j <jobid> -o %N` for the node it runs on.
+2. From the machine running the control: `ssh -N -L 50061:127.0.0.1:50061 <node> &`.
+3. Write `{"url": "grpc://127.0.0.1:50061"}` to `~/.config/biopb/algorithms/<name>.json`
+   and call `ops.refresh()`.
+
+When the job ends or the tunnel drops, the entry turns `unreachable`; rerun the job
+and the tunnel, then `ops.refresh()`.
 
 ## Appendix: a GPU torch
 

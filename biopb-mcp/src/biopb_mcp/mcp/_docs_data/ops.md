@@ -70,6 +70,16 @@ the server too. A streaming op that sends several results returns a list.
 | `error` | answered with an error, or the probe itself failed |
 | `invalid` | the entry is malformed (not a `grpc://` or `grpcs://` URL, or both `x.py` and `x.json` exist) |
 
+`biopb algorithm list --json` prints the control's rows: `name`, `kind`
+(`script` or `url`), `url`, `target`, `scheme`, `state`, `ops`, `op_count`,
+`fingerprint` and `error`. `stopped` is only ever a script entry; a url entry is
+`up`, `unreachable`, `error` or `invalid` by its last probe. To run a server yourself
+and name it by a url entry, see [[algorithm-servers]].
+
+**Two servers with the same op name** are both renamed `<server>_<op>` and the
+plain name goes away, so `ops.invert` stops working when a second server also offers
+`invert`.
+
 ### When a call fails
 
 An argument the op refuses raises `ValueError` with the server's message — read it
