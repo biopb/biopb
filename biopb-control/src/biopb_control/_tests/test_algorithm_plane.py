@@ -444,6 +444,21 @@ def _post_json(path, body):
         return exc.code, json.loads(exc.read())
 
 
+def test_register_a_url_entry_with_a_token_over_http(control, registry):
+    got = _post_json(
+        "/api/algorithms/register", {"url": "grpcs://h:3", "name": "tok", "token": "s3"}
+    )
+    assert got == (200, {"name": "tok"})
+    assert json.loads((registry / "tok.json").read_text()) == {
+        "url": "grpcs://h:3",
+        "token": "s3",
+    }
+    assert (
+        _post_json("/api/algorithms/register", {"url": "grpc://h:4", "token": 5})[0]
+        == 400
+    )
+
+
 def test_register_and_deregister_over_http(control, registry):
     assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"}) == (
         200,

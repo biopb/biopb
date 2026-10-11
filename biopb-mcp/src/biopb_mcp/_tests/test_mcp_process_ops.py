@@ -25,6 +25,7 @@ from biopb_mcp.mcp import _process_ops
 from biopb_mcp.mcp._process_ops import (
     Ops,
     _same_plane,
+    _Server,
 )
 
 PLANE = "grpc://127.0.0.1:8815"
@@ -645,3 +646,11 @@ def test_a_remote_server_gets_inline_data_when_the_plane_advertises_nothing(clie
         call._tensor("image", "src/@fields/x", None, client).WhichOneof("kind")
         == "lazy"
     )
+
+
+def test_a_url_entrys_token_is_sent_as_the_bearer_token():
+    row = {"name": "far", "kind": "url", "url": "grpc://far:1", "token": "s3cret"}
+    _stub, metadata = _Server(row, None).stub()
+    assert metadata == [("authorization", "Bearer s3cret")]
+    row.pop("token")
+    assert _Server(row, None).stub()[1] is None

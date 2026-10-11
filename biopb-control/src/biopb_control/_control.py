@@ -21,10 +21,11 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      dashboard polls).
 - ``GET  /api/algorithms``        -> every algorithm registry entry, with its state
                                      and cached ops; a script entry's row carries
-                                     its loopback url and token.
+                                     its loopback url and token, a url entry's
+                                     its token if it has one.
 - ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
-- ``POST /api/algorithms/register`` (``{url, name?}``), ``POST
+- ``POST /api/algorithms/register`` (``{url, name?, token?}``), ``POST
   /api/algorithms/deregister`` (``?name=``) -> add or remove a url entry.
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
@@ -1454,15 +1455,20 @@ def build_app(
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def algorithms_register(request: Request) -> JSONResponse:
-        # Add a url entry for a server someone else runs: {"url", "name"?}.
+        # Add a url entry for a server someone else runs: {"url", "name"?, "token"?}.
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = None
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
             return JSONResponse({"error": "give a url"}, status_code=400)
+        token = body.get("token")
+        if token is not None and not (isinstance(token, str) and token.strip()):
+            return JSONResponse({"error": "token must be a string"}, status_code=400)
         try:
-            added = algorithms.register_url(body["url"], body.get("name") or None)
+            added = algorithms.register_url(
+                body["url"], body.get("name") or None, token.strip() if token else None
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler

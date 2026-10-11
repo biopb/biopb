@@ -72,7 +72,7 @@ the server too. A streaming op that sends several results returns a list.
 
 `biopb algorithm list --json` prints the control's rows: `name`, `kind`
 (`script` or `url`), `url`, `target`, `scheme`, `state`, `ops`, `op_count`,
-`fingerprint` and `error`. `stopped` is only ever a script entry; a url entry is
+`fingerprint` and `error` (a server's token is left out). `stopped` is only ever a script entry; a url entry is
 `up`, `unreachable`, `error` or `invalid` by its last probe. To run a server yourself
 and name it by a url entry, see [[algorithm-servers]].
 

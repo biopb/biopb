@@ -99,11 +99,12 @@ The control runs only `.py` entries. A server running elsewhere — another mach
 a batch job, a container — is named by `~/.config/biopb/algorithms/<name>.json`:
 
 ```json
-{"url": "grpc://host:50051"}
+{"url": "grpcs://host:50051", "token": "<the server's bearer token>"}
 ```
 
-`grpcs://` for TLS. Then `ops.refresh()` binds its ops. The entry has no other
-fields. The control probes it with `Describe` and never starts, stops or restarts
+`token` is optional, and the file holds a secret, so keep it readable by its owner
+only. `grpcs://` is TLS, checked against the system's trusted roots. Then
+`ops.refresh()` binds its ops. The entry has no other fields. The control probes it with `Describe` and never starts, stops or restarts
 it: `ops.restart` and `ops.logs` refuse it, and its lifecycle belongs to whoever
 runs it. A `.json` with no url, or one sharing a name with a `.py`, is `invalid`;
 the states are in [[ops]].
@@ -112,16 +113,17 @@ the states are in [[ops]].
 
 - **A running server.** The same file serves on its own:
   `uv run --script server.py --host <host> --port <port>`. `serve()` takes `--host`
-  (default `127.0.0.1`), `--port` (default 50051), `--workers`, `--cache-dir` and
-  `--describe`, which prints the op list as JSON and exits without binding: run it
-  first to check the file where it will serve.
+  (default `127.0.0.1`), `--port` (default 50051), `--workers`, `--cache-dir`,
+  `--no-token` (below) and `--describe`, which prints the op list as JSON and exits
+  without binding: run it first to check the file where it will serve.
 - **An address the control's machine can dial.** The url is connected to from the
   machine running the control, so it must reach the server from there, however the
   deployment arranges that.
-- **No token.** A server bound off loopback requires a bearer token
-  (`$BIOPB_ALGORITHM_TOKEN`, or one it mints and prints), and a url entry carries
-  none, so the control cannot probe it and the kernel cannot call it. The server
-  must be bound to loopback, and the entry's url a loopback address that reaches it.
+- **A token policy.** A server bound off loopback requires a bearer token
+  (`$BIOPB_ALGORITHM_TOKEN`, or one it mints and prints at start). Either give the
+  entry that token in its `token` field, or start the server with `--no-token` on a
+  network you trust, where anyone who can reach it can run its ops. A bearer token
+  crosses `grpc://` in clear, so use `grpcs://` when the network is not trusted.
 - **Somewhere for large results.** It is the server's deployment, not the call's:
 
 | deployment | a large result goes to |

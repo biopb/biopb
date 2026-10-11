@@ -69,6 +69,23 @@ def test_a_bad_entry_is_listed_with_its_error(registry):
     assert "both" in listed["c"]
 
 
+def test_a_url_entry_may_carry_a_token(registry):
+    (registry / "far.json").write_text('{"url": "grpcs://gpu:1", "token": " s3cret "}')
+    (registry / "bad.json").write_text('{"url": "grpc://x:1", "token": 7}')
+    listed = {e["name"]: e for e in _registry.entries()}
+    assert listed["far"]["token"] == "s3cret" and listed["far"]["error"] is None
+    assert "token" in listed["bad"]["error"]
+
+
+def test_register_url_keeps_a_token_owner_only(registry):
+    name = _registry.register_url("grpc://gpu:1", "far", token="s3cret")
+    path = registry / f"{name}.json"
+    assert json.loads(path.read_text()) == {"url": "grpc://gpu:1", "token": "s3cret"}
+    assert path.stat().st_mode & 0o077 == 0
+    _registry.register_url("grpc://gpu:2", "open")
+    assert "token" not in json.loads((registry / "open.json").read_text())
+
+
 def test_no_registry_is_empty(home):
     assert _registry.entries() == []
     assert _registry.statuses() == []
@@ -208,6 +225,15 @@ def test_probe_sends_the_token(serve):
     url = serve(_Ops(["a"], token="secret"))
     assert _registry.probe(url, timeout=5.0)["state"] == "error"
     assert _registry.probe(url, token="secret", timeout=5.0)["state"] == "up"
+
+
+def test_a_url_entrys_token_is_probed_with_and_carried_on_its_row(registry, serve):
+    url = serve(_Ops(["a"], token="secret"))
+    (registry / "with.json").write_text(json.dumps({"url": url, "token": "secret"}))
+    (registry / "without.json").write_text(json.dumps({"url": url}))
+    rows = {r["name"]: r for r in _registry.statuses(timeout=5.0)}
+    assert rows["with"]["state"] == "up" and rows["with"]["token"] == "secret"
+    assert rows["without"]["state"] == "error" and "token" not in rows["without"]
 
 
 def test_probe_names_the_retired_protocol(serve):

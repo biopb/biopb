@@ -517,7 +517,10 @@ class AlgorithmPlane:
             return _registry.row(entry, state="new")
         if not probe:
             return _registry.row(entry)
-        return _registry.row(entry, **_registry.probe(entry["url"], timeout=timeout))
+        return _registry.row(
+            entry,
+            **_registry.probe(entry["url"], token=entry.get("token"), timeout=timeout),
+        )
 
     def rows(
         self,
@@ -547,9 +550,11 @@ class AlgorithmPlane:
             script.start_install(retry_failed=False)
         return self.rows(entries=listed)
 
-    def register_url(self, url: str, name: Optional[str] = None) -> str:
+    def register_url(
+        self, url: str, name: Optional[str] = None, token: Optional[str] = None
+    ) -> str:
         """Add a url entry; answer its name. ValueError for a bad URL or name."""
-        return _registry.register_url(url, name, self._directory)
+        return _registry.register_url(url, name, self._directory, token)
 
     def deregister(self, name: str) -> None:
         """Remove a url entry. KeyError if unknown, ValueError for a script entry."""

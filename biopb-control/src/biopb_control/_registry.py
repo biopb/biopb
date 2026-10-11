@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -54,8 +55,14 @@ def _url_entry(name: str, path: Path) -> dict:
     url = data.get("url") if isinstance(data, dict) else None
     if not isinstance(url, str) or not url.strip():
         entry["error"] = 'expected {"url": "grpc://host:port"}'
-    else:
-        entry["url"] = url.strip()
+        return entry
+    entry["url"] = url.strip()
+    token = data.get("token")
+    if token is not None:
+        if isinstance(token, str) and token.strip():
+            entry["token"] = token.strip()
+        else:
+            entry["error"] = '"token" must be a non-empty string'
     return entry
 
 
@@ -172,11 +179,16 @@ def _new_name(name: str, directory: Path) -> str:
 
 
 def register_url(
-    url: str, name: Optional[str] = None, directory: Optional[Path] = None
+    url: str,
+    name: Optional[str] = None,
+    directory: Optional[Path] = None,
+    token: Optional[str] = None,
 ) -> str:
     """Add a url entry for a server someone else runs; answer its name.
 
-    Raises ValueError for a bad URL or a name that is unusable or taken.
+    A *token* is the server's bearer token, kept in the entry's file (readable by
+    its owner only). Raises ValueError for a bad URL or a name that is unusable or
+    taken.
     """
     url = url.strip()
     parsed = urlparse(url)
@@ -185,8 +197,15 @@ def register_url(
     directory = directory or registry_dir()
     directory.mkdir(parents=True, exist_ok=True)
     name = _new_name(name or _name_for(url), directory)
-    with open(directory / f"{name}.json", "x", encoding="utf-8") as f:
-        f.write(json.dumps({"url": url}) + "\n")
+    body = {"url": url}
+    if token:
+        body["token"] = token
+    # Created owner-only: the file may hold a secret.
+    fd = os.open(
+        directory / f"{name}.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(body) + "\n")
     return name
 
 
@@ -339,6 +358,8 @@ def row(entry: dict, **state) -> dict:
         "error": entry.get("error"),
     }
     out.update(state)
+    if entry.get("token") and "token" not in state:
+        out["token"] = entry["token"]
     out["op_count"] = len(out["ops"])
     return out
 
@@ -347,7 +368,7 @@ def status(entry: dict, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
     """A url entry's row with a live probe; any other entry as listed."""
     if entry["kind"] != "url" or entry.get("error"):
         return row(entry, state="invalid" if entry.get("error") else "unknown")
-    return row(entry, **probe(entry["url"], timeout=timeout))
+    return row(entry, **probe(entry["url"], token=entry.get("token"), timeout=timeout))
 
 
 def sweep(items: list, fn, *, max_workers: int = 8) -> list:
