@@ -197,7 +197,18 @@ client.put_rois(image_id, [
   delete them later), and `conflicts`.
 
 Read them back with `list_rois(array_id, set_name="")` — no plane or bbox
-filter, since a client hit-tests the resident set — and drop them with
+filter, since a client hit-tests the resident set. It returns a `RoiListResult`,
+not a list, so `len(result)` fails; the annotations are `result.rois`:
+
+```python
+for r in client.list_rois(image_id, set_name="counts").rois:
+    print(r.roi_id, r.label, r.rev)
+```
+
+`result.sets` lists *every* set on the tensor with its stored row count
+(`set_name`, `count`, `reserved`), whatever `rois` covers, and `result.truncated`
+is true when the per-tensor cap clipped `rois`. An empty `set_name` reads the
+client-owned sets; a reserved one (`@…`) is read only by naming it. Drop annotations with
 `delete_rois(array_id, roi_ids=(), set_name="")`, which without ids deletes
 every annotation on the tensor, narrowed by `set_name` when given.
 

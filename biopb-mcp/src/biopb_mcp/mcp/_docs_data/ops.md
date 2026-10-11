@@ -37,8 +37,8 @@ stats = ops.label_stats(image=img_id, labels=seg_id)  # two tensors -> a table
 ```
 
 **Where an `array_id`'s pixels go** depends on the op's input mode (`op.input_mode`;
-[[algorithm-servers]] says how a file picks one) and on where its server runs
-(`op.url`; a loopback address is local):
+[[algorithm-servers]] says how a file picks one) and on whose server it is
+(`op.kind`, below: `script` is local, `url` is treated as remote):
 
 | op input | local server | remote server |
 |---|---|---|
@@ -49,6 +49,21 @@ A server file's first call starts its server, which can take a while (a model
 loading). A long op prints its progress; there is no overall deadline, only a
 limit on silence (`timeout.process_image`), and `interrupt_kernel` stops it on
 the server too. A streaming op that sends several results returns a list.
+
+### Local or remote?
+
+`op.kind` and `op.url` say which server an op is on, even while that server is
+stopped:
+
+| `op.kind` | whose server | `op.url` |
+|---|---|---|
+| `script` | the control's own, on this machine | the loopback address the control reserved for it, named before it first starts |
+| `url` | someone else's, run wherever its entry says | the entry's url |
+
+A url entry counts as remote whatever its address: a tunnel to another host reads
+as `127.0.0.1`, so the address cannot tell you. Both attributes are fixed when the
+op is bound; `ops.refresh()` rebinds after a server is added or its address
+changes. `ops.status()` and the op's docstring show the same two facts.
 
 ### Server states
 
@@ -83,8 +98,10 @@ plain name goes away, so `ops.invert` stops working when a second server also of
 ### When a call fails
 
 An argument the op refuses raises `ValueError` with the server's message — read it
-before retrying. Any other failure inside a call is a `RuntimeError`; a server
-that cannot start raises `... is failed` (see the states above).
+before retrying. Only a `ValueError` the op raises itself maps to that: a wrong-typed
+argument that fails inside the op comes back as a `RuntimeError` (`INTERNAL: …`), as
+does any other failure inside a call. A server that cannot start raises
+`... is failed` (see the states above).
 
 To add an op the kernel cannot import — its own torch, another Python, a
 conflicting package — write a server file: see [[algorithm-servers]].

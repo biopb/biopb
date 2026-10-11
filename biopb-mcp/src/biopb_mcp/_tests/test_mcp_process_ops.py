@@ -654,3 +654,65 @@ def test_a_url_entrys_token_is_sent_as_the_bearer_token():
     assert metadata == [("authorization", "Bearer s3cret")]
     row.pop("token")
     assert _Server(row, None).stub()[1] is None
+
+
+def _rows(*rows):
+    ops = Ops(lambda: None)
+    ops.bind(list(rows))
+    return ops
+
+
+def test_an_op_says_what_kind_of_server_it_is_on_even_when_that_server_is_stopped():
+    script = {
+        "name": "mine",
+        "kind": "script",
+        "url": "grpc://127.0.0.1:50123",
+        "state": "stopped",
+        "ops": [{"name": "local_op"}],
+    }
+    url = {
+        "name": "far",
+        "kind": "url",
+        "url": "grpc://127.0.0.1:35151",  # a tunnel to somewhere else
+        "state": "up",
+        "ops": [{"name": "far_op"}],
+    }
+    ops = _rows(script, url)
+    assert (ops.local_op.kind, ops.local_op.url) == ("script", "grpc://127.0.0.1:50123")
+    assert (ops.far_op.kind, ops.far_op.url) == ("url", "grpc://127.0.0.1:35151")
+    assert "script entry, grpc://127.0.0.1:50123" in ops.local_op.__doc__
+
+
+def test_a_stopped_script_server_with_a_named_address_is_still_started_not_dialled(
+    monkeypatch,
+):
+    row = {
+        "name": "mine",
+        "kind": "script",
+        "url": "grpc://127.0.0.1:50123",
+        "state": "stopped",
+    }
+    server = _Server(row, None)
+    assert server.url == "grpc://127.0.0.1:50123"
+    started = []
+
+    def ensure(name, timeout):
+        started.append(name)
+        return {"state": "up", "url": "grpc://127.0.0.1:50123", "token": "t"}
+
+    monkeypatch.setattr("biopb._control.ensure_algorithm", ensure)
+    _stub, metadata = server.stub()
+    assert started == ["mine"]
+    assert metadata == [("authorization", "Bearer t")]
+
+
+def test_a_url_entry_on_a_loopback_address_is_still_someone_elses_server(client):
+    # A tunnel to another host reads as loopback: the plane's address must not go
+    # to it just because of how it is reached.
+    client.advertised_location = None
+    far = _remote_ops(client, "grpc://127.0.0.1:35151")
+    assert far.lazy_double.kind == "url"
+    call = far.lazy_double.__closure__[0].cell_contents
+    arg = call._tensor("image", "src/@fields/x", None, client)
+    assert arg.WhichOneof("kind") == "eager"
+    assert client.exports == []

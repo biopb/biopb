@@ -16,6 +16,10 @@ else:
     print(client.health_check())
 ```
 
+`client.location` is the address this client dials; `client.advertised_location` is
+the one the server says it can be reached at from elsewhere, or `None` if it
+published none.
+
 ## Browse Sources
 ```python
 # Preferred: server-side DuckDB query (complete, not truncated).
