@@ -2,6 +2,7 @@
 ``Ops.Describe`` probe against a real in-process server."""
 
 import json
+import sys
 from concurrent import futures
 from pathlib import Path
 
@@ -81,7 +82,8 @@ def test_register_url_keeps_a_token_owner_only(registry):
     name = _registry.register_url("grpc://gpu:1", "far", token="s3cret")
     path = registry / f"{name}.json"
     assert json.loads(path.read_text()) == {"url": "grpc://gpu:1", "token": "s3cret"}
-    assert path.stat().st_mode & 0o077 == 0
+    if sys.platform != "win32":  # POSIX permission bits
+        assert path.stat().st_mode & 0o077 == 0
     _registry.register_url("grpc://gpu:2", "open")
     assert "token" not in json.loads((registry / "open.json").read_text())
 
