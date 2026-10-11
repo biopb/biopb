@@ -127,9 +127,11 @@ if __name__ == "__main__":
   Cancelling the call closes the generator.
 
 `serve()` parses `--host` (default `127.0.0.1`), `--port`, `--workers`,
-`--cache-dir` and `--describe`, which prints the op list as JSON and exits
-without binding. Calls to one server run one at a time. Bound off loopback the
-server requires a token, `$BIOPB_ALGORITHM_TOKEN` or one it mints and prints.
+`--cache-dir`, `--no-token` and `--describe`, which prints the op list as JSON and
+exits without binding. Calls to one server run one at a time. Bound off loopback
+the server requires a token, `$BIOPB_ALGORITHM_TOKEN` or one it mints and prints,
+unless `--no-token` says the network is trusted (it conflicts with a token that was
+also asked for).
 
 ### Where a large result goes
 
@@ -163,8 +165,10 @@ per server, named by its stem; a stem starting with `_` is skipped.
   in an environment built from its header alone, so nothing in it conflicts
   with the kernel or another entry.
 - **`<name>.json`, a url entry**: `{"url": "grpcs://host:port"}`, a server
-  someone else runs, Docker included. The control probes it with `Describe`
-  and never starts or stops it.
+  someone else runs, Docker included, with an optional `"token"` (the server's
+  bearer token; the file is created owner-only). The control probes it with
+  `Describe`, using the token, and never starts or stops it. Its row carries the
+  token to authenticated callers, as a script entry's does.
 
 A name used by both kinds, or a `.json` without a url, is listed with an
 `error` and the state `invalid`. On first start, while the directory does not
@@ -220,7 +224,7 @@ the control, as `failed` and the log tail.
 | `POST /api/algorithms/refresh` | install and describe new or edited entries, probe url entries |
 | `POST /api/algorithms/{ensure,stop,restart}` | one entry by name |
 | `GET /api/algorithms/logs?name=&lines=` | a script entry's log tail |
-| `POST /api/algorithms/register` | add a url entry: `{url, name?}` for a server someone else runs |
+| `POST /api/algorithms/register` | add a url entry: `{url, name?, token?}` for a server someone else runs |
 | `POST /api/algorithms/deregister?name=` | remove a url entry; a script entry is a file on this machine and is refused (400) |
 
 The routes sit behind the control's token like the rest of `/api`. A verb

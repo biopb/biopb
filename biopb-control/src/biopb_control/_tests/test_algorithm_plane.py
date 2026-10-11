@@ -135,7 +135,9 @@ def test_refresh_installs_and_caches_the_op_list(plane, registry):
     row = _wait_for(plane, "seg", {"stopped", "failed"})
     assert row["state"] == "stopped", row["error"]
     assert [o["name"] for o in row["ops"]] == ["alpha", "beta"]
-    assert row["url"] is None and row["token"] is None
+    # Named before it runs: a script entry is always on this machine. Only the
+    # token waits for a start.
+    assert row["url"].startswith("grpc://127.0.0.1:") and row["token"] is None
 
 
 def test_ensure_starts_the_server_with_its_token(plane, registry):
@@ -152,14 +154,27 @@ def test_ensure_starts_the_server_with_its_token(plane, registry):
     )
 
 
+def test_a_script_entry_keeps_the_address_it_named_while_stopped(plane, registry):
+    (registry / "seg.py").write_text(_server())
+    plane.refresh()
+    stopped = _wait_for(plane, "seg", {"stopped", "failed"})
+    up = plane.ensure("seg", wait=30.0)
+    assert up["state"] == "up", up["error"]
+    assert up["url"] == stopped["url"]
+    assert stopped["token"] is None and up["token"]
+
+
 def test_an_edit_takes_effect_on_ensure(plane, registry):
     path = registry / "seg.py"
     path.write_text(_server(["alpha"]))
     first = plane.ensure("seg", wait=30.0)
     path.write_text(_server(["alpha", "gamma"]))
     row = plane.ensure("seg", wait=30.0)
-    # The old server went with its uv.
-    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
+    # The old server went with its uv: its token no longer opens anything,
+    # on the same port or another.
+    assert (
+        _registry.probe(first["url"], token=first["token"], timeout=2)["state"] != "up"
+    )
     assert row["state"] == "up", row["error"]
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     assert row["url"] != first["url"] or row["token"] != first["token"]
@@ -182,7 +197,7 @@ def test_an_edit_is_stale_until_refresh_ensures_it(plane, registry):
     plane.refresh()
     row = _wait_for(plane, "seg", {"stale", "failed"})
     assert row["state"] == "stale", row["error"]
-    assert row["url"] is None and row["token"] is None
+    assert row["url"] == first["url"] and row["token"] is None
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     # The old process is untouched and still answering.
     assert (
@@ -191,7 +206,10 @@ def test_an_edit_is_stale_until_refresh_ensures_it(plane, registry):
 
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up", row["error"]
-    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
+    # The old server, and its token, are gone, whether or not the port was kept.
+    assert (
+        _registry.probe(first["url"], token=first["token"], timeout=2)["state"] != "up"
+    )
     answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
@@ -442,6 +460,21 @@ def _post_json(path, body):
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
+
+
+def test_register_a_url_entry_with_a_token_over_http(control, registry):
+    got = _post_json(
+        "/api/algorithms/register", {"url": "grpcs://h:3", "name": "tok", "token": "s3"}
+    )
+    assert got == (200, {"name": "tok"})
+    assert json.loads((registry / "tok.json").read_text()) == {
+        "url": "grpcs://h:3",
+        "token": "s3",
+    }
+    assert (
+        _post_json("/api/algorithms/register", {"url": "grpc://h:4", "token": 5})[0]
+        == 400
+    )
 
 
 def test_register_and_deregister_over_http(control, registry):

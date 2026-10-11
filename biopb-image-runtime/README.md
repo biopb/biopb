@@ -42,7 +42,8 @@ exits.
   the plane named by `BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`, else inline.
 - The core install serves inline pixels only; `[lazy]` adds lazy input and the
   plane sink. The server checks `$BIOPB_ALGORITHM_TOKEN` when set; bound off
-  loopback without one, it mints one and prints it.
+  loopback without one, it mints one and prints it, unless started with
+  `--no-token`.
 
 ## Register a server with biopb-mcp
 
@@ -51,8 +52,11 @@ control in an environment of its own. A server running elsewhere is named with
 a `<name>.json` file there:
 
 ``` json
-{"url": "grpc://your_ip_address:50051"}
+{"url": "grpcs://your_ip_address:50051", "token": "<the server's token>"}
 ```
+
+`token` is optional. A server bound off loopback requires one, unless it was
+started with `--no-token` for a network you trust.
 
 The control probes it and the kernel binds its ops into `ops`. A server that
 does not implement `Ops` -- one still speaking the retired `ProcessImage`

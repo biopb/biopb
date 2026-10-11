@@ -73,20 +73,14 @@ _BASE_INSTRUCTIONS = (
     "`tensors` (a LIST of STRUCT(array_id, dim_labels, shape, dtype), one per "
     "tensor -- query it with UNNEST(tensors) or list_filter, or reach the "
     "source's first tensor as `tensors[1].dtype` -- DuckDB lists are "
-    "1-indexed, unlike `tensors[0]` in Python/TS code). Unresolved (cloud / "
-    "synced-folder) sources carry an empty `tensors`, so a predicate like "
-    "`WHERE tensors[1].dtype = 'uint8'` silently drops them; filter on "
-    "`is_resolved` to opt them in/out on "
-    "purpose (`WHERE NOT is_resolved` finds what hasn't been resolved yet). "
-    "Right after a server start many sources are `is_resolved = false` with "
-    "`unresolved_reason = 'pending'`: found, not read yet, filling in "
-    '(`client.health_check()["registration_pending"]` counts them); reading '
-    "one registers it at once, and until they are done an empty structural "
-    'search means "not known yet". '
-    "Resolved is not the same as local: assume a cloud or synced-folder source "
-    "may not have its bytes on the serving machine, so the first read can be "
-    "slow or fail offline. Plan for that -- warn the user before a long read "
-    "rather than after it.\n"
+    "1-indexed, unlike `tensors[0]` in Python/TS code). A source not yet read "
+    "(`is_resolved = false`: `pending`, `needs_recall`, `failed`) carries an empty "
+    "`tensors`, so a structural predicate like `WHERE tensors[1].dtype = 'uint8'` "
+    "silently drops it; `WHERE NOT is_resolved` asks for them on purpose, and an "
+    'empty result while `client.health_check()["registration_pending"]` is above 0 '
+    'means "not known yet". Resolved is not local: a cloud source\'s first read can '
+    "be slow or fail offline, so warn the user before a long one "
+    '(`read_doc("tensor-server-client")` has the table).\n'
     "- Prefer lazy dask operations; only `.compute()` the final result.\n"
     "- Show intermediate results for the user to validate at each step: a layer "
     "on `viewer` where the session has a window, otherwise upload the result and "

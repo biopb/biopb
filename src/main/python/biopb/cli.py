@@ -1691,7 +1691,16 @@ def _algorithm_verb(call, *args, **kwargs):
 
 def _print_algorithm_rows(rows: list, json_output: bool) -> None:
     if json_output:
-        print(json.dumps({"servers": rows}))
+        # A row carries its server's token for the kernel; a terminal does not need it.
+        print(
+            json.dumps(
+                {
+                    "servers": [
+                        {k: v for k, v in r.items() if k != "token"} for r in rows
+                    ]
+                }
+            )
+        )
         return
     if not rows:
         console.print(

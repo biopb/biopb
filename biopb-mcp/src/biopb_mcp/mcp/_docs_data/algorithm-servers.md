@@ -1,5 +1,5 @@
 ---
-description: Add an op by writing one server file — the header, `@op` and its keywords, input modes, and a GPU torch.
+description: Add an op by writing one server file — the header, `@op` and its keywords, input modes — and running a server elsewhere (a url entry).
 ---
 
 # Writing an algorithm server
@@ -79,7 +79,8 @@ With `"eager"` and `"lazy"`, the input's axes outside the op's `Tensor(...)`
 must be size 1 — slice before calling. Only `"blocks"` maps over them.
 
 * `"eager"` (default): numpy arrays. An `array_id` is read in the kernel and
-  sent inline; one over 2 GiB is refused rather than pulled whole.
+  sent inline; one over 2 GiB is refused rather than pulled whole (the table in
+  [[ops]] says where `lazy` and `blocks` input goes).
 * `"lazy"`: dask arrays; the function may return one, which is written to the
   plane chunk by chunk.
 * `"blocks"`: the function is mapped over blocks, and over every axis not in
@@ -92,7 +93,56 @@ A function that `yield`s is a streaming op, for work that carries state frame
 to frame (tracking, localization): a yielded string is progress, anything else
 one item's result, and what it `return`s is the final result.
 
-## A GPU torch
+## A server someone runs
+
+The control runs only `.py` entries. A server running elsewhere — another machine,
+a batch job, a container — is named by `~/.config/biopb/algorithms/<name>.json`:
+
+```json
+{"url": "grpcs://host:50051", "token": "<the server's bearer token>"}
+```
+
+`token` is optional, and the file holds a secret, so keep it readable by its owner
+only. `grpcs://` is TLS, checked against the system's trusted roots. Then
+`ops.refresh()` binds its ops. The entry has no other fields. The control probes it with `Describe` and never starts, stops or restarts
+it: `ops.restart` and `ops.logs` refuse it, and its lifecycle belongs to whoever
+runs it. A `.json` with no url, or one sharing a name with a `.py`, is `invalid`;
+the states are in [[ops]].
+
+**What the deployment has to provide**
+
+- **A running server.** The same file serves on its own:
+  `uv run --script server.py --host <host> --port <port>`. `serve()` takes `--host`
+  (default `127.0.0.1`), `--port` (default 50051), `--workers`, `--cache-dir`,
+  `--no-token` (below) and `--describe`, which prints the op list as JSON and exits
+  without binding: run it first to check the file where it will serve.
+- **An address the control's machine can dial.** The url is connected to from the
+  machine running the control, so it must reach the server from there, however the
+  deployment arranges that.
+- **A token policy.** A server bound off loopback requires a bearer token
+  (`$BIOPB_ALGORITHM_TOKEN`, or one it mints and prints at start). Either give the
+  entry that token in its `token` field, or start the server with `--no-token` on a
+  network you trust, where anyone who can reach it can run its ops. A bearer token
+  crosses `grpc://` in clear, so use `grpcs://` when the network is not trusted.
+- **Somewhere for large results.** It is the server's deployment, not the call's:
+
+| deployment | a large result goes to |
+|---|---|
+| `--cache-dir` | the server's own embedded tensor server |
+| `$BIOPB_TENSOR_URL` (and `$BIOPB_TENSOR_TOKEN`) set | that data plane's scratch source |
+| neither | back inline, up to 128 MiB |
+
+**Data crosses the kernel.** A remote server cannot read this machine's plane, so
+an `array_id` input is read here and sent inline (2 GiB cap) unless the plane
+advertises an external address ([[ops]] has the table). Slice first, or run the
+server next to the data.
+
+A server that goes away leaves its entry `unreachable`; once it is back,
+`ops.refresh()` rebinds. How to deploy it is the environment's question, so look at
+what the user has (a scheduler, an SSH host, a container runtime) and ask before
+starting anything on a machine that is not theirs.
+
+## Appendix: a GPU torch
 
 On Linux PyPI's torch is built for one CUDA version, and on Windows it is
 CPU-only. To choose the build, point torch at PyTorch's index in the header:

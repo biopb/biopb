@@ -16,6 +16,18 @@ Three kinds, and the choice matters more than the mechanics:
 | a segmentation, mask or instance labelling | a **label set** — `"zarr://<image array_id>/@labels/<name>"` | `lb=<its array_id>` over the image |
 | points, boxes, polygons, scribbles | **ROI annotations** — `put_rois` | `rs=<set_name>` |
 
+What an `array_id` looks like, by what it names:
+
+| id | names |
+|---|---|
+| `scratch/@fields/<name>` | a tensor of your own, on the scratch source |
+| `<image array_id>/@labels/<name>` | a label set of that image |
+| `<source_id>/<tensor>` | one tensor of a multi-tensor source |
+| `<source_id>` | the tensor of a single-tensor source (a bare id is its default tensor) |
+
+An upload request may carry a `zarr://` or `cache://` prefix to pick the store;
+the id the server answers with never does.
+
 **Prefer a label set to a plain tensor for anything derived from an image.** Its
 id is the image's own plus `/@labels/<name>`, so the two stay registered and one
 link shows both; the same labels uploaded as a tensor of your own are a separate
@@ -105,12 +117,6 @@ when a frame is at least a transfer chunk (~64 MB). The server grows a smaller
 `chunk_shape` toward that size, so a small frame shares its chunk with its
 neighbours.
 
-The reason the two are one moment: **a chunk already read is not read again.**
-A `chunk_id` names fixed bytes everywhere else in this system, so both the
-server and the client cache on it. A region a consumer saw as background would
-stay background for that consumer even after a later write filled it, and
-nothing could tell them otherwise. Sealing at publish removes the case.
-
 **`"DISCARDED"` is the only delete there is**, and it works from every state —
 including READY. It takes the server-minted store with it (a `zarr://` member's
 directory, a label set's sidecar) and takes the tensor out of its source's
@@ -186,9 +192,23 @@ client.put_rois(image_id, [
 - An empty `roi_id` creates (the server mints one); naming an existing one
   updates. The batch applies in a single transaction; `check_rev=True` turns it
   conditional and returns mismatches in `conflicts` instead of applying them.
+- **`put_rois` returns a `RoiPutResult`**: `stored`, the annotations as stored with
+  their server-minted `roi_id`, `rev` and timestamps (keep the ids to update or
+  delete them later), and `conflicts`.
 
 Read them back with `list_rois(array_id, set_name="")` — no plane or bbox
-filter, since a client hit-tests the resident set — and drop them with
+filter, since a client hit-tests the resident set. It returns a `RoiListResult`,
+not a list, so `len(result)` fails; the annotations are `result.rois`:
+
+```python
+for r in client.list_rois(image_id, set_name="counts").rois:
+    print(r.roi_id, r.label, r.rev)
+```
+
+`result.sets` lists *every* set on the tensor with its stored row count
+(`set_name`, `count`, `reserved`), whatever `rois` covers, and `result.truncated`
+is true when the per-tensor cap clipped `rois`. An empty `set_name` reads the
+client-owned sets; a reserved one (`@…`) is read only by naming it. Drop annotations with
 `delete_rois(array_id, roi_ids=(), set_name="")`, which without ids deletes
 every annotation on the tensor, narrowed by `set_name` when given.
 

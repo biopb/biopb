@@ -20,7 +20,6 @@ without an event, and a Stop cancels it on the server.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import os
 import queue
@@ -29,7 +28,6 @@ import threading
 import time
 from collections.abc import Callable
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
 
 import biopb.image as proto
 import dask.array as da
@@ -82,24 +80,6 @@ def _sanitize_name(name: str) -> str:
 _same_plane = same_location
 
 
-def _is_remote(kind: str, url: Optional[str]) -> bool:
-    """Does a registry entry run off this machine? A script entry is always the
-    control's own child on loopback; a url entry is whatever it names."""
-    return kind == "url" and not _is_loopback(url)
-
-
-def _is_loopback(url: Optional[str]) -> bool:
-    """Is *url* served from this machine? An unparseable or unnamed host is not."""
-    host = (urlparse(url or "").hostname or "").lower()
-    if host == "localhost":
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-        return address.is_loopback or address.is_unspecified
-    except ValueError:
-        return False
-
-
 class _Server:
     """One registry entry the kernel calls: where it is and as whom."""
 
@@ -108,21 +88,27 @@ class _Server:
         self.kind = row["kind"]
         self._options = channel_options
         self._lock = threading.Lock()
-        self._url = row.get("url") if row.get("state") == "up" else None
+        # What the row names, whether or not the server is up: a script entry's
+        # reserved address, a url entry's own. `_url` is what is dialled, which a
+        # script entry has only while it is up.
+        self._named_url = row.get("url")
+        self._url = self._named_url if row.get("state") == "up" else None
         self._token = row.get("token")
         if self.kind == "url":
-            self._url = row.get("url")
+            self._url = self._named_url
         self._stub = None
 
     @property
     def remote(self) -> bool:
-        """Does this server run off this machine?"""
-        return _is_remote(self.kind, self._url)
+        """Is this someone else's server? A script entry is the control's own
+        child on this machine; a url entry is treated as remote whatever its
+        address says, since a tunnel to another host reads as loopback."""
+        return self.kind == "url"
 
     @property
     def url(self) -> Optional[str]:
-        """Where the server is dialled; None for a script entry not yet started."""
-        return self._url
+        """Where the server is, as the control named it when this was bound."""
+        return self._url or self._named_url
 
     def stub(self):
         """The stub and call metadata, starting a script entry if needed."""
@@ -139,6 +125,7 @@ class _Server:
                         + f"\nSee ops.status() and ops.logs({self.name!r})."
                     )
                 self._url, self._token, self._stub = row["url"], row["token"], None
+                self._named_url = row["url"]
             if self._stub is None:
                 self._stub = proto.OpsStub(make_channel(self._url, self._options))
             metadata = (
@@ -373,7 +360,7 @@ def _build_op(call: _OpCall) -> Callable:
         info.get("description") or f"The {call.name} op.",
         "",
         f"Server: {call.server.name} ({call.server.kind} entry, "
-        f"{call.server.url or 'started on first call'})",
+        f"{call.server.url or 'address unknown'})",
         f"Tensor arguments (axes the op sees): {tensors}",
     ]
     if info.get("labels"):
@@ -410,6 +397,7 @@ def _build_op(call: _OpCall) -> Callable:
     op.__name__ = _sanitize_name(call.name)
     op.op_name = call.name
     op.server = call.server.name
+    op.kind = call.server.kind
     op.url = call.server.url
     op.labels = list(info.get("labels") or [])
     op.description = info.get("description", "")

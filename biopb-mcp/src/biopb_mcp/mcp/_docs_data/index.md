@@ -7,6 +7,9 @@ one you do not want. A bullet that opens with `id:` is a doc entry, so a note
 written as `- Remember: …` is read as a doc named `Remember`; write notes as
 plain prose instead.
 
+Start with `kernel`, then `tensor-server-client`; to show a result, `upload` it and
+send it with `web-viewer`.
+
 ## References
 
 - kernel: the namespace, long-running jobs, where a compute runs

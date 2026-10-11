@@ -70,7 +70,8 @@ the same need — but **ask before substituting** an op the doc did not name,
 since a different model is a different result. Otherwise the op comes from a
 server: a file in `~/.config/biopb/algorithms/` (see [[algorithm-servers]]; you
 can write one, with the user's consent to its dependencies), or a
-`{"url": ...}` file there naming a server someone runs.
+`{"url": ...}` file there naming a server someone runs
+([[algorithm-servers]], *A server someone runs*).
 
 ## Related
 

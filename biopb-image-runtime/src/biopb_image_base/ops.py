@@ -833,6 +833,32 @@ def _sink_from(args) -> Any:
     return _InlineSink()
 
 
+def _serving_token(host: str, no_token: bool) -> Optional[str]:
+    """The token a server on *host* checks, or None for none.
+
+    ``$BIOPB_ALGORITHM_TOKEN`` if set; else, off loopback, one minted and printed.
+    ``--no-token`` serves with none even off loopback, for a network the operator
+    trusts, and refuses to be combined with a token that was asked for.
+    """
+    token = os.environ.get(TOKEN_ENV) or None
+    if no_token:
+        if token is not None:
+            raise SystemExit(f"--no-token conflicts with ${TOKEN_ENV}")
+        if host_is_public_bind(host):
+            print(
+                f"Serving on {host} with no token: anyone who can reach it can run "
+                "its ops.",
+                flush=True,
+            )
+        return None
+    if token is None and host_is_public_bind(host):
+        import secrets
+
+        token = secrets.token_urlsafe(32)
+        print(f"Token (send as 'authorization: Bearer <token>'): {token}", flush=True)
+    return token
+
+
 def serve(
     argv: Optional[Sequence[str]] = None, *, ops: Optional[Sequence] = None
 ) -> None:
@@ -840,7 +866,7 @@ def serve(
 
     ``--describe`` prints the op list as JSON and exits without binding a port.
     The token is ``$BIOPB_ALGORITHM_TOKEN``; a server bound off loopback without
-    one mints one and prints it.
+    one mints one and prints it, unless ``--no-token`` says the network is trusted.
 
     Args:
         argv: The command line; ``sys.argv[1:]`` by default.
@@ -861,6 +887,11 @@ def serve(
     parser.add_argument("--cache-size", default="32GB")
     parser.add_argument("--tensor-port", type=int, default=8817)
     parser.add_argument("--tensor-external-location")
+    parser.add_argument(
+        "--no-token",
+        action="store_true",
+        help="serve without a token even off loopback (a trusted network only)",
+    )
     args = parser.parse_args(argv)
 
     if ops is None:
@@ -883,12 +914,7 @@ def serve(
     from biopb._lifecycle import deathwatch
 
     deathwatch.install()
-    token = os.environ.get(TOKEN_ENV) or None
-    if token is None and host_is_public_bind(args.host):
-        import secrets
-
-        token = secrets.token_urlsafe(32)
-        print(f"Token (send as 'authorization: Bearer <token>'): {token}", flush=True)
+    token = _serving_token(args.host, args.no_token)
 
     server, port = build_server(
         definitions,
