@@ -81,6 +81,19 @@ export async function chatProxied(): Promise<boolean> {
   }
 }
 
+/** Whether this control proxies a session's `/mcp`, from the public `/health`
+ * probe. True only where the control enforces a token; false when unreadable. */
+export async function mcpProxied(): Promise<boolean> {
+  try {
+    const r = await fetch(withBase("/health"));
+    if (!r.ok) return false;
+    const j = await r.json();
+    return !!j.mcp_proxied;
+  } catch {
+    return false;
+  }
+}
+
 /** Send the browser to the unlock page, returning here afterwards. */
 export function redirectToUnlock(): void {
   // `here` is a router path (so UnlockPage can navigate() back to it), while the
