@@ -540,10 +540,25 @@ async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wi
 
     A doc links another as `[[other-id]]`; follow one with another `read_doc`.
 
+    `read_doc("<collection>/")` lists the docs under a collection the index names
+    (`architecture/`); `search_docs` finds a literal across all of them.
+
     `read_doc("<id>@diff")` shows your local copy of a shipped doc against the
     shipped text -- what an upgrade changed that your copy hides.
     """
     return await asyncio.to_thread(_docs.read_doc, id)
+
+
+@mcp.tool()
+async def search_docs(pattern: str, prefix: str = "") -> str:
+    """Search every doc in the knowledge store for a pattern.
+
+    Case-insensitive; a regular expression, or the literal text if it does not
+    compile. Returns `id:line: text` hits -- use it for an exception name, a
+    config key, a log line. `prefix` narrows to a collection, e.g.
+    `architecture/`. Read a hit's doc with `read_doc(id)`.
+    """
+    return await asyncio.to_thread(_docs.search_docs, pattern, prefix)
 
 
 @mcp.tool()

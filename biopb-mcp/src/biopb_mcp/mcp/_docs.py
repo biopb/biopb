@@ -621,6 +621,7 @@ def render_index(text: str | None = None) -> str:
         text = index_text()
 
     named: set[str] = set(_ignored_ids(text))
+    collections: list[str] = []
     shadowed: set[str] = set()
     out: list[str] = []
     for line in text.splitlines():
@@ -630,7 +631,8 @@ def render_index(text: str | None = None) -> str:
             continue
         named.add(doc_id)
         if doc_id.endswith("/"):
-            out.append(line)  # a collection line: kept verbatim (knowledge.md §7)
+            collections.append(doc_id)  # names every doc under it; kept verbatim
+            out.append(line)
             continue
         meta = describe(doc_id)
         if meta is None:
@@ -643,7 +645,11 @@ def render_index(text: str | None = None) -> str:
             out.append(line)
 
     ids = shipped_ids()
-    new = [i for i in ids if i not in named]
+    new = [
+        i
+        for i in ids
+        if i not in named and not any(i.startswith(c) for c in collections)
+    ]
     _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
 
     stale = stale_shadowed_ids(shadowed, ids)
@@ -732,6 +738,8 @@ def read_doc(doc_id: str) -> str:
         return render_index()
     if doc_id.endswith(DIFF_SUFFIX):
         return read_diff(doc_id[: -len(DIFF_SUFFIX)])
+    if doc_id.endswith("/"):
+        return list_collection(doc_id)
     meta = describe(doc_id)
     if meta is None:
         return (
@@ -739,6 +747,83 @@ def read_doc(doc_id: str) -> str:
             "there is."
         )
     return f"{_header(meta)}\n\n{meta['body']}"
+
+
+def _all_ids() -> list[str]:
+    """Every readable id in either tier, shipped banked docs excluded."""
+    return sorted(set(shipped_ids()) | set(local_ids()))
+
+
+def list_collection(prefix: str) -> str:
+    """One level of the docs under *prefix* (``"architecture/"``), one line each.
+
+    A sub-collection is listed as ``sub/`` so it can be read in turn. A local
+    doc shadowing a shipped one is marked, as it is in the index.
+    """
+    if not valid_id(prefix.rstrip("/")):
+        return f"'{prefix}' is not a collection. Read the index for what there is."
+    docs: dict[str, str] = {}
+    subs: set[str] = set()
+    for doc_id in _all_ids():
+        if not doc_id.startswith(prefix):
+            continue
+        head, sep, _ = doc_id[len(prefix) :].partition("/")
+        if sep:
+            subs.add(prefix + head + "/")
+        else:
+            docs[doc_id] = doc_id
+    if not docs and not subs:
+        return f"No docs under '{prefix}'. Read the index for what there is."
+    lines = [f"{prefix} -- read one with read_doc(id)", ""]
+    lines += [f"- {s}" for s in sorted(subs)]
+    for doc_id in sorted(docs):
+        meta = describe(doc_id)
+        if meta is None:
+            continue
+        mark = " (local copy)" if meta["shadows_shipped"] else ""
+        lines.append(f"- {doc_id}: {meta['description']}{mark}")
+    return "\n".join(lines) + "\n"
+
+
+#: Hits one search returns; past it the agent narrows the pattern or the prefix.
+MAX_SEARCH_HITS = 40
+
+
+def search_docs(pattern: str, prefix: str = "") -> str:
+    """Lines matching *pattern* across both tiers, as ``id:line: text``.
+
+    Case-insensitive regular expression; a pattern that does not compile is
+    searched as the literal string, since the agent usually means a literal
+    (an exception name, a config key). *prefix* narrows to a collection.
+    """
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return "Give a pattern to search for."
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        rx = re.compile(re.escape(pattern), re.IGNORECASE)
+    hits: list[str] = []
+    total = 0
+    for doc_id in _all_ids():
+        if not doc_id.startswith(prefix):
+            continue
+        meta = describe(doc_id)
+        if meta is None:
+            continue
+        for n, line in enumerate(meta["body"].splitlines(), 1):
+            if rx.search(line):
+                total += 1
+                if len(hits) < MAX_SEARCH_HITS:
+                    hits.append(f"{doc_id}:{n}: {line.strip()[:200]}")
+    if not hits:
+        return f"No doc matches '{pattern}'."
+    more = (
+        f"\n... {total - len(hits)} more; narrow the pattern or prefix."
+        if total > len(hits)
+        else ""
+    )
+    return "\n".join(hits) + more + "\n"
 
 
 def read_diff(doc_id: str) -> str:

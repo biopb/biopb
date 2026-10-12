@@ -556,3 +556,55 @@ def test_diff_of_a_local_only_doc_has_nothing_to_compare(store):
 
 def test_the_diff_suffix_cannot_name_a_real_doc():
     assert not _docs.valid_id("one@diff")
+
+
+# --------------------------------------------------------------------------- #
+# Collections and search
+# --------------------------------------------------------------------------- #
+def test_a_collection_line_covers_the_docs_under_it(store):
+    ship(store, "arch/one")
+    ship(store, "arch/sub/two")
+    ship(store, "other")
+    text = _docs.render_index("- arch/: how it is built\n")
+    tail = text.split("New shipped docs")[1]
+    assert "other" in tail
+    assert "arch/" not in tail
+
+
+def test_reading_a_collection_lists_one_level(store):
+    ship(store, "arch/one", "# One\n\nFirst doc.\n")
+    ship(store, "arch/sub/two")
+    out = _docs.read_doc("arch/")
+    assert "- arch/sub/" in out
+    assert "- arch/one: First doc." in out
+    assert "arch/sub/two" not in out
+
+
+def test_an_empty_collection_says_so(store):
+    assert "No docs under 'nope/'" in _docs.read_doc("nope/")
+
+
+def test_search_finds_a_literal_in_either_tier(store):
+    ship(store, "arch/one", "# One\n\nraises BIOPB_X_ERROR when bad\n")
+    _docs.write_doc("mine", "# Mine\n\nalso BIOPB_X_ERROR here\n", None, None)
+    out = _docs.search_docs("biopb_x_error")
+    assert "arch/one:3:" in out
+    assert "mine:3:" in out
+
+
+def test_search_narrows_to_a_prefix_and_survives_a_bad_regex(store):
+    ship(store, "arch/one", "# One\n\nsee f(x[0]\n")
+    ship(store, "other", "# O\n\nsee f(x[0]\n")
+    out = _docs.search_docs("f(x[0]", prefix="arch/")
+    assert "arch/one" in out and "other" not in out
+
+
+def test_search_caps_its_hits(store):
+    ship(store, "big", "# B\n\n" + "hit\n" * 100)
+    out = _docs.search_docs("hit")
+    assert out.count("big:") == _docs.MAX_SEARCH_HITS
+    assert "more" in out
+
+
+def test_search_with_no_match_says_so(store):
+    assert "No doc matches" in _docs.search_docs("zzz")
