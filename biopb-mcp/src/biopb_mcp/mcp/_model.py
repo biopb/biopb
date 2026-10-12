@@ -126,9 +126,7 @@ def check_ready(config):
 
     if not get_setting(config, "chat.model"):
         raise ChatNotConfigured(
-            "No chat model is configured. Set chat.model in mcp-config.json — "
-            "there is no default, because guessing one would bill you for a "
-            "model you did not choose."
+            "No chat model is configured. Set chat.model in mcp-config.json."
         )
     if not api_key(config):
         from biopb._security.credentials import credential_file
