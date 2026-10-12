@@ -154,7 +154,10 @@ takes full access, except `chunk_locate`, which is a read of one tensor
 
 Custom `do_action` verbs: `health` (reports `protocol`),
 `add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
-`add_source`, `remove_source` (below), and `roi_prune`.
+`add_source`, `remove_source` (below), `roi_prune`, and `catalog_children`: one
+level of the catalog tree (`{key, limit}` in, `{key, folders, sources, truncated}`
+out as JSON; `serving/catalog_tree.py`), which the SDKs wrap and the sidecar's
+tree routes build on. It needs the full-access token like the other verbs.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 

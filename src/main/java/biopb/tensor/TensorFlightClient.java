@@ -1418,6 +1418,45 @@ public class TensorFlightClient implements AutoCloseable {
     }
 
     /**
+     * One level of the catalog tree: the folders and sources directly under a
+     * folder, so a large catalog can be browsed without listing it.
+     *
+     * <p>A source's place is its url read as a path: {@code file:///a/b/c.zarr} is
+     * {@code c.zarr} in folder {@code a/b}, and {@code scheme://host/p} roots at the
+     * endpoint {@code scheme://host}. A chain of folders with one child each is one
+     * folder, which ends where a source sits or the chain forks. A resolved source
+     * with no tensor is not listed.
+     *
+     * @param key the folder, as {@code /}-joined names; {@code ""} is the top. Take
+     *        it from a {@link CatalogChildren.Folder#getKey()} rather than building it.
+     * @param limit at most this many folders and sources together (folders first);
+     *        more than the server allows is clamped
+     * @return the level; a source's row is a {@link #query} on its id
+     * @throws UnsupportedOperationException if the server predates this call
+     * @throws IOException if the action fails
+     */
+    public CatalogChildren catalogChildren(String key, int limit) throws IOException {
+        Map<String, Object> request = new HashMap<>();
+        request.put("key", key == null ? "" : key);
+        request.put("limit", limit);
+        byte[] body = doActionOneResult(
+                "catalog_children",
+                GSON.toJson(request).getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                "Browsing the catalog tree is unavailable");
+        CatalogChildren level = GSON.fromJson(
+                new String(body, java.nio.charset.StandardCharsets.UTF_8), CatalogChildren.class);
+        if (level == null) {
+            throw new IOException("catalog_children returned no level");
+        }
+        return level;
+    }
+
+    /** {@link #catalogChildren(String, int)} at the top, with the server's default limit. */
+    public CatalogChildren catalogChildren() throws IOException {
+        return catalogChildren("", 2000);
+    }
+
+    /**
      * Get upload status for a writable tensor.
      *
      * @param arrayId the array_id setupArrayUpload() returned
@@ -1975,6 +2014,66 @@ public class TensorFlightClient implements AutoCloseable {
             b.addPaths(path);
         }
         return b.build();
+    }
+
+    /**
+     * One level of the catalog tree, as {@link #catalogChildren} returns it. Read
+     * straight from the server's JSON, so the field names are its own.
+     */
+    public static final class CatalogChildren {
+        private String key = "";
+        private List<Folder> folders = new ArrayList<>();
+        private List<Source> sources = new ArrayList<>();
+        private boolean truncated;
+
+        /** The folder this level lists. */
+        public String getKey() {
+            return key;
+        }
+
+        /** The folders directly under it, in byte order of name. */
+        public List<Folder> getFolders() {
+            return Collections.unmodifiableList(folders);
+        }
+
+        /** The sources sitting in it, in byte order of name. */
+        public List<Source> getSources() {
+            return Collections.unmodifiableList(sources);
+        }
+
+        /** Whether the limit cut the level. */
+        public boolean isTruncated() {
+            return truncated;
+        }
+
+        /** A folder: how it shows, and the key that opens it. */
+        public static final class Folder {
+            private String name;
+            private String key;
+
+            public String getName() {
+                return name;
+            }
+
+            public String getKey() {
+                return key;
+            }
+        }
+
+        /** A source: how it shows in its folder, and its id. */
+        public static final class Source {
+            private String name;
+            @com.google.gson.annotations.SerializedName("source_id")
+            private String sourceId;
+
+            public String getName() {
+                return name;
+            }
+
+            public String getSourceId() {
+                return sourceId;
+            }
+        }
     }
 
     /**

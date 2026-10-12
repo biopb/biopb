@@ -17,7 +17,8 @@ or a byte-prefix sniff):
   takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
 
 Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
-resolve, runtime source add / remove, and annotation pruning.
+resolve, runtime source add / remove, annotation pruning, and one level of the
+catalog tree.
 """
 
 import hmac
@@ -118,6 +119,7 @@ from biopb_tensor_server.core.read_mask import (
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.ticket_seal import DEFAULT_SEAL_TTL, TicketSealer
+from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.activity import ActivityTracker
 from biopb_tensor_server.serving.metadata_db import (
     MetadataDatabase,
@@ -1160,6 +1162,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "roi_prune",
                 "Report (or with apply, delete) annotations whose source is gone",
             ),
+            flight.ActionType(
+                "catalog_children",
+                "One level of the catalog tree: the folders and sources under a folder",
+            ),
         ]
 
     def do_action(
@@ -1321,9 +1327,39 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
+        elif action.type == "catalog_children":
+            self._authorize(context)
+            yield self._handle_catalog_children(action.body.to_pybytes())
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _handle_catalog_children(self, body: bytes) -> bytes:
+        """``{"key": <folder>, "limit": <n>}`` (both optional) to the level under
+        that folder, as JSON: ``{key, folders: [{name, key}], sources: [{name,
+        source_id}], truncated}``. The sources are ids; their rows are one
+        ``sources`` query away."""
+        try:
+            req = json.loads(body) if body else {}
+            key = req.get("key", "")
+            limit = req.get("limit", catalog_tree.DEFAULT_LIMIT)
+        except (ValueError, AttributeError):
+            raise flight.FlightServerError("catalog_children takes a JSON object")
+        if (
+            not isinstance(key, str)
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+        ):
+            raise flight.FlightServerError(
+                "catalog_children takes a string key and a positive integer limit"
+            )
+        level = self._require_catalog().catalog_children(
+            key, min(limit, catalog_tree.MAX_LIMIT)
+        )
+        return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
     def _registered(self, source_id: str) -> Optional[SourceAdapter]:
         """``SourceRegistry.get_registered``, its refusals as Flight errors: an

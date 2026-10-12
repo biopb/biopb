@@ -112,8 +112,9 @@ folder's `key` is its full path and is what `?key=` takes. A resolved source
 with no tensor is hidden; an unresolved one is shown, since it is read when
 opened. `descriptor` has the shape of a
 `/api/sources/query` row of the `sources` view. `truncated` says that `limit` or the server's row cap cut the
-level. The query lives behind `_tree_level` and reads `source_tree`, plus
-`sources` for the descriptors of the sources it lists.
+level. The server answers a level itself (the `catalog_children` action: folders,
+and the names and ids of the sources); the sidecar adds one `sources` query for
+those sources' descriptors.
 
 The `ETag` is of the body. The sidecar also remembers, per request, the
 catalog generation (the server's `health` `catalog_generation`) it last

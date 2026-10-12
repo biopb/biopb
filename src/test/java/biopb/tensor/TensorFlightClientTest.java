@@ -622,6 +622,46 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testCatalogChildrenReadsALevel() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setCatalogChildrenReply("{\"key\":\"lab\","
+                    + "\"folders\":[{\"name\":\"x\",\"key\":\"lab/x\"},"
+                    + "{\"name\":\"y/z\",\"key\":\"lab/y/z\"}],"
+                    + "\"sources\":[{\"name\":\"a.zarr\",\"source_id\":\"a\"}],"
+                    + "\"truncated\":true}");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                TensorFlightClient.CatalogChildren level = client.catalogChildren("lab", 50);
+                Assert.assertEquals("lab", level.getKey());
+                Assert.assertEquals(2, level.getFolders().size());
+                Assert.assertEquals("y/z", level.getFolders().get(1).getName());
+                Assert.assertEquals("lab/y/z", level.getFolders().get(1).getKey());
+                Assert.assertEquals("a.zarr", level.getSources().get(0).getName());
+                Assert.assertEquals("a", level.getSources().get(0).getSourceId());
+                Assert.assertTrue(level.isTruncated());
+
+                // What the server was asked is the JSON it documents.
+                Map<String, Object> asked = new Gson().fromJson(
+                        server.lastCatalogChildrenRequest(),
+                        new TypeToken<Map<String, Object>>() {}.getType());
+                Assert.assertEquals("lab", asked.get("key"));
+                Assert.assertEquals(50.0, ((Number) asked.get("limit")).doubleValue(), 0.0);
+            }
+        }
+    }
+
+    @Test
+    public void testCatalogChildrenAgainstAnOldServerSaysSo() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                UnsupportedOperationException error = Assert.assertThrows(
+                        UnsupportedOperationException.class, () -> client.catalogChildren());
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("catalog_children"));
+                Assert.assertTrue(error.getMessage(), error.getMessage().contains("Upgrade the server"));
+            }
+        }
+    }
+
+    @Test
     public void testCatalogRowsCarryNoResidency() throws Exception {
         // Residency is asked per call, never stored: the column is gone from
         // SOURCE_ROW_COLUMNS, so a browse cannot report a stale one
@@ -1022,6 +1062,15 @@ public class TensorFlightClientTest {
             producer.resolveHeartbeats = count;
         }
 
+        /** Answer {@code catalog_children} with this JSON; unset, it is an unknown action. */
+        void setCatalogChildrenReply(String json) {
+            producer.catalogChildrenReply = json;
+        }
+
+        String lastCatalogChildrenRequest() {
+            return producer.lastCatalogChildrenRequest;
+        }
+
         void setResolveSendsRow(boolean sends) {
             producer.resolveSendsRow = sends;
         }
@@ -1118,6 +1167,8 @@ public class TensorFlightClientTest {
         private volatile boolean sourceResolved = true;
         private volatile String sourceMetadataJson = "{\"test_key\": \"test_value\"}";
         private volatile int resolveHeartbeats = 0;
+        private volatile String catalogChildrenReply;
+        private volatile String lastCatalogChildrenRequest;
         private volatile boolean resolveSendsRow = true;
         // An unresolved source lists with no tensors -- but so does one that
         // resolved and held nothing readable, which is the pair #1032 exists
@@ -1412,6 +1463,18 @@ public class TensorFlightClientTest {
                 String stubs = ticketStubs ? ",\"ticket_stubs\":true" : "";
                 listener.onNext(new Result(("{\"status\":\"SERVING\",\"protocol\":"
                         + protocolVersion + stubs + external + "}").getBytes(StandardCharsets.UTF_8)));
+                listener.onCompleted();
+                return;
+            }
+            if ("catalog_children".equals(action.getType())) {
+                if (catalogChildrenReply == null) {
+                    // What a server that predates the action says.
+                    listener.onError(CallStatus.UNKNOWN
+                            .withDescription("Unknown action: catalog_children").toRuntimeException());
+                    return;
+                }
+                lastCatalogChildrenRequest = new String(action.getBody(), StandardCharsets.UTF_8);
+                listener.onNext(new Result(catalogChildrenReply.getBytes(StandardCharsets.UTF_8)));
                 listener.onCompleted();
                 return;
             }
