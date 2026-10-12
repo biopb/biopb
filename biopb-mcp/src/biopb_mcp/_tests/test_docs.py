@@ -588,8 +588,8 @@ def test_search_finds_a_literal_in_either_tier(store):
     ship(store, "arch/one", "# One\n\nraises BIOPB_X_ERROR when bad\n")
     _docs.write_doc("mine", "# Mine\n\nalso BIOPB_X_ERROR here\n", None, None)
     out = _docs.search_docs("biopb_x_error")
-    assert "arch/one:3 [One]" in out
-    assert "mine:3 [Mine]" in out
+    assert "arch/one#One (L3)" in out
+    assert "mine#Mine (L3)" in out
 
 
 def test_search_narrows_to_a_prefix_and_survives_a_bad_regex(store):
@@ -602,7 +602,7 @@ def test_search_narrows_to_a_prefix_and_survives_a_bad_regex(store):
 def test_search_caps_its_hits(store):
     ship(store, "big", "# B\n\n" + "hit\n" * 100)
     out = _docs.search_docs("hit")
-    assert out.count("big:") == _docs.MAX_SEARCH_HITS
+    assert out.count("big#B (L") == _docs.MAX_SEARCH_HITS
     assert "more" in out
 
 
@@ -618,31 +618,30 @@ LONG = "# T\n\nintro\n\n## A\n\na body\n\n### A1\n\ndeep\n\n## B\n\nb body\n\n``
 
 def test_a_section_runs_to_the_next_heading_of_its_level(store):
     ship(store, "long", LONG)
-    out = _docs.read_doc("long", "A")
+    out = _docs.read_doc("long#A")
     assert "a body" in out and "deep" in out and "b body" not in out
 
 
 def test_a_section_matches_loosely_and_ignores_code_fences(store):
     ship(store, "long", LONG)
-    assert "b body" in _docs.read_doc("long", "## b")
-    assert "no heading matches" in _docs.read_doc("long", "not a heading")
+    assert "b body" in _docs.read_doc("long#b")
+    assert "no heading matches" in _docs.read_doc("long#not a heading")
 
 
 def test_toc_and_line_ranges(store):
     ship(store, "long", LONG)
-    toc = _docs.read_doc("long", "toc")
+    toc = _docs.read_doc("long#toc")
     assert "5: ## A" in toc and "9: ### A1" in toc
-    assert _docs.read_doc("long", "3-3").endswith("intro")
+    assert _docs.read_doc("long#3-3").endswith("intro")
 
 
 def test_an_ambiguous_section_returns_the_outline(store):
     ship(store, "long", "# T\n\n## Auth one\n\nx\n\n## Auth two\n\ny\n")
-    out = _docs.read_doc("long", "auth")
+    out = _docs.read_doc("long#auth")
     assert "Auth one" in out and "Auth two" in out and "ambiguous" in out
 
 
 def test_a_search_hit_names_its_section(store):
     ship(store, "long", LONG)
     out = _docs.search_docs("b body")
-    assert "long:15 [B]: b body" in out
-    assert "[B]" in out
+    assert "long#B (L15): b body" in out

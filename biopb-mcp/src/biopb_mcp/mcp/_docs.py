@@ -727,16 +727,18 @@ def _header(meta: dict) -> str:
     return f"{meta['id']} — {', '.join(bits)}"
 
 
-def read_doc(doc_id: str, section: str | None = None) -> str:
+def read_doc(doc_id: str) -> str:
     """The doc's body under a one-line header, or the index rendered.
 
-    *section* narrows a long doc: a heading (:func:`read_section`), ``toc``, or a
-    line range ``120-180`` of the body, the numbering ``search_docs`` reports.
+    ``<id>#<section>`` narrows a long doc to a heading (:func:`read_section`),
+    ``toc``, or a line range ``120-180`` of the body. ``#`` is outside the id
+    charset, so the suffix cannot name a real doc.
 
     Fail-open: an unknown id returns a sentence saying so, never an error --
     the value is agent context, not executed code.
     """
-    doc_id = (doc_id or "").strip()
+    doc_id, _, section = (doc_id or "").strip().partition("#")
+    doc_id = doc_id.strip()
     if doc_id == INDEX_ID:
         return render_index()
     if doc_id.endswith(DIFF_SUFFIX):
@@ -750,7 +752,7 @@ def read_doc(doc_id: str, section: str | None = None) -> str:
             "there is."
         )
     body = meta["body"]
-    if section and section.strip():
+    if section.strip():
         body = read_section(body, section.strip())
     return f"{_header(meta)}\n\n{body}"
 
@@ -844,10 +846,10 @@ MAX_SEARCH_HITS = 40
 
 
 def search_docs(pattern: str, prefix: str = "") -> str:
-    """Lines matching *pattern* across both tiers, as ``id:line [heading]: text``.
+    """Lines matching *pattern* across both tiers, as ``id#heading (Lnn): text``.
 
-    The heading is the nearest one above the line: pass it as ``read_doc``'s
-    *section* to read the part of the doc the hit sits in.
+    ``id#heading`` is the nearest heading above the line and is itself a valid
+    ``read_doc`` argument, reading the part of the doc the hit sits in.
 
     Case-insensitive regular expression; a pattern that does not compile is
     searched as the literal string, since the agent usually means a literal
@@ -876,8 +878,8 @@ def search_docs(pattern: str, prefix: str = "") -> str:
                 if len(hits) < MAX_SEARCH_HITS:
                     heads = _headings(lines) if heads is None else heads
                     under = [text for i, _, text in heads if i < n]
-                    where = f" [{under[-1]}]" if under else ""
-                    hits.append(f"{doc_id}:{n}{where}: {line.strip()[:200]}")
+                    where = f"#{under[-1]}" if under else ""
+                    hits.append(f"{doc_id}{where} (L{n}): {line.strip()[:200]}")
     if not hits:
         return f"No doc matches '{pattern}'."
     more = (
