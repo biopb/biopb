@@ -953,7 +953,7 @@ _precompile_bytecode() {
     # single file fails to compile (e.g. a vendored py2-only module) — harmless
     # here, so we don't treat it as a failure.
     "$py" -m compileall -q -j 0 "$site" >/dev/null 2>&1 || true
-    _ok "Bytecode precompiled (first viewer launch will be faster)"
+    _ok "Bytecode precompiled (first launch will be faster)"
 }
 
 # Keep the installed release's own installer (its install.sh asset, stamped with
@@ -1885,11 +1885,19 @@ install_biopb() {
     fi
     _info "Then prompt it:"
     _cmd "start biopb and report status"
-    _info "That brings up the napari viewer and the data plane."
+    if [ "${INSTALL_NAPARI:-1}" = "0" ]; then
+        _info "That brings up the data plane."
+    else
+        _info "That brings up the napari viewer and the data plane."
+    fi
     _info "Keep the agent session running while you work."
     echo ""
 
-    printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+    if [ "${INSTALL_NAPARI:-1}" = "0" ]; then
+        printf "  %s2. Check your data.%s Confirm it appears in the web interface (run: biopb dashboard).\n" "${BOLD}" "${RESET}"
+    else
+        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+    fi
     echo ""
 
     printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"

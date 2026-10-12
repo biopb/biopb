@@ -1018,7 +1018,7 @@ function Invoke-Precompile {
                 if ($compiled % 1000 -eq 0) { Report-Detail "  ...$compiled files" }
             }
         }
-        Report-Ok "Bytecode precompiled ($compiled files; first viewer launch will be faster)"
+        Report-Ok "Bytecode precompiled ($compiled files; first launch will be faster)"
     } catch {
         # Non-fatal: the first run just recompiles, exactly as before this ran.
     }
