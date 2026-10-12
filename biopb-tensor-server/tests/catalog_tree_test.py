@@ -16,6 +16,7 @@ from biopb_tensor_server.serving.tree_paths import (
     SEP,
     catalog_url,
     dec,
+    enc,
     tree_columns,
     tree_parts,
 )
@@ -151,8 +152,39 @@ class TestTreeColumns:
         finally:
             db.close()
 
+    def test_an_unfinished_fill_is_finished_at_the_next_open(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        db.sync_roots([("r", "file:///lab")])
+        _add(db, "a", "x", CatalogRecord(None, {}, "r", "d/a.zarr"))
+        db.close()
+
+        # The columns exist but a crash left them unfilled.
+        raw = duckdb.connect(str(store))
+        raw.execute("UPDATE source_catalog SET tree_dir = '', tree_name = ''")
+        raw.close()
+
+        db = MetadataDatabase(store_path=store)
+        db.open()
+        try:
+            assert _place(db, "a") == (f"lab{SEP}d", "a.zarr")
+        finally:
+            db.close()
+
 
 class TestTreePaths:
+    def test_only_a_leading_endpoint_is_one(self):
+        assert enc("grpc://h:1/a/b") == "grpc\x02h:1/a/b"
+        assert enc("data/http://x/img") == "data/http://x/img"
+        # A later "://" collapses like any "//": it never reaches a segment.
+        assert tree_parts("dnd://data/http://x/img.tif") == [
+            "data",
+            "http:",
+            "x",
+            "img.tif",
+        ]
+
     def test_catalog_url_is_the_views_source_url(self):
         assert catalog_url("", "a/b") == "a/b"
         assert catalog_url("file:///r", ".") == "file:///r"

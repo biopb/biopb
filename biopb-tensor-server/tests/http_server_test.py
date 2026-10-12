@@ -4130,12 +4130,11 @@ class TestTreeLiveCatalog:
             with TestClient(app) as tc:
                 headers = _bearer(_TOKEN)
                 first = tc.get("/api/tree", params={"key": "d"}, headers=headers)
+                held = {**headers, "If-None-Match": first.headers["ETag"]}
+                # The first revalidation learns the generation, at the cost of a query.
+                tc.get("/api/tree", params={"key": "d"}, headers=held)
                 sent = self._count_queries(app)
-                again = tc.get(
-                    "/api/tree",
-                    params={"key": "d"},
-                    headers={**headers, "If-None-Match": first.headers["ETag"]},
-                )
+                again = tc.get("/api/tree", params={"key": "d"}, headers=held)
                 asked_for_304 = list(sent)
                 unconditional = tc.get(
                     "/api/tree", params={"key": "d"}, headers=headers
@@ -4157,6 +4156,7 @@ class TestTreeLiveCatalog:
                 headers = _bearer(_TOKEN)
                 first = tc.get("/api/tree", params={"key": "d"}, headers=headers)
                 held = {**headers, "If-None-Match": first.headers["ETag"]}
+                tc.get("/api/tree", params={"key": "d"}, headers=held)
                 z = zarr.open_array(str(tmp_path / "a.zarr"), mode="r")
                 other = ZarrAdapter(z, "o", ["y", "x"])
                 other._catalog_url = "file:///other/o.zarr"
@@ -4171,6 +4171,20 @@ class TestTreeLiveCatalog:
         assert asked > 0
         assert settled.status_code == 304
         assert len(sent) == asked
+
+    def test_a_folder_with_a_colon_can_be_opened(self, tmp_path):
+        urls = {"x": "dnd://data/http://x/img.tif"}
+        with _tree_catalog(tmp_path, urls) as (_, loc):
+            with TestClient(create_app(flight_location=loc, token=_TOKEN)) as tc:
+                headers = _bearer(_TOKEN)
+                top = tc.get("/api/tree", headers=headers).json()
+                level = tc.get(
+                    "/api/tree",
+                    params={"key": top["folders"][0]["key"]},
+                    headers=headers,
+                ).json()
+        assert top["folders"][0]["key"] == "data/http:/x"
+        assert [s["name"] for s in level["sources"]] == ["img.tif"]
 
     def test_the_server_reports_the_generation(self, tmp_path):
         with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (server, loc):

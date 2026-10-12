@@ -26,7 +26,12 @@ SEP = "\x01"
 
 
 def enc(text: str) -> str:
-    return text.replace("://", ENDPOINT_MARK)
+    """*text* (a folder key) in the stored spelling: only a leading ``scheme://`` is
+    an endpoint; a ``://`` later in the path is part of its segment."""
+    at = text.find("://")
+    if at <= 0 or "/" in text[:at]:
+        return text
+    return text[:at] + ENDPOINT_MARK + text[at + 3 :]
 
 
 def dec(text: str) -> str:

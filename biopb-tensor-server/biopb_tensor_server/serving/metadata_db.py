@@ -1169,9 +1169,8 @@ class MetadataDatabase:
             )
         """)
         # A file written before the tree columns existed keeps its rows: the
-        # columns are added and filled below, once the roots are known, rather than
-        # dropping a catalog that took a long scan to build.
-        added_tree_columns = False
+        # columns are added here and filled below, once the roots are known, rather
+        # than dropping a catalog that took a long scan to build.
         have = {
             r[0]
             for r in conn.execute(
@@ -1184,7 +1183,6 @@ class MetadataDatabase:
                 conn.execute(
                     f"ALTER TABLE source_catalog ADD COLUMN {column} TEXT DEFAULT ''"
                 )
-                added_tree_columns = True
         conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_roots (
                 root_id TEXT PRIMARY KEY,
@@ -1214,7 +1212,12 @@ class MetadataDatabase:
         self._root_urls = dict(
             conn.execute("SELECT root_id, root_url FROM catalog_roots").fetchall()
         )
-        if added_tree_columns:
+        # Rows the columns were added to, or whose fill an earlier open did not
+        # finish: a source with a path always has a name.
+        if conn.execute(
+            "SELECT 1 FROM source_catalog WHERE tree_name = '' "
+            "AND rel NOT IN ('', '.') LIMIT 1"
+        ).fetchone():
             for root_id, root_url in self._root_urls.items():
                 self._retree_root(conn, root_id, root_url)
         row = conn.execute(

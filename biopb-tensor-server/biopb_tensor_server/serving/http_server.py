@@ -2112,6 +2112,10 @@ def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, An
     }
 
 
+def _is_prefix(segs: List[str], path: List[str]) -> bool:
+    return path[: len(segs)] == segs
+
+
 def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, Any]]:
     """Every level from the top down to the one holding *source_id*, with its
     descriptor; ``None`` when the catalog has no such (visible) source."""
@@ -2132,11 +2136,7 @@ def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, 
         if any(s["descriptor"]["source_id"] == source_id for s in level["sources"]):
             break
         below = next(
-            (
-                f
-                for f in level["folders"]
-                if path[: len(_segments(f["key"]))] == _segments(f["key"])
-            ),
+            (f for f in level["folders"] if _is_prefix(_segments(f["key"]), path)),
             None,
         )
         # A level cut by its limit may have lost the way down: stop there; the
@@ -2193,7 +2193,14 @@ async def _tree_response(request: Request, build: Callable[[Any], Any]) -> Respo
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        generation = await run_in_threadpool(_catalog_generation, client)
+        # Only a caller holding a body can be answered from it: for any other the
+        # generation would be stored and never used, and the next request that
+        # does hold one costs a query to start with.
+        generation = (
+            await run_in_threadpool(_catalog_generation, client)
+            if request.headers.get("if-none-match")
+            else None
+        )
         slot = f"{request.url.path}?{request.url.query}"
         seen = ctx.tree_seen.get(slot)
         if (
