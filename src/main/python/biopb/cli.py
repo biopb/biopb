@@ -901,6 +901,7 @@ def _control_run_argv(
     san: Optional[List[str]] = None,
     url_prefix: Optional[str] = None,
     grpc_external_location: Optional[str] = None,
+    tokenless: bool = False,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -940,6 +941,9 @@ def _control_run_argv(
         "--win-sentinel",
         str(_control_shutdown_sentinel()),
     ]
+    if tokenless:
+        # The control requires this to be said: it never infers "local".
+        argv += ["--auth", "none"]
     if static_dir and static_dir.exists():
         argv += ["--static-dir", str(static_dir)]
     if url_prefix:
@@ -1179,6 +1183,7 @@ def control_start(
                 san=san,
                 url_prefix=url_prefix,
                 grpc_external_location=grpc_external_location,
+                tokenless=not resolved_token,
             )
 
             log_file = _control_log_file()

@@ -184,9 +184,8 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 # than trusting the child to: the CSRF gate skips safe methods, so a cross-site
 # GET to any proxied root is forwarded unchecked.
 #
-# Known limitation: a loopback control deliberately published by a reverse proxy
-# reads as local and gets the chat route; that operator owns the exposure
-# decision (`--expose` can turn the root off).
+# Which auth modes offer it is `_session_proxy_roots`'s call; the control never
+# reads its bind for this.
 _SESSION_CHAT_ROOT = "chat"
 
 # The execute-capable roots, which `session_proxy` narrows to POST (above).
@@ -209,36 +208,39 @@ _SESSION_MCP_ROOT = "mcp"
 _SESSION_STREAM_ROOTS = frozenset({_SESSION_MCP_ROOT})
 
 
+AUTH_MODES = ("none", "token", "split")
+
+
+def infer_auth(token: str | None, exec_token: str | None) -> str:
+    """The auth mode implied by the credentials supplied: an exec token means
+    ``split``, a token alone ``token``, neither ``none``. ``none`` is only ever
+    *chosen* (the launcher requires ``--auth none`` to say so)."""
+    if exec_token:
+        return "split"
+    return "token" if token else "none"
+
+
 def _session_proxy_roots(
-    loopback_bound: bool,
-    token_enforced: bool = False,
-    exec_split: bool = False,
-    expose: frozenset[str] | None = None,
+    auth: str, hide: frozenset[str] = frozenset()
 ) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
     guard and the thing it guards cannot disagree about what is reachable.
 
-    ``api`` is always proxied. The execute roots (``chat``, ``mcp``) are offered
-    only where whoever reaches them is trustworthy by construction: a loopback
-    control (same machine, or an operator's tunnel) or one with a separate exec
-    token (``exec_split``), so a viewing token can never reach them. ``mcp``
-    additionally needs a token to be enforced at all. ``expose``, when given,
-    narrows the execute roots further; it can only remove them.
+    ``api`` is always proxied. Which execute roots exist follows the operator's
+    explicit auth mode, never the bind address: ``none`` offers ``chat`` only
+    (``mcp`` needs a token to enforce), ``token`` and ``split`` offer both.
+    ``hide`` removes execute roots the operator does not want served at all.
 
     Whether a given root is actually served is the child's own decision
     (``observe.chat_enabled``), which is the half this control does not and
     should not know.
     """
-    roots = _SESSION_ALLOWED_ROOTS
-    if loopback_bound or exec_split:
-        roots = roots | {_SESSION_CHAT_ROOT}
-        if token_enforced:
-            roots = roots | {_SESSION_MCP_ROOT}
-    if expose is not None:
-        roots = roots & (_SESSION_ALLOWED_ROOTS | expose)
-    return roots
+    roots = _SESSION_ALLOWED_ROOTS | {_SESSION_CHAT_ROOT}
+    if auth != "none":
+        roots = roots | {_SESSION_MCP_ROOT}
+    return (roots - hide) | _SESSION_ALLOWED_ROOTS
 
 
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
@@ -1074,11 +1076,11 @@ def build_app(
     data_web_url: str,
     token: str | None = None,
     static_dir: str | Path | None = None,
-    loopback_bound: bool = False,
     url_prefix: str | None = None,
     algorithms: AlgorithmPlane | None = None,
     exec_token: str | None = None,
-    expose: frozenset[str] | None = None,
+    auth: str | None = None,
+    hide: frozenset[str] = frozenset(),
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -1093,14 +1095,17 @@ def build_app(
     that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
 
-    ``loopback_bound`` allows ``/session/<id>/chat/*``, whose turns **execute
-    code in that session's kernel**. Default off, and the decision is the
-    caller's because only it knows this control's bind address:
-    :func:`serve_control_api` derives it from a loopback bind, so a
-    network-reachable control carries an execute route only with an exec token
-    (below). Deliberately *not* delegated to the session child —
+    ``auth`` is the operator's explicit choice of credential regime, which alone
+    decides whether the execute roots (``/session/<id>/chat/*`` and ``/mcp``, whose
+    requests **run code in that session's kernel**) exist: ``none`` (no token;
+    ``chat`` only), ``token`` (one token for everything) or ``split`` (``token``
+    views, ``exec_token`` additionally runs code and changes sessions). ``None``
+    infers it from the credentials given. The bind address is deliberately not
+    consulted: a loopback control behind a reverse proxy is as reachable as a public
+    one. ``hide`` removes execute roots from whichever mode. Deliberately *not*
+    delegated to the session child --
     the proxy hop strips Host and Origin, so the child cannot tell a browser
-    from this trusted loopback hop and cannot make this call.
+    from this trusted hop and cannot make this call.
 
     ``url_prefix`` publishes this origin under a path prefix (``/node/<host>/
     <port>`` — an Open OnDemand interactive app) rather than at ``/``: requests
@@ -1111,17 +1116,19 @@ def build_app(
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
 
-    ``exec_token`` is a second secret, distinct from ``token``: only it (not the
-    viewing ``token``) may run code in a session or change one -- ``chat``,
-    ``mcp`` and every write under a session's ``api``. Without one, ``token`` is
-    both, which is only offered where the caller is already trusted (a loopback
-    control; see :func:`_session_proxy_roots`). ``expose`` narrows which execute
-    roots are proxied at all.
+    ``exec_token`` (``split`` mode) is a second secret, distinct from ``token``:
+    only it may run code in a session or change one -- ``chat``, ``mcp`` and every
+    write under a session's ``api``. In ``token`` mode ``token`` is both.
     """
-    exec_split = exec_token is not None and exec_token != token
-    session_roots = _session_proxy_roots(
-        loopback_bound, bool(token), exec_split, expose
-    )
+    if auth is None:
+        auth = infer_auth(token, exec_token)
+    if auth not in AUTH_MODES:
+        raise ValueError(f"auth must be one of {AUTH_MODES}, not {auth!r}")
+    if auth == "split" and (not exec_token or exec_token == token):
+        raise ValueError("auth 'split' needs an exec token distinct from the token")
+    if auth != "split":
+        exec_token = None
+    session_roots = _session_proxy_roots(auth, hide)
     if algorithms is None:
         algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
@@ -1354,7 +1361,7 @@ def build_app(
                 # mounts it (only a session whose mode serves it does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
-                "chat": probe["chat"] and loopback_bound,
+                "chat": probe["chat"] and _SESSION_CHAT_ROOT in session_roots,
                 "holder": probe["holder"],
             }
             for rec, probe in zip(records, probes, strict=True)
@@ -1974,33 +1981,22 @@ def serve_control_api(
     if data_web_url is None:
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
-    # The data-plane token gates the control's own /api/* too (single
-    # origin). None in local mode -> the gate falls back to a loopback Host check
-    # instead.
-    #
-    # The execute-capable roots (arbitrary code in a session's kernel) ride this
-    # origin only when the origin is same-machine. Derived from *this* listener's bind
-    # through the shared predicate, not from --remote or the plane's bind: what
-    # decides is who can reach this web front. Deliberately not gated by the
-    # token instead — the data-plane token authorizes reading pixels and is
-    # readable from the local credential file by design (biopb/biopb#470); fine
-    # for viewing, and not a credential to trade for a shell. A remote execute
-    # route, if ever wanted, needs its own.
-    loopback_bound = not _web_auth.host_is_public_bind(host)
+    # The data-plane token gates the control's own /api/* too (single origin).
+    # None in ``none`` mode -> the gate falls back to a loopback Host check
+    # instead. Which execute roots this origin carries is the operator's explicit
+    # ``spec.auth``, not this listener's bind (see build_app).
     app = build_app(
         supervisor,
         ensure_timeout,
         data_web_url,
         token=spec.token,
         static_dir=spec.static_dir,
-        loopback_bound=loopback_bound,
         url_prefix=spec.url_prefix,
         algorithms=algorithms,
         exec_token=spec.exec_token,
-        expose=spec.expose,
+        auth=spec.auth,
+        hide=spec.hide,
     )
-    if not loopback_bound:
-        logger.info("session chat disabled: control bound to %s (not loopback)", host)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":

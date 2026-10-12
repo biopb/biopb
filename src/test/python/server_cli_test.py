@@ -248,6 +248,21 @@ class TestControlRunArgv:
             grpc_bind=grpc_bind,
         )
 
+    def test_a_tokenless_control_is_told_so_explicitly(self, tmp_path):
+        # The control never infers "local" from a bind; it must be told.
+        base = {
+            "config": tmp_path / "biopb.json",
+            "static_dir": None,
+            "web_host": "127.0.0.1",
+            "base_port": 8810,
+            "log_level": "INFO",
+            "data_plane": True,
+            "grpc_bind": "127.0.0.1",
+        }
+        argv = cli._control_run_argv(**base, tokenless=True)
+        assert argv[argv.index("--auth") + 1] == "none"
+        assert "--auth" not in cli._control_run_argv(**base)
+
     def test_token_never_on_argv(self, tmp_path):
         argv = self._argv(tmp_path, grpc_bind="0.0.0.0")
         assert "--token" not in argv

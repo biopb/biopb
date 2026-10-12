@@ -413,9 +413,8 @@ class _Remote:
         if self._ask("GET", "/health").get("mcp_proxied") is not True:
             raise AttachError(
                 f"the control at {self.url} does not serve /mcp for remote "
-                "agents: it serves it only when it enforces a token and, if it is "
-                "reachable off the host, has a separate exec token "
-                "(BIOPB_CONTROL_EXEC_TOKEN)"
+                "agents: it serves it only when it enforces a token "
+                "(`--auth token` or `split`) and has not hidden it (`--hide mcp`)"
             )
         self._checked = True
 

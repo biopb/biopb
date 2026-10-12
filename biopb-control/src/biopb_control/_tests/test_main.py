@@ -25,9 +25,20 @@ from biopb._security import web_auth as _web_auth
 import biopb_control.__main__ as m
 
 
-def _capture(argv, env):
+def _capture(argv, env, say_none=True):
     """Run ``main(argv)`` with a stubbed ``run_control`` and return
-    ``(rc, spec, run_kwargs)``, isolating the process env to ``env``."""
+    ``(rc, spec, run_kwargs)``, isolating the process env to ``env``.
+
+    The control refuses to run without a token unless told ``--auth none``, which
+    most of these tests are not about, so *say_none* supplies it when no
+    credential or choice is given."""
+    if (
+        say_none
+        and "--token" not in argv
+        and "--auth" not in argv
+        and not {"BIOPB_TENSOR_TOKEN", "BIOPB_CONTROL_AUTH"} & set(env)
+    ):
+        env = {**env, "BIOPB_CONTROL_AUTH": "none"}
     captured = {}
 
     def _fake_run_control(spec, **kwargs):
@@ -82,9 +93,14 @@ def test_whitespace_only_token_collapses_to_none():
     # A blank/whitespace-only value is not a real credential: it collapses to None
     # (tokenless) rather than becoming a truthy spec.token that would gate on — and
     # write a bogus empty credential for — the empty string.
-    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": "   \n"})
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--auth", "none"], {"BIOPB_TENSOR_TOKEN": "   \n"}
+    )
     assert rc == 0
     assert spec.token is None
+    # And a blank token is not an answer to "how is this authenticated?".
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": "   \n"}, say_none=False)
+    assert rc == 2 and spec is None
 
 
 def test_local_mode_binds_control_loopback():
@@ -397,54 +413,77 @@ _TOK = "t" * 32
 _EXEC = "e" * 32
 
 
-def test_exec_token_reaches_the_spec_from_the_env():
-    rc, spec, _ = _capture(
+def test_no_token_and_no_auth_says_how_to_run_tokenless(capsys):
+    rc, spec, _ = _capture(_BASE_ARGV, {}, say_none=False)
+    assert rc == 2 and spec is None
+    assert "--auth none" in capsys.readouterr().err
+
+
+def test_auth_none_runs_without_a_token():
+    rc, spec, _ = _capture(_BASE_ARGV + ["--auth", "none"], {})
+    assert rc == 0 and spec.auth == "none" and spec.token is None
+
+
+def test_a_token_implies_token_mode_and_an_exec_token_split():
+    _rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": _TOK})
+    assert spec.auth == "token" and spec.exec_token is None
+    _rc, spec, _ = _capture(
         _BASE_ARGV,
         {"BIOPB_TENSOR_TOKEN": _TOK, "BIOPB_CONTROL_EXEC_TOKEN": f"{_EXEC}\n"},
     )
-    assert rc == 0
-    assert spec.exec_token == _EXEC and spec.token == _TOK
+    assert spec.auth == "split" and spec.exec_token == _EXEC
 
 
-def test_no_exec_token_is_none():
-    _rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": _TOK})
-    assert spec.exec_token is None
+def test_auth_comes_from_the_env_too():
+    _rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_CONTROL_AUTH": "none"})
+    assert spec.auth == "none"
 
 
-def test_exec_token_without_a_token_is_refused(capsys):
-    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_CONTROL_EXEC_TOKEN": _EXEC})
+@pytest.mark.parametrize(
+    "argv, env, fragment",
+    [
+        (["--auth", "none"], {"BIOPB_TENSOR_TOKEN": _TOK}, "takes no token"),
+        (["--auth", "token"], {}, "needs a token"),
+        (
+            ["--auth", "token"],
+            {"BIOPB_TENSOR_TOKEN": _TOK, "BIOPB_CONTROL_EXEC_TOKEN": _EXEC},
+            "no exec token",
+        ),
+        (["--auth", "split"], {"BIOPB_TENSOR_TOKEN": _TOK}, "exec token"),
+        (
+            ["--auth", "split"],
+            {"BIOPB_TENSOR_TOKEN": _TOK, "BIOPB_CONTROL_EXEC_TOKEN": _TOK},
+            "different exec token",
+        ),
+        (
+            ["--exec-token", "short"],
+            {"BIOPB_TENSOR_TOKEN": _TOK},
+            "exec token must be",
+        ),
+    ],
+)
+def test_inconsistent_auth_is_refused(argv, env, fragment, capsys):
+    rc, spec, _ = _capture(_BASE_ARGV + argv, env)
     assert rc == 2 and spec is None
-    assert "needs an access token" in capsys.readouterr().err
-
-
-def test_malformed_exec_token_is_refused(capsys):
-    rc, _spec, _ = _capture(
-        _BASE_ARGV + ["--exec-token", "short"], {"BIOPB_TENSOR_TOKEN": _TOK}
-    )
-    assert rc == 2
-    assert "exec token must be" in capsys.readouterr().err
+    assert fragment in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
     "value, expected",
-    [
-        ("chat,mcp", {"chat", "mcp"}),
-        ("mcp", {"mcp"}),
-        ("none", set()),
-        ("", set()),
-    ],
+    [("chat,mcp", {"chat", "mcp"}), ("mcp", {"mcp"}), ("", set())],
 )
-def test_expose_selects_execute_roots(value, expected):
-    _rc, spec, _ = _capture(_BASE_ARGV + ["--expose", value], {})
-    assert spec.expose == frozenset(expected)
+def test_hide_selects_execute_roots_to_remove(value, expected):
+    _rc, spec, _ = _capture(_BASE_ARGV + ["--auth", "none", "--hide", value], {})
+    assert spec.hide == frozenset(expected)
 
 
-def test_expose_defaults_to_unrestricted_and_reads_the_env():
-    assert _capture(_BASE_ARGV, {})[1].expose is None
-    assert _capture(_BASE_ARGV, {"BIOPB_CONTROL_EXPOSE": "chat"})[1].expose == {"chat"}
+def test_nothing_is_hidden_by_default_and_hide_reads_the_env():
+    assert _capture(_BASE_ARGV + ["--auth", "none"], {})[1].hide == frozenset()
+    env = {"BIOPB_CONTROL_AUTH": "none", "BIOPB_CONTROL_HIDE": "chat"}
+    assert _capture(_BASE_ARGV, env)[1].hide == {"chat"}
 
 
-def test_expose_refuses_an_unknown_root(capsys):
-    rc, _spec, _ = _capture(_BASE_ARGV + ["--expose", "chat,api"], {})
+def test_hide_refuses_an_unknown_root(capsys):
+    rc, _spec, _ = _capture(_BASE_ARGV + ["--auth", "none", "--hide", "api"], {})
     assert rc == 2
-    assert "--expose takes" in capsys.readouterr().err
+    assert "--hide takes" in capsys.readouterr().err

@@ -163,9 +163,9 @@ There is one token for all sessions; there are no per-session grants.
 `biopb-shim --remote <control-url>` (token from `--token` or
 `$BIOPB_TENSOR_TOKEN`; `$BIOPB_REMOTE` for the URL) attaches to another machine's
 sessions through its control, which proxies `/session/<id>/mcp` where it enforces a
-token. A public control takes the **exec** token for this (the viewing token is
-refused with 403): the lease and `/mcp` run code or change the session
-(biopb-control's ARCHITECTURE, "Two credentials"). The lease, status and listing take the same
+token. A control in `split` mode takes its **exec** token for this (the viewing
+token is refused with 403): the lease and `/mcp` run code or change the session
+(biopb-control's ARCHITECTURE, "Auth modes"). The lease, status and listing take the same
 path, `/session/<id>/...` and `/api/sessions`, so everything above holds. The shim
 sends the token as `X-Biopb-Token` and only to that address; this machine's own
 credential file is never used for a remote. `--header 'Name: value'` (repeatable, or

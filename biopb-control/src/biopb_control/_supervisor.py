@@ -417,13 +417,15 @@ class DataPlaneSpec:
     log_level: str = "INFO"
     server_log: Optional[Path] = None
     token: Optional[str] = None
-    # A second secret, distinct from `token`, for what runs code in a session or
-    # changes one (the control's `chat`, `mcp` and session write routes). None =
-    # `token` is both. Consumed only by the control's web front.
+    # The operator's explicit credential regime (`none` | `token` | `split`),
+    # which alone decides which execute roots the control carries; None infers it
+    # from the credentials below. See `_control.build_app`.
+    auth: Optional[str] = None
+    # `split`: a second secret, distinct from `token`, for what runs code in a
+    # session or changes one. Consumed only by the control's web front.
     exec_token: Optional[str] = None
-    # Which execute roots the control proxies at all (`chat`, `mcp`); None = every
-    # one its bind and tokens allow. It can only remove them.
-    expose: Optional[frozenset] = None
+    # Execute roots (`chat`, `mcp`) the control must not proxy at all.
+    hide: frozenset = frozenset()
     # Path prefix a reverse proxy publishes the control's web origin under (an
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.
