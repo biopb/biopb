@@ -28,6 +28,7 @@ from biopb.image import (
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.errors import AnnotationStoreError
+from biopb_tensor_server.core.registration import MAX_CAPTION_LEN
 from biopb_tensor_server.serving import metadata_db
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from google.protobuf import json_format
@@ -264,7 +265,7 @@ class TestStore:
 
     def test_an_overlong_caption_is_refused(self):
         db = MetadataDatabase()
-        note = ROI(text=Caption(text="x" * (metadata_db._MAX_CAPTION_LEN + 1)))
+        note = ROI(text=Caption(text="x" * (MAX_CAPTION_LEN + 1)))
         with pytest.raises(ValueError, match="longer than"):
             db.put_rois(ARRAY_ID, [_annotation(roi=note)])
 

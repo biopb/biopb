@@ -43,6 +43,7 @@ from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.registration import (
     MAX_CAPTION_LEN,
     RegistrationRecord,
+    normalize_caption,
     strip_mask_bindata,
 )
 
@@ -240,20 +241,16 @@ def _geometry(kind: str, shape: Mapping[str, Any]) -> Optional[ROI]:
     def f(key: str) -> float:
         return float(shape.get(key) or 0.0)
 
-    if kind == "labels":
-        text = str(shape.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+    if kind in ("points", "labels"):
+        at = _pt(_map(m, f("x"), f("y")))
+        text = (
+            normalize_caption(str(shape.get("text") or "")) if kind == "labels" else ""
+        )
+        # A label with no text still marks a place. Cut at the store's bound
+        # rather than lose the whole set to it.
         if text.strip():
-            # Cut at the store's bound rather than lose the whole set to it.
-            return ROI(
-                text=Caption(
-                    at=_pt(_map(m, f("x"), f("y"))), text=text[:MAX_CAPTION_LEN]
-                )
-            )
-        # A label with no text still marks a place.
-        return ROI(point=_pt(_map(m, f("x"), f("y"))))
-
-    if kind == "points":
-        return ROI(point=_pt(_map(m, f("x"), f("y"))))
+            return ROI(text=Caption(at=at, text=text[:MAX_CAPTION_LEN]))
+        return ROI(point=at)
 
     if kind == "lines":
         # No Line arm in roi.proto, and a 2-point polyline is the same geometry.
@@ -535,7 +532,7 @@ def _annotation(
         # and proto refuses a non-string outright.
         label=str(
             ome_roi.get("name")
-            or ("" if geometry.WhichOneof("shape") == "text" else shape.get("text"))
+            or ("" if geometry.HasField("text") else shape.get("text"))
             or ""
         ),
         roi=geometry,

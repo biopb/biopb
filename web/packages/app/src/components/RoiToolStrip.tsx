@@ -14,6 +14,7 @@
 
 import { useEffect, useRef } from "react";
 import { useAppStore } from "../store";
+import { sendsOnEnter } from "../utils/chatKeys";
 import {
   MAX_CAPTION_LENGTH,
   MAX_POLYLINE_WIDTH,
@@ -51,13 +52,12 @@ export interface RoiToolStripViewProps {
  * A textarea in the strip rather than a field on the canvas: it needs no
  * projection from image to screen, survives the narrow-screen layout where the
  * panes float over the canvas, and `isTextEntryTarget` already keeps the draft's
- * window-level Enter/Escape/Backspace away from it.
+ * window-level Enter/Escape/Backspace away from it. Enter finishes and
+ * Shift+Enter breaks a line, as in the chat composer.
  *
- * Enter finishes and Shift+Enter breaks a line -- the chat composer's
- * convention, and it keeps the one-line caption to a single key. Refocuses when
- * the anchor moves, because the click that moved it took focus off the field --
- * but only with a fine pointer: on a touch screen focusing raises the soft
- * keyboard and scrolls the page on every tap.
+ * Refocuses when the anchor moves, because the click that moved it took focus
+ * off the field -- but only with a fine pointer: on a touch screen focusing
+ * raises the soft keyboard on every tap.
  */
 function CaptionField({
   draft,
@@ -65,35 +65,30 @@ function CaptionField({
   onFinish,
   onCancel,
 }: {
-  draft: RoiDraft;
+  draft: Extract<RoiDraft, { tool: "text" }>;
   onChange: (text: string) => void;
   onFinish: () => void;
   onCancel: () => void;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [x, y] = draft.points[0] ?? [0, 0];
-  const placed = useRef(false);
   useEffect(() => {
-    const fine =
-      typeof window.matchMedia !== "function" || window.matchMedia("(pointer: fine)").matches;
-    // The first mount always focuses: the user has just asked to type.
-    if (!placed.current || fine) ref.current?.focus();
-    placed.current = true;
+    if (typeof window.matchMedia !== "function" || window.matchMedia("(pointer: fine)").matches) {
+      ref.current?.focus();
+    }
   }, [x, y]);
   return (
     <textarea
       ref={ref}
+      autoFocus
       className="roi-caption-input"
-      rows={Math.min(6, (draft.text ?? "").split("\n").length + 1)}
+      rows={Math.min(6, draft.text.split("\n").length + 1)}
       maxLength={MAX_CAPTION_LENGTH}
       placeholder="Text (Shift+Enter for a new line)"
-      value={draft.text ?? ""}
+      value={draft.text}
       onChange={(e) => onChange(e.target.value)}
       onKeyDown={(e) => {
-        // An IME owns Enter while composing: committing a candidate is not
-        // finishing the caption.
-        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-        if (e.key === "Enter" && !e.shiftKey) {
+        if (sendsOnEnter(e.nativeEvent)) {
           e.preventDefault();
           onFinish();
         } else if (e.key === "Escape") {
@@ -210,7 +205,7 @@ export function RoiToolStrip({
       polylineWidth={polylineWidth}
       onSetTool={onSetTool}
       onSetPolylineWidth={onSetPolylineWidth}
-      onSetDraftText={(text) => draft && setDraft({ ...draft, text })}
+      onSetDraftText={(text) => draft?.tool === "text" && setDraft({ ...draft, text })}
       onFinish={onFinish}
       onCancel={() => setDraft(null)}
     />

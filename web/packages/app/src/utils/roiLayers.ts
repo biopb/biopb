@@ -303,17 +303,15 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
     .map((roi) => ({ roi, path: roiPath(roi.geometry) }))
     .filter((entry): entry is { roi: RoiAnnotation; path: XY[] } => entry.path !== null);
   const points = shown.filter((roi) => roi.geometry.kind === "point");
-  const captions: CaptionDatum[] = shown.flatMap((roi) =>
-    roi.geometry.kind === "text"
-      ? [
-          {
-            at: [roi.geometry.at.x, roi.geometry.at.y] as XY,
-            text: roi.geometry.text,
-            color: [...setColor(roi.setName), 255] as CaptionDatum["color"],
-          },
-        ]
-      : [],
-  );
+  const captions: CaptionDatum[] = [];
+  for (const roi of shown) {
+    if (roi.geometry.kind !== "text") continue;
+    captions.push({
+      at: [roi.geometry.at.x, roi.geometry.at.y],
+      text: roi.geometry.text,
+      color: [...setColor(roi.setName), 255],
+    });
+  }
 
   const layers: unknown[] = [];
 
@@ -520,7 +518,7 @@ export function buildDraftLayers(options: DraftLayerOptions): unknown[] {
 
   if (draft.tool === "text") {
     const at = draft.points[0] as XY;
-    const typed = draft.text ?? "";
+    const typed = draft.text;
     // The prompt stands where the text will, so the click visibly landed. It is
     // not a marker: it is the placeholder of the field the user is about to type
     // in, and it goes away with the first character.

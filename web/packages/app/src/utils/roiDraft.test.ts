@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
   CLOSE_HANDLE_PX,
-  MAX_CAPTION_LENGTH,
   DEFAULT_POLYLINE_WIDTH,
   MAX_POLYLINE_WIDTH,
   MIN_POLYLINE_WIDTH,
@@ -224,35 +223,20 @@ describe("the text tool", () => {
 
   it("starts empty when the open draft belongs to another tool", () => {
     const poly: RoiDraft = { tool: "polygon", points: [[0, 0], [1, 1]] };
-    expect(placePoint(poly, "text", [5, 5]).draft?.text).toBe("");
+    expect(placePoint(poly, "text", [5, 5]).draft).toEqual({ tool: "text", points: [[5, 5]], text: "" });
   });
 
   it("is completable only with something to say", () => {
     const at: RoiDraft["points"] = [[1, 1]];
-    expect(isCompletable({ tool: "text", points: at })).toBe(false);
+    expect(isCompletable({ tool: "text", points: at, text: "" })).toBe(false);
     expect(isCompletable({ tool: "text", points: at, text: " \n\t" })).toBe(false);
     expect(isCompletable({ tool: "text", points: at, text: "x" })).toBe(true);
     expect(isCompletable({ tool: "text", points: [], text: "x" })).toBe(false);
   });
 
-  it("closes to a caption with newlines normalised and the length bounded", () => {
-    const draft: RoiDraft = { tool: "text", points: [[2, 3]], text: "a\r\nb\rc" };
-    expect(closeDraft(draft)).toEqual({ kind: "text", at: { x: 2, y: 3 }, text: "a\nb\nc" });
-    const long: RoiDraft = { ...draft, text: "x".repeat(MAX_CAPTION_LENGTH + 5) };
-    const geometry = closeDraft(long);
-    expect(geometry?.kind === "text" && geometry.text.length).toBe(MAX_CAPTION_LENGTH);
-  });
-
-  it("cuts an over-long caption between characters, not inside an emoji", () => {
-    const draft: RoiDraft = {
-      tool: "text",
-      points: [[2, 3]],
-      text: "x".repeat(MAX_CAPTION_LENGTH - 1) + "\u{1F600}\u{1F600}",
-    };
-    const geometry = closeDraft(draft);
-    const text = geometry?.kind === "text" ? geometry.text : "";
-    expect(Array.from(text)).toHaveLength(MAX_CAPTION_LENGTH);
-    expect(text.endsWith("\u{1F600}")).toBe(true);
+  it("closes to a caption carrying the typed text", () => {
+    const draft: RoiDraft = { tool: "text", points: [[2, 3]], text: "late\nstage" };
+    expect(closeDraft(draft)).toEqual({ kind: "text", at: { x: 2, y: 3 }, text: "late\nstage" });
   });
 
   it("refuses to close a blank caption", () => {

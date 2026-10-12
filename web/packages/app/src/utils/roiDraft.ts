@@ -20,19 +20,19 @@ export type RoiTool = "select" | "point" | "rectangle" | "polygon" | "polyline" 
 /** Tools that build a shape from a run of clicks rather than a fixed count. */
 export const OPEN_ENDED_TOOLS: ReadonlySet<RoiTool> = new Set(["polygon", "polyline"]);
 
-export interface RoiDraft {
-  tool: Exclude<RoiTool, "select">;
-  /** Vertices placed so far, in level-0 pixel coordinates. */
-  points: XY[];
-  /**
-   * What a text draft says so far. Only the text tool uses it: a caption is the
-   * one shape whose content cannot be had from clicks, so its draft waits for
-   * typing instead of completing on the click that placed it.
-   */
-  text?: string;
-}
+/**
+ * The shape being drawn; `points` are the vertices placed so far, in level-0
+ * pixel coordinates.
+ *
+ * A caption is the one shape whose content cannot be had from clicks, so its
+ * draft carries the text typed so far and waits for it instead of completing on
+ * the click that placed it.
+ */
+export type RoiDraft =
+  | { tool: Exclude<RoiTool, "select" | "text">; points: XY[] }
+  | { tool: "text"; points: XY[]; text: string };
 
-/** The longest caption the store accepts; see `_MAX_CAPTION_LEN` server-side. */
+/** The longest caption the store accepts (`MAX_CAPTION_LEN` server-side). */
 export const MAX_CAPTION_LENGTH = 2000;
 
 /**
@@ -80,7 +80,7 @@ export function isTextEntryTarget(target: EventTarget | null): boolean {
 export function isCompletable(draft: RoiDraft | null): boolean {
   if (draft === null || draft.points.length < minimumPoints(draft.tool)) return false;
   // A caption with nothing in it marks nothing and could not be selected again.
-  if (draft.tool === "text") return (draft.text ?? "").trim() !== "";
+  if (draft.tool === "text") return draft.text.trim() !== "";
   return true;
 }
 
@@ -168,15 +168,9 @@ export function closeDraft(
   const points = draft.points.map(([x, y]) => ({ x, y }));
   if (draft.tool === "text") {
     const [at] = points;
-    if (!at) return null;
-    // '\r' from a pasted Windows line ending would reach the store as-is; it
-    // normalises too, but a draft should not depend on that.
-    // By code point, as the server counts: slice() counts UTF-16 units and can cut
-    // an emoji in half, leaving a lone surrogate the server cannot parse.
-    const text = Array.from((draft.text ?? "").replace(/\r\n?/g, "\n"))
-      .slice(0, MAX_CAPTION_LENGTH)
-      .join("");
-    return { kind: "text", at, text };
+    // The textarea's maxLength bounds the text and the store normalises its
+    // line breaks, so it goes through as typed.
+    return at ? { kind: "text", at, text: draft.text } : null;
   }
   if (draft.tool === "polygon") return { kind: "polygon", points };
   if (draft.tool === "polyline") {
@@ -200,8 +194,7 @@ export function isRealClick(event?: { type?: string } | null): boolean {
 /** Undo the last placed vertex; an empty draft becomes null. */
 export function undoPoint(draft: RoiDraft | null): RoiDraft | null {
   if (!draft) return null;
-  // A caption has one anchor and its text lives in the input; Backspace outside
-  // the input must not throw the typed text away. Escape cancels it.
+  // Backspace outside the field must not throw the typed text away.
   if (draft.tool === "text") return draft;
   const points = draft.points.slice(0, -1);
   return points.length === 0 ? null : { ...draft, points };

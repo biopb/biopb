@@ -79,7 +79,7 @@ from google.protobuf import json_format
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
-from biopb_tensor_server.core.registration import MAX_CAPTION_LEN
+from biopb_tensor_server.core.registration import MAX_CAPTION_LEN, normalize_caption
 from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.tree_paths import tree_columns
 
@@ -489,10 +489,6 @@ _ACCEPTED_SHAPES: Set[str] = {
     "text",
 }
 
-# A caption is a note on the image, not a document: bounded so a paste cannot
-# turn a geometry row into bulk storage.
-_MAX_CAPTION_LEN = MAX_CAPTION_LEN
-
 
 # Set names in this namespace are server-owned, not client data: an importer
 # fills them from the source file and replaces them WHOLESALE when that file
@@ -650,13 +646,13 @@ def _prepare_roi(
         # and every reader sees one newline convention.
         geometry_msg = ROI()
         geometry_msg.CopyFrom(roi.roi)
-        text = geometry_msg.text.text.replace("\r\n", "\n").replace("\r", "\n")
+        text = normalize_caption(geometry_msg.text.text)
         # An empty caption marks nothing and has no extent to select.
         if not text.strip():
             raise ValueError("Caption text is empty")
-        if len(text) > _MAX_CAPTION_LEN:
+        if len(text) > MAX_CAPTION_LEN:
             raise ValueError(
-                f"Caption text is longer than {_MAX_CAPTION_LEN} characters "
+                f"Caption text is longer than {MAX_CAPTION_LEN} characters "
                 f"({len(text)})"
             )
         geometry_msg.text.text = text
