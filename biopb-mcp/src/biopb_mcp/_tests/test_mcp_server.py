@@ -1722,6 +1722,7 @@ class TestToolReturnShape:
     #: (tool, minimal kwargs, declares an outputSchema / returns the tuple)
     SHAPES = [
         ("read_doc", {"id": "index"}, True),
+        ("search_docs", {"pattern": "kernel"}, True),
         ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
         ("show_view", {"view": "id=a"}, False),

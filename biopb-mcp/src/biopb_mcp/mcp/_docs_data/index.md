@@ -20,6 +20,7 @@ send it with `web-viewer`.
 - ops: the server-side image-processing ops in `ops`
 - algorithm-servers: add an op the kernel cannot import, as one server file
 - requirements: check what a procedure needs, and what to do when a piece is missing
+- architecture/: how biopb itself is built — the control, tensor server, mcp, web viewer; `read_doc("architecture/")` lists it, `search_docs` finds an exception name, config key or log line
 
 ## Procedures
 

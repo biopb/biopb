@@ -1,0 +1,287 @@
+---
+description: "biopb-mcp Architecture: biopb-mcp is an MCP server that connects [napari](https://napari.org) and AI agents to biopb servers."
+---
+
+# biopb-mcp Architecture
+
+## Overview
+
+`biopb-mcp` is an **MCP server** that connects [napari](https://napari.org) and AI
+agents to biopb servers. It gives an agent a live Python kernel holding the data
+plane (`client`) and the algorithm plane (`ops`), plus a napari
+viewer where the session has one. Thesis: *"agent first; provide tools only if they
+help."* Image results go to the viewer or the control's web viewer, other results to
+the agent's chat.
+
+The viewer is optional: it needs the `[napari]` extra, `viewer.enabled`, and a
+display. The launcher decides once per session and hands the kernel its reason when
+there is none; the kernel then skips Qt and napari entirely. A display-less host runs
+without one unless `viewer.virtual_display` opts into a launcher-owned Xvfb, which is
+for tests.
+
+The viewer docks the **Tensor Browser**, and the agent's `add_tensor` builds its
+layers through the same pipeline; both come from the separate napari plugin
+[biopb-napari-widget](https://github.com/biopb/biopb-napari-widget), which
+depends on nothing here. biopb-mcp imports only its three root exports:
+`TensorBrowserWidget`, `add_tensor_layer` and `wrap_levels`. `add_tensor_layer`
+builds napari layers, so it cannot live in the napari-free SDK, and it must not
+be copied back here: sharing it is what keeps the browser and `add_tensor` in
+agreement on what a layer is (label sets, axes, pyramids).
+
+---
+
+## Process structure
+
+Everything the package runs is a chain of processes, but not one that ends
+together. The shim is **client-scoped**: it comes up when an MCP client connects
+and is gone when that client disconnects. It owns no session. A session is a
+detached process the control launched (or a person did, with `biopb mcp view`),
+and it outlives the client: it runs until a person stops it from the dashboard,
+and the next agent can attach to it.
+
+```
+              AI agent / MCP client
+                        │  stdio JSON-RPC (fd 0 / fd 1)
+                        ▼
+   ┌──────────────────────────────────────────────────┐
+   │ shim                     per client connection   │
+   │   owns fd 1; imports only the mcp SDK            │
+   └────────────────────────┬─────────────────────────┘
+                            │  http → /mcp, dynamic port
+                            ▼
+   ┌──────────────────────────────────────────────────┐
+   │ session child            detached, user-stopped  │
+   │   FastMCP / uvicorn  — tools + resources         │
+   │   KernelHost         — owns the kernel           │
+   │   observe UI         — job history + cancel      │
+   └───────┬──────────────────────────────────────────┘
+           │ spawns; jupyter ZMQ
+           ▼
+   ┌────────────────────────────┐   ┌───────────────────────┐
+   │ Jupyter kernel             │┈┈►│ dask LocalCluster     │
+   │   napari viewer window (Qt)│   │   scheduler + workers │
+   │   agent namespace          │   └───────────────────────┘
+   │   job runner, viewer proxy │    spawned by the kernel,
+   └──────────────┬─────────────┘    only when asked for
+                  │ Flight / gRPC
+                  ▼
+      data plane · algorithm servers · control plane
+      (outside this package — see ../development.md)
+```
+
+One ownership fact deliberately does not follow the chain: the **planes at the
+bottom are never started here** — the session is a pure client of them, and only
+*registers* itself with the control.
+
+### Why this shape
+
+The chain is split where it is because of **fd-1 corruption**. Under stdio MCP,
+**fd 1 *is* the JSON-RPC channel**, so any stray stdout from a heavy process
+(uvicorn/Qt/dask/kernel) corrupts it. Hence the **shim/heavy split**: a
+featherweight shim (`biopb._shim` in the SDK, run as `biopb-shim`) owns fd 1 and
+imports only the mcp SDK, and all heavy work runs
+in a separate child it bridges to over http — making fd-1 corruption structurally
+impossible.
+
+The biopb-mcp package is the only biopb component that requires a GUI environment
+(to run napari). This is why it is **client-scoped** rather than a shared daemon:
+to avoid a stale env, e.g. `DISPLAY` (#98).
+
+The session's relationship to the durable planes — it uses them, never starts them,
+and only registers itself with the control — is the control plane's side of the
+contract; see [[architecture/control]].
+
+---
+
+## Components
+
+### Attaching a client to a session
+
+The shim (`biopb-shim`) is the interface the mcp clients (claude code) see. It
+starts **unbound** and owns nothing until the agent calls its local `attach` tool:
+
+1. **Unbound**, it answers the handshake with a paragraph saying to call `attach`,
+   and lists `attach` alone; a client that never attaches costs no session. It
+   imports no session code and holds no copy of any session's tools, docs or
+   instructions. Every other tool is an error that lists the live sessions and
+   whether each is free.
+2. `attach(session=<id>)` takes the session's **lease** and bridges stdio
+   JSON-RPC ↔ its `/mcp`. The tool, resource and prompt lists become the session's
+   own (`list_changed` is declared in the handshake and sent on attach and on
+   detach), and `attach` returns the session's operating rules, which cannot ride
+   the handshake any more; attaching again to the same session returns them
+   again. The session is not the shim's: the shim renews the lease on a short
+   beat and releases it on the way out, and never stops the session. A lease that
+   is lost (another holder forced it, or the session stopped answering) unbinds
+   the shim.
+
+   A client that does not follow `list_changed` (Codex, within a turn) uses
+   `--session <id|new|auto>` instead: the shim binds before it answers
+   `initialize`, so the handshake already carries the session's own instructions
+   and tools. `auto` takes the newest free session, else launches one; the client
+   gives up choosing in exchange.
+3. `attach(session='new')` asks the **control** to launch a session for this
+   client (`POST /api/sessions/new`, with the client's display variables),
+   starting the control first if need be, and leases it from birth. The session
+   is the user's, not the shim's: it runs until stopped from the dashboard, and
+   the next agent can attach to it, so the shim only releases it. No control is
+   an error, not a fallback: a session without one has no data plane, so one
+   started without it would attach and then fail on first use.
+   `--session new` (or `$BIOPB_SESSION`) does this before the handshake, with no
+   `attach` call.
+
+What the shim does own is itself: a shim that outlived its client would go on
+renewing its lease and keep the session locked, so it releases and exits on stdin
+EOF, on SIGTERM/SIGHUP, and -- where a multi-process client can keep the stdin
+handle open after it is gone (Windows, #403) -- when a watchdog sees the client
+exit.
+
+### The lease
+
+A session answers to one holder at a time, an `agent` or the built-in `chat`
+(`mcp/_lease.py`); the other kind is refused while the lease lives. So one agent
+per session, and chat and an agent never write to one kernel together. The session
+holds the lease, not the control: the shim reaches a session directly on its
+loopback port.
+
+- **Agent**: taken by `attach`, renewed by the shim every 10 s, lapsed after 30 s
+  of silence (three missed beats), so a `kill -9`'d shim frees the session. The
+  holder is identified by a token the shim keeps, not by the connection, so a
+  restarted shim reclaims its own lease.
+- **Chat**: taken by the first turn (not by opening the pane, so a session with an
+  open pane stays attachable), renewed by turns only, never by the history poll,
+  lapsed after 5 min and kept alive while a turn runs. Released on idle, on clear,
+  and by `/chat/release`. Losing it cancels a running turn and drops queued
+  messages, which must not replay against a kernel the agent changed.
+- **Refusals and force**: `attach` on a held session answers with the holder's
+  kind and age; a chat turn on an agent-held session is a 409 with the same
+  facts. `force` takes the lease, and taking it from a mid-turn chat cancels the
+  turn; nothing else ever aborts one.
+- **Busy status** in the session list is the lease: free, agent or chat.
+  A change of holder clears the kernel's one-agent claim (`_writers`).
+
+There is one token for all sessions; there are no per-session grants.
+
+### Attaching from another machine
+
+`biopb-shim --remote <control-url>` (token from `--token` or
+`$BIOPB_TENSOR_TOKEN`; `$BIOPB_REMOTE` for the URL) attaches to another machine's
+sessions through its control, which proxies `/session/<id>/mcp` where it enforces a
+token. A control in `split` mode takes its **exec** token for this (the viewing
+token is refused with 403): the lease and `/mcp` run code or change the session
+(biopb-control's ARCHITECTURE, "Auth modes"). The lease, status and listing take the same
+path, `/session/<id>/...` and `/api/sessions`, so everything above holds. The shim
+sends the token as `X-Biopb-Token` and only to that address; this machine's own
+credential file is never used for a remote. `--header 'Name: value'` (repeatable, or
+`$BIOPB_REMOTE_HEADERS`) adds what a portal in front of the control wants, such as
+its session cookie, and the URL may carry a path prefix. `attach new` launches on
+the host, headless: the client sends no display variables, since the viewer,
+screenshots, paths and data plane all belong to the session's host. The control has
+no TLS of its own, so a published control needs the operator's proxy for it.
+
+The shim and a session meet only over HTTP and the registry: `/api/lease/*`,
+`/api/status`, `/mcp`, the control's `/api/sessions`, `/api/sessions/new`,
+`/health` (`mcp_proxied`) and its `/session/<id>/...` proxy, and `biopb._lifecycle.sessions`.
+A change to any of them is a change to the SDK and biopb-mcp together.
+
+### The kernel
+
+The session owns a **single child Jupyter kernel** hosting the tensor client, dask,
+`ops` and, where there is one, the napari viewer. Agent code runs *in that kernel*, not on the MCP
+thread or napari's Qt loop — so a runaway execution can be interrupted or
+hard-restarted without killing the MCP server. The host's round trips are quick
+snippets that may overlap: one threaded client routes each reply and iopub
+message to the call it answers, and the kernel runs requests in arrival order.
+
+The kernel is **launched lazily, not at boot**, so a long-running server binds
+cheaply and never pops a napari viewer until user requested it; kernel-dependent
+tools return a structured not-ready status until then. **Closing the napari window tears the
+kernel back down to idle**, and `start_kernel` rebuilds it.
+
+An agent's code runs as a cell on the kernel's main thread, like a notebook user's,
+so the Qt loop pauses while it runs; a long compute can run on a worker thread through
+`run_async`, keeping the viewer live. The agent-facing `viewer` object is a
+**main-thread marshaling proxy** over the real `napari.Viewer`, because an off-main
+napari mutation can segfault the kernel (#100).
+
+### dask cluster
+
+The kernel leaves dask as dask configures itself: computes run on the in-process
+scheduler, shared with the napari viewer, and a cell that wants parallel
+multi-process computation builds a dask `Client` itself. Defaulting to in-process is a
+reliability choice: a long-lived cluster nobody opted into is one nobody watches,
+and a suspended host left every `.compute()` blocked on a scheduler whose workers
+were gone (**#970**). Stop needs no dask machinery either: a blocking dask
+`Client` call cancels its own futures when interrupted.
+
+A cluster a cell spins belongs to the **kernel** — its workers are that process
+group's children, so they go down with it. There is no cluster machinery in the
+session child or the kernel's bootstrap, and no MCP tool: attaching is
+`Client(...)` and detaching is `close()`. The one piece kept is the viewer's pin:
+its slice reads run in-process whatever the default scheduler is
+(biopb-napari-widget's `wrap_levels`, #8).
+
+### Data connection
+
+The kernel and the Tensor Browser share one `biopb.tensor.Connection` (the SDK's):
+the plane's URL, the live Flight client, and why there is none. The kernel builds
+it and hands it to the widget, which connects it, so a reconnect in the widget is
+the agent's next `client`. It caches nothing; the catalog the tree is drawn from
+is the widget's own (biopb-napari-widget's `SourceList`), re-listed when the server's
+`source_count` moves.
+
+Where the plane is comes from `biopb`'s control client (backed by the private
+`biopb._control`) (#628): one `ensure_data_plane` call brings the plane up if it is down and returns
+its endpoint and credential. `$BIOPB_TENSOR_URL` is the one escape hatch, for a
+data server the control does not supervise; it bypasses the control completely,
+and the control's credential is **never** sent to it — authenticate it with
+`$BIOPB_TENSOR_TOKEN`. A local TLS data server is trusted from disk. The contract
+is `docs/discovery-contract.md`.
+
+A session with no control has no data plane to be told about. The stdio shim
+starts the control for an agent harness; a plain `napari` session does not, and
+the Tensor Browser then offers a URL and token field; `biopb mcp view` refuses to
+open without one.
+
+### Ports, logs, and per-user isolation
+
+The data plane's default gRPC port is **8815**, which is the one piece of shared
+state on a multi-user machine — an HPC node where another user already holds it is
+the common startup failure. Two ways out: point at the existing server with
+`$BIOPB_TENSOR_URL`, or move your own. The containerized/HPC server derives its
+ports from `$BIOPB_BASE_PORT` (HTTP `BASE+4`, gRPC `BASE+5`); a local
+`biopb control start` takes the same number as `--base-port`.
+
+Everything else is already per-user: each user gets a private on-disk cache
+(`/tmp/biopb-cache-<uid>`) with its own lock, so co-tenants running their own
+servers on one node do not collide. When a plane fails to come up the browser
+shows the cause inline; the full server output is in
+`~/.local/state/biopb/logs/`, and the MCP session's own log in
+`~/.local/state/biopb/mcp/`.
+
+### Extending the kernel namespace
+
+The agent's capability surface **is** the kernel namespace (`client`, `ops`,
+`np`/`da`, and `viewer` where there is one). Anything beyond that goes through the
+**algorithm plane**: a self-contained `@op`-decorated server file dropped in
+`~/.config/biopb/algorithms/`, which the control runs under `uv` and the kernel's
+`ops` calls — see `docs/algorithm-plane.md`. That is now cheap enough (one file, no
+packaging) that the kernel namespace itself stays fixed rather than pluggable.
+
+---
+
+## Security model
+
+**The kernel is a real IPython kernel with imports allowed — `execute_code` is
+arbitrary code execution by design.** Everything the session exposes is therefore an RCE
+threat, and it is protected in two places:
+
+- **Its own listener** binds loopback only and enforces an `Origin`/`Host`
+  allowlist, so a malicious page in the user's browser is rejected before it
+  reaches the kernel. There is **no loopback token** — the `Origin` check already
+  blocks the browser-attacker threat.
+- **The control's proxy**, for anything reached through it. The `/session/<id>/*`
+  hop strips the guard above, so the control's web-origin check is the child's
+  **only** authentication there — and `/mcp` itself is deliberately never proxied,
+  reachable only by the shim that owns the child. Both are enforced control-side:
+  [[architecture/control]].

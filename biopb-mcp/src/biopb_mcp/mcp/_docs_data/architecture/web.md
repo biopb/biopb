@@ -1,0 +1,158 @@
+---
+description: "biopb `web/` — front-end architecture: Internals of the browser front end."
+---
+
+# biopb `web/` — front-end architecture
+
+Internals of the browser front end. For the workspace layout, the surfaces/routes,
+and the dev/build/test commands, see `README.md`; this doc covers the TypeScript
+data-plane SDK (`@biopb/tensor-flight-client`), how a slice reaches the screen, and
+the SPA's token/store model.
+
+## `@biopb/tensor-flight-client` — the data-plane SDK
+
+ESM output (`dist/index.js` + `.d.ts`). The browser's HTTP client + lazy array API
+for the tensor server's FastAPI data API — reached **same-origin** through the
+control plane at `/data_plane/*`, which the app resolves at runtime (`base.ts`).
+
+### TensorHttpClient
+
+Low-level wrapper over the REST API. `new TensorHttpClient(apiBase, token)`.
+
+- Injects `Authorization: Bearer <token>` on every request when a token is present.
+- Per-call timeouts: **3 s** for metadata/listing, **8 s** for binary chunks.
+- Non-OK responses throw `TensorApiError(status, message, detail)`.
+
+| Method | Endpoint |
+|--------|----------|
+| `livez()` / `readyz()` | `GET /livez` / `GET /readyz` |
+| `treeLevel(key, limit)` | `GET /api/tree?key=&limit=` (one folder's children; carries an `ETag`) |
+| `treeReveal(id)` | `GET /api/tree/reveal?source_id=` (every level down to one source) |
+| `getSourceMetadata(id)` | `GET /api/sources/{id}/metadata` |
+| `slice(req)` | `POST /api/slice` |
+| `diagnostics()` | `GET /api/diagnostics` |
+
+`slice()` parses the binary response headers (`X-Shape`, `X-Dtype`, `X-Dim-Labels`)
+into a `TypedNdArray { buffer, shape, dtype, dimLabels }` (C-contiguous numpy bytes).
+
+### TensorArray — lazy per-tensor accessor
+
+`new TensorArray(client, sourceId, descriptor)`. On `.compute(options)`: build
+per-axis `[start, stop)` ranges from `SliceOptions` (scalar → single index,
+`[start, stop]` → range, `undefined` → full extent), clamp to `[0, shape[axis])`,
+and send a `SliceRequest`.
+
+### Axis mapping
+
+`buildAxisMap(dimLabels)` derives an `AxisMap` (`t | z | c | y | x → index`) from
+explicit labels, with a positional fallback for unrecognized labels:
+
+| Axis | Recognized labels |
+|------|------------------|
+| `t`  | t, time, frame, frames |
+| `z`  | z, depth, plane, planes, slice |
+| `c`  | c, channel, channels, band, bands |
+| `y`  | y, height, row, rows |
+| `x`  | x, width, col, cols, column, columns |
+
+Fallback: last unassigned dim → X, second-last → Y, third-last → Z, …
+`isAxisMapAmbiguous(dimLabels)` returns `true` when any label used the fallback;
+the app surfaces a warning in that case.
+
+### computeScaleHint
+
+```ts
+computeScaleHint(tensorShape, axisMap, viewportW, viewportH, pixelBudget = 1_000_000, viewportZoom = 1)
+  → ScaleVector { factors: number[], snapped: boolean }
+```
+
+A **pure** function — no `prevFactors`, no hysteresis band (that render-loop
+gesture-stability concern lives entirely in the web layer now). It selects a
+power-of-two downsample factor for the Y/X axes:
+
+1. Pixel-budget ceiling: `maxScale = max(1, sqrt(dataH·dataW / pixelBudget))`.
+2. `effectiveTargetScale = max(1 / viewportZoom, 1)` — zoomed in (`viewportZoom > 1`)
+   means a smaller scale, i.e. more detail.
+3. Snap that scale to the nearest power of two; non-spatial axes stay at `1`.
+
+`snapped` is `true` when snapping changed the factor.
+
+### TensorFlightClient
+
+Higher-level facade over `TensorHttpClient`: caches the source list and returns
+`LazyTensorArray` instances (wrapping `TensorArray`). Also exports
+`validateConfig()`, the client-side mirror of the server's `PUT /api/config`
+validation used by the admin page.
+
+## Rendering a slice — two paths
+
+`ViewerPane` picks one per tensor.
+
+**Tiled, client-side (`TileViewer`, the default).** Raw tiles reach the GPU and
+contrast is a shader uniform, so a pan refetches only what came into view and a
+contrast drag costs no request at all.
+
+```
+GET /api/tile_info/{array_id} → PixelSource[] (viv-source.ts, one per level)
+  → Viv / deck.gl TileLayer → GET /api/tile/{array_id}?level&col&row&t&z&c
+```
+
+There is no second viewer. Where the tiled path cannot run — no WebGL2, a dtype
+with no GPU equivalent, a server without the tile routes — `ViewerPane` states the
+reason instead of substituting a server-rendered one; the `/ws/render` viewer that
+used to fill that role is gone.
+
+Design and measurements: `../biopb-tensor-server/docs/remote-viewer-tiles.md`.
+
+## `@biopb/web` — SPA internals
+
+Vite + React + React Router v6, Zustand state, and Viv/deck.gl (WebGL2) in a
+lazily-loaded viewer chunk. The routes, the surfaces table, and the build/serve
+model are in `README.md`; the architectural notes that aren't there:
+
+- **Token / auth flow.** The token lives in `sessionStorage` under `biopb_token`
+  (clears on tab close, never persisted to disk). On load `ClientBootstrap` reads
+  it (`auth.ts`); absent → redirect to `/unlock`, which stores the pasted token and
+  initializes the client. Every HTTP request then carries `Authorization: Bearer`;
+  the Flight server (`BearerAuthMiddlewareFactory`) and the sidecar (`HTTPBearer`)
+  validate the *same* token. The unlock step is skipped only when no token is
+  enforced (driven by `/health` → `auth_required`) — which is the default locally,
+  though a local deployment may opt into a token and then gates like a remote one.
+- **Store (Zustand, `store/`, one slice file per lifetime).** Holds the `TensorHttpClient` + connection state,
+  the source tree (read a folder at a time from `/api/tree`: only the levels the
+  viewer has opened are held, and the poll re-reads just those), a `scanning` flag
+  seeded from `/readyz` `backend_health` so
+  the UI can distinguish "indexing" from "empty" during progressive discovery — see
+  `../biopb-tensor-server/docs/catalog-persistence.md`), the active source/tensor,
+  and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
+  `initClient` / `loadCatalog` / `openTensor` / `setSlice` / `clearSession`.
+- **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
+  A label set is an ordinary tensor at `<image array_id>/@labels/<name>`, so the
+  path is the only thing that marks one — `splitLabelArrayId` is the single
+  reading of that rule, and the tree groups sets under their image with it. A
+  set has the image's rank (channel a singleton, RGB samples axis left out), so
+  `labelSelection` aligns the two by position. The
+  overlay is a second Viv image layer over a second `PixelSource[]`, added to
+  `deckProps.layers` beneath the annotation layers, with the colour step
+  replaced by `LabelPaletteExtension`: a hue rotated by the golden-ratio
+  conjugate, 0 transparent, and the contrast ramp left at identity so the id the
+  server stored is the id that gets coloured. Nearest sampling is enforced at
+  both ends (the server on every computed level of a set, Viv on the GPU). The
+  overlay is drawn only while it holds the plane the image has landed -- two
+  independent reads land when they land, and during play the stale-plane cover
+  is dropped, so a mask that is merely *asked* for the right plane would be a
+  wrong picture that looks like a right one. Play paces on both layers for the
+  same reason: on the image alone, a set whose read is slower never catches up. See
+  `../biopb-tensor-server/docs/label-tensors.md`.
+- **Image viewer.** Component ownership, store lifetimes, tensor identity and the
+  viewer → store publish-back channels: `docs/viewer-architecture.md`.
+- **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
+  (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,
+  `ObservePage` — wired to routes in `main.tsx` (see `README.md` for the
+  route → surface map).
+
+## Client tests
+
+`packages/tensor-flight-client/` (vitest): `buildAxisMap`, `isAxisMapAmbiguous`,
+`computeScaleHint`, `TensorArray.compute`, `TensorHttpClient` (all methods with a
+mocked `fetch`), and `validateConfig`.

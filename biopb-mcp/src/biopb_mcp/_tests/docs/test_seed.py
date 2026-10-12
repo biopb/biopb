@@ -13,9 +13,11 @@ import importlib.util
 import re
 from pathlib import Path
 
+import pytest
+
 from biopb_mcp.mcp import _docs
 
-from .conftest import doc_id_of, offered_files, read_doc_file
+from .conftest import doc_id_of, is_architecture, offered_files, read_doc_file
 
 # `[[link]]`s, ignoring any inside an inline code span -- `authoring` quotes the
 # syntax itself as `[[id]]`, which is documentation, not a link.
@@ -69,7 +71,8 @@ def test_every_shipped_doc_is_within_the_body_cap(shipped_docs):
     too_long = {
         doc_id_of(p): len(read_doc_file(p).splitlines())
         for p in shipped_docs
-        if len(read_doc_file(p).splitlines()) > _docs.MAX_BODY_LINES
+        if not is_architecture(p)
+        and len(read_doc_file(p).splitlines()) > _docs.MAX_BODY_LINES
     }
     assert not too_long, f"over {_docs.MAX_BODY_LINES} lines: {too_long}"
 
@@ -144,7 +147,7 @@ def test_the_seed_groups_its_procedures_under_one_heading(seed_index):
 def test_no_body_names_a_specific_dataset(shipped_docs):
     """A path or an id from the run that produced it makes a doc unusable."""
     offenders = []
-    for path in shipped_docs:
+    for path in (p for p in shipped_docs if not is_architecture(p)):
         for line in read_doc_file(path).splitlines():
             if re.search(r"/(home|Users)/|[A-Za-z]:\\\\", line):
                 offenders.append(f"{doc_id_of(path)}: {line.strip()[:80]}")
@@ -201,3 +204,20 @@ def test_the_ci_gate_walks_the_docs_the_runtime_offers():
         f"offered:\n  only the gate: {sorted(gated - offered)}\n"
         f"  only the runtime: {sorted(offered - gated)}"
     )
+
+
+def test_the_seed_lists_the_architecture_collection(seed_index):
+    assert "architecture/" in _named_by(seed_index)
+
+
+def test_the_architecture_copies_match_their_sources():
+    """The copies are generated; a hand edit or a stale one fails here."""
+    import importlib.util
+
+    tool = Path(__file__).resolve().parents[4] / "tools" / "sync_architecture_docs.py"
+    if not tool.exists():
+        pytest.skip("not run from a checkout")
+    spec = importlib.util.spec_from_file_location("sync_architecture_docs", tool)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.main(["--check"]) == 0, "run biopb-mcp/tools/sync_architecture_docs.py"

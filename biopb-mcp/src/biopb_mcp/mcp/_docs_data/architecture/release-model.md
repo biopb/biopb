@@ -1,0 +1,253 @@
+---
+description: "biopb release model: How the monorepo is released."
+---
+
+# biopb release model
+
+How the monorepo is released. The guiding split: **library distribution (PyPI +
+Maven + a Docker base image)** and **product deployment (the GitHub release +
+the tensor-server Docker image)** are different things with different audiences
+and cadences, and are driven by different tags.
+
+## Two release lines, two tags
+
+The scheme is **two version lines, two tags**:
+
+| | Audience | Mechanism | Tag | Members |
+|---|---|---|---|---|
+| **SDK / library** | developers / integrators | **PyPI + Maven Central** | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Python → PyPI) |
+| **Product / deployment** | end users (`install.sh`), operators | **GitHub release** + Docker | `release-v*` | `biopb-tensor-server` (wheel **and** Docker image), `biopb-mcp`, `biopb-control`, and the `web/` bundle |
+
+Each package reads exactly one tag prefix (setuptools_scm `tag_regex` +
+`git describe --match`, or `sync-version.js`):
+
+- **`biopb`** and **`biopb-image-base`** read `v*`.
+- **`biopb-tensor-server`**, **`biopb-mcp`**, **`biopb-control`**, and the
+  **`web/` bundle** read `release-v*`, so they always share one product version.
+
+The tensor server used to have its own `server-v*` line; it now tracks
+`release-v*` for **both** its wheel (bundled into the GitHub release the
+installer `file://`-installs) and its Docker image (built by `tensor-server-ci`
+on the same tag). So a single `release-v*` tag cuts the whole product — the
+wheel bundle and the image agree on version by construction.
+
+PyPI is deliberately **excluded** from the `release-v*` deployment: `biopb`
+publishes to PyPI (and Maven Central) on its own `v*` tag, on its own cadence.
+`biopb-mcp`, `biopb-tensor-server`, and `biopb-control` are **not** on PyPI — they
+only reach end users as the `release-v*` wheel bundle the installer
+`file://`-installs. `biopb-image-base` rides the SDK's `v*` tag too: `python-ci`'s
+`deploy` job publishes it to PyPI alongside `biopb`. Its Docker base image (the
+foundation others build compute servers on) is on **neither** tag: it bundles the
+in-repo `biopb-tensor-server`, so `image-runtime-ci` publishes it only by manual
+dispatch, tagged with the commit SHA (see "The image-base image" below).
+
+## Cutting a release: up to two tags
+
+Put whichever of the two tags apply on the release commit:
+
+| Tag | Cut it when | Drives |
+|---|---|---|
+| `v<A>` | the SDK changed | `python-ci` → PyPI (`biopb` + `biopb-image-base`), `java-ci` → Maven Central |
+| `release-v<R>` | the product bundle or the tensor-server image changed | `release.yaml` → the GitHub release bundle (below) **and** `tensor-server-ci` → `biopb-tensor-server:<R>` Docker |
+
+The tags are independent: an SDK-only change is just `v<A>`; a product change
+(bundle and/or tensor-server image) is just `release-v<R>`. Cut both on one commit
+when one commit changes both lines. A commit that is not on a clean tag (a dry
+run) just yields a `.devN+gSHA` version, which is fine for testing.
+
+One ordering rule: a product release ships only with a published SDK.
+`release.yaml` fails unless the SDK at the release commit is byte-identical to
+the PyPI wheel of the nearest `v*` tag. So if the SDK changed since that tag,
+cut a new `v<A>` first (on the same commit is fine; the check waits for PyPI).
+
+Because every product-bundle package reads `release-v*` from the **same release
+commit**, `release.yaml`'s `setuptools_scm` build produces **clean** wheel
+versions for all of them (`biopb_tensor_server 0.11.0`, `biopb_mcp 0.11.0`,
+`biopb_control 0.11.0`) — not `.devN+gSHA`.
+
+### Release candidates (prereleases, e.g. off `dev`)
+
+A tag whose version is a **PEP 440 prerelease** (`…rc1`, `…a1`, `…b1`) is treated
+as a candidate. Tags are branch-agnostic, so an RC is typically cut on a `dev`
+commit to validate before it lands on `main`.
+
+- **`release-v…rc1`** marks the **GitHub release** `prerelease: true` (the
+  installer skips prereleases — see below), and publishes **no Docker image at
+  all**: `tensor-server-ci` still runs the full test + build matrix (that is what
+  the RC tag is for), but its `publish` job is gated to a final `release-vX.Y.Z`
+  and skips. Registry tags are permanent and public, and an RC is cut off `dev`,
+  so publishing one would park unmerged code next to the real releases for nobody
+  to consume. To try an RC image, build it locally from the tagged commit
+  (`docker build -f biopb-tensor-server/Dockerfile .`).
+
+The `v*` PyPI tag (biopb) follows PyPI's own prerelease rules: a `…rc1` version
+uploads as a prerelease, which `pip` ignores unless `--pre`.
+
+## What each tag produces
+
+### `release-v*` → the GitHub bundle (`release.yaml`) + the tensor-server image (`tensor-server-ci`)
+
+Two independent workflows fire on the same tag, from the tagged commit:
+
+1. **`release.yaml`** builds `biopb-tensor-server`, `biopb-mcp`, `biopb-control`
+   wheels (+ mcp sdist) and the data-browser `webapp.tar.gz`, plus the curated
+   `biopb-samples.tar.gz`, and attaches them — with `versions.json` +
+   `SHA256SUMS` + `install.sh`/`install.ps1` + the Windows GUI installer — to the
+   **GitHub release `release-v<R>`**. **This is the installer's source of truth**
+   (it `file://`-installs the wheels; from PyPI it takes the `biopb` SDK and
+   `napari[all]`, both pinned by `versions.json`, and `biopb-napari-widget`,
+   which biopb-mcp's `[napari]` extra brings). The SDK is not a release asset; `release.yaml`
+   builds it only to check it against PyPI. It builds **no Docker**.
+2. **`tensor-server-ci`**'s `publish` job builds the `biopb-tensor-server` image
+   and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**, tagged with the version
+   **and** `:latest`. This is the ONLY place the tensor-server image is
+   published, and it runs **only on a final `release-vX.Y.Z`** — an rc tag tests
+   and builds the image but publishes nothing.
+
+`versions.json` carries `release`, `tensor_server` (the shipped wheel's version —
+now the same `release-v*` line, so equal to `release` on a real tag), `napari`
+(the pinned Qt binding), `biopb` (the SDK pin) and `install_schema`. Docker
+versions are **not** in it.
+
+`install_schema` pairs an installer with the releases it can install.
+`install.sh`'s `INSTALL_SCHEMA` (and the engine's `$script:InstallSchema`, kept
+equal by a test) is the only number an installer accepts, and `release.yaml`
+copies it into each release's manifest. A release that declares another, or none
+(every release before the napari plugin split), is refused with a pointer to the
+installer published alongside it, so an installer carries no compatibility code
+for older releases. Bump it when a change
+to the release makes an earlier installer wrong for it.
+
+### The image-base image (`image-runtime-ci`, manual dispatch)
+
+`image-runtime-ci` publishes nothing on a tag. Dispatch the workflow on a commit
+and its `publish` job builds the `biopb-image-base` image (biopb + tensor-server
+wheels from that tree) and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**,
+tagged `sha-<7 chars>` of the commit, and `:latest` unless the `latest` input is
+unticked. Image labels record the revision and the bundled `biopb` and
+`biopb-tensor-server` versions. Neither the SDK `v*` nor the product `release-v*`
+describes the image, because it carries the in-repo tensor server.
+
+### Idempotent Docker publish (the "did the version change?" check)
+
+Each image `publish` job (tensor-server-ci, image-runtime-ci) is **idempotent**:
+it publishes only if that version tag (image-runtime-ci: the `sha-` tag) is missing from **at least one** of the two
+registries (ghcr.io, Docker Hub), so re-running a tag with both already present is
+a noop, while a partial prior publish (one registry pushed, the other failed)
+re-runs to fill the gap:
+
+```bash
+if docker manifest inspect ghcr.io/biopb/biopb-image-base:$VER >/dev/null 2>&1 \
+   && docker manifest inspect docker.io/jiyuuchc/biopb-image-base:$VER >/dev/null 2>&1; then
+  echo "$VER already in both registries — skip"
+else
+  # build + push :$VER to both (+ move :latest for a clean X.Y.Z)
+fi
+```
+
+The check needs a **clean** version with no `+gSHA` local segment (a Docker
+reference forbids `+`): both jobs derive `$VER` straight from the tag name
+(`${GITHUB_REF#refs/tags/…}`), which is always clean, so no sanitization is
+needed.
+
+## The napari plugin: a separate repo
+
+`biopb-napari-widget` (the Tensor Browser and the OME-Zarr writers) lives in
+[biopb/biopb-napari-widget](https://github.com/biopb/biopb-napari-widget) and is a
+third release line: its own `v*` tags publish it to PyPI. It pins a floor on
+`biopb`, and biopb-mcp pins a floor on it, so a change that crosses the boundary
+releases in order: the SDK (`v*` here), then the plugin, then the product that
+raises biopb-mcp's floor.
+
+Outside the monorepo the plugin can lag an SDK protocol change (the SDK refuses
+older Flight servers, #1018). Its CI's `sdk-head` job runs its tests against
+this repo's `dev` to catch that before an SDK release. The plugin leaves napari
+unpinned; biopb-mcp pins it exactly (see `versions.json` above).
+
+## Installer
+
+The user-facing installer is `install.sh` / `install.ps1`, fetched (by end users,
+via `biopb.org`) from a `release-v*` GitHub release of `biopb/biopb`:
+`RELEASE_TAG_PREFIX = "release-v"`. Asset regexes and the `file://` install are
+unchanged.
+
+**Every shipped installer is pinned to its paired release.** The scripts are
+published *with* each release (from the tagged commit), and `release.yaml`'s **Pin
+installers to this release** step stamps the exact tag into `BIOPB_PINNED_RELEASE`
+(`install.sh`) / `$script:BiopbPinnedRelease` (`install.ps1`, `biopb-engine.ps1`)
+*before* they ship — so this holds for **all** the copies that leave a release:
+the GitHub-release **assets** (`install.sh`/`install.ps1`), the **biopb.org**
+publish, and the Windows **`.exe`** engine (stamped in the `windows-installer`
+job). Stamping runs for **every** `release-v*` tag, stable or rc, so a copy
+downloaded from an rc release installs that rc — only the *biopb.org rsync* is
+gated to stable (that canonical URL tracks the latest stable release). The result:
+any installer you download from a given release installs the *exact* release it
+came from, not "whatever is newest at run time"; re-fetching is how you move
+forward. A **raw / git-checkout** copy has an empty pin and tracks the **latest
+stable** release (prereleases skipped).
+
+**`biopb.org/install.sh` and `install.ps1` are not the installers but
+bootstraps** (`install/bootstrap.sh`, `install/bootstrap.ps1`, uploaded by hand to
+`/var/www/biopb.org/install/` when they change, which is rare; no workflow
+publishes them). Each checks for `curl`/`tar` (`tar` on Windows), picks the release the way the installer does
+(`BIOPB_INSTALL_VERSION`, `BIOPB_INSTALL_RC`, else the latest stable), downloads
+that release's pinned `install.sh` / `install.ps1` asset and runs it with the
+caller's arguments and environment (the Windows one, in memory, so a Restricted
+ExecutionPolicy does not block it). It carries no release logic, so it does not change per release
+and never pairs an installer with a release it was not written for (an older
+`BIOPB_INSTALL_VERSION` used to run the newest `install.ps1` over that release's
+engine); `INSTALL_SCHEMA` now only guards a raw or checked-out installer. It does not verify the asset: `SHA256SUMS` does
+not cover the install scripts, which are stamped after it is written.
+
+`install.ps1` is a thin bootstrapper that loads the install *engine*
+(`biopb-engine.ps1`) and drives it. When it is pinned (or `BIOPB_INSTALL_VERSION`
+is set) it fetches the engine **from that release's GitHub assets** — a versioned
+copy that matches the wheels — instead of the unversioned biopb.org one, falling
+back to biopb.org only if that fetch fails. So a lone
+`install.ps1` downloaded from a release is self-contained: one script resolves a
+release and pulls the engine **and** wheels from it, exactly like `install.sh`
+(no separate engine download — which is why `biopb-engine.ps1` is also a release
+asset). A sibling `biopb-engine.ps1` on disk (a checkout) still wins. Overrides
+(all paths): `BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact
+release that declares the installer's `install_schema`; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
+rc builds are not published to `biopb.org`).
+
+**Canonical location: the repo-root `install/`** — this is the copy users track.
+The full-stack installer design (formerly staged in `biopb-mcp/install/`) was
+promoted into the root `install/` after the first `release-v*`; the transitional
+`biopb-mcp/install/` copy has been removed, so the root `install/` is now the
+single source of truth.
+
+## Per-tag workflow summary
+
+| Tag | Workflow | Publishes |
+|---|---|---|
+| `v*` | `python-ci`, `java-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) |
+| `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` |
+
+The canonical install scripts are published by a **step inside `release.yaml`**,
+after the GitHub release is created (formerly a standalone push-to-main
+`install-scripts.yaml`). Folding it in means the live installer publishes *only*
+if the release succeeds — a failed release can never leave a `biopb.org`
+installer newer than any release it can install. The step is gated to a **stable**
+tag: the `guard` job already blocks an off-main final tag, and prereleases
+(`…rc/a/b`) are skipped so the canonical URL keeps tracking the latest stable
+release (`install.sh` defaults to stable; `BIOPB_INSTALL_RC=1` opts into
+candidates on demand).
+
+`mcp-ci` and `control-ci` keep their PR test/build jobs but **do not publish**.
+`tensor-server-ci` publishes its Docker image on the product `release-v*` tag;
+`image-runtime-ci` publishes `biopb-image-base`'s Docker image only by manual
+dispatch (its PyPI wheel ships from `python-ci`, alongside `biopb`). There are no
+`server-v*` / `mcp-v*` / `control-v*` tags — the tensor server, mcp, control, and
+web all ship together on `release-v*`.
+
+## Open items
+
+- Confirm `biopb.org/install.sh` serves the repo-root `install/install.sh` (the
+  installer was promoted to root post-first-release; the host-side copy/redirect
+  should point at it).
+- Prerelease test tags (`release-v…rc1`, `v…rc1`) publish harmlessly: the
+  installer skips the GitHub release and **neither publishes a Docker image
+  at all**, so the tensor-server `:latest` stays on the last stable image (see
+  "Release candidates" above).

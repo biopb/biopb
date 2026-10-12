@@ -556,3 +556,113 @@ def test_diff_of_a_local_only_doc_has_nothing_to_compare(store):
 
 def test_the_diff_suffix_cannot_name_a_real_doc():
     assert not _docs.valid_id("one@diff")
+
+
+# --------------------------------------------------------------------------- #
+# Collections and search
+# --------------------------------------------------------------------------- #
+def test_a_collection_line_covers_the_docs_under_it(store):
+    ship(store, "arch/one")
+    ship(store, "arch/sub/two")
+    ship(store, "other")
+    text = _docs.render_index("- arch/: how it is built\n")
+    tail = text.split("New shipped docs")[1]
+    assert "other" in tail
+    assert "arch/" not in tail
+
+
+def test_reading_a_collection_lists_one_level(store):
+    ship(store, "arch/one", "# One\n\nFirst doc.\n")
+    ship(store, "arch/sub/two")
+    out = _docs.read_doc("arch/")
+    assert "- arch/sub/" in out
+    assert "- arch/one: First doc." in out
+    assert "arch/sub/two" not in out
+
+
+def test_an_empty_collection_says_so(store):
+    assert "No docs under 'nope/'" in _docs.read_doc("nope/")
+
+
+def test_search_finds_a_literal_in_either_tier(store):
+    ship(store, "arch/one", "# One\n\nraises BIOPB_X_ERROR when bad\n")
+    _docs.write_doc("mine", "# Mine\n\nalso BIOPB_X_ERROR here\n", None, None)
+    out = _docs.search_docs("biopb_x_error")
+    assert "arch/one#One (L3)" in out
+    assert "mine#Mine (L3)" in out
+
+
+def test_search_narrows_to_a_prefix_and_survives_a_bad_regex(store):
+    ship(store, "arch/one", "# One\n\nsee f(x[0]\n")
+    ship(store, "other", "# O\n\nsee f(x[0]\n")
+    out = _docs.search_docs("f(x[0]", prefix="arch/")
+    assert "arch/one" in out and "other" not in out
+
+
+def test_search_caps_its_hits(store):
+    ship(store, "big", "# B\n\n" + "hit\n" * 100)
+    out = _docs.search_docs("hit")
+    assert out.count("big#B (L") == _docs.MAX_SEARCH_HITS
+    assert "more" in out
+
+
+def test_search_with_no_match_says_so(store):
+    assert "No doc matches" in _docs.search_docs("zzz")
+
+
+# --------------------------------------------------------------------------- #
+# Section reads
+# --------------------------------------------------------------------------- #
+LONG = "# T\n\nintro\n\n## A\n\na body\n\n### A1\n\ndeep\n\n## B\n\nb body\n\n```\n## not a heading\n```\n"
+
+
+def test_a_section_runs_to_the_next_heading_of_its_level(store):
+    ship(store, "long", LONG)
+    out = _docs.read_doc("long#A")
+    assert "a body" in out and "deep" in out and "b body" not in out
+
+
+def test_a_section_matches_loosely_and_ignores_code_fences(store):
+    ship(store, "long", LONG)
+    assert "b body" in _docs.read_doc("long#b")
+    assert "no heading matches" in _docs.read_doc("long#not a heading")
+
+
+def test_toc_and_line_ranges(store):
+    ship(store, "long", LONG)
+    toc = _docs.read_doc("long#toc")
+    assert "5: ## A" in toc and "9: ### A1" in toc
+    assert _docs.read_doc("long#3-3").endswith("intro")
+
+
+def test_an_ambiguous_section_returns_the_outline(store):
+    ship(store, "long", "# T\n\n## Auth one\n\nx\n\n## Auth two\n\ny\n")
+    out = _docs.read_doc("long#auth")
+    assert "Auth one" in out and "Auth two" in out and "ambiguous" in out
+
+
+def test_a_search_hit_names_its_section(store):
+    ship(store, "long", LONG)
+    out = _docs.search_docs("b body")
+    assert "long#B (L15): b body" in out
+
+
+def test_new_docs_under_a_directory_reach_the_tail_as_one_collection_line(store):
+    for i in range(5):
+        ship(store, f"arch/d{i}")
+    ship(store, "solo")
+    tail = _docs.render_index("- kernel: k\n").split("New shipped docs")[1]
+    assert tail.count("\n- ") == 2
+    assert '- arch/: list it with read_doc("arch/")' in tail
+    assert "arch/d0" not in tail and "- solo:" in tail
+
+
+def test_an_index_from_before_the_collection_gets_one_architecture_line(
+    store, monkeypatch
+):
+    ship(store, "arch/one")
+    monkeypatch.setattr(
+        _docs, "_seed_index_text", lambda: "- arch/: how it is built; search it\n"
+    )
+    tail = _docs.render_index("- kernel: k\n").split("New shipped docs")[1]
+    assert "- arch/: how it is built; search it" in tail

@@ -621,6 +621,7 @@ def render_index(text: str | None = None) -> str:
         text = index_text()
 
     named: set[str] = set(_ignored_ids(text))
+    collections: list[str] = []
     shadowed: set[str] = set()
     out: list[str] = []
     for line in text.splitlines():
@@ -630,7 +631,8 @@ def render_index(text: str | None = None) -> str:
             continue
         named.add(doc_id)
         if doc_id.endswith("/"):
-            out.append(line)  # a collection line: kept verbatim (knowledge.md §7)
+            collections.append(doc_id)  # names every doc under it; kept verbatim
+            out.append(line)
             continue
         meta = describe(doc_id)
         if meta is None:
@@ -643,8 +645,25 @@ def render_index(text: str | None = None) -> str:
             out.append(line)
 
     ids = shipped_ids()
-    new = [i for i in ids if i not in named]
-    _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
+    new = [
+        i
+        for i in ids
+        if i not in named and not any(i.startswith(c) for c in collections)
+    ]
+    # Docs under a directory are offered as one collection line, which is what
+    # the agent files: a release adding a tree must not add a tail line per doc.
+    groups = sorted({i.partition("/")[0] + "/" for i in new if "/" in i})
+    items = [i for i in new if "/" not in i] + groups
+    _append_tail(
+        out,
+        _NEW_TAIL,
+        items,
+        lambda i: (
+            f"- {i}: {_collection_hook(i)}"
+            if i.endswith("/")
+            else f"- {i}: {_shipped_description(i)}"
+        ),
+    )
 
     stale = stale_shadowed_ids(shadowed, ids)
     _append_tail(
@@ -654,6 +673,15 @@ def render_index(text: str | None = None) -> str:
         lambda i: f'- {i}: {_shipped_description(i)} — read_doc("{i}{DIFF_SUFFIX}")',
     )
     return "\n".join(out).rstrip() + "\n"
+
+
+def _collection_hook(prefix: str) -> str:
+    """The seed index's own hook for a collection line, else a generic one."""
+    for line in _seed_index_text().splitlines():
+        m = _ENTRY.match(line)
+        if m and m.group(2) == prefix:
+            return m.group(3)
+    return f'list it with read_doc("{prefix}"), search it with search_docs'
 
 
 def _append_tail(out: list[str], header: str, ids: list[str], line) -> None:
@@ -724,21 +752,164 @@ def _header(meta: dict) -> str:
 def read_doc(doc_id: str) -> str:
     """The doc's body under a one-line header, or the index rendered.
 
+    ``<id>#<section>`` narrows a long doc to a heading (:func:`read_section`),
+    ``toc``, or a line range ``120-180`` of the body. ``#`` is outside the id
+    charset, so the suffix cannot name a real doc.
+
     Fail-open: an unknown id returns a sentence saying so, never an error --
     the value is agent context, not executed code.
     """
-    doc_id = (doc_id or "").strip()
+    doc_id, _, section = (doc_id or "").strip().partition("#")
+    doc_id = doc_id.strip()
     if doc_id == INDEX_ID:
         return render_index()
     if doc_id.endswith(DIFF_SUFFIX):
         return read_diff(doc_id[: -len(DIFF_SUFFIX)])
+    if doc_id.endswith("/"):
+        return list_collection(doc_id)
     meta = describe(doc_id)
     if meta is None:
         return (
             f"No doc '{doc_id}'. Read the index with read_doc('index') for what "
             "there is."
         )
-    return f"{_header(meta)}\n\n{meta['body']}"
+    body = meta["body"]
+    if section.strip():
+        body = read_section(body, section.strip())
+    return f"{_header(meta)}\n\n{body}"
+
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_RANGE = re.compile(r"\A(\d+)\s*-\s*(\d+)\Z")
+
+
+def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """``(index, level, text)`` per heading, fenced code skipped."""
+    out, fenced = [], False
+    for n, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and (m := _HEADING.match(line)):
+            out.append((n, len(m.group(1)), m.group(2)))
+    return out
+
+
+def read_section(body: str, section: str) -> str:
+    """One slice of *body*: ``toc``, a line range, or the named heading.
+
+    A heading is matched case-insensitively, whole text first and then as a
+    substring; the slice runs to the next heading of the same or a higher level.
+    An ambiguous or unknown name returns the outline instead of guessing.
+    """
+    lines = body.splitlines()
+    heads = _headings(lines)
+    toc = (
+        "\n".join(f"{n + 1}: {'#' * lvl} {text}" for n, lvl, text in heads)
+        or "(no headings)"
+    )
+    if section.lower() == "toc":
+        return toc
+    if m := _RANGE.match(section):
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (
+            "\n".join(lines[max(lo, 1) - 1 : hi])
+            or f"No lines {lo}-{hi}; the doc has {len(lines)}."
+        )
+    want = section.lower().lstrip("# ").strip()
+    hits = [h for h in heads if h[2].lower() == want] or [
+        h for h in heads if want in h[2].lower()
+    ]
+    if len(hits) != 1:
+        why = "ambiguous" if hits else "no heading matches"
+        return f"{why} '{section}'. Headings (line: heading):\n{toc}"
+    start, level, _ = hits[0]
+    end = next((n for n, lvl, _ in heads if n > start and lvl <= level), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def _all_ids() -> list[str]:
+    """Every readable id in either tier, shipped banked docs excluded."""
+    return sorted(set(shipped_ids()) | set(local_ids()))
+
+
+def list_collection(prefix: str) -> str:
+    """One level of the docs under *prefix* (``"architecture/"``), one line each.
+
+    A sub-collection is listed as ``sub/`` so it can be read in turn. A local
+    doc shadowing a shipped one is marked, as it is in the index.
+    """
+    if not valid_id(prefix.rstrip("/")):
+        return f"'{prefix}' is not a collection. Read the index for what there is."
+    docs: dict[str, str] = {}
+    subs: set[str] = set()
+    for doc_id in _all_ids():
+        if not doc_id.startswith(prefix):
+            continue
+        head, sep, _ = doc_id[len(prefix) :].partition("/")
+        if sep:
+            subs.add(prefix + head + "/")
+        else:
+            docs[doc_id] = doc_id
+    if not docs and not subs:
+        return f"No docs under '{prefix}'. Read the index for what there is."
+    lines = [f"{prefix} -- read one with read_doc(id)", ""]
+    lines += [f"- {s}" for s in sorted(subs)]
+    for doc_id in sorted(docs):
+        meta = describe(doc_id)
+        if meta is None:
+            continue
+        mark = " (local copy)" if meta["shadows_shipped"] else ""
+        lines.append(f"- {doc_id}: {meta['description']}{mark}")
+    return "\n".join(lines) + "\n"
+
+
+#: Hits one search returns; past it the agent narrows the pattern or the prefix.
+MAX_SEARCH_HITS = 40
+
+
+def search_docs(pattern: str, prefix: str = "") -> str:
+    """Lines matching *pattern* across both tiers, as ``id#heading (Lnn): text``.
+
+    ``id#heading`` is the nearest heading above the line and is itself a valid
+    ``read_doc`` argument, reading the part of the doc the hit sits in.
+
+    Case-insensitive regular expression; a pattern that does not compile is
+    searched as the literal string, since the agent usually means a literal
+    (an exception name, a config key). *prefix* narrows to a collection.
+    """
+    pattern = (pattern or "").strip()
+    if not pattern:
+        return "Give a pattern to search for."
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        rx = re.compile(re.escape(pattern), re.IGNORECASE)
+    hits: list[str] = []
+    total = 0
+    for doc_id in _all_ids():
+        if not doc_id.startswith(prefix):
+            continue
+        meta = describe(doc_id)
+        if meta is None:
+            continue
+        lines = meta["body"].splitlines()
+        heads = None
+        for n, line in enumerate(lines, 1):
+            if rx.search(line):
+                total += 1
+                if len(hits) < MAX_SEARCH_HITS:
+                    heads = _headings(lines) if heads is None else heads
+                    under = [text for i, _, text in heads if i < n]
+                    where = f"#{under[-1]}" if under else ""
+                    hits.append(f"{doc_id}{where} (L{n}): {line.strip()[:200]}")
+    if not hits:
+        return f"No doc matches '{pattern}'."
+    more = (
+        f"\n... {total - len(hits)} more; narrow the pattern or prefix."
+        if total > len(hits)
+        else ""
+    )
+    return "\n".join(hits) + more + "\n"
 
 
 def read_diff(doc_id: str) -> str:
