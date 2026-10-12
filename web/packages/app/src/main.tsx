@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, lazy } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { captureUrlToken } from "./auth";
 import { BASE } from "./base";
 import { ViewerLayout } from "./ViewerLayout";
 import { HomePage } from "./pages/HomePage";
@@ -29,6 +30,12 @@ const root = document.getElementById("root")!;
 // always base "/" because the prefix is a per-job value with no build-time
 // answer (see base.ts).
 const basename = BASE || "/";
+
+// The one-time access URL (`/?token=…`) hands the app its token. Taken before
+// anything renders, because a page's first request is made by an effect that
+// runs ahead of any effect that would capture it, and without the token that
+// request is a 401 that sends the user to /unlock.
+captureUrlToken();
 
 createRoot(root).render(
   <StrictMode>
