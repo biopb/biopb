@@ -37,7 +37,7 @@ interface SourcesEditorProps {
 
 // Curated field order per source kind; every other *set* scalar key on a source
 // (source_id, cloud, path, …) is appended so nothing is hidden.
-const LOCAL_KEYS = ["url", "type", "monitor"];
+const LOCAL_KEYS = ["url", "type", "alias", "monitor", "cloud"];
 const REMOTE_KEYS = ["url", "alias", "credentials_profile", "monitor"];
 
 function str(v: unknown): string {
