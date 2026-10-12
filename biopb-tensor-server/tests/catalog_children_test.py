@@ -74,12 +74,12 @@ class TestCatalogChildren:
         ]
 
     def test_a_key_with_nothing_under_it_is_an_empty_level(self, client):
-        level = client.catalog_children("nowhere")
-        assert (level["folders"], level["sources"], level["truncated"]) == (
-            [],
-            [],
-            False,
-        )
+        assert client.catalog_children("nowhere") == {
+            "key": "nowhere",
+            "folders": [],
+            "sources": [],
+            "truncated": False,
+        }
 
     def test_the_limit_cuts_a_level_and_says_so(self, client):
         level = client.catalog_children("lab/x", limit=1)
@@ -136,5 +136,5 @@ def test_a_server_that_predates_it_is_named():
             raise flight.FlightServerError("Unknown action: catalog_children")
 
     state = SimpleNamespace(client=Old(), call_options=None)
-    with pytest.raises(NotImplementedError, match="catalog_children"):
+    with pytest.raises(RuntimeError, match="catalog_children"):
         CatalogClient(state).children()

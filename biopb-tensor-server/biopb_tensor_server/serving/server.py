@@ -1341,10 +1341,12 @@ class TensorFlightServer(flight.FlightServerBase):
         ``sources`` query away."""
         try:
             req = json.loads(body) if body else {}
-            key = req.get("key", "")
-            limit = req.get("limit", catalog_tree.DEFAULT_LIMIT)
-        except (ValueError, AttributeError):
+        except ValueError:
+            req = None
+        if not isinstance(req, dict):
             raise flight.FlightServerError("catalog_children takes a JSON object")
+        key = req.get("key", "")
+        limit = req.get("limit", catalog_tree.DEFAULT_LIMIT)
         if (
             not isinstance(key, str)
             or isinstance(limit, bool)
@@ -1355,14 +1357,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 "catalog_children takes a string key and a positive integer limit"
             )
         try:
-            level = self._require_catalog().catalog_children(
-                key, min(limit, catalog_tree.MAX_LIMIT)
-            )
-            return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            )
+            level = self._require_catalog().catalog_children(key, limit)
         except UnicodeError:
             raise flight.FlightServerError("catalog_children takes a text key")
+        return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
     def _registered(self, source_id: str) -> Optional[SourceAdapter]:
         """``SourceRegistry.get_registered``, its refusals as Flight errors: an

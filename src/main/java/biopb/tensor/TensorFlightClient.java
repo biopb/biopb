@@ -1455,9 +1455,11 @@ public class TensorFlightClient implements AutoCloseable {
         return level;
     }
 
+    private static final int CATALOG_CHILDREN_DEFAULT_LIMIT = 2000;
+
     /** {@link #catalogChildren(String, int)} at the top, with the server's default limit. */
     public CatalogChildren catalogChildren() throws IOException {
-        return catalogChildren("", 2000);
+        return catalogChildren("", CATALOG_CHILDREN_DEFAULT_LIMIT);
     }
 
     /**

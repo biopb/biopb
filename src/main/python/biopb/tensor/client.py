@@ -277,7 +277,7 @@ class TensorFlightClient:
 
         Raises:
             ValueError: If *limit* is below 1.
-            NotImplementedError: If the server predates this call.
+            RuntimeError: If the server predates this call.
             FlightServerError: If the server refuses it.
 
         Example:

@@ -7,16 +7,11 @@ sitting in it.
 
 from typing import Any, Dict, List
 
-from biopb_tensor_server.serving.tree_paths import SEP, dec, enc
+from biopb_tensor_server.serving.tree_paths import SEP, dec, enc, key_dir
 
 DEFAULT_LIMIT = 2000
 # What one level may ask for; a larger limit is this.
 MAX_LIMIT = 100_000
-
-
-def key_dir(key: str) -> str:
-    """The ``dir`` of the folder *key* ("" is the top, whose ``dir`` is ``""``)."""
-    return SEP.join(enc(key).split("/")) if key else ""
 
 
 def _chain(lo: str, hi: str) -> List[str]:
@@ -41,8 +36,10 @@ def children(cursor: Any, key: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any
     A chain of single-child folders is one folder, ending where a source sits or
     the chain forks. Folders come first and share *limit* with the sources; both
     are in byte order of name. A source with no path sits at the top, named by its
-    id; a resolved source holding no tensor is not listed.
+    id; a resolved source holding no tensor is not listed. A *limit* above
+    ``MAX_LIMIT`` is that.
     """
+    limit = min(limit, MAX_LIMIT)
     here = key_dir(key)
     if key:
         # The folder itself, and everything below it: a range on ``dir``.

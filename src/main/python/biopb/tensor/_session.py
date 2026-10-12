@@ -969,18 +969,11 @@ class CatalogClient:
         action = flight.Action(
             "catalog_children", json.dumps({"key": key, "limit": limit}).encode()
         )
-        try:
-            results = list(
-                self._state.client.do_action(action, options=self._state.call_options)
+        return json.loads(
+            self._do_action_one_result(
+                action, unavailable_hint="Browsing the catalog tree is unavailable"
             )
-        except flight.FlightServerError as exc:
-            if "Unknown action" in str(exc):
-                raise NotImplementedError(
-                    "this server does not offer catalog_children; it predates the "
-                    "catalog tree"
-                ) from exc
-            raise
-        return json.loads(results[0].body.to_pybytes())
+        )
 
     def get_source_metadata(self, source_id: str) -> dict:
         """Backs TensorFlightClient.get_source_metadata; see that method for the full
