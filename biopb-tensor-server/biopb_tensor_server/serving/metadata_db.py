@@ -485,7 +485,12 @@ _ACCEPTED_SHAPES: Set[str] = {
     "ellipse",
     "polygon",
     "polyline",
+    "text",
 }
+
+# A caption is a note on the image, not a document: bound it so a paste cannot
+# turn a geometry row into bulk storage.
+_MAX_CAPTION_LEN = 2000
 
 
 # Set names in this namespace are server-owned, not client data: an importer
@@ -638,6 +643,23 @@ def _prepare_roi(
             f"segmentation belongs in a label tensor."
         )
 
+    geometry_msg = roi.roi
+    if shape_kind == "text":
+        # Normalised on a copy, so the caller's message is not edited under it
+        # and every reader sees one newline convention.
+        geometry_msg = ROI()
+        geometry_msg.CopyFrom(roi.roi)
+        text = geometry_msg.text.text.replace("\r\n", "\n").replace("\r", "\n")
+        # An empty caption marks nothing and has no extent to select.
+        if not text.strip():
+            raise ValueError("Caption text is empty")
+        if len(text) > _MAX_CAPTION_LEN:
+            raise ValueError(
+                f"Caption text is longer than {_MAX_CAPTION_LEN} characters "
+                f"({len(text)})"
+            )
+        geometry_msg.text.text = text
+
     # The plane pin is unvalidated: uint32 rules out a negative axis or index,
     # and the rank cannot be checked because this path binds no tensor -- a pin
     # naming an axis the tensor lacks simply matches nothing.
@@ -648,10 +670,10 @@ def _prepare_roi(
         label=roi.label,
         shape_kind=shape_kind,
         plane=dict(roi.plane),
-        bbox=_roi_bbox(roi.roi, shape_kind),
+        bbox=_roi_bbox(geometry_msg, shape_kind),
         # Canonical proto3 JSON, so the SPA and the SQL surface read the same
         # text and the sidecar can pass it through without re-encoding.
-        geometry=json_format.MessageToJson(roi.roi, indent=0).replace("\n", ""),
+        geometry=json_format.MessageToJson(geometry_msg, indent=0).replace("\n", ""),
         props_json=roi.props_json or None,
         # Hex, not raw bytes: the token is opaque and a TEXT column keeps the row
         # legible to the SQL surface.
@@ -661,7 +683,7 @@ def _prepare_roi(
             else None
         ),
         rev=roi.rev,
-        roi=roi.roi,
+        roi=geometry_msg,
     )
 
 
@@ -669,6 +691,11 @@ def _roi_bbox(roi, shape_kind: str) -> List[float]:
     """Axis-aligned [x0, y0, x1, y1] in level-0 pixels."""
     if shape_kind == "point":
         p = roi.point
+        return [p.x, p.y, p.x, p.y]
+    if shape_kind == "text":
+        # The anchor only: the text's extent is set by the font and the zoom, so
+        # it is not image geometry and has no honest pixel box.
+        p = roi.text.at
         return [p.x, p.y, p.x, p.y]
     if shape_kind == "rectangle":
         xs = (roi.rectangle.top_left.x, roi.rectangle.bottom_right.x)

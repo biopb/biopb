@@ -185,8 +185,10 @@ client.put_rois(image_id, [
   names no registered source is refused.
 - **Level-0 pixel coordinates.** A shape measured on a downsampled level has to
   be scaled up first; nothing does it for you.
-- **The 2-D vector arms only**: point, rectangle, ellipse, polygon, polyline
-  (a scribble's `width` is geometry and widens its bounding box). A mask or mesh
+- **The 2-D vector arms only**: point, rectangle, ellipse, polygon, polyline,
+  text (a scribble's `width` is geometry and widens its bounding box; a text
+  ROI's `text` is non-empty, up to 2000 characters, and its box is its anchor).
+  A mask or mesh
   is refused on purpose — instance segmentation belongs in a label set.
 - **`set_name` is the layer**, and it is what `rs=` matches in a viewer link.
 - An empty `roi_id` creates (the server mints one); naming an existing one

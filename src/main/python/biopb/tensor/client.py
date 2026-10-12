@@ -590,7 +590,8 @@ class TensorFlightClient:
         drawn on a downsampled level must be scaled up by the caller. Only the
         2-D vector arms are accepted (point / rectangle / ellipse / polygon /
         polyline -- the scribble stroke, whose ``width`` is geometry and widens
-        its bounding box); a mask or mesh is refused, because instance
+        its bounding box / text -- a non-empty ``Caption`` anchored at its
+        top-left); a mask or mesh is refused, because instance
         segmentation belongs in a label tensor.
 
         An annotation with an empty ``roi_id`` is created (the server mints a
