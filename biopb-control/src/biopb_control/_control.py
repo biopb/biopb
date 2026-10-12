@@ -879,6 +879,9 @@ def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
     screen the control happened to start under.
     """
     env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
+    # The kernel runs agent code; the exec token is what authorizes that, not
+    # something for it to hold.
+    env.pop("BIOPB_CONTROL_EXEC_TOKEN", None)
     if display is not None:
         for key in _DISPLAY_ENV:
             env.pop(key, None)
@@ -1191,8 +1194,8 @@ def build_app(
         # `chat_proxied` rides the same public probe for the same reason: the
         # observe page must know whether to offer the chat composer before it
         # renders one, and a composer whose every POST 404s is worse than none.
-        # It follows the bind alone, so it discloses nothing a caller cannot
-        # already infer from reaching this endpoint.
+        # It follows the operator's auth mode and --hide, so it discloses nothing
+        # a caller cannot already infer from reaching this endpoint.
         return JSONResponse(
             {
                 "control": "ok",
@@ -1968,6 +1971,22 @@ class _ControlServer:
         self._server.should_exit = True
 
 
+def _warn_exec_under_view_token(host: str, spec) -> None:
+    """Say so when ``chat``/``mcp`` ride the one access token on a listener other
+    machines can reach. The token views pixels and is carried in browser URLs, so
+    there it is also a shell; ``split`` (an exec token) or ``--hide`` closes that.
+    A warning only: the mode is the operator's choice, never inferred from the bind."""
+    auth = spec.auth or infer_auth(spec.token, spec.exec_token)
+    served = {_SESSION_CHAT_ROOT, _SESSION_MCP_ROOT} - set(spec.hide)
+    if auth == "token" and served and _web_auth.host_is_public_bind(host):
+        logger.warning(
+            "this control is reachable from other machines and serves %s under "
+            "the one access token, which can also view data and is carried in "
+            "browser URLs: use --auth split with an exec token, or --hide them",
+            " and ".join(sorted(served)),
+        )
+
+
 def serve_control_api(
     host: str,
     port: int,
@@ -1994,6 +2013,7 @@ def serve_control_api(
     # None in ``none`` mode -> the gate falls back to a loopback Host check
     # instead. Which execute roots this origin carries is the operator's explicit
     # ``spec.auth``, not this listener's bind (see build_app).
+    _warn_exec_under_view_token(host, spec)
     app = build_app(
         supervisor,
         ensure_timeout,

@@ -397,13 +397,23 @@ class _Remote:
         except (OSError, ValueError) as e:
             raise AttachError(f"the control at {self.url} is not reachable: {e}") from e
         if status in (401, 403):
-            raise AttachError(
-                f"the control at {self.url} refused the token "
-                "(--token or $BIOPB_TENSOR_TOKEN)"
-            )
+            raise AttachError(self._refused(status))
         if status != 200:
             raise AttachError(f"the control at {self.url} answered {status}: {data}")
         return data
+
+    def _refused(self, status):
+        """Why the control turned the token away. A 403 is a token that views but
+        may not attach: a control with a separate exec token wants that one."""
+        if status == 403:
+            return (
+                f"the control at {self.url} accepts this token for viewing only; "
+                "attaching needs its exec token (--token or $BIOPB_CONTROL_EXEC_TOKEN)"
+            )
+        return (
+            f"the control at {self.url} refused the token "
+            "(--token, $BIOPB_CONTROL_EXEC_TOKEN or $BIOPB_TENSOR_TOKEN)"
+        )
 
     def check(self):
         """Refuse early, with the reason, when this control serves no ``/mcp``.
@@ -464,7 +474,7 @@ class _Remote:
         except (OSError, ValueError) as e:
             raise AttachError(f"the control would not launch a session: {e}") from e
         if status in (401, 403):
-            raise AttachError(f"the control at {self.url} refused the token")
+            raise AttachError(self._refused(status))
         state = answer.get("state")
         if status != 200 or state == "failed":
             raise AttachError(
@@ -610,6 +620,8 @@ class _Binding:
             raise AttachError(f"session {label} is not reachable: {e}") from e
         if status == 404:
             raise AttachError(f"no live session {label!r}.\n{self.plane.listing()}")
+        if status == 403 and hasattr(self.plane, "_refused"):
+            raise AttachError(self.plane._refused(403))
         if status == 409:
             raise AttachError(
                 f"session {label} is held by its {data.get('holder')} "
@@ -962,9 +974,9 @@ def main(argv=None):
     parser.add_argument(
         "--token",
         default=None,
-        help="The remote control's token (default: $BIOPB_TENSOR_TOKEN): its exec "
-        "token where it has one, since attaching runs code. This machine's own "
-        "credential file is never sent to a remote.",
+        help="The remote control's token (default: $BIOPB_CONTROL_EXEC_TOKEN, then "
+        "$BIOPB_TENSOR_TOKEN): its exec token where it has one, since attaching "
+        "runs code. This machine's own credential file is never sent to a remote.",
     )
     parser.add_argument(
         "--header",
@@ -986,12 +998,16 @@ def main(argv=None):
             )
         except ValueError as e:
             parser.error(str(e))
+        # Attaching runs code, so a control with a separate exec token wants that
+        # one: --token, else $BIOPB_CONTROL_EXEC_TOKEN, else the access token.
         token = _control.resolve_data_plane_token(
-            opts.token, allow_credential_file=False
+            opts.token or os.environ.get("BIOPB_CONTROL_EXEC_TOKEN"),
+            allow_credential_file=False,
         )
         if not token:
             parser.error(
-                "--remote needs the control's token (--token or $BIOPB_TENSOR_TOKEN)"
+                "--remote needs the control's token (--token, "
+                "$BIOPB_CONTROL_EXEC_TOKEN or $BIOPB_TENSOR_TOKEN)"
             )
     try:
         serve(session=opts.session, remote=opts.remote, token=token, headers=headers)

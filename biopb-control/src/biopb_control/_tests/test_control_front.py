@@ -1274,6 +1274,44 @@ def test_token_mode_serves_the_execute_roots_under_the_one_token(
     assert health["mcp_proxied"] is True and health["chat_proxied"] is True
 
 
+def test_a_session_does_not_inherit_the_exec_token(monkeypatch):
+    from biopb_control import _control
+
+    monkeypatch.setenv("BIOPB_CONTROL_EXEC_TOKEN", _EXEC_TOKEN)
+    monkeypatch.setenv("BIOPB_TENSOR_TOKEN", _TOKEN)
+    env = _control._launch_env("launch", None, display=None)
+    assert "BIOPB_CONTROL_EXEC_TOKEN" not in env
+    # The data-plane token is what the session's own clients need.
+    assert env["BIOPB_TENSOR_TOKEN"] == _TOKEN
+
+
+@pytest.mark.parametrize(
+    "host, auth, hide, warns",
+    [
+        ("0.0.0.0", "token", frozenset(), True),
+        ("0.0.0.0", "token", frozenset({"chat"}), True),  # mcp is still served
+        ("0.0.0.0", "token", frozenset({"chat", "mcp"}), False),
+        ("0.0.0.0", "split", frozenset(), False),
+        ("127.0.0.1", "token", frozenset(), False),
+    ],
+)
+def test_execute_roots_under_the_one_token_on_a_public_listener_are_warned_about(
+    caplog, tmp_path, host, auth, hide, warns
+):
+    from biopb_control._control import _warn_exec_under_view_token
+
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        token=_TOKEN,
+        exec_token=_EXEC_TOKEN if auth == "split" else None,
+        auth=auth,
+        hide=hide,
+    )
+    with caplog.at_level("WARNING", logger="biopb_control._control"):
+        _warn_exec_under_view_token(host, spec)
+    assert bool(caplog.records) is warns
+
+
 def test_the_proxy_does_not_forward_the_callers_credential(public_control, upstream):
     _register_session("s1", upstream)
     req = urllib.request.Request(

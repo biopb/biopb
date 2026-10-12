@@ -193,7 +193,7 @@ the user's back.
 
 **The gate is not the same for the two shapes.** opencode's is a loopback
 listener, so its button belongs behind the same condition as the chat proxy
-(the control's `--auth` mode; the bind is no longer consulted). The relay clients are the opposite case: being
+(the control's `--auth` mode). The relay clients are the opposite case: being
 reachable from another device is the entire point, and gating them on
 loopback-only forbids the case that makes them worth building. They need their
 own opt-in — starting an agent with shell access on the owner's subscription is a
