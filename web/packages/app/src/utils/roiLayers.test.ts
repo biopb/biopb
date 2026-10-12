@@ -428,6 +428,8 @@ describe("a caption", () => {
       pickable: boolean;
       sizeUnits: string;
       background?: boolean;
+      outlineColor: number[];
+      getBackgroundColor: number[];
     };
   };
 
@@ -459,6 +461,27 @@ describe("a caption", () => {
       visible: true,
     }) as Layer[];
     expect(layers.map((l) => l.id)).toEqual([roiLayerId("points"), roiLayerId("captions")]);
+  });
+
+  it("stays legible on any pixels: opaque outline, half-transparent backing", () => {
+    const [layer] = buildRoiLayers({
+      rois: [note],
+      currentPlane: {},
+      visibleSets: null,
+      visible: true,
+    }) as Layer[];
+    expect(layer!.props.outlineColor[3]).toBe(255);
+    expect(layer!.props.background).toBe(true);
+    // Neither invisible nor opaque: an opaque box would hide the pixels the
+    // caption is about.
+    const alpha = layer!.props.getBackgroundColor[3]!;
+    expect(alpha).toBeGreaterThan(0);
+    expect(alpha).toBeLessThan(255);
+  });
+
+  it("draws a selected caption's border with no second backing or glyphs", () => {
+    const [layer] = buildSelectionLayers(note) as Layer[];
+    expect(layer!.props.getBackgroundColor[3]).toBe(0);
   });
 
   it("is emphasised with a border on one datum", () => {

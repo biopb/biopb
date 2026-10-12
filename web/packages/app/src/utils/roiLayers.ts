@@ -105,6 +105,9 @@ const AREA_ALPHA = 40;
 const POINT_AREA_ALPHA = 90;
 const OUTLINE_ALPHA = 230;
 const OUTLINE_PX = 1.5;
+/** Caption text outline width, in SDF pixels, and its backing's opacity (0-255). */
+const CAPTION_OUTLINE_WIDTH = 4;
+const CAPTION_BACKING_ALPHA = 140;
 const SELECTED_OUTLINE_PX = 3;
 
 /** The geometry's text and anchor, for the layers that draw captions. */
@@ -120,9 +123,12 @@ interface CaptionDatum {
  * A layer of captions.
  *
  * Screen-sized, like the point marker, so it stays readable as the user zooms.
- * The block's top-left is the anchor and lines run down from it. The dark
- * outline is what keeps white-on-bright and dark-on-dark both legible over
- * microscopy, where there is no background to choose a colour against.
+ * The block's top-left is the anchor and lines run down from it. Over
+ * microscopy there is no background to choose a colour against, so the text
+ * has an opaque dark outline and sits on a half-transparent dark backing:
+ * legible on any pixels, with the image still showing through. A thinner or
+ * more transparent outline disappears into sensor noise; a fully opaque
+ * backing would hide the pixels the caption is about.
  * `characterSet: "auto"` builds the glyph atlas from the text itself, so
  * non-Latin captions render rather than falling back to blanks.
  */
@@ -145,13 +151,13 @@ function captionLayer(id: string, data: CaptionDatum[], pickable = false): unkno
     // A bordered layer is the selection's, drawn over the overlay's own copy of
     // the text, so its glyphs are invisible: drawn twice they would composite
     // into a bolder caption than the unselected ones.
-    outlineWidth: bordered ? 0 : 2,
-    outlineColor: [0, 0, 0, 220],
+    outlineWidth: bordered ? 0 : CAPTION_OUTLINE_WIDTH,
+    outlineColor: [0, 0, 0, 255],
+    background: true,
+    backgroundPadding: [3, 2],
+    getBackgroundColor: [0, 0, 0, bordered ? 0 : CAPTION_BACKING_ALPHA],
     ...(bordered
       ? {
-          background: true,
-          backgroundPadding: [3, 2],
-          getBackgroundColor: [0, 0, 0, 0],
           getBorderColor: (d: CaptionDatum) => d.border ?? [0, 0, 0, 0],
           getBorderWidth: SELECTED_OUTLINE_PX,
         }
