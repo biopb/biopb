@@ -35,7 +35,11 @@ from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._security import tls_material as _tls_material, web_auth as _web_auth
+from ._security import (
+    credentials as _credentials,
+    tls_material as _tls_material,
+    web_auth as _web_auth,
+)
 
 console = Console()
 
@@ -892,8 +896,8 @@ def _says_tokenless(resolved_token: Optional[str]) -> bool:
     control's own to read, and a flag here would contradict it."""
     return not (
         resolved_token
-        or os.environ.get("BIOPB_CONTROL_EXEC_TOKEN")
-        or os.environ.get("BIOPB_CONTROL_AUTH")
+        or os.environ.get(_credentials.ENV_CONTROL_EXEC_TOKEN)
+        or os.environ.get(_credentials.ENV_CONTROL_AUTH)
     )
 
 

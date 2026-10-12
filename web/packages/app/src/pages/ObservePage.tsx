@@ -21,7 +21,7 @@ import {
   clampChatWidth,
   defaultChatWidth,
 } from "../utils/chatPaneWidth";
-import { useCanExec, NEEDS_EXEC } from "../hooks/useCanExec";
+import { useCanExec, execTitle, NEEDS_EXEC } from "../hooks/useCanExec";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -847,7 +847,7 @@ export function JobRow({
           <button
             className="job-stop"
             disabled={!canInterrupt}
-            title={canInterrupt ? "Interrupt this cell" : NEEDS_EXEC}
+            title={execTitle(canInterrupt, "Interrupt this cell")}
             onClick={(e) => {
               e.stopPropagation();
               onInterrupt();

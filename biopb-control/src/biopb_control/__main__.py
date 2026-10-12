@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
     # TLS proxy.
     from biopb._control._endpoints import control_host, control_port
-    from biopb._security import web_auth as _web_auth
+    from biopb._security import credentials as _credentials, web_auth as _web_auth
 
     resolved_control_host = args.control_host or control_host()
 
@@ -197,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     exec_token = (
-        args.exec_token or os.environ.get("BIOPB_CONTROL_EXEC_TOKEN") or ""
+        args.exec_token or os.environ.get(_credentials.ENV_CONTROL_EXEC_TOKEN) or ""
     ).strip() or None
     if exec_token and not _web_auth.valid_token(exec_token):
         print(
@@ -207,15 +207,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    from ._control import AUTH_MODES, infer_auth
+    from ._control import EXEC_ROOTS, infer_auth, validate_auth
 
-    auth = args.auth or os.environ.get("BIOPB_CONTROL_AUTH") or None
-    if auth is not None and auth not in AUTH_MODES:
-        print(
-            f"biopb-control: --auth takes {', '.join(AUTH_MODES)}, not {auth!r}.",
-            file=sys.stderr,
-        )
-        return 2
+    auth = args.auth or os.environ.get(_credentials.ENV_CONTROL_AUTH) or None
     if auth is None:
         if not token and not exec_token:
             print(
@@ -226,25 +220,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         auth = infer_auth(token, exec_token)
-    problem = {
-        "none": "takes no token" if token or exec_token else None,
-        "token": "needs a token and no exec token" if not token or exec_token else None,
-        "split": "needs a token and a different exec token"
-        if not token or not exec_token or exec_token == token
-        else None,
-    }[auth]
-    if problem:
-        print(f"biopb-control: --auth {auth} {problem}.", file=sys.stderr)
+    if problem := validate_auth(auth, token, exec_token):
+        print(f"biopb-control: {problem}.", file=sys.stderr)
         return 2
 
-    hide_arg = (
-        args.hide if args.hide is not None else os.environ.get("BIOPB_CONTROL_HIDE")
-    )
+    hide_arg = args.hide
+    if hide_arg is None:
+        hide_arg = os.environ.get(_credentials.ENV_CONTROL_HIDE)
     hide = frozenset(n.strip() for n in (hide_arg or "").split(",") if n.strip())
-    if hide - {"chat", "mcp"}:
+    if hide - EXEC_ROOTS:
         print(
-            f"biopb-control: --hide takes chat and mcp, not "
-            f"{sorted(hide - {'chat', 'mcp'})}.",
+            f"biopb-control: --hide takes {' and '.join(sorted(EXEC_ROOTS))}, "
+            f"not {sorted(hide - EXEC_ROOTS)}.",
             file=sys.stderr,
         )
         return 2

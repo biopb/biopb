@@ -105,3 +105,9 @@ class TestHardening:
         assert "everyone" not in aces
         assert "\\users" not in aces
         assert "authenticated users" not in aces
+
+
+def test_scrub_control_secrets_drops_only_the_exec_token():
+    env = {"BIOPB_CONTROL_EXEC_TOKEN": "e", "BIOPB_TENSOR_TOKEN": "t", "PATH": "/bin"}
+    assert C.scrub_control_secrets(env) is env
+    assert env == {"BIOPB_TENSOR_TOKEN": "t", "PATH": "/bin"}

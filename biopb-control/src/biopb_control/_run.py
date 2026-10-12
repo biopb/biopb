@@ -136,7 +136,7 @@ def run_control(
     # and the SDK reach the control's other exec routes. Any file left by an
     # earlier split run is dropped, or it would shadow this run's credential.
     _credentials.remove_credential(_credentials.CONTROL_EXEC_CREDENTIAL)
-    if spec.auth == "split" and spec.exec_token:
+    if spec.exec_token:
         try:
             _credentials.write_credential(
                 spec.exec_token, _credentials.CONTROL_EXEC_CREDENTIAL

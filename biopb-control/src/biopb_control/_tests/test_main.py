@@ -453,7 +453,7 @@ def test_auth_comes_from_the_env_too():
         (
             ["--auth", "split"],
             {"BIOPB_TENSOR_TOKEN": _TOK, "BIOPB_CONTROL_EXEC_TOKEN": _TOK},
-            "different exec token",
+            "exec token different",
         ),
         (
             ["--exec-token", "short"],

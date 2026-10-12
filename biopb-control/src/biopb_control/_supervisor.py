@@ -48,6 +48,7 @@ from typing import Optional, Tuple
 
 from biopb._config import locations as _locations
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb._security import credentials as _credentials
 
 from biopb_control._rotating_log import RotatingLog, pump
 
@@ -530,8 +531,7 @@ class DataPlaneSupervisor(ServiceProcess):
         env = os.environ.copy()
         if self._spec.token:
             env["BIOPB_TENSOR_TOKEN"] = self._spec.token
-        # The exec token is the control's, not the data plane's.
-        env.pop("BIOPB_CONTROL_EXEC_TOKEN", None)
+        _credentials.scrub_control_secrets(env)
         # No token resolved (tokenless local mode): the tensor `launch` runs
         # tokenless on its own because the config binds the flight server to
         # loopback — no bypass signal is needed or read anymore. (A local

@@ -31,3 +31,7 @@ export function useCanExec(): boolean {
 
 /** The tooltip for a control a viewing token cannot use. */
 export const NEEDS_EXEC = "Needs the exec token — this one can only view";
+
+/** *title* for a control that needs exec, or the reason it is off. */
+export const execTitle = (canExec: boolean, title: string): string =>
+  canExec ? title : NEEDS_EXEC;

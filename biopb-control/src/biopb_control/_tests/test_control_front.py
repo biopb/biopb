@@ -1296,19 +1296,12 @@ def test_a_session_does_not_inherit_the_exec_token(monkeypatch):
     ],
 )
 def test_execute_roots_under_the_one_token_on_a_public_listener_are_warned_about(
-    caplog, tmp_path, host, auth, hide, warns
+    caplog, host, auth, hide, warns
 ):
     from biopb_control._control import _warn_exec_under_view_token
 
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        token=_TOKEN,
-        exec_token=_EXEC_TOKEN if auth == "split" else None,
-        auth=auth,
-        hide=hide,
-    )
     with caplog.at_level("WARNING", logger="biopb_control._control"):
-        _warn_exec_under_view_token(host, spec)
+        _warn_exec_under_view_token(host, auth, hide)
     assert bool(caplog.records) is warns
 
 

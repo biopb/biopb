@@ -114,7 +114,7 @@ from biopb._config import locations as _locations
 from biopb._control import _agents, _endpoints
 from biopb._lifecycle import sessions as _sessions
 from biopb._lifecycle.daemon import detach_kwargs
-from biopb._security import web_auth as _web_auth
+from biopb._security import credentials as _credentials, web_auth as _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -210,6 +210,9 @@ _SESSION_STREAM_ROOTS = frozenset({_SESSION_MCP_ROOT})
 
 AUTH_MODES = ("none", "token", "split")
 
+# The roots `--hide` may name: the ones that run code in a session's kernel.
+EXEC_ROOTS = frozenset({_SESSION_CHAT_ROOT, _SESSION_MCP_ROOT})
+
 
 def infer_auth(token: str | None, exec_token: str | None) -> str:
     """The auth mode implied by the credentials supplied: an exec token means
@@ -218,6 +221,21 @@ def infer_auth(token: str | None, exec_token: str | None) -> str:
     if exec_token:
         return "split"
     return "token" if token else "none"
+
+
+def validate_auth(auth: str, token: str | None, exec_token: str | None) -> str | None:
+    """Why *auth* does not fit the credentials given, or ``None`` if it does."""
+    if auth not in AUTH_MODES:
+        return f"--auth takes {', '.join(AUTH_MODES)}, not {auth!r}"
+    if auth == "none":
+        return "--auth none takes no token" if token or exec_token else None
+    if not token:
+        return f"--auth {auth} needs a token"
+    if auth == "token":
+        return "--auth token takes no exec token" if exec_token else None
+    if not exec_token or exec_token == token:
+        return "--auth split needs an exec token different from the token"
+    return None
 
 
 def _session_proxy_roots(
@@ -237,10 +255,12 @@ def _session_proxy_roots(
     (``observe.chat_enabled``), which is the half this control does not and
     should not know.
     """
-    roots = _SESSION_ALLOWED_ROOTS | {_SESSION_CHAT_ROOT}
-    if auth != "none":
-        roots = roots | {_SESSION_MCP_ROOT}
-    return (roots - hide) | _SESSION_ALLOWED_ROOTS
+    roots = set(_SESSION_ALLOWED_ROOTS)
+    if _SESSION_CHAT_ROOT not in hide:
+        roots.add(_SESSION_CHAT_ROOT)
+    if auth != "none" and _SESSION_MCP_ROOT not in hide:
+        roots.add(_SESSION_MCP_ROOT)
+    return frozenset(roots)
 
 
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
@@ -597,18 +617,19 @@ class _ControlAuthMiddleware:
     ) -> None:
         self.app = app
         self._token = token
-        self._exec_token = exec_token if exec_token != token else None
+        self._exec_token = exec_token
         self._session_roots = session_roots
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and self._guarded(scope["path"]):
             get = Headers(scope=scope).get
-            denial = self._deny(scope["method"], scope["path"], get)
+            carried = self._scope_of(get)
+            denial = self._deny(scope["method"], scope["path"], get, carried)
             if denial is not None:
                 await denial(scope, receive, send)
                 return
             # For /api/scope: which credential this request carried.
-            scope["biopb.scope"] = self._scope_of(get)
+            scope["biopb.scope"] = carried
         await self.app(scope, receive, send)
 
     def _guarded(self, path: str) -> bool:
@@ -628,11 +649,10 @@ class _ControlAuthMiddleware:
         return None
 
     def _deny(
-        self, method: str, path: str, get: _web_auth.HeaderGetter
+        self, method: str, path: str, get: _web_auth.HeaderGetter, scope: str | None
     ) -> Response | None:
         """The response to send if the request is refused, else ``None``."""
         if self._token:
-            scope = self._scope_of(get)
             if scope is None:
                 return JSONResponse(
                     {"error": "invalid or missing token"}, status_code=401
@@ -879,9 +899,7 @@ def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
     screen the control happened to start under.
     """
     env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
-    # The kernel runs agent code; the exec token is what authorizes that, not
-    # something for it to hold.
-    env.pop("BIOPB_CONTROL_EXEC_TOKEN", None)
+    _credentials.scrub_control_secrets(env)
     if display is not None:
         for key in _DISPLAY_ENV:
             env.pop(key, None)
@@ -1114,10 +1132,9 @@ def build_app(
     views, ``exec_token`` additionally runs code and changes sessions). ``None``
     infers it from the credentials given. The bind address is deliberately not
     consulted: a loopback control behind a reverse proxy is as reachable as a public
-    one. ``hide`` removes execute roots from whichever mode. Deliberately *not*
-    delegated to the session child --
-    the proxy hop strips Host and Origin, so the child cannot tell a browser
-    from this trusted hop and cannot make this call.
+    one. ``hide`` removes execute roots from whichever mode. The control decides,
+    not the session child: the proxy hop strips Host and Origin, so the child
+    cannot tell a browser from this trusted hop.
 
     ``url_prefix`` publishes this origin under a path prefix (``/node/<host>/
     <port>`` — an Open OnDemand interactive app) rather than at ``/``: requests
@@ -1134,12 +1151,8 @@ def build_app(
     """
     if auth is None:
         auth = infer_auth(token, exec_token)
-    if auth not in AUTH_MODES:
-        raise ValueError(f"auth must be one of {AUTH_MODES}, not {auth!r}")
-    if auth == "split" and (not exec_token or exec_token == token):
-        raise ValueError("auth 'split' needs an exec token distinct from the token")
-    if auth != "split":
-        exec_token = None
+    if problem := validate_auth(auth, token, exec_token):
+        raise ValueError(problem)
     session_roots = _session_proxy_roots(auth, hide)
     if algorithms is None:
         algorithms = AlgorithmPlane()
@@ -1802,8 +1815,8 @@ def build_app(
         target = base + "/" + sub_path
         if request.url.query:
             target = f"{target}?{request.url.query}"
-        # The caller's credential is the control's to check, not the child's, so
-        # it is dropped too. Drop Host AND Origin: httpx sets Host from the target (127.0.0.1:<port>,
+        # Drop Host AND Origin, and the caller's credential (the control's to
+        # check, not the child's): httpx sets Host from the target (127.0.0.1:<port>,
         # matching the child's loopback Host allowlist) and an absent Origin
         # passes the child's Origin guard, so the trusted control->child hop is
         # accepted whatever external host the browser used. Everything else
@@ -1971,13 +1984,12 @@ class _ControlServer:
         self._server.should_exit = True
 
 
-def _warn_exec_under_view_token(host: str, spec) -> None:
+def _warn_exec_under_view_token(host: str, auth: str, hide: frozenset[str]) -> None:
     """Say so when ``chat``/``mcp`` ride the one access token on a listener other
     machines can reach. The token views pixels and is carried in browser URLs, so
     there it is also a shell; ``split`` (an exec token) or ``--hide`` closes that.
     A warning only: the mode is the operator's choice, never inferred from the bind."""
-    auth = spec.auth or infer_auth(spec.token, spec.exec_token)
-    served = {_SESSION_CHAT_ROOT, _SESSION_MCP_ROOT} - set(spec.hide)
+    served = EXEC_ROOTS - hide
     if auth == "token" and served and _web_auth.host_is_public_bind(host):
         logger.warning(
             "this control is reachable from other machines and serves %s under "
@@ -2013,7 +2025,8 @@ def serve_control_api(
     # None in ``none`` mode -> the gate falls back to a loopback Host check
     # instead. Which execute roots this origin carries is the operator's explicit
     # ``spec.auth``, not this listener's bind (see build_app).
-    _warn_exec_under_view_token(host, spec)
+    auth = spec.auth or infer_auth(spec.token, spec.exec_token)
+    _warn_exec_under_view_token(host, auth, spec.hide)
     app = build_app(
         supervisor,
         ensure_timeout,
@@ -2023,7 +2036,7 @@ def serve_control_api(
         url_prefix=spec.url_prefix,
         algorithms=algorithms,
         exec_token=spec.exec_token,
-        auth=spec.auth,
+        auth=auth,
         hide=spec.hide,
     )
 
