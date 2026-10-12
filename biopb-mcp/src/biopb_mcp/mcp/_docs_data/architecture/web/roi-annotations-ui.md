@@ -1,3 +1,7 @@
+---
+description: "ROI annotations — frontend design: Draw, edit and persist 2-D ROIs on a tensor in the viewer SPA."
+---
+
 # ROI annotations — frontend design
 
 Draw, edit and persist 2-D ROIs on a tensor in the viewer SPA. Backend

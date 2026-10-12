@@ -645,3 +645,24 @@ def test_a_search_hit_names_its_section(store):
     ship(store, "long", LONG)
     out = _docs.search_docs("b body")
     assert "long#B (L15): b body" in out
+
+
+def test_new_docs_under_a_directory_reach_the_tail_as_one_collection_line(store):
+    for i in range(5):
+        ship(store, f"arch/d{i}")
+    ship(store, "solo")
+    tail = _docs.render_index("- kernel: k\n").split("New shipped docs")[1]
+    assert tail.count("\n- ") == 2
+    assert '- arch/: list it with read_doc("arch/")' in tail
+    assert "arch/d0" not in tail and "- solo:" in tail
+
+
+def test_an_index_from_before_the_collection_gets_one_architecture_line(
+    store, monkeypatch
+):
+    ship(store, "arch/one")
+    monkeypatch.setattr(
+        _docs, "_seed_index_text", lambda: "- arch/: how it is built; search it\n"
+    )
+    tail = _docs.render_index("- kernel: k\n").split("New shipped docs")[1]
+    assert "- arch/: how it is built; search it" in tail

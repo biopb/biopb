@@ -1,3 +1,7 @@
+---
+description: "biopb-tensor-server Architecture: biopb-tensor-server provides two server components:"
+---
+
 # biopb-tensor-server Architecture
 
 ## Overview

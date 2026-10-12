@@ -1,3 +1,7 @@
+---
+description: "The algorithm plane: How biopb runs algorithms it cannot import into the agent's kernel: servers of the Ops gRPC protocol, listed in a registry the control r..."
+---
+
 # The algorithm plane
 
 How biopb runs algorithms it cannot import into the agent's kernel: servers of

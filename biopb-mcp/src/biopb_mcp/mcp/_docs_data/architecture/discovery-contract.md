@@ -1,3 +1,7 @@
+---
+description: "Finding the data plane: the discovery contract: How a client on this machine finds the tensor (data) plane and the token for it."
+---
+
 # Finding the data plane: the discovery contract
 
 How a client on this machine finds the tensor (data) plane and the token for

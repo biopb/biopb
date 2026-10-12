@@ -1,3 +1,7 @@
+---
+description: "ROI annotations: Experimental. The ROI annotation schema and wire types may still change without notice."
+---
+
 # ROI annotations
 
 **Experimental.** The ROI annotation schema and wire types may still change without notice.

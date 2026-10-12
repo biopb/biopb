@@ -1,3 +1,7 @@
+---
+description: "The tensor-server HTTP sidecar (FastAPI): Endpoint/contract reference for the API-only HTTP sidecar."
+---
+
 # The tensor-server HTTP sidecar (FastAPI)
 
 Endpoint/contract reference for the **API-only** HTTP sidecar. It wraps the

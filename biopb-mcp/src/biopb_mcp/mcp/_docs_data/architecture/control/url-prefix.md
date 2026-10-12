@@ -1,3 +1,7 @@
+---
+description: "Publishing the control under a URL prefix: The control plane is the single web origin, normally at /."
+---
+
 # Publishing the control under a URL prefix
 
 The control plane is the single web origin, normally at `/`. `--url-prefix`

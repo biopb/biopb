@@ -68,12 +68,37 @@ def rewrite(text: str, source: Path, ids: dict[Path, str]) -> str:
     return "".join(out)
 
 
+def describe(text: str, doc_id: str) -> str:
+    """``<title>: <first sentence>`` -- what a collection listing shows.
+
+    The sources have no frontmatter, and their first prose line is often a
+    fragment (``Scope: ...``) that reads badly as a one-line description.
+    """
+    title = next(
+        (ln[2:].strip() for ln in text.splitlines() if ln.startswith("# ")), doc_id
+    )
+    para: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(("#", ">", "|", "```", "- ", "* ")) or not line:
+            if para:
+                break
+            continue
+        para.append(line)
+    first = re.split(r"(?<=[.!?])\s", " ".join(para), maxsplit=1)[0] if para else ""
+    first = re.sub(r"\[\[[^\]]*\]\]|[*`]", "", first).replace('"', "'")
+    desc = f"{title}: {first}" if first else title
+    return desc if len(desc) <= 160 else desc[:157].rstrip() + "..."
+
+
 def build() -> dict[Path, str]:
     ids = {p.resolve(): i for p, i in sources().items()}
-    return {
-        OUT / f"{doc_id}.md": rewrite(src.read_text(encoding="utf-8"), src, ids)
-        for src, doc_id in sources().items()
-    }
+    out = {}
+    for src, doc_id in sources().items():
+        body = rewrite(src.read_text(encoding="utf-8"), src, ids)
+        front = f'---\ndescription: "{describe(body, doc_id)}"\n---\n\n'
+        out[OUT / f"{doc_id}.md"] = front + body
+    return out
 
 
 def main(argv: list[str]) -> int:

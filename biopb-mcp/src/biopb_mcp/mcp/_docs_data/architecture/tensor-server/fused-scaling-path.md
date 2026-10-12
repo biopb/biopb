@@ -1,3 +1,7 @@
+---
+description: "The scaled read path: How the tensor server serves a scaled chunk (a pyramid level computed on demand) without holding its full-resolution extent."
+---
+
 # The scaled read path
 
 How the tensor server serves a *scaled* chunk (a pyramid level computed on

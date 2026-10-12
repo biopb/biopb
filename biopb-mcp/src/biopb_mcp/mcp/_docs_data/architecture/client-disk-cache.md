@@ -1,3 +1,7 @@
+---
+description: "A client-side disk chunk cache: Experimental. Off by default and may still change without notice."
+---
+
 # A client-side disk chunk cache
 
 **Experimental.** Off by default and may still change without notice.

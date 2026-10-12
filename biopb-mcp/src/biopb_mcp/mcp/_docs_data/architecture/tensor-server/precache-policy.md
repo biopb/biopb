@@ -1,3 +1,7 @@
+---
+description: "Pre-cache policy: Scope: biopb-tensor-server's background warming worker (serving/precache.py) and the two pyramid ladders it and the HTTP sidecar reconcile."
+---
+
 # Pre-cache policy
 
 Scope: `biopb-tensor-server`'s background warming worker (`serving/precache.py`)

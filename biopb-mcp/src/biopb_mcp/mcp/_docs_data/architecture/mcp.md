@@ -1,3 +1,7 @@
+---
+description: "biopb-mcp Architecture: biopb-mcp is an MCP server that connects [napari](https://napari.org) and AI agents to biopb servers."
+---
+
 # biopb-mcp Architecture
 
 ## Overview

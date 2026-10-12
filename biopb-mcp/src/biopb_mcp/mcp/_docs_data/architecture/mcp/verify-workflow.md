@@ -1,3 +1,7 @@
+---
+description: "Verifying a workflow: Component: biopb-mcp — mcp/_scratch.py (the scratch kernel, the run and the slot), mcp/_server.py (verify_workflow), mcp/_notebook.py (..."
+---
+
 # Verifying a workflow
 
 **Component:** `biopb-mcp` — `mcp/_scratch.py` (the scratch kernel, the run

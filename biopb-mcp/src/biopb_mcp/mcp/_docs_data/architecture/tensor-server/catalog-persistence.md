@@ -1,3 +1,7 @@
+---
+description: "Discovery, the catalog and its persistence: Scope: biopb-tensor-server (core/discovery.py, sources/source_manager.py, sources/reconciler.py, serving/metadata..."
+---
+
 # Discovery, the catalog and its persistence
 
 Scope: `biopb-tensor-server` (`core/discovery.py`, `sources/source_manager.py`,

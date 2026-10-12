@@ -1,3 +1,7 @@
+---
+description: "Remote tensor server as a source type: Scope: biopb-tensor-server (adapter + config/reconcile)."
+---
+
 # Remote tensor server as a source type
 
 Scope: `biopb-tensor-server` (adapter + config/reconcile).

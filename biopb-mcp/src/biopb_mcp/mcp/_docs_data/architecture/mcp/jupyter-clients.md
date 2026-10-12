@@ -1,3 +1,7 @@
+---
+description: "The session kernel — agent, user and host on one ipykernel: The session kernel is an ordinary ipykernel, launched by KernelHost (mcp/_kernel.py) with a kerne..."
+---
+
 # The session kernel — agent, user and host on one ipykernel
 
 The session kernel is an ordinary ipykernel, launched by `KernelHost`

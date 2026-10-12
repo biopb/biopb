@@ -1,3 +1,7 @@
+---
+description: "Label tensors: Experimental. The label-tensor model may still change without notice."
+---
+
 # Label tensors
 
 **Experimental.** The label-tensor model may still change without notice.

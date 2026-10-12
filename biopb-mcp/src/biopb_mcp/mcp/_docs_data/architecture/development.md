@@ -1,3 +1,7 @@
+---
+description: "The biopb Project — Architecture Overview: biopb is a monorepo, with a sister repo biopb-server for specific algorithm plane implementations."
+---
+
 # The biopb Project — Architecture Overview
 
 ### Monorepo layout

@@ -1,3 +1,7 @@
+---
+description: "Viewer thread-safety — the main-thread marshaling proxy: The kernel namespace's viewer is a transparent marshaling proxy (mcp/_viewer_proxy.py, wired in _boo..."
+---
+
 # Viewer thread-safety — the main-thread marshaling proxy
 
 The kernel namespace's `viewer` is a transparent marshaling **proxy**

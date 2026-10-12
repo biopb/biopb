@@ -1,3 +1,7 @@
+---
+description: "Chat: the built-in loop: mcp/_chat.py is the chat pane's agent, and the only one."
+---
+
 # Chat: the built-in loop
 
 `mcp/_chat.py` is the chat pane's agent, and the only one. It exists for a user

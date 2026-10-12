@@ -1,3 +1,7 @@
+---
+description: "biopb `web/` — front-end architecture: Internals of the browser front end."
+---
+
 # biopb `web/` — front-end architecture
 
 Internals of the browser front end. For the workspace layout, the surfaces/routes,

@@ -1,3 +1,7 @@
+---
+description: "Uploads and the scratch source: Experimental. The upload/scratch-source model may still change without notice."
+---
+
 # Uploads and the scratch source
 
 **Experimental.** The upload/scratch-source model may still change without notice.

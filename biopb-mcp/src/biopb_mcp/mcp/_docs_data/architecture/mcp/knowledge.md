@@ -1,3 +1,7 @@
+---
+description: "Knowledge store — one flat set of docs, an agent-edited index: Component: biopb-mcp — mcp/_docs.py (store, index, tools), mcp/_docs_data/ (the shipped seed),..."
+---
+
 # Knowledge store — one flat set of docs, an agent-edited index
 
 **Component:** `biopb-mcp` — `mcp/_docs.py` (store, index, tools),

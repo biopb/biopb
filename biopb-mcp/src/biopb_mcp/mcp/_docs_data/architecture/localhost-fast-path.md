@@ -1,3 +1,7 @@
+---
+description: "The localhost read path (client side): How biopb.tensor.TensorFlightClient gets chunk bytes when the tensor server is on the same machine, and how the chunks..."
+---
+
 # The localhost read path (client side)
 
 How `biopb.tensor.TensorFlightClient` gets chunk bytes when the tensor server is

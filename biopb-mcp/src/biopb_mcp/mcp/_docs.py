@@ -650,7 +650,20 @@ def render_index(text: str | None = None) -> str:
         for i in ids
         if i not in named and not any(i.startswith(c) for c in collections)
     ]
-    _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
+    # Docs under a directory are offered as one collection line, which is what
+    # the agent files: a release adding a tree must not add a tail line per doc.
+    groups = sorted({i.partition("/")[0] + "/" for i in new if "/" in i})
+    items = [i for i in new if "/" not in i] + groups
+    _append_tail(
+        out,
+        _NEW_TAIL,
+        items,
+        lambda i: (
+            f"- {i}: {_collection_hook(i)}"
+            if i.endswith("/")
+            else f"- {i}: {_shipped_description(i)}"
+        ),
+    )
 
     stale = stale_shadowed_ids(shadowed, ids)
     _append_tail(
@@ -660,6 +673,15 @@ def render_index(text: str | None = None) -> str:
         lambda i: f'- {i}: {_shipped_description(i)} — read_doc("{i}{DIFF_SUFFIX}")',
     )
     return "\n".join(out).rstrip() + "\n"
+
+
+def _collection_hook(prefix: str) -> str:
+    """The seed index's own hook for a collection line, else a generic one."""
+    for line in _seed_index_text().splitlines():
+        m = _ENTRY.match(line)
+        if m and m.group(2) == prefix:
+            return m.group(3)
+    return f'list it with read_doc("{prefix}"), search it with search_docs'
 
 
 def _append_tail(out: list[str], header: str, ids: list[str], line) -> None:

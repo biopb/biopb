@@ -1,3 +1,7 @@
+---
+description: "biopb-control Architecture: The control plane is the durable root of a biopb deployment — a small always-on Starlette/uvicorn app that does three things:"
+---
+
 # biopb-control Architecture
 
 ## Role

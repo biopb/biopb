@@ -1,3 +1,7 @@
+---
+description: "Cloud storage support in the tensor server: Experimental. The cloud/synced-folder source model -- the SourceConfig.cloud config surface and the unresolved/re..."
+---
+
 # Cloud storage support in the tensor server
 
 **Experimental.** The cloud/synced-folder source model -- the `SourceConfig.cloud` config surface and the unresolved/resolve mechanism -- may still change without notice.

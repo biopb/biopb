@@ -1,3 +1,7 @@
+---
+description: "Remote data viewer: client-side rendering over a tile API: Scope: biopb-tensor-server (HTTP sidecar, tile route), web/ (viewer SPA), biopb-control (same-orig..."
+---
+
 # Remote data viewer: client-side rendering over a tile API
 
 Scope: `biopb-tensor-server` (HTTP sidecar, tile route), `web/` (viewer SPA),

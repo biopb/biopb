@@ -1,3 +1,7 @@
+---
+description: "Image viewer — architecture: How the dataviewer route (/viewer, HomePage) is put together: which component owns what, what lives in the store and for how lon..."
+---
+
 # Image viewer — architecture
 
 How the dataviewer route (`/viewer`, `HomePage`) is put together: which

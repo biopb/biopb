@@ -1,3 +1,7 @@
+---
+description: "biopb release model: How the monorepo is released."
+---
+
 # biopb release model
 
 How the monorepo is released. The guiding split: **library distribution (PyPI +

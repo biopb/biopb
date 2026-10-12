@@ -1,3 +1,7 @@
+---
+description: "Tensor-Server Admin Endpoint — Config / Status / Restart over HTTP: Config/status HTTP routes on the FastAPI sidecar (http_server.py) plus a schema-driven ad..."
+---
+
 # Tensor-Server Admin Endpoint — Config / Status / Restart over HTTP
 
 Config/status HTTP routes on the FastAPI sidecar (`http_server.py`) plus a schema-driven admin page in the top-level `web/` SPA (served by the **control plane**, not this sidecar); restart is owned by the control plane (`POST /api/data_plane/restart`), and `save_config` lives in the tensor-server config model. **Related:** [[architecture/tensor-server/catalog-persistence]] (the scan-freshness `health` fields this page consumes), [[architecture/tensor-server/remote-tensor-cache]] (the config-GUI design this realizes).

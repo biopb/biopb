@@ -1,3 +1,7 @@
+---
+description: "Fixtures — what a run is given, and what it has to recover: Component: biopb-mcp — _tests/agentbench/_fixture.py (the vocabulary), _tests/agentbench/test_fix..."
+---
+
 # Fixtures — what a run is given, and what it has to recover
 
 **Component:** `biopb-mcp` — `_tests/agentbench/_fixture.py` (the vocabulary),
