@@ -36,6 +36,31 @@ afterAll(() => {
   console.error = realError;
 });
 
+describe("ChatPane with a viewing token", () => {
+  const view = () =>
+    renderToStaticMarkup(
+      <ChatPane
+        base="/session/abc"
+        status={status()}
+        pollMs={3000}
+        canExec={false}
+      />,
+    );
+
+  it("keeps the composer and the thread buttons, disabled and saying why", () => {
+    const html = view();
+    expect(html).toContain("<textarea");
+    expect(html).toMatch(/<textarea[^>]*disabled/);
+    expect(html).toContain("Needs the exec token");
+    // Both header buttons are still there.
+    expect(html.match(/class="chat-new"[^>]*disabled/g)?.length).toBe(2);
+  });
+
+  it("is untouched with an exec token", () => {
+    expect(render(status())).not.toMatch(/<textarea[^>]*disabled/);
+  });
+});
+
 describe("ChatPane", () => {
   it("mounts an empty thread", () => {
     const html = render(status());

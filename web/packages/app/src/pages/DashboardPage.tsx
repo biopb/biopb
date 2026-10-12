@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useCanExec, execTitle } from "../hooks/useCanExec";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 import { catalogIsFilling } from "../utils/catalogHealth";
@@ -93,6 +94,7 @@ export default function DashboardPage() {
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
   const [starting, setStarting] = useState(false);
+  const canExec = useCanExec();
   // Whether the control proxies a session's /mcp, i.e. remote MCP access is on
   // (only with a token); the copy button is offered only then.
   const [mcpViaControl, setMcpViaControl] = useState(false);
@@ -618,8 +620,8 @@ export default function DashboardPage() {
             <button
               className="mini"
               onClick={startSession}
-              disabled={starting}
-              title="Start a session on this machine"
+              disabled={starting || !canExec}
+              title={execTitle(canExec, "Start a session on this machine")}
             >
               {starting ? "starting…" : "+ new session"}
             </button>
@@ -693,8 +695,8 @@ export default function DashboardPage() {
                     <button
                       className="mini stop"
                       onClick={() => stopSession(s.session_id, s.holder)}
-                      disabled={stoppingId === s.session_id}
-                      title="Stop this session"
+                      disabled={stoppingId === s.session_id || !canExec}
+                      title={execTitle(canExec, "Stop this session")}
                       aria-label={`Stop session ${s.session_id}`}
                     >
                       {stoppingId === s.session_id ? "…" : "✕"}

@@ -248,6 +248,36 @@ class TestControlRunArgv:
             grpc_bind=grpc_bind,
         )
 
+    def test_tokenless_is_only_said_when_nothing_else_states_the_regime(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("BIOPB_CONTROL_EXEC_TOKEN", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_AUTH", raising=False)
+        assert cli._says_tokenless(None) is True
+        assert cli._says_tokenless("a-token") is False
+        # An exec token or an explicit mode in the env is the control's to read; a
+        # flag here would contradict it.
+        monkeypatch.setenv("BIOPB_CONTROL_EXEC_TOKEN", "e" * 32)
+        assert cli._says_tokenless(None) is False
+        monkeypatch.delenv("BIOPB_CONTROL_EXEC_TOKEN")
+        monkeypatch.setenv("BIOPB_CONTROL_AUTH", "token")
+        assert cli._says_tokenless(None) is False
+
+    def test_a_tokenless_control_is_told_so_explicitly(self, tmp_path):
+        # The control never infers "local" from a bind; it must be told.
+        base = {
+            "config": tmp_path / "biopb.json",
+            "static_dir": None,
+            "web_host": "127.0.0.1",
+            "base_port": 8810,
+            "log_level": "INFO",
+            "data_plane": True,
+            "grpc_bind": "127.0.0.1",
+        }
+        argv = cli._control_run_argv(**base, tokenless=True)
+        assert argv[argv.index("--auth") + 1] == "none"
+        assert "--auth" not in cli._control_run_argv(**base)
+
     def test_token_never_on_argv(self, tmp_path):
         argv = self._argv(tmp_path, grpc_bind="0.0.0.0")
         assert "--token" not in argv

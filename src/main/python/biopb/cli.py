@@ -35,7 +35,11 @@ from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._security import tls_material as _tls_material, web_auth as _web_auth
+from ._security import (
+    credentials as _credentials,
+    tls_material as _tls_material,
+    web_auth as _web_auth,
+)
 
 console = Console()
 
@@ -886,6 +890,17 @@ def _resolve_url_prefix(url_prefix: Optional[str]) -> Optional[str]:
         raise typer.Exit(2)
 
 
+def _says_tokenless(resolved_token: Optional[str]) -> bool:
+    """Whether to tell the control ``--auth none``: only when nothing else already
+    states the regime. An exec token or ``BIOPB_CONTROL_AUTH`` in the env is the
+    control's own to read, and a flag here would contradict it."""
+    return not (
+        resolved_token
+        or os.environ.get(_credentials.ENV_CONTROL_EXEC_TOKEN)
+        or os.environ.get(_credentials.ENV_CONTROL_AUTH)
+    )
+
+
 def _control_run_argv(
     *,
     config: Path,
@@ -901,6 +916,7 @@ def _control_run_argv(
     san: Optional[List[str]] = None,
     url_prefix: Optional[str] = None,
     grpc_external_location: Optional[str] = None,
+    tokenless: bool = False,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -940,6 +956,9 @@ def _control_run_argv(
         "--win-sentinel",
         str(_control_shutdown_sentinel()),
     ]
+    if tokenless:
+        # The control requires this to be said: it never infers "local".
+        argv += ["--auth", "none"]
     if static_dir and static_dir.exists():
         argv += ["--static-dir", str(static_dir)]
     if url_prefix:
@@ -1179,6 +1198,7 @@ def control_start(
                 san=san,
                 url_prefix=url_prefix,
                 grpc_external_location=grpc_external_location,
+                tokenless=_says_tokenless(resolved_token),
             )
 
             log_file = _control_log_file()

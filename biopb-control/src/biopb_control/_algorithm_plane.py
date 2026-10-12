@@ -50,6 +50,7 @@ from typing import Callable, Optional
 
 from biopb._config import locations as _locations
 from biopb._lifecycle import winjob as _winjob
+from biopb._security import credentials as _credentials
 
 from . import _registry
 from ._supervisor import (
@@ -163,7 +164,7 @@ class ScriptEntry(ServiceProcess):
     # --- ServiceProcess -------------------------------------------------- #
 
     def _service_spec(self) -> ServiceSpec:
-        env = os.environ.copy()
+        env = _credentials.scrub_control_secrets(os.environ.copy())
         env[TOKEN_ENV] = self._token
         plane = self._data_plane()
         if plane is not None:

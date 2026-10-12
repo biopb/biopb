@@ -48,6 +48,7 @@ from typing import Optional, Tuple
 
 from biopb._config import locations as _locations
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb._security import credentials as _credentials
 
 from biopb_control._rotating_log import RotatingLog, pump
 
@@ -417,6 +418,15 @@ class DataPlaneSpec:
     log_level: str = "INFO"
     server_log: Optional[Path] = None
     token: Optional[str] = None
+    # The operator's explicit credential regime (`none` | `token` | `split`),
+    # which alone decides which execute roots the control carries; None infers it
+    # from the credentials below. See `_control.build_app`.
+    auth: Optional[str] = None
+    # `split`: a second secret, distinct from `token`, for what runs code in a
+    # session or changes one. Consumed only by the control's web front.
+    exec_token: Optional[str] = None
+    # Execute roots (`chat`, `mcp`) the control must not proxy at all.
+    hide: frozenset = frozenset()
     # Path prefix a reverse proxy publishes the control's web origin under (an
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.
@@ -521,6 +531,7 @@ class DataPlaneSupervisor(ServiceProcess):
         env = os.environ.copy()
         if self._spec.token:
             env["BIOPB_TENSOR_TOKEN"] = self._spec.token
+        _credentials.scrub_control_secrets(env)
         # No token resolved (tokenless local mode): the tensor `launch` runs
         # tokenless on its own because the config binds the flight server to
         # loopback — no bypass signal is needed or read anymore. (A local

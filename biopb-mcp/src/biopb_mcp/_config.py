@@ -257,9 +257,9 @@ class ObserveConfig:
         "Offer the built-in chat client: a pane on the observe page that drives "
         "this session's kernel through a model. Lives here because it needs the "
         "page: chat routes served without one have nothing to reach them. On by "
-        "default, but inert until the model and key in `chat` are set, so it "
-        "costs nothing to leave on. This can only narrow the surface -- the "
-        "control refuses to proxy chat at all unless it is loopback-bound.",
+        "default, but inert until the model and key in `chat` are set. This can "
+        "only narrow the surface: whether the control proxies chat at all is its "
+        "own setting (`--auth`, `--hide`).",
     )
 
 

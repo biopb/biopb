@@ -68,27 +68,56 @@ def test_chat_root_is_gated_wherever_it_is_proxied():
     # The auth gate reads the proxy's own root set, so enabling chat cannot open
     # an unauthenticated execute path: the same switch that makes it reachable
     # makes it guarded.
-    roots = _session_proxy_roots(loopback_bound=True)
+    roots = _session_proxy_roots("none")
     assert _is_proxied_session_path("/session/s1/chat/turn", roots) is True
     assert _is_proxied_session_path("/session/s1/api/jobs", roots) is True
     assert _is_proxied_session_path("/session/s1/mcp", roots) is False
 
 
-def test_mcp_root_exists_only_where_a_token_is_enforced():
-    for loopback in (True, False):
-        assert "mcp" not in _session_proxy_roots(loopback)
-        assert "mcp" in _session_proxy_roots(loopback, token_enforced=True)
-    # Independent of chat, which follows the bind alone.
-    assert "chat" not in _session_proxy_roots(False, token_enforced=True)
-    roots = _session_proxy_roots(True, token_enforced=True)
-    assert _is_proxied_session_path("/session/s1/mcp", roots) is True
+def test_execute_roots_follow_the_auth_mode():
+    # No token means nothing to enforce on /mcp, so only chat is on offer.
+    assert _session_proxy_roots("none") == _SESSION_ALLOWED_ROOTS | {"chat"}
+    for mode in ("token", "split"):
+        roots = _session_proxy_roots(mode)
+        assert roots == _SESSION_ALLOWED_ROOTS | {"chat", "mcp"}
+        assert _is_proxied_session_path("/session/s1/mcp", roots) is True
 
 
-def test_chat_root_is_off_by_default():
-    assert "chat" not in _session_proxy_roots(loopback_bound=False)
-    assert "chat" in _session_proxy_roots(loopback_bound=True)
-    # Loopback only adds; it never displaces the always-on root.
-    assert _session_proxy_roots(loopback_bound=True) >= _SESSION_ALLOWED_ROOTS
+def test_hide_only_removes_execute_roots():
+    assert _session_proxy_roots("token", frozenset({"chat", "mcp"})) == (
+        _SESSION_ALLOWED_ROOTS
+    )
+    assert "chat" not in _session_proxy_roots("token", frozenset({"chat"}))
+    assert "mcp" in _session_proxy_roots("token", frozenset({"chat"}))
+    # Hiding what is not offered changes nothing, and `api` cannot be hidden.
+    assert _session_proxy_roots("none", frozenset({"mcp", "api"})) == (
+        _SESSION_ALLOWED_ROOTS | {"chat"}
+    )
+
+
+@pytest.mark.parametrize(
+    "method, path, needs",
+    [
+        ("GET", "/session/s1/api/jobs", False),
+        ("GET", "/session/s1/api/chat/status", False),
+        ("HEAD", "/session/s1/api/status", False),
+        ("POST", "/session/s1/api/kernel/restart", True),
+        ("POST", "/session/s1/api/kernel/interrupt", True),
+        ("POST", "/session/s1/api/shutdown", True),
+        ("POST", "/session/s1/api/lease/acquire", True),
+        ("POST", "/api/sessions/new", True),  # starts a process on the host
+        ("GET", "/api/sessions", False),
+        ("POST", "/session/s1/chat/turn", True),
+        ("GET", "/session/s1/mcp", True),
+        # An unknown root is gated until someone classifies it.
+        ("GET", "/session/s1/other/x", True),
+        ("POST", "/api/data_plane/restart", False),  # control's own API
+    ],
+)
+def test_needs_exec(method, path, needs):
+    from biopb_control._control import _needs_exec
+
+    assert _needs_exec(method, path) is needs
 
 
 def _free_port() -> int:
@@ -1061,15 +1090,14 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         assert exc.value.code == 404, path
 
 
-@pytest.fixture
-def public_control(upstream, tmp_path, web_bundle):
-    """A control on a public bind (which is never run without a token)."""
+def _public(upstream, tmp_path, web_bundle, exec_token):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),
         server_log=tmp_path / "server.log",
         token=_TOKEN,
+        exec_token=exec_token,
         static_dir=web_bundle,
     )
     sup = DataPlaneSupervisor(spec)
@@ -1077,13 +1105,33 @@ def public_control(upstream, tmp_path, web_bundle):
     server, _thread = serve_control_api(
         "0.0.0.0", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
     )
+    return server, f"http://127.0.0.1:{api_port}"
+
+
+_EXEC_TOKEN = "x" * 32
+
+
+@pytest.fixture
+def public_control(upstream, tmp_path, web_bundle):
+    """A control on a public bind (never run without a token), with a separate
+    exec token: ``_TOKEN`` views, ``_EXEC_TOKEN`` runs code."""
+    server, url = _public(upstream, tmp_path, web_bundle, _EXEC_TOKEN)
     try:
-        yield f"http://127.0.0.1:{api_port}"
+        yield url
     finally:
         server.shutdown()
 
 
-def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
+@pytest.fixture
+def public_control_one_token(upstream, tmp_path, web_bundle):
+    server, url = _public(upstream, tmp_path, web_bundle, None)
+    try:
+        yield url
+    finally:
+        server.shutdown()
+
+
+def test_session_mcp_is_proxied_on_a_public_control_under_the_exec_token(
     public_control, upstream
 ):
     _register_session("s1", upstream)
@@ -1102,7 +1150,7 @@ def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
         url,
         data=b"{}",
         method="POST",
-        headers={"Authorization": f"Bearer {_TOKEN}"},
+        headers={"Authorization": f"Bearer {_EXEC_TOKEN}"},
     )
     with urllib.request.urlopen(ok, timeout=5) as resp:
         echoed = json.loads(resp.read())
@@ -1111,7 +1159,7 @@ def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(
             f"{public_control}/session/s1/api/../mcp",
-            headers={"Authorization": f"Bearer {_TOKEN}"},
+            headers={"Authorization": f"Bearer {_EXEC_TOKEN}"},
         )
     assert exc.value.code == 404
 
@@ -1129,6 +1177,142 @@ def test_session_mcp_is_proxied_on_a_loopback_control_with_a_token(
         headers={"X-Biopb-Token": _TOKEN},
     )
     assert status == 200 and json.loads(body)["path"] == "/mcp"
+
+
+def test_a_viewing_token_cannot_reach_execute_routes(public_control, upstream):
+    _register_session("s1", upstream)
+    view = {"X-Biopb-Token": _TOKEN}
+    for method, path in (
+        ("POST", "/session/s1/mcp"),
+        ("GET", "/session/s1/mcp"),
+        ("POST", "/session/s1/chat/turn"),
+        ("POST", "/session/s1/api/kernel/restart"),
+        ("POST", "/session/s1/api/shutdown"),
+    ):
+        req = urllib.request.Request(
+            f"{public_control}{path}",
+            data=b"{}" if method == "POST" else None,
+            method=method,
+            headers=view,
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 403, (method, path)
+    # Reading is what it is for.
+    status, _h, body = _get(f"{public_control}/session/s1/api/jobs", headers=view)
+    assert status == 200 and json.loads(body)["path"] == "/api/jobs"
+
+
+def test_starting_a_session_needs_the_exec_token(public_control, monkeypatch):
+    from biopb_control import _control
+
+    monkeypatch.setattr(
+        _control, "_launch_session", lambda wait, **kw: {"state": "starting"}
+    )
+
+    def start(token):
+        req = urllib.request.Request(
+            f"{public_control}/api/sessions/new",
+            data=b"",
+            method="POST",
+            headers={"X-Biopb-Token": token},
+        )
+        return urllib.request.urlopen(req, timeout=5)
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        start(_TOKEN)
+    assert exc.value.code == 403
+    with start(_EXEC_TOKEN) as resp:
+        assert json.loads(resp.read()) == {"state": "starting"}
+
+
+def test_the_exec_token_can_also_view_and_write(public_control, upstream):
+    _register_session("s1", upstream)
+    ex = {"X-Biopb-Token": _EXEC_TOKEN}
+    assert _get(f"{public_control}/session/s1/api/jobs", headers=ex)[0] == 200
+    req = urllib.request.Request(
+        f"{public_control}/session/s1/api/kernel/restart",
+        data=b"{}",
+        method="POST",
+        headers=ex,
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert json.loads(resp.read())["path"] == "/api/kernel/restart"
+
+
+def test_scope_endpoint_reports_the_token_scope(public_control):
+    def scope(token):
+        _s, _h, body = _get(
+            f"{public_control}/api/scope", headers={"X-Biopb-Token": token}
+        )
+        return json.loads(body)["scope"]
+
+    assert scope(_TOKEN) == "view"
+    assert scope(_EXEC_TOKEN) == "exec"
+
+
+def test_token_mode_serves_the_execute_roots_under_the_one_token(
+    public_control_one_token, upstream
+):
+    # The operator chose one token for everything; the bind (public here) does
+    # not second-guess it.
+    _register_session("s1", upstream)
+    for path in ("mcp", "chat/turn"):
+        req = urllib.request.Request(
+            f"{public_control_one_token}/session/s1/{path}",
+            data=b"{}",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 401, path
+        req.add_header("X-Biopb-Token", _TOKEN)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200, path
+    _s, _h, body = _get(f"{public_control_one_token}/health")
+    health = json.loads(body)
+    assert health["mcp_proxied"] is True and health["chat_proxied"] is True
+
+
+def test_a_session_does_not_inherit_the_exec_token(monkeypatch):
+    from biopb_control import _control
+
+    monkeypatch.setenv("BIOPB_CONTROL_EXEC_TOKEN", _EXEC_TOKEN)
+    monkeypatch.setenv("BIOPB_TENSOR_TOKEN", _TOKEN)
+    env = _control._launch_env("launch", None, display=None)
+    assert "BIOPB_CONTROL_EXEC_TOKEN" not in env
+    # The data-plane token is what the session's own clients need.
+    assert env["BIOPB_TENSOR_TOKEN"] == _TOKEN
+
+
+@pytest.mark.parametrize(
+    "host, auth, hide, warns",
+    [
+        ("0.0.0.0", "token", frozenset(), True),
+        ("0.0.0.0", "token", frozenset({"chat"}), True),  # mcp is still served
+        ("0.0.0.0", "token", frozenset({"chat", "mcp"}), False),
+        ("0.0.0.0", "split", frozenset(), False),
+        ("127.0.0.1", "token", frozenset(), False),
+    ],
+)
+def test_execute_roots_under_the_one_token_on_a_public_listener_are_warned_about(
+    caplog, host, auth, hide, warns
+):
+    from biopb_control._control import _warn_exec_under_view_token
+
+    with caplog.at_level("WARNING", logger="biopb_control._control"):
+        _warn_exec_under_view_token(host, auth, hide)
+    assert bool(caplog.records) is warns
+
+
+def test_the_proxy_does_not_forward_the_callers_credential(public_control, upstream):
+    _register_session("s1", upstream)
+    req = urllib.request.Request(
+        f"{public_control}/session/s1/api/jobs",
+        headers={"Authorization": f"Bearer {_TOKEN}", "X-Biopb-Token": _TOKEN},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert json.loads(resp.read())["auth"] is None
 
 
 def test_session_mcp_is_not_proxied_by_a_tokenless_control(control, upstream):
@@ -1247,7 +1431,7 @@ def _registering_child_script(session_id: str) -> str:
     )
 
 
-def _launch_app(tmp_path, loopback_bound=True):
+def _launch_app(tmp_path, auth="none", token=None):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
@@ -1258,7 +1442,8 @@ def _launch_app(tmp_path, loopback_bound=True):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        loopback_bound=loopback_bound,
+        token=token,
+        auth=auth,
     )
 
 
@@ -1279,9 +1464,9 @@ def test_session_argv_is_a_self_publishing_http_session():
     assert "--start-kernel" not in _control._session_argv(start_kernel=False)
 
 
-@pytest.mark.parametrize("loopback_bound", [True, False])
-def test_start_session_is_offered_on_any_bind(tmp_path, monkeypatch, loopback_bound):
-    # No display or bind gate: a session without a viewer is still useful.
+@pytest.mark.parametrize("auth, token", [("none", None), ("token", "t" * 32)])
+def test_start_session_is_offered_in_any_auth_mode(tmp_path, monkeypatch, auth, token):
+    # No display or auth-mode gate: a session without a viewer is still useful.
     from starlette.testclient import TestClient
 
     from biopb_control import _control
@@ -1291,9 +1476,10 @@ def test_start_session_is_offered_on_any_bind(tmp_path, monkeypatch, loopback_bo
     monkeypatch.setattr(
         _control, "_launch_session", lambda wait, **kw: {"state": "starting"}
     )
-    app = _launch_app(tmp_path, loopback_bound=loopback_bound)
+    app = _launch_app(tmp_path, auth, token)
+    headers = {"X-Biopb-Token": token} if token else {}
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
-        resp = client.post("/api/sessions/new")
+        resp = client.post("/api/sessions/new", headers=headers)
         assert resp.status_code == 200
         assert resp.json() == {"state": "starting"}
 
@@ -1521,37 +1707,30 @@ def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
         assert seen["start_new_session"] is True
 
 
-@pytest.mark.parametrize("loopback_bound", [True, False])
-def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, loopback_bound):
-    # Stopping a session is deliberately NOT gated like chat:
-    # it is not an execute surface, it lives under `api`, and `api` already
-    # carries a comparably destructive verb in /api/kernel/restart. 502 both
-    # ways means routed to a child that is not there -- the point is that the
-    # route exists regardless of the bind. (Whether the child *serves* it is the
-    # child's own call: only a session that owns its reap mounts it.)
+@pytest.mark.parametrize("auth, token", [("none", None), ("token", "t" * 32)])
+def test_stop_verb_rides_the_api_root_not_the_execute_roots(tmp_path, auth, token):
+    # Stopping a session is not gated like chat: it lives under `api`, which is
+    # always proxied, and `api` already carries a comparably destructive verb in
+    # /api/kernel/restart. 502 means routed to a child that is not there -- the
+    # point is that the route exists in every mode. (Whether the child *serves* it
+    # is the child's own call: only a session that owns its reap mounts it.)
     from starlette.testclient import TestClient
 
     _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        grpc_host="127.0.0.1",
-        grpc_port=_free_port(),
-        server_log=tmp_path / "server.log",
-    )
-    app = build_app(
-        DataPlaneSupervisor(spec),
-        8.0,
-        f"http://127.0.0.1:{_free_port()}",
-        loopback_bound=loopback_bound,
-    )
+    app = _launch_app(tmp_path, auth, token)
+    headers = {"X-Biopb-Token": token} if token else {}
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
-        assert client.post("/session/s1/api/shutdown").status_code == 502
+        assert (
+            client.post("/session/s1/api/shutdown", headers=headers).status_code == 502
+        )
 
 
-@pytest.mark.parametrize("loopback_bound, expected", [(True, 502), (False, 404)])
-def test_chat_root_follows_the_same_switch(tmp_path, loopback_bound, expected):
+@pytest.mark.parametrize(
+    "hide, expected", [(frozenset(), 502), (frozenset({"chat"}), 404)]
+)
+def test_chat_root_follows_hide(tmp_path, hide, expected):
     # The chat turn runs arbitrary code in the session kernel, so it is the same
-    # RCE the allowlist exists to keep off this origin and rides the same gate.
+    # RCE the allowlist exists to keep off this origin; `--hide chat` removes it.
     from starlette.testclient import TestClient
 
     _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
@@ -1565,7 +1744,8 @@ def test_chat_root_follows_the_same_switch(tmp_path, loopback_bound, expected):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        loopback_bound=loopback_bound,
+        auth="none",
+        hide=hide,
     )
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/session/s1/chat/turn", json={"text": "hi"})
@@ -1581,21 +1761,17 @@ class _StopServe(Exception):
     """Abort serve_control_api once build_app has been called (nothing binds)."""
 
 
-@pytest.mark.parametrize(
-    "host, expected",
-    [("127.0.0.1", True), ("localhost", True), ("0.0.0.0", False), ("::", False)],
-)
-def test_bind_address_decides_the_local_roots(
-    monkeypatch, tmp_path, upstream, host, expected
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "0.0.0.0", "::"])
+def test_the_bind_address_does_not_decide_the_execute_roots(
+    monkeypatch, tmp_path, upstream, host
 ):
-    # The gate reads *this* listener's bind through the shared predicate: a
-    # loopback control proxies the local roots, a network-reachable one does not --
-    # regardless of --remote or the data plane's own bind. Asserted on the call
-    # into build_app, so the "public" cases need no public listener.
+    # The operator's auth mode decides, and serve_control_api hands it to build_app
+    # untouched; the listener's bind is not consulted. Asserted on the call into
+    # build_app, so the "public" cases need no public listener.
     captured = {}
 
-    def _capture(*_args, loopback_bound, **_kwargs):
-        captured["loopback"] = loopback_bound
+    def _capture(*_args, **kwargs):
+        captured.update(kwargs)
         raise _StopServe
 
     monkeypatch.setattr("biopb_control._control.build_app", _capture)
@@ -1604,6 +1780,8 @@ def test_bind_address_decides_the_local_roots(
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),
         server_log=tmp_path / "server.log",
+        auth="none",
+        hide=frozenset({"mcp"}),
     )
     with pytest.raises(_StopServe):
         serve_control_api(
@@ -1613,7 +1791,8 @@ def test_bind_address_decides_the_local_roots(
             ensure_timeout=8.0,
             data_web_url=upstream,
         )
-    assert captured["loopback"] is expected
+    assert "loopback_bound" not in captured
+    assert captured["auth"] == "none" and captured["hide"] == frozenset({"mcp"})
 
 
 def test_unknown_session_returns_404(control):
