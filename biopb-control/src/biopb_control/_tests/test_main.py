@@ -391,3 +391,60 @@ def test_no_tls_material_leaves_the_spec_alone():
         None,
         (),
     )
+
+
+_TOK = "t" * 32
+_EXEC = "e" * 32
+
+
+def test_exec_token_reaches_the_spec_from_the_env():
+    rc, spec, _ = _capture(
+        _BASE_ARGV,
+        {"BIOPB_TENSOR_TOKEN": _TOK, "BIOPB_CONTROL_EXEC_TOKEN": f"{_EXEC}\n"},
+    )
+    assert rc == 0
+    assert spec.exec_token == _EXEC and spec.token == _TOK
+
+
+def test_no_exec_token_is_none():
+    _rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_TENSOR_TOKEN": _TOK})
+    assert spec.exec_token is None
+
+
+def test_exec_token_without_a_token_is_refused(capsys):
+    rc, spec, _ = _capture(_BASE_ARGV, {"BIOPB_CONTROL_EXEC_TOKEN": _EXEC})
+    assert rc == 2 and spec is None
+    assert "needs an access token" in capsys.readouterr().err
+
+
+def test_malformed_exec_token_is_refused(capsys):
+    rc, _spec, _ = _capture(
+        _BASE_ARGV + ["--exec-token", "short"], {"BIOPB_TENSOR_TOKEN": _TOK}
+    )
+    assert rc == 2
+    assert "exec token must be" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("chat,mcp", {"chat", "mcp"}),
+        ("mcp", {"mcp"}),
+        ("none", set()),
+        ("", set()),
+    ],
+)
+def test_expose_selects_execute_roots(value, expected):
+    _rc, spec, _ = _capture(_BASE_ARGV + ["--expose", value], {})
+    assert spec.expose == frozenset(expected)
+
+
+def test_expose_defaults_to_unrestricted_and_reads_the_env():
+    assert _capture(_BASE_ARGV, {})[1].expose is None
+    assert _capture(_BASE_ARGV, {"BIOPB_CONTROL_EXPOSE": "chat"})[1].expose == {"chat"}
+
+
+def test_expose_refuses_an_unknown_root(capsys):
+    rc, _spec, _ = _capture(_BASE_ARGV + ["--expose", "chat,api"], {})
+    assert rc == 2
+    assert "--expose takes" in capsys.readouterr().err

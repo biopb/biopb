@@ -413,8 +413,9 @@ class _Remote:
         if self._ask("GET", "/health").get("mcp_proxied") is not True:
             raise AttachError(
                 f"the control at {self.url} does not serve /mcp for remote "
-                "agents: it serves it only when it enforces a token "
-                "(`biopb control start --token ...`)"
+                "agents: it serves it only when it enforces a token and, if it is "
+                "reachable off the host, has a separate exec token "
+                "(BIOPB_CONTROL_EXEC_TOKEN)"
             )
         self._checked = True
 
@@ -962,8 +963,9 @@ def main(argv=None):
     parser.add_argument(
         "--token",
         default=None,
-        help="The remote control's token (default: $BIOPB_TENSOR_TOKEN). This "
-        "machine's own credential file is never sent to a remote.",
+        help="The remote control's token (default: $BIOPB_TENSOR_TOKEN): its exec "
+        "token where it has one, since attaching runs code. This machine's own "
+        "credential file is never sent to a remote.",
     )
     parser.add_argument(
         "--header",

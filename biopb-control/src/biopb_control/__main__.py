@@ -88,6 +88,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "a command line is world-readable via `ps`)",
     )
     run.add_argument(
+        "--exec-token",
+        default=None,
+        help="second access token for what runs code in a session or changes one "
+        "(the control's chat and mcp proxies, and session writes); the plain "
+        "token then only views. Prefer BIOPB_CONTROL_EXEC_TOKEN in the env. "
+        "Without it a non-loopback control proxies neither chat nor mcp.",
+    )
+    run.add_argument(
+        "--expose",
+        default=None,
+        help="comma-separated execute roots this control may proxy (chat, mcp; "
+        "or 'none'); default every one its bind and tokens allow "
+        "(or BIOPB_CONTROL_EXPOSE). It only removes roots.",
+    )
+    run.add_argument(
         "--remote",
         action="store_true",
         help="deprecated and redundant: a public --grpc-host already says the "
@@ -174,6 +189,44 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    exec_token = (
+        args.exec_token or os.environ.get("BIOPB_CONTROL_EXEC_TOKEN") or ""
+    ).strip() or None
+    if exec_token:
+        if not token:
+            print(
+                "biopb-control: an exec token needs an access token too "
+                "(BIOPB_TENSOR_TOKEN or --token): it adds a second credential, "
+                "it does not replace the first.",
+                file=sys.stderr,
+            )
+            return 2
+        if not _web_auth.valid_token(exec_token):
+            print(
+                "biopb-control: the exec token must be 16-128 URL-safe characters "
+                "([A-Za-z0-9_-]).",
+                file=sys.stderr,
+            )
+            return 2
+
+    expose_arg = (
+        args.expose
+        if args.expose is not None
+        else os.environ.get("BIOPB_CONTROL_EXPOSE")
+    )
+    expose = None
+    if expose_arg is not None:
+        names = {n.strip() for n in expose_arg.split(",") if n.strip()}
+        names.discard("none")
+        if names - {"chat", "mcp"}:
+            print(
+                f"biopb-control: --expose takes chat, mcp or none, not "
+                f"{sorted(names - {'chat', 'mcp'})}.",
+                file=sys.stderr,
+            )
+            return 2
+        expose = frozenset(names)
+
     # BYO TLS material, validated before anything is spawned: a half pair, or
     # material the server cannot read, would otherwise exit 2 inside the
     # supervised child on every spawn, crash-looping with the reason in
@@ -241,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
         log_level=args.log_level,
         server_log=Path(args.server_log) if args.server_log else None,
         token=token,
+        exec_token=exec_token,
+        expose=expose,
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,

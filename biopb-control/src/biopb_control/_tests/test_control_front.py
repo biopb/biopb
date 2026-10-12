@@ -74,18 +74,58 @@ def test_chat_root_is_gated_wherever_it_is_proxied():
     assert _is_proxied_session_path("/session/s1/mcp", roots) is False
 
 
-def test_mcp_root_exists_only_where_a_token_is_enforced():
-    for loopback in (True, False):
-        assert "mcp" not in _session_proxy_roots(loopback)
-        assert "mcp" in _session_proxy_roots(loopback, token_enforced=True)
-    # Independent of chat, which follows the bind alone.
-    assert "chat" not in _session_proxy_roots(False, token_enforced=True)
-    roots = _session_proxy_roots(True, token_enforced=True)
+def test_mcp_root_needs_a_token_and_a_trustworthy_caller():
+    # mcp needs a token enforced AND a caller trusted by construction: a loopback
+    # control, or a separate exec token. A public control with one token has
+    # neither, so it proxies neither execute root.
+    assert "mcp" not in _session_proxy_roots(True)
+    assert "mcp" in _session_proxy_roots(True, token_enforced=True)
+    assert "mcp" not in _session_proxy_roots(False, token_enforced=True)
+    roots = _session_proxy_roots(False, token_enforced=True, exec_split=True)
+    assert {"chat", "mcp"} <= roots
     assert _is_proxied_session_path("/session/s1/mcp", roots) is True
+
+
+def test_expose_only_removes_execute_roots():
+    full = _session_proxy_roots(True, token_enforced=True)
+    assert (
+        _session_proxy_roots(True, True, expose=frozenset()) == _SESSION_ALLOWED_ROOTS
+    )
+    assert "chat" not in _session_proxy_roots(True, True, expose=frozenset({"mcp"}))
+    assert "mcp" not in _session_proxy_roots(True, True, expose=frozenset({"chat"}))
+    # It cannot add: nothing is offered to a public control with one token.
+    assert _session_proxy_roots(False, True, expose=frozenset({"chat", "mcp"})) == (
+        _SESSION_ALLOWED_ROOTS
+    )
+    assert _session_proxy_roots(True, True, expose=frozenset({"chat", "mcp"})) == full
+
+
+@pytest.mark.parametrize(
+    "method, path, needs",
+    [
+        ("GET", "/session/s1/api/jobs", False),
+        ("GET", "/session/s1/api/chat/status", False),
+        ("HEAD", "/session/s1/api/status", False),
+        ("POST", "/session/s1/api/kernel/restart", True),
+        ("POST", "/session/s1/api/kernel/interrupt", True),
+        ("POST", "/session/s1/api/shutdown", True),
+        ("POST", "/session/s1/api/lease/acquire", True),
+        ("POST", "/session/s1/chat/turn", True),
+        ("GET", "/session/s1/mcp", True),
+        # An unknown root is gated until someone classifies it.
+        ("GET", "/session/s1/other/x", True),
+        ("POST", "/api/data_plane/restart", False),  # control's own API
+    ],
+)
+def test_needs_exec(method, path, needs):
+    from biopb_control._control import _needs_exec
+
+    assert _needs_exec(method, path) is needs
 
 
 def test_chat_root_is_off_by_default():
     assert "chat" not in _session_proxy_roots(loopback_bound=False)
+    assert "chat" not in _session_proxy_roots(False, token_enforced=True)
     assert "chat" in _session_proxy_roots(loopback_bound=True)
     # Loopback only adds; it never displaces the always-on root.
     assert _session_proxy_roots(loopback_bound=True) >= _SESSION_ALLOWED_ROOTS
@@ -1061,15 +1101,14 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         assert exc.value.code == 404, path
 
 
-@pytest.fixture
-def public_control(upstream, tmp_path, web_bundle):
-    """A control on a public bind (which is never run without a token)."""
+def _public(upstream, tmp_path, web_bundle, exec_token):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
         grpc_port=_free_port(),
         server_log=tmp_path / "server.log",
         token=_TOKEN,
+        exec_token=exec_token,
         static_dir=web_bundle,
     )
     sup = DataPlaneSupervisor(spec)
@@ -1077,13 +1116,33 @@ def public_control(upstream, tmp_path, web_bundle):
     server, _thread = serve_control_api(
         "0.0.0.0", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
     )
+    return server, f"http://127.0.0.1:{api_port}"
+
+
+_EXEC_TOKEN = "x" * 32
+
+
+@pytest.fixture
+def public_control(upstream, tmp_path, web_bundle):
+    """A control on a public bind (never run without a token), with a separate
+    exec token: ``_TOKEN`` views, ``_EXEC_TOKEN`` runs code."""
+    server, url = _public(upstream, tmp_path, web_bundle, _EXEC_TOKEN)
     try:
-        yield f"http://127.0.0.1:{api_port}"
+        yield url
     finally:
         server.shutdown()
 
 
-def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
+@pytest.fixture
+def public_control_one_token(upstream, tmp_path, web_bundle):
+    server, url = _public(upstream, tmp_path, web_bundle, None)
+    try:
+        yield url
+    finally:
+        server.shutdown()
+
+
+def test_session_mcp_is_proxied_on_a_public_control_under_the_exec_token(
     public_control, upstream
 ):
     _register_session("s1", upstream)
@@ -1102,7 +1161,7 @@ def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
         url,
         data=b"{}",
         method="POST",
-        headers={"Authorization": f"Bearer {_TOKEN}"},
+        headers={"Authorization": f"Bearer {_EXEC_TOKEN}"},
     )
     with urllib.request.urlopen(ok, timeout=5) as resp:
         echoed = json.loads(resp.read())
@@ -1111,7 +1170,7 @@ def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(
             f"{public_control}/session/s1/api/../mcp",
-            headers={"Authorization": f"Bearer {_TOKEN}"},
+            headers={"Authorization": f"Bearer {_EXEC_TOKEN}"},
         )
     assert exc.value.code == 404
 
@@ -1129,6 +1188,82 @@ def test_session_mcp_is_proxied_on_a_loopback_control_with_a_token(
         headers={"X-Biopb-Token": _TOKEN},
     )
     assert status == 200 and json.loads(body)["path"] == "/mcp"
+
+
+def test_a_viewing_token_cannot_reach_execute_routes(public_control, upstream):
+    _register_session("s1", upstream)
+    view = {"X-Biopb-Token": _TOKEN}
+    for method, path in (
+        ("POST", "/session/s1/mcp"),
+        ("GET", "/session/s1/mcp"),
+        ("POST", "/session/s1/chat/turn"),
+        ("POST", "/session/s1/api/kernel/restart"),
+        ("POST", "/session/s1/api/shutdown"),
+    ):
+        req = urllib.request.Request(
+            f"{public_control}{path}",
+            data=b"{}" if method == "POST" else None,
+            method=method,
+            headers=view,
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 403, (method, path)
+    # Reading is what it is for.
+    status, _h, body = _get(f"{public_control}/session/s1/api/jobs", headers=view)
+    assert status == 200 and json.loads(body)["path"] == "/api/jobs"
+
+
+def test_the_exec_token_can_also_view_and_write(public_control, upstream):
+    _register_session("s1", upstream)
+    ex = {"X-Biopb-Token": _EXEC_TOKEN}
+    assert _get(f"{public_control}/session/s1/api/jobs", headers=ex)[0] == 200
+    req = urllib.request.Request(
+        f"{public_control}/session/s1/api/kernel/restart",
+        data=b"{}",
+        method="POST",
+        headers=ex,
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert json.loads(resp.read())["path"] == "/api/kernel/restart"
+
+
+def test_scope_endpoint_reports_the_token_scope(public_control):
+    def scope(token):
+        _s, _h, body = _get(
+            f"{public_control}/api/scope", headers={"X-Biopb-Token": token}
+        )
+        return json.loads(body)["scope"]
+
+    assert scope(_TOKEN) == "view"
+    assert scope(_EXEC_TOKEN) == "exec"
+
+
+def test_a_public_control_with_one_token_proxies_no_execute_root(
+    public_control_one_token, upstream
+):
+    _register_session("s1", upstream)
+    for path in ("mcp", "chat/turn"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _get(
+                f"{public_control_one_token}/session/s1/{path}",
+                headers={"X-Biopb-Token": _TOKEN},
+            )
+        assert exc.value.code == 404, path
+    # /health says so, so a page can hide what would not work.
+    _s, _h, body = _get(f"{public_control_one_token}/health")
+    health = json.loads(body)
+    assert health["mcp_proxied"] is False and health["chat_proxied"] is False
+
+
+def test_the_proxy_does_not_forward_the_callers_credential(public_control, upstream):
+    _register_session("s1", upstream)
+    req = urllib.request.Request(
+        f"{public_control}/session/s1/api/jobs",
+        headers={"Authorization": f"Bearer {_TOKEN}", "X-Biopb-Token": _TOKEN},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert json.loads(resp.read())["auth"] is None
 
 
 def test_session_mcp_is_not_proxied_by_a_tokenless_control(control, upstream):

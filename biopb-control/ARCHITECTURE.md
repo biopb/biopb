@@ -119,23 +119,31 @@ authenticated, for itself and for everything it fronts.
   the observe page's chat pane runs code in that session's kernel, so it is an
   RCE on the same origin the allowlist above exists to keep RCE off. Folding it
   into `api` would leave that allowlist enforced but no longer true, so it gets
-  its own root and is proxied only when the control is loopback-bound — `api`
-  always, `chat` local-mode only. The control decides because only it knows its own
-  bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
-  from this trusted hop. Not gated by the token instead: that credential
-  authorizes reading pixels, is readable from a local file by design, and rides
-  the render WS as a query param — fine for viewing, not a thing to trade for a
-  shell. Known limit: a loopback control published by a reverse proxy reads as
-  local; that operator owns the exposure decision, as they already do for the
-  data-plane token.
-- **`/mcp` is a third root, gated on the token.** A remote agent attaches through
+  its own root. `api` is always proxied; `chat` and `/mcp` (below) only where
+  whoever reaches them is trusted by construction: a loopback-bound control, or a
+  control with a separate **exec token**. The control decides because only it knows
+  its own bind: the proxy hop strips Host and Origin (and the caller's credential),
+  so the child cannot tell a browser from this trusted hop. Known limit: a
+  loopback control published by a reverse proxy reads as local; that operator owns
+  the exposure decision, as they already do for the data-plane token.
+- **`/mcp` is a third root.** A remote agent attaches through
   `/session/<id>/mcp` (biopb-mcp's ARCHITECTURE, "Attaching from another
   machine"). It runs code in the kernel, so it exists only where this control
-  enforces a token, whatever its bind: a tokenless control never serves it, a
-  loopback one with a token does (an SSH tunnel's case). `/health` reports
-  `mcp_proxied`. It is not narrowed to POST (streamable-http also uses GET and
-  DELETE, and a hostile page cannot set the token header) and its GET stream has
-  no read timeout.
+  enforces a token *and* the caller is trusted as above: a tokenless control never
+  serves it, a loopback one with a token does (an SSH tunnel's case), a public one
+  only with an exec token. `/health` reports `chat_proxied` and `mcp_proxied`. It
+  is not narrowed to POST (streamable-http also uses GET and DELETE, and a hostile
+  page cannot set the token header) and its GET stream has no read timeout.
+- **Two credentials.** The access token (`BIOPB_TENSOR_TOKEN`) *views*: it is the
+  data-plane token, readable from a local file by design and carried in browser
+  URLs, so it cannot also be a shell. An optional **exec token**
+  (`BIOPB_CONTROL_EXEC_TOKEN`) additionally authorizes whatever runs code in a
+  session or changes one: `chat`, `/mcp`, and every non-read request under a
+  session's `api` (kernel interrupt/restart, job cancel, shutdown, the lease).
+  Reads under `api` (the observe page) stay with the viewing token, and an unknown
+  root defaults to exec. One token (or none) means that credential is both, which
+  is only offered where the caller is already trusted. `GET /api/scope` reports
+  which a request carried. `--expose chat,mcp|none` can only remove roots.
 - **Supervised restart is control-routed, not blind-proxied.** The tensor
   sidecar's self-restart spawns a detached process — correct standalone, but under
   supervision it would race the supervisor for the port. So the control marks its

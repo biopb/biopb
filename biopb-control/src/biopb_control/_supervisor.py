@@ -417,6 +417,13 @@ class DataPlaneSpec:
     log_level: str = "INFO"
     server_log: Optional[Path] = None
     token: Optional[str] = None
+    # A second secret, distinct from `token`, for what runs code in a session or
+    # changes one (the control's `chat`, `mcp` and session write routes). None =
+    # `token` is both. Consumed only by the control's web front.
+    exec_token: Optional[str] = None
+    # Which execute roots the control proxies at all (`chat`, `mcp`); None = every
+    # one its bind and tokens allow. It can only remove them.
+    expose: Optional[frozenset] = None
     # Path prefix a reverse proxy publishes the control's web origin under (an
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.
@@ -521,6 +528,8 @@ class DataPlaneSupervisor(ServiceProcess):
         env = os.environ.copy()
         if self._spec.token:
             env["BIOPB_TENSOR_TOKEN"] = self._spec.token
+        # The exec token is the control's, not the data plane's.
+        env.pop("BIOPB_CONTROL_EXEC_TOKEN", None)
         # No token resolved (tokenless local mode): the tensor `launch` runs
         # tokenless on its own because the config binds the flight server to
         # loopback — no bypass signal is needed or read anymore. (A local
