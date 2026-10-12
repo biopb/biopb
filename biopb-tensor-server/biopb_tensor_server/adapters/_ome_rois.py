@@ -29,7 +29,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.image.roi_pb2 import ROI, Ellipse, Point, Polygon, Polyline, Rectangle
+from biopb.image.roi_pb2 import (
+    ROI,
+    Caption,
+    Ellipse,
+    Point,
+    Polygon,
+    Polyline,
+    Rectangle,
+)
 
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.registration import (
@@ -187,6 +195,10 @@ def _points(spec: Any) -> List[Tuple[float, float]]:
     return out
 
 
+# The annotation store's bound on a caption (metadata_db._MAX_CAPTION_LEN).
+_MAX_CAPTION_LEN = 2000
+
+
 def _pt(xy: Tuple[float, float]) -> Point:
     return Point(x=xy[0], y=xy[1])
 
@@ -201,6 +213,8 @@ def _coords(roi: ROI) -> Tuple[float, ...]:
     if kind == "ellipse":
         e = roi.ellipse
         return (e.center.x, e.center.y, e.radius.x, e.radius.y, e.rotation)
+    if kind == "text":
+        return (roi.text.at.x, roi.text.at.y)
     points = roi.polygon.points if kind == "polygon" else roi.polyline.points
     return tuple(v for p in points for v in (p.x, p.y))
 
@@ -229,7 +243,19 @@ def _geometry(kind: str, shape: Mapping[str, Any]) -> Optional[ROI]:
     def f(key: str) -> float:
         return float(shape.get(key) or 0.0)
 
-    if kind in ("points", "labels"):
+    if kind == "labels":
+        text = str(shape.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+        if text.strip():
+            # Cut at the store's bound rather than lose the whole set to it.
+            return ROI(
+                text=Caption(
+                    at=_pt(_map(m, f("x"), f("y"))), text=text[:_MAX_CAPTION_LEN]
+                )
+            )
+        # A label with no text still marks a place.
+        return ROI(point=_pt(_map(m, f("x"), f("y"))))
+
+    if kind == "points":
         return ROI(point=_pt(_map(m, f("x"), f("y"))))
 
     if kind == "lines":
@@ -510,7 +536,11 @@ def _annotation(
         set_name=OME_SET_NAME,
         # str(): a name is text in the schema but this dict came from a file,
         # and proto refuses a non-string outright.
-        label=str(ome_roi.get("name") or shape.get("text") or ""),
+        label=str(
+            ome_roi.get("name")
+            or ("" if geometry.WhichOneof("shape") == "text" else shape.get("text"))
+            or ""
+        ),
         roi=geometry,
         props_json=_props(ome_roi, shape) or "",
         rev=1,
