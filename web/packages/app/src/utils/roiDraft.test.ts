@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   CLOSE_HANDLE_PX,
+  MAX_CAPTION_LENGTH,
   DEFAULT_POLYLINE_WIDTH,
   MAX_POLYLINE_WIDTH,
   MIN_POLYLINE_WIDTH,
@@ -205,5 +206,54 @@ describe("isTextEntryTarget", () => {
   it("survives a target that is not an element", () => {
     expect(isTextEntryTarget(null)).toBe(false);
     expect(isTextEntryTarget({} as EventTarget)).toBe(false);
+  });
+});
+
+describe("the text tool", () => {
+  it("opens a draft on the click instead of completing, because the content is typed", () => {
+    const { draft, completed } = placePoint(null, "text", [3, 4]);
+    expect(completed).toBeUndefined();
+    expect(draft).toEqual({ tool: "text", points: [[3, 4]], text: "" });
+  });
+
+  it("moves the anchor on a later click and keeps what was typed", () => {
+    const typed: RoiDraft = { tool: "text", points: [[3, 4]], text: "late stage" };
+    const { draft } = placePoint(typed, "text", [10, 20]);
+    expect(draft).toEqual({ tool: "text", points: [[10, 20]], text: "late stage" });
+  });
+
+  it("starts empty when the open draft belongs to another tool", () => {
+    const poly: RoiDraft = { tool: "polygon", points: [[0, 0], [1, 1]] };
+    expect(placePoint(poly, "text", [5, 5]).draft?.text).toBe("");
+  });
+
+  it("is completable only with something to say", () => {
+    const at: RoiDraft["points"] = [[1, 1]];
+    expect(isCompletable({ tool: "text", points: at })).toBe(false);
+    expect(isCompletable({ tool: "text", points: at, text: " \n\t" })).toBe(false);
+    expect(isCompletable({ tool: "text", points: at, text: "x" })).toBe(true);
+    expect(isCompletable({ tool: "text", points: [], text: "x" })).toBe(false);
+  });
+
+  it("closes to a caption with newlines normalised and the length bounded", () => {
+    const draft: RoiDraft = { tool: "text", points: [[2, 3]], text: "a\r\nb\rc" };
+    expect(closeDraft(draft)).toEqual({ kind: "text", at: { x: 2, y: 3 }, text: "a\nb\nc" });
+    const long: RoiDraft = { ...draft, text: "x".repeat(MAX_CAPTION_LENGTH + 5) };
+    const geometry = closeDraft(long);
+    expect(geometry?.kind === "text" && geometry.text.length).toBe(MAX_CAPTION_LENGTH);
+  });
+
+  it("refuses to close a blank caption", () => {
+    expect(closeDraft({ tool: "text", points: [[2, 3]], text: "  " })).toBeNull();
+  });
+
+  it("keeps its text when Backspace is pressed outside the field", () => {
+    const draft: RoiDraft = { tool: "text", points: [[2, 3]], text: "keep me" };
+    expect(undoPoint(draft)).toBe(draft);
+  });
+
+  it("never closes by clicking its anchor, as the open-ended tools do", () => {
+    const draft: RoiDraft = { tool: "text", points: [[2, 3]], text: "x" };
+    expect(closesOnFirstVertex(draft, [2, 3], 1)).toBe(false);
   });
 });

@@ -15,7 +15,7 @@ import type { RoiGeometry } from "@biopb/tensor-flight-client";
 import type { XY } from "./roiLayers";
 
 /** What the pointer places. `select` draws nothing and picks instead. */
-export type RoiTool = "select" | "point" | "rectangle" | "polygon" | "polyline";
+export type RoiTool = "select" | "point" | "rectangle" | "polygon" | "polyline" | "text";
 
 /** Tools that build a shape from a run of clicks rather than a fixed count. */
 export const OPEN_ENDED_TOOLS: ReadonlySet<RoiTool> = new Set(["polygon", "polyline"]);
@@ -24,7 +24,16 @@ export interface RoiDraft {
   tool: Exclude<RoiTool, "select">;
   /** Vertices placed so far, in level-0 pixel coordinates. */
   points: XY[];
+  /**
+   * What a text draft says so far. Only the text tool uses it: a caption is the
+   * one shape whose content cannot be had from clicks, so its draft waits for
+   * typing instead of completing on the click that placed it.
+   */
+  text?: string;
 }
+
+/** The longest caption the store accepts; see `_MAX_CAPTION_LEN` server-side. */
+export const MAX_CAPTION_LENGTH = 2000;
 
 /**
  * How close to the first vertex a click must land to close the shape, in
@@ -37,6 +46,7 @@ export const CLOSE_HANDLE_PX = 10;
 export function minimumPoints(tool: Exclude<RoiTool, "select">): number {
   switch (tool) {
     case "point":
+    case "text":
       return 1;
     case "rectangle":
       return 2;
@@ -68,7 +78,10 @@ export function isTextEntryTarget(target: EventTarget | null): boolean {
 
 /** A draft that has enough vertices to become a shape. */
 export function isCompletable(draft: RoiDraft | null): boolean {
-  return draft !== null && draft.points.length >= minimumPoints(draft.tool);
+  if (draft === null || draft.points.length < minimumPoints(draft.tool)) return false;
+  // A caption with nothing in it marks nothing and could not be selected again.
+  if (draft.tool === "text") return (draft.text ?? "").trim() !== "";
+  return true;
 }
 
 export interface PlaceResult {
@@ -88,6 +101,11 @@ export interface PlaceResult {
  */
 export function placePoint(draft: RoiDraft | null, tool: RoiTool, at: XY): PlaceResult {
   if (tool === "select") return { draft };
+  if (tool === "text") {
+    // Placing is not creating: the caption is finished by typing. A later click
+    // moves the anchor and keeps what was typed.
+    return { draft: { tool, points: [at], text: draft?.tool === "text" ? draft.text : "" } };
+  }
   const points = draft && draft.tool === tool ? [...draft.points, at] : [at];
 
   if (tool === "point") {
@@ -148,6 +166,14 @@ export function closeDraft(
 ): RoiGeometry | null {
   if (!isCompletable(draft) || !draft) return null;
   const points = draft.points.map(([x, y]) => ({ x, y }));
+  if (draft.tool === "text") {
+    const [at] = points;
+    if (!at) return null;
+    // '\r' from a pasted Windows line ending would reach the store as-is; it
+    // normalises too, but a draft should not depend on that.
+    const text = (draft.text ?? "").replace(/\r\n?/g, "\n").slice(0, MAX_CAPTION_LENGTH);
+    return { kind: "text", at, text };
+  }
   if (draft.tool === "polygon") return { kind: "polygon", points };
   if (draft.tool === "polyline") {
     return { kind: "polyline", points, width: clampPolylineWidth(polylineWidth) };
@@ -170,6 +196,9 @@ export function isRealClick(event?: { type?: string } | null): boolean {
 /** Undo the last placed vertex; an empty draft becomes null. */
 export function undoPoint(draft: RoiDraft | null): RoiDraft | null {
   if (!draft) return null;
+  // A caption has one anchor and its text lives in the input; Backspace outside
+  // the input must not throw the typed text away. Escape cancels it.
+  if (draft.tool === "text") return draft;
   const points = draft.points.slice(0, -1);
   return points.length === 0 ? null : { ...draft, points };
 }
