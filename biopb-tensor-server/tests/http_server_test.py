@@ -153,6 +153,34 @@ def _answer(rows, format, **schema_metadata):  # noqa: A002 - mirrors the real k
     return table
 
 
+def _serve_tree(mock_fc, rows, reasons=None):
+    """Make *mock_fc* answer ``/api/tree`` at the top level with *rows* as the
+    sources sitting there. *reasons* is ``{source_id: reason}`` for the narrow
+    unresolved-reason query, or an exception for a server that refuses it."""
+
+    def query(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
+        if "unresolved_reason" in sql:
+            if isinstance(reasons, Exception):
+                raise reasons
+            return [
+                {"source_id": k, "unresolved_reason": v}
+                for k, v in (reasons or {}).items()
+            ]
+        if "GROUPING SETS" in sql:
+            count = {"seg": "", "lo": None, "hi": None, "direct": len(rows), "total": 1}
+            return _answer([count], format)
+        return _answer([{**r, "name": r["source_id"]} for r in rows], format)
+
+    mock_fc.query.side_effect = query
+
+
+def _tree_descriptors(tc, headers=None):
+    """The descriptors of the sources at the top of ``/api/tree``."""
+    r = tc.get("/api/tree", headers=headers or {})
+    assert r.status_code == 200
+    return [s["descriptor"] for s in r.json()["sources"]]
+
+
 def _build_mock_client(src_desc=None) -> MagicMock:
     """Return a MagicMock that satisfies the TensorFlightClient interface."""
     mc = MagicMock()
@@ -425,34 +453,37 @@ class TestReadyzTracksBackend:
 
 
 class TestAuthentication:
-    def test_sources_requires_token(self, auth_client):
+    def test_tree_requires_token(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources")
+        r = tc.get("/api/tree")
         assert r.status_code == 401
 
-    def test_sources_wrong_token_bearer(self, auth_client):
+    def test_tree_wrong_token_bearer(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_WRONG))
+        r = tc.get("/api/tree", headers=_bearer(_WRONG))
         assert r.status_code == 401
 
-    def test_sources_wrong_token_xbiopb(self, auth_client):
+    def test_tree_wrong_token_xbiopb(self, auth_client):
         tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_xbiopb(_WRONG))
+        r = tc.get("/api/tree", headers=_xbiopb(_WRONG))
         assert r.status_code == 401
 
-    def test_sources_valid_bearer_token(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+    def test_tree_valid_bearer_token(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree", headers=_bearer(_TOKEN))
         assert r.status_code == 200
 
-    def test_sources_valid_xbiopb_token(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_xbiopb(_TOKEN))
+    def test_tree_valid_xbiopb_token(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree", headers=_xbiopb(_TOKEN))
         assert r.status_code == 200
 
     def test_dev_mode_bypasses_auth(self, dev_client):
-        tc, _ = dev_client
-        r = tc.get("/api/sources")
+        tc, mock_fc = dev_client
+        _serve_tree(mock_fc, [])
+        r = tc.get("/api/tree")
         assert r.status_code == 200
 
     def test_diagnostics_requires_token(self, auth_client):
@@ -490,23 +521,21 @@ class TestCorsHeaders:
 
 
 class TestSourcesEndpoints:
-    def test_list_sources_returns_list(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        body = r.json()
-        assert isinstance(body, list)
-        assert len(body) == 1
-        assert body[0]["source_id"] == "src0"
-        assert body[0]["source_url"] == "/data/src0"
-        assert isinstance(body[0]["tensors"], list)
+    def test_tree_descriptor_shape(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        assert body["source_id"] == "src0"
+        assert body["source_url"] == "/data/src0"
+        assert isinstance(body["tensors"], list)
         # Source metadata is its own route, not a column of the row.
-        assert "metadata_json" not in body[0]
+        assert "metadata_json" not in body
 
-    def test_list_sources_tensor_fields(self, auth_client):
-        tc, _ = auth_client
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        tensor = r.json()[0]["tensors"][0]
+    def test_tree_descriptor_tensor_fields(self, auth_client):
+        tc, mock_fc = auth_client
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        tensor = body["tensors"][0]
         assert tensor["array_id"] == "src0"
         assert tensor["shape"] == [4, 8, 16]
         assert tensor["dtype"] == "uint16"
@@ -524,145 +553,48 @@ class TestSourcesEndpoints:
         assert r.status_code == 200
         assert "ome_ngff" in r.json()
 
-    def test_list_sources_calls_flight_client(self, auth_client):
+    def test_tree_is_resolved_field(self, auth_client):
         tc, mock_fc = auth_client
-        tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.query.assert_called()
-
-    def test_list_sources_is_resolved_field(self):
         unresolved = _make_source_desc(tensors=[], is_resolved=False)
-        mock_fc = _build_mock_client(unresolved)
-        with patch(
-            "biopb_tensor_server.serving.http_server.TensorFlightClient",
-            return_value=mock_fc,
-        ):
-            app = create_app(token=_TOKEN)
-            with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["is_resolved"] is False
+        _serve_tree(mock_fc, [_source_row(unresolved)])
+        assert _tree_descriptors(tc, _bearer(_TOKEN))[0]["is_resolved"] is False
 
-    def test_list_sources_carries_why_a_source_is_unresolved(self, auth_client):
+    def test_tree_carries_why_a_source_is_unresolved(self, auth_client):
         tc, mock_fc = auth_client
         row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+        _serve_tree(mock_fc, [row], reasons={"src0": "pending"})
+        body = _tree_descriptors(tc, _bearer(_TOKEN))[0]
+        assert body["unresolved_reason"] == "pending"
 
-        def query(sql, format="arrow"):  # noqa: A002
-            if "unresolved_reason" in sql:
-                return [{"source_id": "src0", "unresolved_reason": "pending"}]
-            return _answer([row], format)
-
-        mock_fc.query.side_effect = query
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["unresolved_reason"] == "pending"
-
-    def test_list_sources_still_lists_against_a_server_without_the_column(
-        self, auth_client
-    ):
+    def test_tree_still_lists_against_a_server_without_the_column(self, auth_client):
         # The reason is a second, narrow query: a server older than the column
-        # refuses it, and the listing must not go with it.
+        # refuses it, and the level must not go with it.
         tc, mock_fc = auth_client
         row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
-
-        def query(sql, format="arrow"):  # noqa: A002
-            if "unresolved_reason" in sql:
-                raise RuntimeError("Binder Error: column not found")
-            return _answer([row], format)
-
-        mock_fc.query.side_effect = query
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert r.json()[0]["is_resolved"] is False
-        assert "unresolved_reason" not in r.json()[0]
+        _serve_tree(mock_fc, [row], reasons=RuntimeError("Binder Error: no column"))
+        (body,) = _tree_descriptors(tc, _bearer(_TOKEN))
+        assert body["is_resolved"] is False
+        assert "unresolved_reason" not in body
 
     def test_a_resolved_source_carries_no_reason(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
-            [_source_row(_make_source_desc())], format
-        )
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert "unresolved_reason" not in r.json()[0]
+        _serve_tree(mock_fc, [_source_row(_make_source_desc())])
+        body = _tree_descriptors(tc, _bearer(_TOKEN))[0]
+        assert "unresolved_reason" not in body
 
-    def test_list_sources_is_resolved_defaults_true_on_missing_column(
-        self, auth_client
-    ):
+    def test_tree_is_resolved_defaults_true_on_missing_column(self, auth_client):
         # A server predating this column has no is_resolved key in the row at
         # all; the default reads as resolved, the correct answer for every
         # pre-existing source.
         tc, mock_fc = auth_client
-        mock_fc.query.side_effect = lambda sql, format="arrow": _answer(  # noqa: A006
-            [
-                {
-                    "source_id": "src0",
-                    "source_url": "/data/src0",
-                    "source_type": "zarr",
-                    "tensors": [],
-                }
-            ],
-            format,
-        )
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.json()[0]["is_resolved"] is True
-
-    @staticmethod
-    def _catalog_of(mock_fc, n, **schema_metadata):
-        """A catalog of *n* sources that honours the LIMIT it is asked for."""
-        asked = []
-
-        def query(sql, format="arrow"):  # noqa: A002
-            asked.append(sql)
-            rows = [
-                {**_source_row(_make_source_desc()), "source_id": f"s{i:04d}"}
-                for i in range(n)
-            ]
-            if " LIMIT " in sql:
-                rows = rows[: int(sql.rsplit(" LIMIT ", 1)[1])]
-            return _answer(rows, format, **schema_metadata)
-
-        mock_fc.query.side_effect = query
-        return asked
-
-    def test_limit_cuts_the_listing_and_says_so(self, auth_client):
-        tc, mock_fc = auth_client
-        asked = self._catalog_of(mock_fc, 10)
-        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
-        assert [s["source_id"] for s in r.json()] == [
-            "s0000",
-            "s0001",
-            "s0002",
-            "s0003",
-        ]
-        assert r.headers["X-Truncated"] == "true"
-        # One row past the limit is how it learns the catalog is longer.
-        assert asked[0].endswith("ORDER BY source_id LIMIT 5")
-
-    def test_a_catalog_within_the_limit_is_not_truncated(self, auth_client):
-        tc, mock_fc = auth_client
-        self._catalog_of(mock_fc, 4)
-        r = tc.get("/api/sources?limit=4", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 4
-        assert r.headers["X-Truncated"] == "false"
-
-    def test_without_a_limit_the_listing_is_whole(self, auth_client):
-        tc, mock_fc = auth_client
-        asked = self._catalog_of(mock_fc, 10)
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 10
-        assert r.headers["X-Truncated"] == "false"
-        assert "LIMIT" not in asked[0]
-
-    def test_the_servers_own_cap_is_reported_too(self, auth_client):
-        # max_query_results cuts a listing the caller never limited; the flag
-        # rides on the table's schema metadata.
-        tc, mock_fc = auth_client
-        self._catalog_of(mock_fc, 3, truncated=True, total_rows=9, returned_rows=3)
-        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert len(r.json()) == 3
-        assert r.headers["X-Truncated"] == "true"
-
-    @pytest.mark.parametrize("limit", ["0", "-1", "abc"])
-    def test_a_bad_limit_is_refused(self, auth_client, limit):
-        tc, _ = auth_client
-        r = tc.get(f"/api/sources?limit={limit}", headers=_bearer(_TOKEN))
-        assert r.status_code == 422
+        row = {
+            "source_id": "src0",
+            "source_url": "/data/src0",
+            "source_type": "zarr",
+            "tensors": [],
+        }
+        _serve_tree(mock_fc, [row])
+        assert _tree_descriptors(tc, _bearer(_TOKEN))[0]["is_resolved"] is True
 
 
 # ===========================================================================
@@ -1003,7 +935,7 @@ class TestRedact:
         mock_fc.query.side_effect = RuntimeError(
             "failed to open /home/user/secret/data.zarr"
         )
-        tc.get("/api/sources", headers=_bearer(_TOKEN))
+        tc.get("/api/tree", headers=_bearer(_TOKEN))
         mock_fc.query.side_effect = None
 
         # The error should be recorded and redacted in diagnostics
@@ -1141,32 +1073,42 @@ class TestIntegration:
         )
         return TestClient(app, raise_server_exceptions=True)
 
-    def test_integration_list_sources(self):
-        with self._make_tc() as tc:
-            r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+    def _reveal(self, tc):
+        r = tc.get(
+            "/api/tree/reveal",
+            params={"source_id": "int-tensor"},
+            headers=_bearer(_TOKEN),
+        )
         assert r.status_code == 200
-        body = r.json()
-        assert len(body) == 1
-        # source_id comes from DataSourceDescriptor returned by the server
-        assert body[0]["source_id"] is not None
-        assert body[0]["tensors"][0]["shape"] == list(self._shape)
-        assert r.headers["X-Truncated"] == "false"
+        return r.json()
 
-    def test_integration_list_sources_with_a_limit(self):
-        # The real metadata DB has to accept the LIMIT the route appends.
-        with self._make_tc() as tc:
-            r = tc.get("/api/sources?limit=1", headers=_bearer(_TOKEN))
+    def _array_id(self, tc):
+        r = tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT tensors FROM sources"},
+            headers=_bearer(_TOKEN),
+        )
         assert r.status_code == 200
-        assert len(r.json()) == 1
-        assert r.headers["X-Truncated"] == "false"
+        return r.json()[0]["tensors"][0]["array_id"]
 
-    def test_integration_a_search_row_is_the_listed_descriptor(self):
+    def test_integration_tree_reveals_the_source(self):
+        with self._make_tc() as tc:
+            revealed = self._reveal(tc)
+        body = revealed["descriptor"]
+        assert body["source_id"] == "int-tensor"
+        assert body["tensors"][0]["shape"] == list(self._shape)
+        assert not revealed["levels"][-1]["truncated"]
+        assert any(
+            s["descriptor"] == body for lv in revealed["levels"] for s in lv["sources"]
+        )
+
+    def test_integration_a_search_row_is_the_tree_descriptor(self):
         # The viewer's server-side search selects the descriptor columns with the
         # catalog query and renders from them, so a row has to say what the
-        # listing says -- including the column a newer server adds.
+        # tree says -- including the column a newer server adds.
         columns = "source_id, source_url, source_type, is_resolved, tensors"
         with self._make_tc() as tc:
-            (listed,) = tc.get("/api/sources", headers=_bearer(_TOKEN)).json()
+            listed = self._reveal(tc)["descriptor"]
             r = tc.post(
                 "/api/sources/query",
                 json={"sql": f"SELECT {columns}, unresolved_reason FROM sources"},
@@ -1186,9 +1128,7 @@ class TestIntegration:
     def test_integration_slice_roundtrip(self):
         with self._make_tc() as tc:
             # The array_id a real server advertises is the whole address.
-            src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-            assert src_r.status_code == 200
-            array_id = src_r.json()[0]["tensors"][0]["array_id"]
+            array_id = self._array_id(tc)
             r = tc.post(
                 "/api/slice",
                 json={"array_id": array_id},
@@ -1203,8 +1143,7 @@ class TestIntegration:
 
     def test_integration_slice_subregion(self):
         with self._make_tc() as tc:
-            src_r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-            array_id = src_r.json()[0]["tensors"][0]["array_id"]
+            array_id = self._array_id(tc)
             r = tc.post(
                 "/api/slice",
                 json={
@@ -2651,14 +2590,16 @@ class TestTileGridComesFromTheDescribedTensor:
         assert body["tile_size"] == 256
         assert mock_fc.get_descriptor.called
 
-    def test_the_source_listing_publishes_no_grid(self):
+    def test_the_tree_descriptor_publishes_no_grid(self):
         mock_fc = self._client()
+        listed = _make_tensor_desc("s", [1, 1, 1, 512, 512], "uint16", list("TCZYX"))
+        _serve_tree(mock_fc, [_source_row(_make_source_desc("s", tensors=[listed]))])
         with patch(
             "biopb_tensor_server.serving.http_server.TensorFlightClient",
             return_value=mock_fc,
         ):
             with TestClient(create_app(token=None)) as tc:
-                (source,) = tc.get("/api/sources").json()
+                (source,) = _tree_descriptors(tc)
 
         assert source["tensors"][0]["shape"] == [1, 1, 1, 512, 512]
         assert "chunk_shape" not in source["tensors"][0]
@@ -3730,11 +3671,11 @@ class TestVolumeStaysWithinTheBudget:
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-class TestListingCap:
-    """A source past the listing's row cap is unlisted but still addressable.
+class TestQueryCap:
+    """A source past the server's row cap is still addressable by id.
 
-    Real Flight server, real sidecar. The listing says it was cut, and a catalog
-    query keyed on the id still finds the source the cap clipped.
+    Real Flight server, real sidecar. A catalog query keyed on the id finds the
+    source the cap clipped from an unfiltered query.
     """
 
     @pytest.fixture(autouse=True)
@@ -3744,7 +3685,7 @@ class TestListingCap:
         from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
         # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
-        # clipped from the listing (which is a catalog query).
+        # clipped from an unfiltered query.
         db = MetadataDatabase(max_query_results=1)
         server = TensorFlightServer("127.0.0.1:0", metadata_db=db)
         for sid in ("a", "b", "c"):
@@ -3777,13 +3718,6 @@ class TestListingCap:
             raise_server_exceptions=True,
         )
 
-    def test_the_listing_is_capped_and_says_so(self):
-        with self._tc() as tc:
-            r = tc.get("/api/sources", headers=_bearer(_TOKEN))
-        assert r.status_code == 200
-        assert [s["source_id"] for s in r.json()] == ["a"]
-        assert r.headers["X-Truncated"] == "true"
-
     def test_the_clipped_source_still_answers_a_query_by_id(self):
         with self._tc() as tc:
             r = tc.post(
@@ -3793,6 +3727,406 @@ class TestListingCap:
             )
         assert r.status_code == 200
         assert [row["source_id"] for row in r.json()] == ["c"]
+
+
+# ===========================================================================
+# Tree levels (/api/tree, /api/tree/reveal)
+# ===========================================================================
+
+
+# What the browser's `getPathParts` (web/packages/app/src/utils/sourceTree.ts)
+# answers for each url, as the tree path's segments.
+_PATH_PARTS = [
+    ("file:///data/experiment/plate1.zarr", ["data", "experiment", "plate1.zarr"]),
+    (
+        "grpc://host:8815/remote/plate1.zarr",
+        ["grpc://host:8815", "remote", "plate1.zarr"],
+    ),
+    ("s3://bucket/key", ["s3://bucket", "key"]),
+    ("grpc://host:8815", ["grpc://host:8815"]),
+    ("dnd://scratch/exp:2.zarr", ["scratch", "exp:2.zarr"]),
+    ("dnd://a\\b\\\\c//d", ["a", "b", "c", "d"]),
+    ("just/a/path", ["just", "a", "path"]),
+    ("/abs//path/", ["abs", "path"]),
+    ("file:///", []),
+    ("", []),
+]
+
+
+def _tree_path_of(url: str) -> list:
+    import duckdb
+    from biopb_tensor_server.serving.http_server import (
+        _TREE_BODY_SQL,
+        _TREE_PATH_SQL,
+        _dec,
+    )
+
+    row = (
+        duckdb.connect()
+        .execute(
+            f"WITH t AS (SELECT {_TREE_BODY_SQL} AS b FROM (SELECT ? AS source_url))"
+            f" SELECT {_TREE_PATH_SQL} FROM t",
+            [url],
+        )
+        .fetchone()
+    )
+    return [_dec(part) for part in row[0].split("\x01")] if row[0] else []
+
+
+class TestTreePath:
+    @pytest.mark.parametrize("url,parts", _PATH_PARTS)
+    def test_agrees_with_getPathParts(self, url, parts):
+        assert _tree_path_of(url) == parts
+
+    def test_dnd_is_stripped_not_parsed_as_a_host(self):
+        assert _tree_path_of("dnd://exp:2.zarr") == ["exp:2.zarr"]
+
+    def test_an_authority_url_roots_at_its_endpoint(self):
+        assert _tree_path_of("grpc://h:1/a/b")[0] == "grpc://h:1"
+
+    def test_an_empty_host_is_just_the_path(self):
+        assert _tree_path_of("file:///x/y.zarr") == ["x", "y.zarr"]
+
+
+@contextmanager
+def _tree_catalog(tmp_path, urls, pending=(), empty=(), **db_kwargs):
+    """A real server whose catalog lists *urls* ``{source_id: url}``; a source
+    in *pending* is claimed, not registered (an unresolved placeholder row), and
+    one in *empty* is resolved and holds no tensor."""
+    import zarr
+    from biopb_tensor_server import ZarrAdapter
+    from biopb_tensor_server.core.discovery import SourceClaim
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    db = MetadataDatabase(**db_kwargs)
+    server = catalog_server("127.0.0.1:0", metadata_db=db)
+    z = zarr.open_array(
+        str(tmp_path / "a.zarr"), mode="w", shape=(8, 8), chunks=(8, 8), dtype="u2"
+    )
+    for sid, url in urls.items():
+        adapter = ZarrAdapter(z, sid, ["y", "x"])
+        adapter._catalog_url = url or "file:///placeholder"
+        register_and_catalog(server, sid, adapter)
+        if not url:
+            # A source with no url at all: an upload.
+            db._get_connection().execute(
+                "UPDATE source_catalog SET rel = '' WHERE source_id = ?", [sid]
+            )
+    for sid, url in dict(pending).items():
+        db.sync_pending_source(SourceClaim("zarr", url, sid), url)
+    for sid, url in dict(empty).items():
+        adapter = ZarrAdapter(z, sid, ["y", "x"])
+        adapter._catalog_url = url
+        register_and_catalog(server, sid, adapter)
+        db._get_connection().execute(
+            "UPDATE source_catalog SET tensors = [] WHERE source_id = ?", [sid]
+        )
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(0.5)
+    try:
+        yield server, f"grpc://localhost:{server.port}"
+    finally:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+
+
+_TREE_URLS = {
+    "solo": "file:///solo.zarr",
+    "c1": "file:///chain/one/two/three/plate01/x.zarr",
+    "c2": "file:///chain/one/two/three/plate02/x.zarr",
+    "st1": "file:///stop/direct.zarr",
+    "st2": "file:///stop/a/x.zarr",
+    "m1": "file:///mid/a/x.zarr",
+    "m2": "file:///mid/a/b/y.zarr",
+    "o1": "file:///ord/a/p.zarr",
+    "o2": "file:///ord/a-b/q.zarr",
+    "o3": "file:///ord/a/r/s.zarr",
+    "w1": "file:///we_ird/100%/it's/z.zarr",
+    "w2": "file:///weXird/100%/it's/z.zarr",
+    "g1": "grpc://host:8815/remote/plate1.zarr",
+    "g2": "grpc://host:8815/remote/b/plate2.zarr",
+    "d1": "dnd://scratch\\exp:2.zarr",
+    "d2": "dnd://scratch/other.zarr",
+    "upload_7f3": "",
+    "wide00": "file:///wide/f00.zarr",
+    "wide01": "file:///wide/f01.zarr",
+    "wide02": "file:///wide/f02.zarr",
+    "wide03": "file:///wide/f03.zarr",
+    "wide04": "file:///wide/f04.zarr",
+}
+_TREE_PENDING = {
+    "ghost": "file:///pending/ghost.zarr",
+    "ghost2": "file:///wide/f99.zarr",
+}
+_TREE_EMPTY = {
+    "void": "file:///hidden/void.zarr",
+    "void2": "file:///wide/f98.zarr",
+}
+
+
+@pytest.fixture(scope="module")
+def tree_loc(tmp_path_factory):
+    with _tree_catalog(
+        tmp_path_factory.mktemp("tree"), _TREE_URLS, _TREE_PENDING, _TREE_EMPTY
+    ) as (
+        _,
+        loc,
+    ):
+        yield loc
+
+
+class TestTree:
+    @pytest.fixture
+    def tc(self, tree_loc):
+        loc = tree_loc
+        with TestClient(
+            create_app(flight_location=loc, token=_TOKEN),
+            raise_server_exceptions=True,
+        ) as tc:
+            yield tc
+
+    def _get(self, tc, **params):
+        return tc.get("/api/tree", params=params, headers=_bearer(_TOKEN))
+
+    def _level(self, tc, key="", **params):
+        r = self._get(tc, key=key, **params)
+        assert r.status_code == 200
+        return r.json()
+
+    def test_top_level(self, tc):
+        level = self._level(tc)
+        assert level["key"] == ""
+        assert level["truncated"] is False
+        assert [f["name"] for f in level["folders"]] == [
+            "chain/one/two/three",
+            "grpc://host:8815/remote",
+            "mid/a",
+            "ord",
+            "pending",
+            "scratch",
+            "stop",
+            "weXird/100%/it's",
+            "we_ird/100%/it's",
+            "wide",
+        ]
+        # Sources at a level sit beside its folders, byte-ordered by name.
+        assert [s["name"] for s in level["sources"]] == ["solo.zarr", "upload_7f3"]
+
+    def test_folder_keys_are_the_tree_path(self, tc):
+        level = self._level(tc)
+        keys = {f["name"]: f["key"] for f in level["folders"]}
+        assert keys["chain/one/two/three"] == "chain/one/two/three"
+        assert keys["grpc://host:8815/remote"] == "grpc://host:8815/remote"
+
+    def test_a_source_carries_the_catalog_row_as_its_descriptor(self, tc):
+        row = tc.post(
+            "/api/sources/query",
+            json={
+                "sql": "SELECT source_id, source_url, source_type, is_resolved,"
+                " tensors FROM sources WHERE source_id = 'solo'"
+            },
+            headers=_bearer(_TOKEN),
+        ).json()[0]
+        level = self._level(tc)
+        solo = next(s for s in level["sources"] if s["name"] == "solo.zarr")
+        assert solo["descriptor"] == row
+
+    def test_a_pathless_source_is_top_level_and_named_by_its_id(self, tc):
+        level = self._level(tc)
+        assert "upload_7f3" in [s["name"] for s in level["sources"]]
+
+    def test_a_chain_merges_to_the_first_fork(self, tc):
+        level = self._level(tc, key="chain/one/two/three")
+        assert [f["name"] for f in level["folders"]] == ["plate01", "plate02"]
+        assert level["sources"] == []
+        leaf = self._level(tc, key="chain/one/two/three/plate01")
+        assert [s["name"] for s in leaf["sources"]] == ["x.zarr"]
+        assert leaf["folders"] == []
+
+    def test_a_source_in_an_intermediate_folder_stops_the_merge(self, tc):
+        level = self._level(tc, key="stop")
+        assert [f["name"] for f in level["folders"]] == ["a"]
+        assert [s["name"] for s in level["sources"]] == ["direct.zarr"]
+
+    def test_a_source_in_the_last_merged_folder_ends_the_chain_there(self, tc):
+        level = self._level(tc, key="mid/a")
+        assert [f["name"] for f in level["folders"]] == ["b"]
+        assert [s["name"] for s in level["sources"]] == ["x.zarr"]
+
+    def test_the_merge_follows_component_order_not_string_order(self, tc):
+        # "ord/a-b" sorts between "ord/a" and "ord/a/r" as a string; as
+        # components "a-b" is a sibling of "a", so nothing merges below "ord".
+        level = self._level(tc, key="ord")
+        assert [f["name"] for f in level["folders"]] == ["a", "a-b"]
+        assert [s["name"] for s in self._level(tc, key="ord/a")["sources"]] == [
+            "p.zarr"
+        ]
+
+    def test_underscore_percent_and_quote_in_a_key_match_literally(self, tc):
+        level = self._level(tc, key="we_ird/100%/it's")
+        assert [s["name"] for s in level["sources"]] == ["z.zarr"]
+        assert level["sources"][0]["descriptor"]["source_id"] == "w1"
+        other = self._level(tc, key="weXird/100%/it's")
+        assert other["sources"][0]["descriptor"]["source_id"] == "w2"
+
+    def test_a_key_that_matches_nothing_is_an_empty_level(self, tc):
+        level = self._level(tc, key="no/such%")
+        assert level == {
+            "key": "no/such%",
+            "folders": [],
+            "sources": [],
+            "truncated": False,
+        }
+
+    def test_a_remote_mirror_roots_at_its_endpoint(self, tc):
+        level = self._level(tc, key="grpc://host:8815/remote")
+        assert [f["name"] for f in level["folders"]] == ["b"]
+        assert [s["name"] for s in level["sources"]] == ["plate1.zarr"]
+        assert level["folders"][0]["key"] == "grpc://host:8815/remote/b"
+
+    def test_a_dropped_source_is_rooted_without_its_scheme(self, tc):
+        level = self._level(tc, key="scratch")
+        assert [s["name"] for s in level["sources"]] == ["exp:2.zarr", "other.zarr"]
+
+    def test_a_resolved_source_with_no_tensor_is_hidden(self, tc):
+        top = [f["name"] for f in self._level(tc)["folders"]]
+        assert "hidden" not in top
+        wide = self._level(tc, key="wide")
+        assert "f98.zarr" not in [s["name"] for s in wide["sources"]]
+
+    def test_an_unresolved_source_is_shown_to_be_resolved_from(self, tc):
+        wide = self._level(tc, key="wide")
+        pending = [s for s in wide["sources"] if s["name"] == "f99.zarr"]
+        assert len(pending) == 1
+        assert pending[0]["descriptor"]["is_resolved"] is False
+        assert len(wide["sources"]) == 6
+
+    def test_limit_cuts_the_level_and_says_so(self, tc):
+        level = self._level(tc, key="wide", limit=3)
+        assert [s["name"] for s in level["sources"]] == [
+            "f00.zarr",
+            "f01.zarr",
+            "f02.zarr",
+        ]
+        assert level["truncated"] is True
+        assert self._level(tc, key="wide", limit=6)["truncated"] is False
+
+    def test_limit_is_shared_with_folders_which_come_first(self, tc):
+        level = self._level(tc, key="stop", limit=1)
+        assert [f["name"] for f in level["folders"]] == ["a"]
+        assert level["sources"] == []
+        assert level["truncated"] is True
+        assert self._level(tc, key="stop", limit=2)["truncated"] is False
+
+    def test_limit_must_be_positive(self, tc):
+        assert self._get(tc, key="", limit=0).status_code == 422
+
+    def test_the_level_has_a_strong_etag_and_revalidates_to_304(self, tc):
+        first = self._get(tc, key="wide")
+        etag = first.headers["ETag"]
+        assert etag.startswith('"') and not etag.startswith("W/")
+        again = tc.get(
+            "/api/tree",
+            params={"key": "wide"},
+            headers={**_bearer(_TOKEN), "If-None-Match": etag},
+        )
+        assert again.status_code == 304
+        assert again.content == b""
+        assert again.headers["ETag"] == etag
+        assert self._get(tc, key="wide").headers["ETag"] == etag
+
+    def test_a_different_level_has_a_different_etag(self, tc):
+        assert (
+            self._get(tc, key="wide").headers["ETag"]
+            != self._get(tc, key="stop").headers["ETag"]
+        )
+
+    def test_it_needs_the_token(self, tc):
+        assert tc.get("/api/tree").status_code == 401
+
+    # -- reveal ------------------------------------------------------------
+
+    def _reveal(self, tc, source_id):
+        return tc.get(
+            "/api/tree/reveal",
+            params={"source_id": source_id},
+            headers=_bearer(_TOKEN),
+        )
+
+    def test_reveal_returns_every_level_top_to_bottom(self, tc):
+        r = self._reveal(tc, "c2")
+        assert r.status_code == 200
+        body = r.json()
+        assert [lv["key"] for lv in body["levels"]] == [
+            "",
+            "chain/one/two/three",
+            "chain/one/two/three/plate02",
+        ]
+        assert [s["name"] for s in body["levels"][-1]["sources"]] == ["x.zarr"]
+        assert body["descriptor"]["source_id"] == "c2"
+        assert body["levels"][0] == self._level(tc)
+
+    def test_reveal_descends_through_an_endpoint(self, tc):
+        body = self._reveal(tc, "g2").json()
+        assert [lv["key"] for lv in body["levels"]] == [
+            "",
+            "grpc://host:8815/remote",
+            "grpc://host:8815/remote/b",
+        ]
+
+    def test_reveal_of_a_pathless_source_is_the_top_level(self, tc):
+        body = self._reveal(tc, "upload_7f3").json()
+        assert [lv["key"] for lv in body["levels"]] == [""]
+        assert body["descriptor"]["source_id"] == "upload_7f3"
+
+    def test_reveal_of_an_unknown_source_is_404(self, tc):
+        r = self._reveal(tc, "nope")
+        assert r.status_code == 404
+        assert "nope" in r.json()["detail"]
+
+    def test_reveal_of_a_hidden_source_is_404(self, tc):
+        assert self._reveal(tc, "void").status_code == 404
+
+    def test_reveal_finds_an_unresolved_source(self, tc):
+        r = self._reveal(tc, "ghost")
+        assert r.status_code == 200
+        assert r.json()["descriptor"]["is_resolved"] is False
+
+    def test_reveal_escapes_the_id(self, tc):
+        assert self._reveal(tc, "x' OR '1'='1").status_code == 404
+
+
+class TestTreeLiveCatalog:
+    def test_a_changed_level_changes_its_etag(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import ZarrAdapter
+
+        with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (server, loc):
+            with TestClient(create_app(flight_location=loc, token=_TOKEN)) as tc:
+                headers = _bearer(_TOKEN)
+                before = tc.get("/api/tree", params={"key": "d"}, headers=headers)
+                z = zarr.open_array(str(tmp_path / "a.zarr"), mode="r")
+                added = ZarrAdapter(z, "b", ["y", "x"])
+                added._catalog_url = "file:///d/b.zarr"
+                register_and_catalog(server, "b", added)
+                stale = tc.get(
+                    "/api/tree",
+                    params={"key": "d"},
+                    headers={**headers, "If-None-Match": before.headers["ETag"]},
+                )
+        assert stale.status_code == 200
+        assert stale.headers["ETag"] != before.headers["ETag"]
+        assert [s["name"] for s in stale.json()["sources"]] == ["a.zarr", "b.zarr"]
+
+    def test_the_servers_own_cap_marks_the_level_truncated(self, tmp_path):
+        urls = {f"s{i}": f"file:///d/{i}.zarr" for i in range(4)}
+        with _tree_catalog(tmp_path, urls, max_query_results=2) as (_, loc):
+            with TestClient(create_app(flight_location=loc, token=_TOKEN)) as tc:
+                r = tc.get("/api/tree", params={"key": "d"}, headers=_bearer(_TOKEN))
+        assert r.json()["truncated"] is True
+        assert len(r.json()["sources"]) == 2
 
 
 # ===========================================================================

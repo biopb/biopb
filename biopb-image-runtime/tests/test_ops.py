@@ -26,6 +26,7 @@ from biopb_image_base.ops import (
     _EmbeddedSink,
     _InlineSink,
     _PlaneSink,
+    _serving_token,
     build_server,
     describe,
 )
@@ -600,3 +601,36 @@ def test_embedded_sink(tmp_path: Path, monkeypatch):
         s.close()
         cache._server.shutdown()
         CacheManager.reset()
+
+
+# --------------------------------------------------------------------------- #
+# The token a server checks
+# --------------------------------------------------------------------------- #
+
+
+def test_loopback_serves_without_a_token(monkeypatch):
+    monkeypatch.delenv("BIOPB_ALGORITHM_TOKEN", raising=False)
+    assert _serving_token("127.0.0.1", no_token=False) is None
+
+
+def test_off_loopback_mints_a_token_and_prints_it(monkeypatch, capsys):
+    monkeypatch.delenv("BIOPB_ALGORITHM_TOKEN", raising=False)
+    token = _serving_token("0.0.0.0", no_token=False)
+    assert token and token in capsys.readouterr().out
+
+
+def test_the_env_token_is_used_as_given(monkeypatch):
+    monkeypatch.setenv("BIOPB_ALGORITHM_TOKEN", "mine")
+    assert _serving_token("0.0.0.0", no_token=False) == "mine"
+
+
+def test_no_token_serves_open_off_loopback_and_says_so(monkeypatch, capsys):
+    monkeypatch.delenv("BIOPB_ALGORITHM_TOKEN", raising=False)
+    assert _serving_token("0.0.0.0", no_token=True) is None
+    assert "no token" in capsys.readouterr().out
+
+
+def test_no_token_refuses_a_token_that_was_also_asked_for(monkeypatch):
+    monkeypatch.setenv("BIOPB_ALGORITHM_TOKEN", "mine")
+    with pytest.raises(SystemExit, match="conflicts"):
+        _serving_token("0.0.0.0", no_token=True)

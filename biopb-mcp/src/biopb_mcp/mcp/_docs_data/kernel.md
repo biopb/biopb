@@ -63,11 +63,7 @@ a `task-...` id at once, and the main thread stays free. Notes on tasks:
 
 Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next bytecode) or
 `restart_kernel` (guaranteed, kills the kernel). Notes:
-* **`poll_job` waits for you — do not spin on it.** It watches a running job for
-  `wait` seconds (10 by default, 30 max) and answers the moment the job ends, so
-  calling it back-to-back asks the same question sooner and costs you a round trip
-  for nothing. Raise `wait` if you have nothing to do until the job finishes; pass
-  `wait=0` only for a snapshot you are not about to ask for again.
+* `poll_job` already waits for the job (see its description): do not call it in a loop.
 * **A blocking `.compute()` is interruptible.** In a cell it stops at once, on either
   scheduler; on a dask `Client` the compute's own tasks are cancelled with it. In a
   `run_async` task the stop lands when dask's wait next wakes — on a dask `Client`,
@@ -94,46 +90,38 @@ processes adds hops rather than speed — and a cluster nobody asked for is one 
 quietly dies with the laptop lid and hangs every later `.compute()` (#970).
 
 When the work is CPU-heavy and parallel — a per-tile filter over a big stack, a
-segmentation sweep — put it on a cluster from a cell, the ordinary dask way:
+segmentation sweep — put it on a cluster from a cell:
 
 ```python
 from dask.distributed import Client as DaskClient   # not `client`, the tensor one
-dask_client = DaskClient()                    # a local cluster, workers in this kernel
-dask_client = DaskClient("tcp://host:8786")   # or an external scheduler
-dask_client.close()                           # back to in-process
+dask_client = DaskClient()          # local workers in this kernel; or DaskClient("tcp://host:8786")
+dask_client.close()                 # back to in-process
 ```
 
 A live dask `Client` becomes dask's default, so plain `.compute()` calls go to it. A
-local cluster's workers belong to this kernel and go with it: `restart_kernel`
-starts in-process again. `server_status`'s `## Dask` section says which is in
-effect, and warns when an attached cluster has lost its workers (a host suspend
-does that, and a `.compute()` would then block forever).
-
-Either way a stop reaches Python code at its next bytecode, so a chunk fetch
-inside a C call ends only when it returns. Your own Python loops are stoppable
-either way.
+local cluster goes with the kernel: `restart_kernel` starts in-process again.
+`server_status`'s `## Dask` section says which is in effect, and warns when an
+attached cluster has lost its workers (a host suspend does that, and a `.compute()`
+would then block forever). Either way a stop reaches Python code at its next
+bytecode, so a chunk fetch inside a C call ends only when it returns.
 
 ## You are not the only writer of this namespace
 The user can run their own code in this kernel, from a Jupyter notebook or console
-attached to it. It is the same namespace, so their cells can rebind a variable you set, add
-or remove a layer, or import something you did not.
+attached to it, so their cells can rebind a variable you set, add or remove a layer, or import
+something you did not.
 
-* **You will be told, after the fact.** When user cells have run since your last call,
-  a note listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job`
-  / `server_status` result. Read them with `poll_job`, and re-check what you rely on
-  (`dir()`, `inspect_object`) instead of trusting what you last saw.
+* **You are told after the fact.** When user cells ran since your last call, a note
+  listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job` /
+  `server_status` result. Read them with `poll_job` and re-check what you rely on
+  (`dir()`, `inspect_object`).
 * **One cell at a time.** While the user's cell runs, your new cells are refused and
-  your other calls wait for it; while your cell runs, theirs waits for it. A user's cell
-  can run while your `run_async` task does. Do not try to clear either.
-* **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
-  only your own). Do not reach for `restart_kernel` to get around that: it would
-  destroy the user's variables along with yours.
-* **But no second agent.** The user is the only other writer you will meet: whichever
-  agent runs code first holds the kernel until it restarts, and another client is
-  refused by everything that changes kernel state — `execute_code`, `interrupt_kernel`,
-  `restart_kernel` — keeping only the read-only tools. So a namespace change you did
-  not make came from the person, and the note above is the whole story. If you are the
-  one refused, say so and let the user decide; the restart is theirs.
+  your other calls wait; while yours runs, theirs waits for it. Their cell is not yours to
+  stop: `interrupt_kernel` refuses a user job, and `restart_kernel` would destroy
+  their variables along with yours.
+* **No second agent.** Whichever agent runs code first holds the kernel until it
+  restarts, and another client is refused by everything that changes kernel state,
+  keeping only the read-only tools. A namespace change you did not make came from the
+  person. If you are the one refused, say so and let the user decide.
 
 Reading pixels off the server is [[tensor-server-client]], off a layer is
 [[napari-viewer]], and the round trip for data too large to hold is [[upload]].

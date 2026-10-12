@@ -5,6 +5,7 @@ import { createPreferencesSlice } from "./preferences";
 import { createRecentsSlice } from "./recents";
 import { createRuntimeSlice } from "./runtime";
 import { createTargetSlice } from "./target";
+import { createTreeSlice } from "./tree";
 import type { AppState } from "./types";
 import { createViewsSlice } from "./views";
 
@@ -16,12 +17,14 @@ export * from "./recents";
 export * from "./runtime";
 export * from "./slice";
 export * from "./target";
+export * from "./tree";
 export * from "./views";
 export * from "./tensorView";
 export * from "./roi";
 
 export const useAppStore = create<AppState>()((...a) => ({
   ...createConnectionSlice(...a),
+  ...createTreeSlice(...a),
   ...createRecentsSlice(...a),
   ...createJobsSlice(...a),
   ...createPreferencesSlice(...a),

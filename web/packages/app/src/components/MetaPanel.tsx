@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { selectTileInfo, useAppStore } from "../store";
 import {
   MAX_ROWS,
@@ -152,16 +152,14 @@ export function MetaPanel({ sourceId }: MetaPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // A listed source carries its url (the tree names its entry from it). One the
-  // catalog does not list -- past the listing's limit, or opened from a shared
-  // link before the listing lands -- has none to show, and the row is left out
-  // rather than filled with something that only looks like one. An upload has
-  // an empty url, so its id stands in.
-  const sources = useAppStore((s) => s.sources);
-  const sourceUrl = useMemo(() => {
-    const listed = sources.find((s) => s.source_id === sourceId);
-    return listed ? listed.source_url || sourceId : null;
-  }, [sources, sourceId]);
+  // A source the tree has shown carries its url (the tree names its entry from
+  // it). One it has not -- opened from a shared link before the reveal lands --
+  // has none to show, and the row is left out rather than filled with something
+  // that only looks like one. An upload has an empty url, so its id stands in.
+  const sourceUrl = useAppStore((s) => {
+    const shown = sourceId ? s.sourceIndex[sourceId] : undefined;
+    return shown ? shown.source_url || sourceId : null;
+  });
 
   useEffect(() => {
     let cancelled = false;

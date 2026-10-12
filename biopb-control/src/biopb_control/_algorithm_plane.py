@@ -18,10 +18,13 @@ starting   spawned, waiting for its port
 up         serving the file's current hash
 stale      serving, but the file changed since this process started;
            ``refresh()`` picks up the new op list without restarting it,
-           so its row withholds the url/token, forcing the next call
-           through :meth:`AlgorithmPlane.ensure`, which restarts it
+           so its row withholds the token and is not ``up``, forcing the
+           next call through :meth:`AlgorithmPlane.ensure`, which restarts it
 failed     install, describe or start failed; ``error`` holds the log tail
 ========== =========================================================
+
+A script entry's row names its loopback address in every state: the port is
+reserved with the entry and kept across restarts. Only the token waits for a start.
 
 A failure before the port binds (a bad header, an import error) is
 ``failed`` and waits for the next ensure; only a server that was ``up`` and
@@ -105,6 +108,16 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _port_free(port: int) -> bool:
+    """Can *port* still be bound on loopback?"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 class ScriptEntry(ServiceProcess):
     """One script entry: its install, its cached op list, and its server."""
 
@@ -133,8 +146,11 @@ class ScriptEntry(ServiceProcess):
         # file changes, and by ensure always.
         self._error: Optional[str] = None
         self._failed_hash: Optional[str] = None
-        # The running server.
-        self._port = 0
+        # The server's address. A script entry is always on this machine, so its
+        # port is reserved here and kept across restarts: the row can name the
+        # address before the server is up, and a client that bound early has it.
+        self._port = _free_port()
+        # The running server's token.
         self._token = ""
         self._running_hash: Optional[str] = None
         self._want = False
@@ -311,7 +327,8 @@ class ScriptEntry(ServiceProcess):
         self._close_death_pipe()
 
     def _spawn_locked(self) -> bool:
-        self._port = _free_port()
+        if not _port_free(self._port):
+            self._port = _free_port()  # something else took the reserved one
         self._token = secrets.token_urlsafe(32)
         try:
             self._start_process()
@@ -437,7 +454,7 @@ class ScriptEntry(ServiceProcess):
             running = state in ("up", "starting") and self._proc is not None
             return _registry.row(
                 {"name": self.name, "kind": "script", "url": None},
-                url=f"grpc://127.0.0.1:{self._port}" if running else None,
+                url=f"grpc://127.0.0.1:{self._port}",
                 state=state,
                 ops=oplist.get("ops", []),
                 fingerprint=oplist.get("fingerprint", ""),
@@ -517,7 +534,10 @@ class AlgorithmPlane:
             return _registry.row(entry, state="new")
         if not probe:
             return _registry.row(entry)
-        return _registry.row(entry, **_registry.probe(entry["url"], timeout=timeout))
+        return _registry.row(
+            entry,
+            **_registry.probe(entry["url"], token=entry.get("token"), timeout=timeout),
+        )
 
     def rows(
         self,
@@ -547,9 +567,11 @@ class AlgorithmPlane:
             script.start_install(retry_failed=False)
         return self.rows(entries=listed)
 
-    def register_url(self, url: str, name: Optional[str] = None) -> str:
+    def register_url(
+        self, url: str, name: Optional[str] = None, token: Optional[str] = None
+    ) -> str:
         """Add a url entry; answer its name. ValueError for a bad URL or name."""
-        return _registry.register_url(url, name, self._directory)
+        return _registry.register_url(url, name, self._directory, token)
 
     def deregister(self, name: str) -> None:
         """Remove a url entry. KeyError if unknown, ValueError for a script entry."""

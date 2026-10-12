@@ -82,6 +82,14 @@ def test_list_json_emits_the_rows(stub_control):
     assert json.loads(result.stdout) == {"servers": _ROWS}
 
 
+def test_list_json_never_prints_a_servers_token(stub_control):
+    stub_control([{**_ROWS[0], "token": "s3cret"}])
+    result = runner.invoke(app, ["algorithm", "list", "--json"])
+    assert result.exit_code == 0
+    assert "s3cret" not in result.stdout
+    assert json.loads(result.stdout) == {"servers": [_ROWS[0]]}
+
+
 def test_list_empty_config_message(stub_control):
     stub_control([])
     result = runner.invoke(app, ["algorithm", "list"])

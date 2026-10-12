@@ -3,19 +3,15 @@
  *
  * Usage:
  *   const client = new TensorFlightClient("http://localhost:8816", token);
- *   const { sources } = await client.listSourcesPage(20000);
  *   const arr = client.getTensor("my-source/tensor-0");
  *   const data = await arr.compute({ z: 5, c: 0, scaleHint: [1,1,1,8,8] });
  */
 
 import { TensorHttpClient } from "./client.js";
 import { TensorArray, buildAxisMap, isAxisMapAmbiguous } from "./tensor-array.js";
-import type { DataSourceDescriptor, SourceListing } from "./types.js";
 
 export class TensorFlightClient {
   private readonly _http: TensorHttpClient;
-  /** Source cache populated by listSourcesPage(). */
-  private _sources: Map<string, DataSourceDescriptor> = new Map();
 
   /**
    * @param apiBase  Base URL of the FastAPI HTTP sidecar, e.g.
@@ -35,13 +31,6 @@ export class TensorFlightClient {
   // API
   // -------------------------------------------------------------------------
 
-  /** List at most `limit` data sources, and whether the catalog is longer. */
-  async listSourcesPage(limit: number): Promise<SourceListing> {
-    const listing = await this._http.listSourcesPage(limit);
-    this._sources = new Map(listing.sources.map((s) => [s.source_id, s]));
-    return listing;
-  }
-
   /**
    * Get source-level OME/vendor metadata as a plain JS object.
    * Returns {} if no metadata is available.
@@ -51,51 +40,14 @@ export class TensorFlightClient {
   }
 
   /**
-   * Return a lazy TensorArray for the given source + tensor.
+   * Return a lazy TensorArray for the given tensor.
    *
-   * If the source has already been fetched (via listSourcesPage), the descriptor
-   * is resolved from the local cache.  Otherwise the tensor describes itself
-   * on the first .compute() (one tileInfo() call).
-   *
-   * This method is synchronous-first for the cache-hit path; the returned
-   * TensorArray only issues network requests when .compute() is called.
+   * The tensor describes itself on the first .compute() (one tileInfo() call);
+   * this method issues no request.
    */
   getTensor(arrayId: string): TensorArray {
-    const cached = this._sources.get(sourceOf(arrayId));
-    if (cached) {
-      const td = descriptorIn(cached, arrayId);
-      if (td) return new TensorArray(this._http, td);
-    }
-    // Return a "pending" proxy — actual descriptor resolved lazily
     return new LazyTensorArray(this._http, arrayId);
   }
-}
-
-// ---------------------------------------------------------------------------
-// array_id resolution
-// ---------------------------------------------------------------------------
-
-/** The routing prefix of an array_id: everything before the first `/`. */
-function sourceOf(arrayId: string): string {
-  return arrayId.split("/", 1)[0]!;
-}
-
-/**
- * The descriptor `arrayId` names within `source`, or undefined.
- *
- * A bare source_id resolves only when the source holds exactly one tensor,
- * which is what the identity policy says its array_id *is*. On a multi-tensor
- * source it stays unresolved rather than guessing tensors[0] (biopb/biopb#75).
- * This is a lookup in a listing already in hand, with no server answer to defer
- * to — unlike the sidecar, which asks and reports what it is told.
- */
-function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
-  const exact = source.tensors.find((t) => t.array_id === arrayId);
-  if (exact) return exact;
-  if (arrayId === source.source_id && source.tensors.length === 1) {
-    return source.tensors[0];
-  }
-  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +56,7 @@ function descriptorIn(source: DataSourceDescriptor, arrayId: string) {
 
 /**
  * TensorArray whose descriptor is fetched lazily on the first .compute().
- * Used when getTensor() is called before listSourcesPage().
+ * Returned by getTensor().
  */
 class LazyTensorArray extends TensorArray {
   /** Single shared resolution promise — prevents concurrent duplicate tileInfo() calls. */

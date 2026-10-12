@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import type { DataSourceDescriptor, SourceJobStatus } from "@biopb/tensor-flight-client";
+import type { SourceJobStatus } from "@biopb/tensor-flight-client";
 import type { AppState, Get, Set } from "./types";
 
 export type SourceJobKind = "resolve";
@@ -179,8 +179,8 @@ async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<v
   const epochAtStart = _epochAtResolveStart.get(key);
   _epochAtResolveStart.delete(key);
   if (job.state !== "done") return;
-  if (job.source) applySourceRow(set, job.source);
-  else await get().loadSources();
+  if (job.source) get().applySourceRow(job.source);
+  else await get().refreshTree();
   // Open it unless something else was opened meanwhile, checked after the row
   // is in place so the open never runs against the stale unresolved one. The
   // bare source id: the server binds the default tensor, so a multi-array
@@ -188,11 +188,4 @@ async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<v
   if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
     get().openTensor(job.source_id);
   }
-}
-
-/** Swap one source's row into the catalog copy, keeping its order. */
-function applySourceRow(set: Set, row: DataSourceDescriptor): void {
-  set((s) => ({
-    sources: s.sources.map((src) => (src.source_id === row.source_id ? row : src)),
-  }));
 }
