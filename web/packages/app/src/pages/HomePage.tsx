@@ -22,6 +22,7 @@ import {
   MIN_CONTROL_WIDTH,
   MIN_SIDEBAR_WIDTH,
   clampPaneWidth,
+  panesFit,
 } from "../utils/paneWidth";
 
 /**
@@ -83,6 +84,28 @@ export function HomePage() {
       /* as above */
     }
   }, [controlWidth]);
+
+  // --- floating panes ------------------------------------------------------
+  // Too narrow for both panes beside a usable canvas: they become overlays,
+  // collapsed until their handle is pressed, one at a time.
+  const [viewport, setViewport] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setViewport(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const floating = !panesFit(
+    viewport,
+    sidebarWidth ?? DEFAULT_SIDEBAR_WIDTH,
+    controlWidth ?? DEFAULT_CONTROL_WIDTH,
+  );
+  const [openPane, setOpenPane] = useState<"sidebar" | "control" | null>(null);
+  // Picking a source is the end of browsing: show it.
+  useEffect(() => {
+    setOpenPane((p) => (p === "sidebar" ? null : p));
+  }, [activeSourceId, activeTensorId]);
+  const togglePane = (pane: "sidebar" | "control") =>
+    setOpenPane((p) => (p === pane ? null : pane));
 
   const dragging = useRef<"sidebar" | "control" | null>(null);
 
@@ -161,7 +184,11 @@ export function HomePage() {
   };
 
   return (
-    <div className="app-shell" ref={shellRef} style={paneStyle}>
+    <div
+      className={`app-shell${floating ? " floating" : ""}`}
+      ref={shellRef}
+      style={paneStyle}
+    >
       <header className="app-topbar">
         <img
           className="topbar-logo"
@@ -185,9 +212,20 @@ export function HomePage() {
         </Link>
       </header>
 
-      <aside className="app-sidebar">
+      <aside className={`app-sidebar${openPane === "sidebar" ? " open" : ""}`}>
         <SourceTree />
       </aside>
+      {floating && (
+        <button
+          type="button"
+          className="pane-handle pane-handle-left"
+          aria-label={openPane === "sidebar" ? "Hide the source list" : "Show the source list"}
+          aria-expanded={openPane === "sidebar"}
+          onClick={() => togglePane("sidebar")}
+        >
+          {openPane === "sidebar" ? "‹" : "›"}
+        </button>
+      )}
 
       <ResolveModal />
       {capture.capturing && <CaptureOverlay cancel={capture.cancel} />}
@@ -202,7 +240,18 @@ export function HomePage() {
               </div>
             </div>
             {splitter("control", "Resize the control panel")}
-            <div className="control-column">
+            {floating && (
+              <button
+                type="button"
+                className="pane-handle pane-handle-right"
+                aria-label={openPane === "control" ? "Hide the controls" : "Show the controls"}
+                aria-expanded={openPane === "control"}
+                onClick={() => togglePane("control")}
+              >
+                {openPane === "control" ? "›" : "‹"}
+              </button>
+            )}
+            <div className={`control-column${openPane === "control" ? " open" : ""}`}>
               <SliceControls sourceId={activeSourceId} tensorId={activeTensorId} />
               {!render3d && (
                 <>

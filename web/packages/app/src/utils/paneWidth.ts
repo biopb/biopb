@@ -19,6 +19,18 @@ export const MIN_CANVAS_WIDTH = 320;
 export const DEFAULT_SIDEBAR_WIDTH = 320;
 export const DEFAULT_CONTROL_WIDTH = 320;
 
+/** The two splitter strips between the panes and the canvas. */
+const SPLITTERS = 16;
+
+/**
+ * Whether both panes can sit beside the canvas without taking it below
+ * `MIN_CANVAS_WIDTH`. When they cannot, the panes float over the canvas instead
+ * (phones, tablets held upright, a narrow window).
+ */
+export function panesFit(viewport: number, sidebar: number, control: number): boolean {
+  return viewport >= sidebar + control + SPLITTERS + MIN_CANVAS_WIDTH;
+}
+
 /**
  * A width that leaves the other pane and the canvas usable, or 0 when `width`
  * is not a number.

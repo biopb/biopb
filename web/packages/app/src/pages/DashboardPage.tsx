@@ -906,4 +906,12 @@ const DASH_CSS = `
          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
          font-family: ui-monospace, Menlo, monospace; }
   .ctrl-dash .ops.err { color: #d88; }
+  /* Phone width: the header and every list row wrap rather than run past the
+     screen edge. */
+  @media (max-width: 640px) {
+    .ctrl-dash header { flex-wrap: wrap; row-gap: 6px; }
+    .ctrl-dash main { padding: 10px; }
+    .ctrl-dash li { flex-wrap: wrap; }
+    .ctrl-dash .ops { max-width: 100%; }
+  }
 `;

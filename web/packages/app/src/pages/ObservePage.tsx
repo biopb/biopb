@@ -956,6 +956,12 @@ const OBS_CSS = `
     .obs-page main.with-chat #jobs { overflow-y: visible; }
     .obs-page .splitter { display: none; }
   }
+  @media (max-width: 640px) {
+    .obs-page header { flex-wrap: wrap; row-gap: 6px; }
+    .obs-page header button.primary { min-width: 0; }
+    .obs-page main { padding: 10px; }
+    .obs-page .row { flex-wrap: wrap; }
+  }
   .obs-page .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
   /* A new cell arrives where it will sit rather than being there between two
      paints. Small and short: this is the list you watch while work runs, and
