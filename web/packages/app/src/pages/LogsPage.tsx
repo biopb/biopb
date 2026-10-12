@@ -212,4 +212,8 @@ const LOGS_CSS = `
   .ctrl-logs .console { flex: 1; min-height: 0; margin: 0; overflow: auto; background: #0c0c0c;
            border: 1px solid #262626; border-radius: 6px; padding: 12px 14px; white-space: pre-wrap;
            word-break: break-word; font: 12px/1.5 ui-monospace, Menlo, monospace; color: #cdd; }
+  @media (max-width: 640px) {
+    .ctrl-logs header { flex-wrap: wrap; row-gap: 6px; }
+    .ctrl-logs main { padding: 10px; }
+  }
 `;
