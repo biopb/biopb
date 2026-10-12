@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 # The data-plane credential file, in the state tree beside the pid / sentinel files.
 _CREDENTIAL_NAME = "tensor-server.token"
 
+# The control's exec token in ``split`` mode, for same-user local clients: they
+# can already run code as this user, so holding it grants them nothing new. The
+# data plane never sees it, so it is a separate file from the data-plane token.
+CONTROL_EXEC_CREDENTIAL = "control-exec.token"
+
 
 def credential_file(name: str = _CREDENTIAL_NAME) -> Path:
     """Path to a local credential file (default: the data plane's).

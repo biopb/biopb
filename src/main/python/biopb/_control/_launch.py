@@ -15,7 +15,7 @@ import threading
 
 from . import _agents
 from ._client import base_url
-from ._data_plane import resolve_data_plane_token
+from ._data_plane import resolve_control_token
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ def launch_session(
         # Keeps the control's own wait under ours, so a slow start returns a verdict.
         "client_timeout": timeout,
     }
-    token = resolve_data_plane_token()
+    token = resolve_control_token()
     req = urllib.request.Request(
         f"{_control_url()}/api/sessions/new?{urlencode(params)}",
         data=b"",

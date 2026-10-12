@@ -304,6 +304,32 @@ class TestProbeScheme:
         )
 
 
+class TestControlTokenResolution:
+    """What a local client sends to this machine's control: the exec credential
+    file when a ``split`` control wrote one, else the data-plane token."""
+
+    def test_the_exec_credential_wins(self):
+        from biopb._security.credentials import (
+            CONTROL_EXEC_CREDENTIAL,
+            write_credential,
+        )
+
+        write_credential("view-token")
+        write_credential("exec-token", CONTROL_EXEC_CREDENTIAL)
+        assert _data_plane.resolve_control_token() == "exec-token"
+        # The data plane still gets the viewing token: it does not know the other.
+        assert _data_plane.resolve_data_plane_token() == "view-token"
+
+    def test_without_one_it_is_the_data_plane_token(self):
+        from biopb._security.credentials import write_credential
+
+        write_credential("view-token")
+        assert _data_plane.resolve_control_token() == "view-token"
+
+    def test_nothing_anywhere_is_none(self):
+        assert _data_plane.resolve_control_token() is None
+
+
 class TestTokenResolution:
     """explicit -> $BIOPB_TENSOR_TOKEN -> the control's credential file.
 

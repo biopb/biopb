@@ -105,6 +105,8 @@ def test_hide_only_removes_execute_roots():
         ("POST", "/session/s1/api/kernel/interrupt", True),
         ("POST", "/session/s1/api/shutdown", True),
         ("POST", "/session/s1/api/lease/acquire", True),
+        ("POST", "/api/sessions/new", True),  # starts a process on the host
+        ("GET", "/api/sessions", False),
         ("POST", "/session/s1/chat/turn", True),
         ("GET", "/session/s1/mcp", True),
         # An unknown root is gated until someone classifies it.
@@ -1199,6 +1201,29 @@ def test_a_viewing_token_cannot_reach_execute_routes(public_control, upstream):
     # Reading is what it is for.
     status, _h, body = _get(f"{public_control}/session/s1/api/jobs", headers=view)
     assert status == 200 and json.loads(body)["path"] == "/api/jobs"
+
+
+def test_starting_a_session_needs_the_exec_token(public_control, monkeypatch):
+    from biopb_control import _control
+
+    monkeypatch.setattr(
+        _control, "_launch_session", lambda wait, **kw: {"state": "starting"}
+    )
+
+    def start(token):
+        req = urllib.request.Request(
+            f"{public_control}/api/sessions/new",
+            data=b"",
+            method="POST",
+            headers={"X-Biopb-Token": token},
+        )
+        return urllib.request.urlopen(req, timeout=5)
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        start(_TOKEN)
+    assert exc.value.code == 403
+    with start(_EXEC_TOKEN) as resp:
+        assert json.loads(resp.read()) == {"state": "starting"}
 
 
 def test_the_exec_token_can_also_view_and_write(public_control, upstream):

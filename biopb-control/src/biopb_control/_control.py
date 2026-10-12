@@ -299,12 +299,21 @@ def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
 _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+# The control's own routes that start or change what runs on the host, so they
+# need the exec credential like a session's writes do. (The algorithm verbs are
+# not here: they only start or stop entries the user registered, and `register`
+# adds a url, never code.)
+_EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new"})
+
+
 def _needs_exec(method: str, path: str) -> bool:
-    """Whether a proxied session request needs the exec credential: the
+    """Whether a request needs the exec credential: the control routes above, the
     execute roots outright, and any write under ``api`` (kernel interrupt and
     restart, job cancel, shutdown, the lease). Reads under ``api`` are the
     observe page and stay with the viewing token. Everything unknown defaults
     to exec, so a verb added to the child later is gated until classified."""
+    if path in _EXEC_CONTROL_PATHS:
+        return True
     root = _session_root(path)
     if root is None:
         return False

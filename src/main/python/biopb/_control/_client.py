@@ -26,7 +26,7 @@ def _request(
     """The control's JSON answer to *method* ``path`` with *params* as its query
     string and, if given, *body* as a JSON body; raises ``OSError`` when no control answers and
     ``urllib.error.HTTPError`` when it refuses."""
-    token = _data_plane.resolve_data_plane_token()
+    token = _data_plane.resolve_control_token()
     query = f"?{urlencode(params)}" if params else ""
     req = urllib.request.Request(
         f"{base_url()}{path}{query}",

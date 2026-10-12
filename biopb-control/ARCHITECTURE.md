@@ -139,9 +139,13 @@ authenticated, for itself and for everything it fronts.
   the access token *views* (it is the data-plane token, readable from a local file
   by design and carried in browser URLs, so it cannot also be a shell) and the exec
   token additionally authorizes whatever runs code in a session or changes one:
-  `chat`, `/mcp`, and every non-read request under a session's `api` (kernel
-  interrupt/restart, job cancel, shutdown, the lease). Reads under `api` (the
-  observe page) stay with the viewing token, and an unknown root defaults to exec.
+  `chat`, `/mcp`, every non-read request under a session's `api` (kernel
+  interrupt/restart, job cancel, shutdown, the lease) and `POST
+  /api/sessions/new`. Reads under `api` (the observe page) stay with the viewing
+  token, and an unknown root defaults to exec. A `split` control also writes the
+  exec token to its own owner-only file, which same-user local clients (the shim,
+  the SDK's control calls) send in place of the data-plane token: they can already
+  run code as that user, and the data plane never sees it.
   `GET /api/scope` reports which a request carried. `--hide chat,mcp` removes
   roots in any mode. `biopb control start` passes `--auth none` when it has no
   token.
