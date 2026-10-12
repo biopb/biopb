@@ -292,7 +292,9 @@ exception name, a config key, a log line), returning `id:line: text`.
 keep relative markdown links for GitHub, and the copy rewrites each to
 `[[id]]`, or to plain text where the target is not copied. It is reference
 prose, not procedures, so the body cap and the dependency gates skip it.
-Section reads are still not built.
+`read_doc(id, section)` reads part of a long doc: a heading (to the next one
+of the same or higher level), `toc` for the headings with line numbers, or a
+line range `120-180` in the numbering `search_docs` reports.
 
 ## 8. Open risks
 

@@ -531,12 +531,16 @@ def get_index() -> str:
 
 
 @mcp.tool()
-async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wire contract
+async def read_doc(id: str, section: str | None = None) -> str:  # noqa: A002 - the parameter name is the wire contract
     """Read one doc from the biopb knowledge store.
 
     `id` is what the index lists. `read_doc("index")` returns the index itself
     -- the catalog of everything readable, with the agent's own hooks -- and is
     worth re-reading when the session's handshake copy has gone stale.
+
+    A long doc can be read in part with `section`: a heading ("Auth modes"),
+    `toc` for the headings with line numbers, or a line range like `120-180`
+    (the numbering `search_docs` reports).
 
     A doc links another as `[[other-id]]`; follow one with another `read_doc`.
 
@@ -546,7 +550,7 @@ async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wi
     `read_doc("<id>@diff")` shows your local copy of a shipped doc against the
     shipped text -- what an upgrade changed that your copy hides.
     """
-    return await asyncio.to_thread(_docs.read_doc, id)
+    return await asyncio.to_thread(_docs.read_doc, id, section)
 
 
 @mcp.tool()

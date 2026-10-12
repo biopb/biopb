@@ -727,8 +727,11 @@ def _header(meta: dict) -> str:
     return f"{meta['id']} — {', '.join(bits)}"
 
 
-def read_doc(doc_id: str) -> str:
+def read_doc(doc_id: str, section: str | None = None) -> str:
     """The doc's body under a one-line header, or the index rendered.
+
+    *section* narrows a long doc: a heading (:func:`read_section`), ``toc``, or a
+    line range ``120-180`` of the body, the numbering ``search_docs`` reports.
 
     Fail-open: an unknown id returns a sentence saying so, never an error --
     the value is agent context, not executed code.
@@ -746,7 +749,58 @@ def read_doc(doc_id: str) -> str:
             f"No doc '{doc_id}'. Read the index with read_doc('index') for what "
             "there is."
         )
-    return f"{_header(meta)}\n\n{meta['body']}"
+    body = meta["body"]
+    if section and section.strip():
+        body = read_section(body, section.strip())
+    return f"{_header(meta)}\n\n{body}"
+
+
+_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_RANGE = re.compile(r"\A(\d+)\s*-\s*(\d+)\Z")
+
+
+def _headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """``(index, level, text)`` per heading, fenced code skipped."""
+    out, fenced = [], False
+    for n, line in enumerate(lines):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and (m := _HEADING.match(line)):
+            out.append((n, len(m.group(1)), m.group(2)))
+    return out
+
+
+def read_section(body: str, section: str) -> str:
+    """One slice of *body*: ``toc``, a line range, or the named heading.
+
+    A heading is matched case-insensitively, whole text first and then as a
+    substring; the slice runs to the next heading of the same or a higher level.
+    An ambiguous or unknown name returns the outline instead of guessing.
+    """
+    lines = body.splitlines()
+    heads = _headings(lines)
+    toc = (
+        "\n".join(f"{n + 1}: {'#' * lvl} {text}" for n, lvl, text in heads)
+        or "(no headings)"
+    )
+    if section.lower() == "toc":
+        return toc
+    if m := _RANGE.match(section):
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (
+            "\n".join(lines[max(lo, 1) - 1 : hi])
+            or f"No lines {lo}-{hi}; the doc has {len(lines)}."
+        )
+    want = section.lower().lstrip("# ").strip()
+    hits = [h for h in heads if h[2].lower() == want] or [
+        h for h in heads if want in h[2].lower()
+    ]
+    if len(hits) != 1:
+        why = "ambiguous" if hits else "no heading matches"
+        return f"{why} '{section}'. Headings (line: heading):\n{toc}"
+    start, level, _ = hits[0]
+    end = next((n for n, lvl, _ in heads if n > start and lvl <= level), len(lines))
+    return "\n".join(lines[start:end])
 
 
 def _all_ids() -> list[str]:

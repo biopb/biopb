@@ -608,3 +608,34 @@ def test_search_caps_its_hits(store):
 
 def test_search_with_no_match_says_so(store):
     assert "No doc matches" in _docs.search_docs("zzz")
+
+
+# --------------------------------------------------------------------------- #
+# Section reads
+# --------------------------------------------------------------------------- #
+LONG = "# T\n\nintro\n\n## A\n\na body\n\n### A1\n\ndeep\n\n## B\n\nb body\n\n```\n## not a heading\n```\n"
+
+
+def test_a_section_runs_to_the_next_heading_of_its_level(store):
+    ship(store, "long", LONG)
+    out = _docs.read_doc("long", "A")
+    assert "a body" in out and "deep" in out and "b body" not in out
+
+
+def test_a_section_matches_loosely_and_ignores_code_fences(store):
+    ship(store, "long", LONG)
+    assert "b body" in _docs.read_doc("long", "## b")
+    assert "no heading matches" in _docs.read_doc("long", "not a heading")
+
+
+def test_toc_and_line_ranges(store):
+    ship(store, "long", LONG)
+    toc = _docs.read_doc("long", "toc")
+    assert "5: ## A" in toc and "9: ### A1" in toc
+    assert _docs.read_doc("long", "3-3").endswith("intro")
+
+
+def test_an_ambiguous_section_returns_the_outline(store):
+    ship(store, "long", "# T\n\n## Auth one\n\nx\n\n## Auth two\n\ny\n")
+    out = _docs.read_doc("long", "auth")
+    assert "Auth one" in out and "Auth two" in out and "ambiguous" in out
