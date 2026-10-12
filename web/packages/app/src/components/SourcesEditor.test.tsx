@@ -33,4 +33,9 @@ describe("SourcesEditor", () => {
     expect(html).toContain("cloud");
     expect(html).toContain("(experimental) Cloud root");
   });
+
+  it("offers no monitor option on a remote source, which is always re-listed", () => {
+    const html = render([{ url: "grpc://lab:8815", alias: "" }]);
+    expect(html).not.toContain("monitor");
+  });
 });

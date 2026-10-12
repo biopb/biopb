@@ -38,7 +38,7 @@ interface SourcesEditorProps {
 // Curated field order per source kind; every other *set* scalar key on a source
 // (source_id, cloud, path, …) is appended so nothing is hidden.
 const LOCAL_KEYS = ["url", "type", "alias", "monitor", "cloud"];
-const REMOTE_KEYS = ["url", "alias", "credentials_profile", "monitor"];
+const REMOTE_KEYS = ["url", "alias", "credentials_profile"];
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : v == null ? "" : String(v);
@@ -87,7 +87,7 @@ export function SourcesEditor({
 
   function addRemote() {
     // A remote tensor server is identified by a grpc:// url + an alias.
-    onChange([...sources, { url: "grpc://", alias: "", monitor: false }]);
+    onChange([...sources, { url: "grpc://", alias: "" }]);
     setAddOpen(false);
   }
 
