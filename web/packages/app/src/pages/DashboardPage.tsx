@@ -8,6 +8,7 @@ import {
   captureUrlToken,
   clearToken,
   getToken,
+  mcpProxied,
   redirectToUnlock,
 } from "../auth";
 
@@ -91,6 +92,11 @@ export default function DashboardPage() {
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
   const [starting, setStarting] = useState(false);
+  // Whether the control proxies a session's /mcp, i.e. remote MCP access is on
+  // (only with a token); the copy button is offered only then.
+  const [mcpViaControl, setMcpViaControl] = useState(false);
+  // Which session's endpoint was just copied, for the button's brief "copied".
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   // Which session's stop is in flight, so only that row's button goes busy.
   const [stoppingId, setStoppingId] = useState<string | null>(null);
   // Outcome of the last launch, rendered under the list rather than alert()ed:
@@ -156,6 +162,21 @@ export default function DashboardPage() {
       setBackendReady(false);
     }
   }, []);
+
+  useEffect(() => {
+    void mcpProxied().then(setMcpViaControl);
+  }, []);
+
+  // The address another machine uses; the token is sent separately, never copied.
+  const mcpEndpoint = (s: SessionRec): string =>
+    `${window.location.origin}${withBase(`/session/${s.session_id}/mcp`)}`;
+
+  const copyEndpoint = (s: SessionRec) => {
+    void navigator.clipboard?.writeText(mcpEndpoint(s)).then(() => {
+      setCopiedId(s.session_id);
+      setTimeout(() => setCopiedId((id) => (id === s.session_id ? null : id)), 1500);
+    });
+  };
 
   const pollSessions = useCallback(async () => {
     try {
@@ -648,6 +669,16 @@ export default function DashboardPage() {
                     >
                       {s.chat ? "chat →" : "observe →"}
                     </a>
+                    {mcpViaControl ? (
+                      <button
+                        className="mini"
+                        onClick={() => copyEndpoint(s)}
+                        title={`Copy the MCP endpoint: ${mcpEndpoint(s)}`}
+                        aria-label={`Copy MCP endpoint of session ${s.session_id}`}
+                      >
+                        {copiedId === s.session_id ? "copied" : "copy MCP url"}
+                      </button>
+                    ) : null}
                     <button
                       className="mini stop"
                       onClick={() => stopSession(s.session_id, s.holder)}
