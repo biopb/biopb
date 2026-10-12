@@ -243,6 +243,18 @@ describe("the text tool", () => {
     expect(geometry?.kind === "text" && geometry.text.length).toBe(MAX_CAPTION_LENGTH);
   });
 
+  it("cuts an over-long caption between characters, not inside an emoji", () => {
+    const draft: RoiDraft = {
+      tool: "text",
+      points: [[2, 3]],
+      text: "x".repeat(MAX_CAPTION_LENGTH - 1) + "\u{1F600}\u{1F600}",
+    };
+    const geometry = closeDraft(draft);
+    const text = geometry?.kind === "text" ? geometry.text : "";
+    expect(Array.from(text)).toHaveLength(MAX_CAPTION_LENGTH);
+    expect(text.endsWith("\u{1F600}")).toBe(true);
+  });
+
   it("refuses to close a blank caption", () => {
     expect(closeDraft({ tool: "text", points: [[2, 3]], text: "  " })).toBeNull();
   });

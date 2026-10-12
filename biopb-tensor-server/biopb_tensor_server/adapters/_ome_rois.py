@@ -41,6 +41,7 @@ from biopb.image.roi_pb2 import (
 
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.registration import (
+    MAX_CAPTION_LEN,
     RegistrationRecord,
     strip_mask_bindata,
 )
@@ -195,10 +196,6 @@ def _points(spec: Any) -> List[Tuple[float, float]]:
     return out
 
 
-# The annotation store's bound on a caption (metadata_db._MAX_CAPTION_LEN).
-_MAX_CAPTION_LEN = 2000
-
-
 def _pt(xy: Tuple[float, float]) -> Point:
     return Point(x=xy[0], y=xy[1])
 
@@ -249,7 +246,7 @@ def _geometry(kind: str, shape: Mapping[str, Any]) -> Optional[ROI]:
             # Cut at the store's bound rather than lose the whole set to it.
             return ROI(
                 text=Caption(
-                    at=_pt(_map(m, f("x"), f("y"))), text=text[:_MAX_CAPTION_LEN]
+                    at=_pt(_map(m, f("x"), f("y"))), text=text[:MAX_CAPTION_LEN]
                 )
             )
         # A label with no text still marks a place.

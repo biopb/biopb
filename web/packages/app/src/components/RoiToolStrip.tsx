@@ -55,7 +55,9 @@ export interface RoiToolStripViewProps {
  *
  * Enter finishes and Shift+Enter breaks a line -- the chat composer's
  * convention, and it keeps the one-line caption to a single key. Refocuses when
- * the anchor moves, because the click that moved it took focus off the field.
+ * the anchor moves, because the click that moved it took focus off the field --
+ * but only with a fine pointer: on a touch screen focusing raises the soft
+ * keyboard and scrolls the page on every tap.
  */
 function CaptionField({
   draft,
@@ -70,8 +72,13 @@ function CaptionField({
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const [x, y] = draft.points[0] ?? [0, 0];
+  const placed = useRef(false);
   useEffect(() => {
-    ref.current?.focus();
+    const fine =
+      typeof window.matchMedia !== "function" || window.matchMedia("(pointer: fine)").matches;
+    // The first mount always focuses: the user has just asked to type.
+    if (!placed.current || fine) ref.current?.focus();
+    placed.current = true;
   }, [x, y]);
   return (
     <textarea

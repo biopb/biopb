@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Mapping, Optional
 
+# The longest ROI caption the annotation store accepts, in characters. Here and
+# not in the store because the importers that feed it must cut to the same
+# bound, and an adapter cannot import the serving package.
+MAX_CAPTION_LEN = 2000
+
 
 @dataclass(frozen=True)
 class RegistrationRecord:

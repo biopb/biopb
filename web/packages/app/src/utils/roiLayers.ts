@@ -142,7 +142,10 @@ function captionLayer(id: string, data: CaptionDatum[], pickable = false): unkno
     getAlignmentBaseline: "top",
     characterSet: "auto",
     fontSettings: { sdf: true },
-    outlineWidth: 2,
+    // A bordered layer is the selection's, drawn over the overlay's own copy of
+    // the text, so its glyphs are invisible: drawn twice they would composite
+    // into a bolder caption than the unselected ones.
+    outlineWidth: bordered ? 0 : 2,
     outlineColor: [0, 0, 0, 220],
     ...(bordered
       ? {
@@ -440,7 +443,7 @@ export function buildSelectionLayers(roi: RoiAnnotation | null): unknown[] {
         {
           at: [roi.geometry.at.x, roi.geometry.at.y],
           text: roi.geometry.text,
-          color: [...setColor(roi.setName), 255],
+          color: [0, 0, 0, 0],
           border: SELECTED_COLOR,
         },
       ]),

@@ -215,6 +215,13 @@ describe("a caption", () => {
     expect(roiAt([one], [300, 300], 1)).toBeNull();
   });
 
+  it("counts emoji and astral CJK as a full em too", () => {
+    const emoji = roi({ kind: "text", at, text: "\u{1F600}\u{1F600}\u{1F600}" });
+    const plain = roi({ kind: "text", at, text: "abc" });
+    expect(hitsRoi(emoji, [138, 105], 0)).toBe(true);
+    expect(hitsRoi(plain, [138, 105], 0)).toBe(false);
+  });
+
   it("counts a wide character as a full em", () => {
     const wide = roi({ kind: "text", at, text: "细胞核" });
     const narrow = roi({ kind: "text", at, text: "abc" });

@@ -171,7 +171,11 @@ export function closeDraft(
     if (!at) return null;
     // '\r' from a pasted Windows line ending would reach the store as-is; it
     // normalises too, but a draft should not depend on that.
-    const text = (draft.text ?? "").replace(/\r\n?/g, "\n").slice(0, MAX_CAPTION_LENGTH);
+    // By code point, as the server counts: slice() counts UTF-16 units and can cut
+    // an emoji in half, leaving a lone surrogate the server cannot parse.
+    const text = Array.from((draft.text ?? "").replace(/\r\n?/g, "\n"))
+      .slice(0, MAX_CAPTION_LENGTH)
+      .join("");
     return { kind: "text", at, text };
   }
   if (draft.tool === "polygon") return { kind: "polygon", points };

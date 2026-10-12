@@ -79,6 +79,7 @@ from google.protobuf import json_format
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
+from biopb_tensor_server.core.registration import MAX_CAPTION_LEN
 from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.tree_paths import tree_columns
 
@@ -488,9 +489,9 @@ _ACCEPTED_SHAPES: Set[str] = {
     "text",
 }
 
-# A caption is a note on the image, not a document: bound it so a paste cannot
+# A caption is a note on the image, not a document: bounded so a paste cannot
 # turn a geometry row into bulk storage.
-_MAX_CAPTION_LEN = 2000
+_MAX_CAPTION_LEN = MAX_CAPTION_LEN
 
 
 # Set names in this namespace are server-owned, not client data: an importer

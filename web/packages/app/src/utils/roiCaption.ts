@@ -13,10 +13,13 @@ export const CAPTION_SIZE_PX = 14;
 /** Distance between baselines, as a multiple of the font size. */
 export const CAPTION_LINE_HEIGHT = 1.2;
 
-/** Average advance of a Latin glyph, as a multiple of the font size. */
-const NARROW_EM = 0.6;
-/** CJK, Hangul and full-width forms advance a full em. */
-const WIDE = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹯＀-｠￠-￦]/u;
+/**
+ * Advance of a Latin glyph, as a multiple of the font size. A little over the
+ * average (about 0.55), so a run of wide capitals still falls inside the box.
+ */
+const NARROW_EM = 0.65;
+/** CJK, Hangul, full-width forms and emoji advance a full em. */
+const WIDE = /[\u{1100}-\u{115f}\u{2e80}-\u{a4cf}\u{ac00}-\u{d7a3}\u{f900}-\u{faff}\u{fe30}-\u{fe6f}\u{ff00}-\u{ff60}\u{ffe0}-\u{ffe6}\u{1f300}-\u{1faff}\u{20000}-\u{3fffd}]/u;
 
 export interface CaptionSize {
   width: number;
