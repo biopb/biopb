@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 import { catalogIsFilling } from "../utils/catalogHealth";
+import { copyText } from "../utils/clipboard";
 import { sessionFetch } from "../utils/sessionFetch";
 import {
   authRequired,
@@ -97,6 +98,11 @@ export default function DashboardPage() {
   const [mcpViaControl, setMcpViaControl] = useState(false);
   // Which session's endpoint was just copied, for the button's brief "copied".
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // "copied", or "failed" when nothing could reach the clipboard; one timer, so
+  // a second click restarts the wait, and none outlives the page.
+  const [copyFailed, setCopyFailed] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(copyTimer.current), []);
   // Which session's stop is in flight, so only that row's button goes busy.
   const [stoppingId, setStoppingId] = useState<string | null>(null);
   // Outcome of the last launch, rendered under the list rather than alert()ed:
@@ -171,11 +177,12 @@ export default function DashboardPage() {
   const mcpEndpoint = (s: SessionRec): string =>
     `${window.location.origin}${withBase(`/session/${s.session_id}/mcp`)}`;
 
-  const copyEndpoint = (s: SessionRec) => {
-    void navigator.clipboard?.writeText(mcpEndpoint(s)).then(() => {
-      setCopiedId(s.session_id);
-      setTimeout(() => setCopiedId((id) => (id === s.session_id ? null : id)), 1500);
-    });
+  const copyEndpoint = async (s: SessionRec) => {
+    const ok = await copyText(mcpEndpoint(s));
+    setCopiedId(s.session_id);
+    setCopyFailed(!ok);
+    clearTimeout(copyTimer.current);
+    copyTimer.current = setTimeout(() => setCopiedId(null), 1500);
   };
 
   const pollSessions = useCallback(async () => {
@@ -676,7 +683,11 @@ export default function DashboardPage() {
                         title={`Copy the MCP endpoint: ${mcpEndpoint(s)}`}
                         aria-label={`Copy MCP endpoint of session ${s.session_id}`}
                       >
-                        {copiedId === s.session_id ? "copied" : "copy MCP url"}
+                        {copiedId === s.session_id
+                          ? copyFailed
+                            ? "copy failed"
+                            : "copied"
+                          : "copy MCP url"}
                       </button>
                     ) : null}
                     <button
