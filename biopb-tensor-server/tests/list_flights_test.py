@@ -73,7 +73,11 @@ def test_one_flight_per_public_table_with_its_schema():
 
     infos = list(server.list_flights(_Context(), b""))
     by_path = {"/".join(p.decode() for p in i.descriptor.path): i for i in infos}
-    assert set(by_path) == set(db.allowed_tables) == {"sources", "decode_rates", "rois"}
+    assert (
+        set(by_path)
+        == set(db.allowed_tables)
+        == {"sources", "source_tree", "decode_rates", "rois"}
+    )
     assert "source_catalog" not in by_path  # a physical table, not a public one
 
     sources = by_path["sources"]
@@ -161,4 +165,4 @@ def test_the_catalog_tier_is_the_server_token():
         list(server.list_flights(_Context(), b""))
     with pytest.raises(flight.FlightUnauthenticatedError):
         list(server.list_flights(_Context("wrong"), b""))
-    assert len(list(server.list_flights(_Context("secret"), b""))) == 3
+    assert len(list(server.list_flights(_Context("secret"), b""))) == 4
