@@ -166,12 +166,17 @@ def _serve_tree(mock_fc, rows, reasons=None):
                 {"source_id": k, "unresolved_reason": v}
                 for k, v in (reasons or {}).items()
             ]
-        if "GROUPING SETS" in sql:
-            count = {"seg": "", "lo": None, "hi": None, "direct": len(rows), "total": 1}
-            return _answer([count], format)
-        return _answer([{**r, "name": r["source_id"]} for r in rows], format)
+        return _answer(rows, format)
 
     mock_fc.query.side_effect = query
+    mock_fc.catalog_children.side_effect = lambda key, limit=2000: {
+        "key": key,
+        "folders": [],
+        "sources": [
+            {"name": r["source_id"], "source_id": r["source_id"]} for r in rows
+        ],
+        "truncated": False,
+    }
 
 
 def _tree_descriptors(tc, headers=None):
@@ -3882,6 +3887,10 @@ class TestTree:
         r = self._get(tc, key=key, **params)
         assert r.status_code == 200
         return r.json()
+
+    def test_a_limit_beyond_the_ceiling_is_refused(self, tc):
+        assert self._get(tc, limit=10_001).status_code == 422
+        assert self._get(tc, limit=10_000).status_code == 200
 
     def test_top_level(self, tc):
         level = self._level(tc)

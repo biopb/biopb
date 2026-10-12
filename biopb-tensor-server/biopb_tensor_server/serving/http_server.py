@@ -80,7 +80,8 @@ from google.protobuf import json_format
 from pydantic import BaseModel
 
 from biopb_tensor_server.core.chunk import current_epoch
-from biopb_tensor_server.serving.tree_paths import ENDPOINT_MARK, SEP, dec, enc
+from biopb_tensor_server.serving.catalog_tree import DEFAULT_LIMIT
+from biopb_tensor_server.serving.tree_paths import SEP, key_dir
 
 logger = logging.getLogger(__name__)
 
@@ -1989,124 +1990,40 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
 
 # -- Tree (lazy folder levels) ----------------------------------------------
 
-# The catalog keeps where each source sits (``source_tree``: ``dir`` and ``name``,
-# see ``tree_paths`` for the rules and the spelling), so a level is a lookup on
-# ``dir`` and no url is parsed here.
-_TREE_LIMIT = 2000
+# The server answers a level (``catalog_children``: folders, and the names and ids
+# of the sources); the sidecar adds the descriptors of those sources.
+# The most a level may ask for: its sources' descriptors are fetched by id.
+_TREE_LIMIT_MAX = 10_000
 # How many (route, query) pairs the sidecar remembers an answer's generation for.
 _TREE_SEEN_MAX = 4096
 
 
-def _segments(key: str) -> List[str]:
-    """The segments of folder *key* in the catalog's spelling ("" is the top: none)."""
-    return enc(key).split("/") if key else []
-
-
-def _seg_sql(seg: str) -> str:
-    """Folder segment *seg* as a SQL expression, with the endpoint mark spelled
-    as ``chr(2)`` rather than carried in the text."""
-    if ENDPOINT_MARK in seg:
-        return f"replace({sql_literal(dec(seg))}, '://', chr(2))"
-    return sql_literal(seg)
-
-
-def _dir_sql(segs: List[str]) -> str:
-    """The ``dir`` of the folder with segments *segs*, as a SQL expression."""
-    return " || chr(1) || ".join(_seg_sql(s) for s in segs)
-
-
-def _chain(lo: str, hi: str) -> List[str]:
-    """The folder chain a group of rows shares, from the least and greatest folder
-    among them (the common prefix of a set of strings is that of its min and max).
-
-    A source sitting in a folder of the chain is a row whose folder is that short,
-    so the chain stops there.
-    """
-    chain = []
-    for x, y in zip(lo.split(SEP), hi.split(SEP), strict=False):
-        if x != y:
-            break
-        chain.append(x)
-    return chain
-
-
-def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, Any]:
+def _tree_level(client: Any, key: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
     """The direct children of folder *key* ("" is the top): its folders, and the
-    sources sitting in it with their listing descriptors.
-
-    Single-child folder chains are merged into one folder. Everything the routes
-    need from the catalog is here. Folders come first and share *limit* with the
-    sources.
-    """
-    segs = _segments(key)
-    here = _dir_sql(segs) if segs else "''"
-    if segs:
-        # The folder itself, and everything below it: a range on ``dir``.
-        near = f"(dir = {here} OR (dir >= {here} || chr(1) AND dir < {here} || chr(2)))"
-        rest = (
-            f"CASE WHEN dir = {here} THEN ''"
-            f" ELSE substr(dir, {len(SEP.join(segs)) + 2}) END"
-        )
-    else:
-        near, rest = "TRUE", "dir"
-    # One pass answers both halves: a row per first segment that holds a folder,
-    # and a grand-total row counting the sources sitting directly in this folder,
-    # so the second pass (the sources) runs only where there are any. The total
-    # sorts first so a limit cannot cut it off. The distinct folders are found
-    # before anything is split, so the work follows the folders, not the sources.
-    folder_table = client.query(
-        "WITH d AS (SELECT dir, count(*) AS n FROM source_tree"
-        f" WHERE visible AND {near} GROUP BY dir),"
-        f" r AS (SELECT {rest} AS rest, n FROM d)"
-        " SELECT seg, min(rest) FILTER (WHERE rest <> '') AS lo,"
-        " max(rest) FILTER (WHERE rest <> '') AS hi,"
-        " sum(n) FILTER (WHERE rest = '') AS direct, grouping(seg) AS total"
-        " FROM (SELECT split_part(rest, chr(1), 1) AS seg, rest, n FROM r)"
-        " GROUP BY GROUPING SETS ((seg), ())"
-        " HAVING grouping(seg) = 1"
-        " OR count(*) FILTER (WHERE rest <> '') > 0"
-        f" ORDER BY total DESC, seg LIMIT {limit + 2}"
-    )
-    rows_all = folder_table.to_pylist()
-    direct = sum(r["direct"] or 0 for r in rows_all if r["total"])
-    folder_rows = [r for r in rows_all if not r["total"]]
-    _, _, truncated = _truncation(folder_table, len(rows_all))
-    folders = []
-    for row in folder_rows[:limit]:
-        name = "/".join(_chain(row["lo"], row["hi"]))
-        folders.append(
-            {"name": dec(name), "key": dec(f"{enc(key)}/{name}" if key else name)}
-        )
-    folders.sort(key=lambda f: f["name"].encode("utf-8"))
+    sources sitting in it with their listing descriptors."""
+    level = client.catalog_children(key, limit)
     sources: List[Dict[str, Any]] = []
-    if len(folder_rows) > limit:
-        truncated = True
-    elif direct:
-        budget = limit - len(folders)
-        source_table = client.query(
-            f"SELECT {client.source_row_columns()}, t.name AS name FROM"
-            " (SELECT source_id, CASE WHEN name = '' THEN source_id ELSE name END"
-            f" AS name FROM source_tree WHERE visible AND dir = {here}"
-            f" ORDER BY name, source_id LIMIT {budget + 1}) t"
-            " JOIN sources USING (source_id) ORDER BY t.name, source_id"
+    if level["sources"]:
+        ids = ", ".join(sql_literal(s["source_id"]) for s in level["sources"])
+        table = client.query(
+            f"SELECT {client.source_row_columns()} FROM sources"
+            f" WHERE source_id IN ({ids})"
         )
-        rows = source_table.to_pylist()
-        truncated = truncated or _truncation(source_table, len(rows))[2]
-        if len(rows) > budget:
-            rows, truncated = rows[:budget], True
-        if rows:
-            ids = ", ".join(sql_literal(r["source_id"]) for r in rows)
-            _add_unresolved_reasons(client, rows, f"AND source_id IN ({ids})")
+        rows = table.to_pylist()
+        # The server's own row cap can clip even this.
+        level["truncated"] = level["truncated"] or _truncation(table, len(rows))[2]
+        _add_unresolved_reasons(client, rows, f"AND source_id IN ({ids})")
+        by_id = {row["source_id"]: row for row in rows}
+        # A source removed since the level was read has no row to show.
         sources = [
-            {"name": dec(row["name"]), "descriptor": _source_row_to_dict(row)}
-            for row in rows
+            {
+                "name": s["name"],
+                "descriptor": _source_row_to_dict(by_id[s["source_id"]]),
+            }
+            for s in level["sources"]
+            if s["source_id"] in by_id
         ]
-    return {
-        "key": key,
-        "folders": folders,
-        "sources": sources,
-        "truncated": truncated,
-    }
+    return {**level, "sources": sources}
 
 
 def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, Any]]:
@@ -2132,8 +2049,7 @@ def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, 
             (
                 f
                 for f in level["folders"]
-                if path == (at := SEP.join(_segments(f["key"])))
-                or path.startswith(at + SEP)
+                if path == (at := key_dir(f["key"])) or path.startswith(at + SEP)
             ),
             None,
         )
@@ -2234,7 +2150,7 @@ async def _tree_response(request: Request, build: Callable[[Any], Any]) -> Respo
 async def get_tree(
     request: Request,
     key: str = Query(""),
-    limit: int = Query(_TREE_LIMIT, ge=1),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=_TREE_LIMIT_MAX),
 ) -> Response:
     """One level of the source tree: the folders and sources directly under *key*.
 
@@ -2251,7 +2167,7 @@ async def get_tree(
 async def reveal_in_tree(
     request: Request,
     source_id: str = Query(...),
-    limit: int = Query(_TREE_LIMIT, ge=1),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=_TREE_LIMIT_MAX),
 ) -> Response:
     """Every level from the top down to the one holding *source_id*, in one
     request: ``{levels: [<level>...], descriptor}``."""

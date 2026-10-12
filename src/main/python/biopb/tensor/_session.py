@@ -961,6 +961,20 @@ class CatalogClient:
                 df[col_field.name] = col.where(col.notna(), None)
         return df
 
+    def children(self, key: str = "", limit: int = 2000) -> dict:
+        """Backs TensorFlightClient.catalog_children; see that method for the
+        documentation."""
+        if limit < 1:
+            raise ValueError(f"catalog_children: limit must be positive, got {limit}")
+        action = flight.Action(
+            "catalog_children", json.dumps({"key": key, "limit": limit}).encode()
+        )
+        return json.loads(
+            self._do_action_one_result(
+                action, unavailable_hint="Browsing the catalog tree is unavailable"
+            )
+        )
+
     def get_source_metadata(self, source_id: str) -> dict:
         """Backs TensorFlightClient.get_source_metadata; see that method for the full
         documentation."""

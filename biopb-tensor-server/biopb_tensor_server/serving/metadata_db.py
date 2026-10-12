@@ -79,6 +79,7 @@ from google.protobuf import json_format
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
+from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.tree_paths import tree_columns
 
 if TYPE_CHECKING:
@@ -1459,6 +1460,12 @@ class MetadataDatabase:
         return (
             self._get_cursor().execute(f"SELECT * FROM {table} LIMIT 0").arrow().schema
         )
+
+    def catalog_children(
+        self, key: str, limit: int = catalog_tree.DEFAULT_LIMIT
+    ) -> Dict[str, Any]:
+        """One level of the catalog tree; see :func:`catalog_tree.children`."""
+        return catalog_tree.children(self._get_cursor(), key, limit)
 
     def _count_sources(self, cursor: duckdb.DuckDBPyConnection) -> int:
         """``COUNT(*)`` of ``sources``, counted once per generation: it is on every

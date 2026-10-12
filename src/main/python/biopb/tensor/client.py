@@ -253,6 +253,44 @@ class TensorFlightClient:
         """Coerce a query result to the requested format. See :meth:`CatalogClient._format_query_result`."""
         return CatalogClient._format_query_result(table, format)
 
+    def catalog_children(self, key: str = "", limit: int = 2000) -> dict:
+        """One level of the catalog tree: the folders and sources directly under
+        a folder, so a large catalog can be browsed without listing it.
+
+        A source's place is its url read as a path: ``file:///a/b/c.zarr`` is
+        ``c.zarr`` in folder ``a/b``, and ``scheme://host/p`` roots at the
+        endpoint ``scheme://host``. A chain of folders with one child each is one
+        folder (``a/b``), which ends where a source sits or the chain forks. A
+        resolved source with no tensor is not listed.
+
+        Args:
+            key: The folder, as ``/``-joined names; ``""`` is the top. Take it
+                from a ``folders`` entry rather than building it.
+            limit: At most this many folders and sources together (folders
+                first); more than the server allows is clamped.
+
+        Returns:
+            ``{"key", "folders", "sources", "truncated"}``. ``folders`` is
+            ``[{"name", "key"}]`` and ``sources`` ``[{"name", "source_id"}]``, each
+            in byte order of name; ``truncated`` says ``limit`` cut the level.
+            A source's row is ``query(...)`` on its ``source_id``.
+
+        Raises:
+            ValueError: If *limit* is below 1.
+            RuntimeError: If the server predates this call.
+            FlightServerError: If the server refuses it.
+
+        Example:
+            ```python
+            >>> top = client.catalog_children()
+            >>> top["folders"][0]
+            {'name': 'data/lab', 'key': 'data/lab'}
+            >>> client.catalog_children(top["folders"][0]["key"])["sources"][:1]
+            [{'name': 'a.zarr', 'source_id': 'a'}]
+            ```
+        """
+        return self._catalog.children(key, limit)
+
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata as a dict.
 

@@ -34,6 +34,11 @@ def enc(text: str) -> str:
     return text[:at] + ENDPOINT_MARK + text[at + 3 :]
 
 
+def key_dir(key: str) -> str:
+    """The ``dir`` of the folder *key* ("" is the top, whose ``dir`` is ``""``)."""
+    return enc(key).replace("/", SEP) if key else ""
+
+
 def dec(text: str) -> str:
     return text.replace(ENDPOINT_MARK, "://").replace(SEP, "/")
 
