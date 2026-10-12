@@ -840,6 +840,13 @@ html, body {
 }
 .roi-tool:hover { background: #1e2435; color: #e2e8f0; }
 .roi-tool.active { border-color: #38bdf8; color: #38bdf8; }
+/* Sized by its rows (the strip is narrow), and not user-resizable so it cannot
+   widen it. */
+.roi-caption-input {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 4px;
+  box-sizing: border-box; color: #cbd5e1; display: block; font: inherit;
+  font-size: 12px; margin-top: 4px; resize: none; width: 100%;
+}
 .roi-draft-status {
   align-items: center; color: #94a3b8; display: flex; font-size: 11px;
   gap: 6px; padding: 4px 2px 2px;

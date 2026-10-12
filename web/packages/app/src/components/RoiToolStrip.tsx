@@ -12,8 +12,10 @@
  * workspace's node-only environment.
  */
 
+import { useEffect, useRef } from "react";
 import { useAppStore } from "../store";
 import {
+  MAX_CAPTION_LENGTH,
   MAX_POLYLINE_WIDTH,
   MIN_POLYLINE_WIDTH,
   isCompletable,
@@ -28,6 +30,7 @@ const TOOLS: Array<{ tool: RoiTool; glyph: string; title: string }> = [
   { tool: "rectangle", glyph: "▭", title: "Rectangle (two clicks)" },
   { tool: "polygon", glyph: "⬠", title: "Polygon (click vertices, Enter to close)" },
   { tool: "polyline", glyph: "〜", title: "Freehand path (click vertices, Enter to end)" },
+  { tool: "text", glyph: "T", title: "Text (click where it goes, then type)" },
 ];
 
 export interface RoiToolStripViewProps {
@@ -37,8 +40,62 @@ export interface RoiToolStripViewProps {
   polylineWidth: number;
   onSetTool: (tool: RoiTool) => void;
   onSetPolylineWidth: (width: number) => void;
+  onSetDraftText: (text: string) => void;
   onFinish: () => void;
   onCancel: () => void;
+}
+
+/**
+ * The text of a caption being written.
+ *
+ * A textarea in the strip rather than a field on the canvas: it needs no
+ * projection from image to screen, survives the narrow-screen layout where the
+ * panes float over the canvas, and `isTextEntryTarget` already keeps the draft's
+ * window-level Enter/Escape/Backspace away from it.
+ *
+ * Enter finishes and Shift+Enter breaks a line -- the chat composer's
+ * convention, and it keeps the one-line caption to a single key. Refocuses when
+ * the anchor moves, because the click that moved it took focus off the field.
+ */
+function CaptionField({
+  draft,
+  onChange,
+  onFinish,
+  onCancel,
+}: {
+  draft: RoiDraft;
+  onChange: (text: string) => void;
+  onFinish: () => void;
+  onCancel: () => void;
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const [x, y] = draft.points[0] ?? [0, 0];
+  useEffect(() => {
+    ref.current?.focus();
+  }, [x, y]);
+  return (
+    <textarea
+      ref={ref}
+      className="roi-caption-input"
+      rows={Math.min(6, (draft.text ?? "").split("\n").length + 1)}
+      maxLength={MAX_CAPTION_LENGTH}
+      placeholder="Text (Shift+Enter for a new line)"
+      value={draft.text ?? ""}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => {
+        // An IME owns Enter while composing: committing a candidate is not
+        // finishing the caption.
+        if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          onFinish();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          onCancel();
+        }
+      }}
+    />
+  );
 }
 
 export function RoiToolStripView({
@@ -47,6 +104,7 @@ export function RoiToolStripView({
   polylineWidth,
   onSetTool,
   onSetPolylineWidth,
+  onSetDraftText,
   onFinish,
   onCancel,
 }: RoiToolStripViewProps) {
@@ -90,13 +148,19 @@ export function RoiToolStripView({
           <span className="roi-width-value">{polylineWidth}</span>
         </label>
       )}
+      {tool === "text" && !draft && <p className="roi-note">Click the image where the text goes.</p>}
+      {draft?.tool === "text" && (
+        <CaptionField draft={draft} onChange={onSetDraftText} onFinish={onFinish} onCancel={onCancel} />
+      )}
       {draft && (
         <div className="roi-draft-status">
-          <span>
-            {canFinish
-              ? `${placed} points`
-              : `${placed} of ${needed} points`}
-          </span>
+          {draft.tool !== "text" && (
+            <span>
+              {canFinish
+                ? `${placed} points`
+                : `${placed} of ${needed} points`}
+            </span>
+          )}
           <button type="button" className="roi-tool-text" onClick={onFinish} disabled={!canFinish}>
             Finish
           </button>
@@ -139,6 +203,7 @@ export function RoiToolStrip({
       polylineWidth={polylineWidth}
       onSetTool={onSetTool}
       onSetPolylineWidth={onSetPolylineWidth}
+      onSetDraftText={(text) => draft && setDraft({ ...draft, text })}
       onFinish={onFinish}
       onCancel={() => setDraft(null)}
     />

@@ -63,9 +63,11 @@ A content-version on array_id is legal but ignored by the sidecar.
 | polygon, rectangle, ellipse | `PolygonLayer` (ellipse tessellated client-side) |
 | polyline | two `PathLayer`s — the band (width from geometry, not styling) and its centreline |
 | point | `ScatterplotLayer` |
+| text | `TextLayer` — screen-sized, top-left at the anchor, no marker |
 
-Every kind renders as a translucent area under an opaque, screen-unit-width
-outline, from shared alpha constants. **An axis absent from `plane` means the ROI applies at every index of that
+Every kind but text renders as a translucent area under an opaque, screen-unit-width
+outline, from shared alpha constants; text is its set's colour with a dark outline
+for legibility over the image. **An axis absent from `plane` means the ROI applies at every index of that
 axis**.
 
 **The overlay is drawn for the plane on screen, not the plane requested.**
@@ -83,7 +85,10 @@ on top would intercept that. Selection therefore hit-tests in JS
 it or within a few screen pixels of its outline, a point hits by proximity,
 and a polyline hits within its own stroke plus that same tolerance (scaled by
 world-units-per-pixel at click time) — the same half-width the store pads the
-bbox by, so what's selectable and what SQL reports as covered agree.
+bbox by, so what's selectable and what SQL reports as covered agree. A caption
+hits anywhere in its text block, whose size is estimated from the text
+(`roiCaption.ts`) because the block is a fixed size on screen while the store
+keeps only its anchor.
 
 ## Authoring
 
@@ -102,7 +107,15 @@ render-mode, or tensor change** — it's hidden (not destroyed, so scrubbing
 back restores it) rather than finished onto the wrong image, keyed off the
 same `loadedKey`/`selectDraft` selector the overlay uses.
 
-**Shapes authored in v1:** point, rectangle, polygon, polyline. Ellipse is
+**Text is typed, not clicked.** The one click sets the anchor and opens a
+draft that waits for text; the draft's `<textarea>` lives in the tool strip, so
+`isTextEntryTarget` already keeps the window-level keys away from it. Enter
+finishes, Shift+Enter breaks a line, Escape cancels, and a later click on the
+canvas moves the anchor and keeps what was typed. The draft previews on the
+canvas as the user types. A blank caption never completes (the store refuses
+one, and it would have nothing to select).
+
+**Shapes authored in v1:** point, rectangle, polygon, polyline, text. Ellipse is
 render-only (the store accepts one and the overlay draws its `rotation`) —
 drawing one wants a rotate handle, which is the drag-editing machinery not yet
 built.

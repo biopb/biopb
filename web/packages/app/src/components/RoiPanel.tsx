@@ -388,7 +388,14 @@ function selectedSummary(roi: RoiAnnotation, axes: SliderAxis[]): string {
       : Object.entries(roi.plane)
           .map(([axis, index]) => `${axisTitle(axes, Number(axis))} ${index}`)
           .join(", ");
-  return `${roi.label || "no label"} — ${roi.geometry.kind} in ${roi.setName}, ${where}`;
+  return `${roi.label || captionPreview(roi) || "no label"} — ${roi.geometry.kind} in ${roi.setName}, ${where}`;
+}
+
+/** A caption's first line, with a mark when there are more; "" for any other kind. */
+function captionPreview(roi: RoiAnnotation): string {
+  if (roi.geometry.kind !== "text") return "";
+  const [first = "", ...rest] = roi.geometry.text.split("\n");
+  return rest.length > 0 ? `${first}…` : first;
 }
 
 export function RoiAuthor() {

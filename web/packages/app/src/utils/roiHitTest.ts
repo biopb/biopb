@@ -11,6 +11,7 @@
  */
 
 import type { RoiAnnotation } from "@biopb/tensor-flight-client";
+import { captionSizePx } from "./roiCaption";
 import type { XY } from "./roiLayers";
 import { roiPath, roiRing } from "./roiLayers";
 
@@ -63,8 +64,22 @@ function distanceToPath(at: XY, path: XY[]): number {
  * grabbable anywhere it is drawn, not only near its centreline. Same half-width
  * the store pads the bbox by (`_roi_bbox`), so what is selectable and what the
  * SQL surface reports as covered agree.
+ *
+ * A caption hits anywhere in its text block, which grows down and right from its
+ * anchor and is a fixed size on SCREEN -- so `scale` (world units per screen
+ * pixel) is what turns the block into world units. See `captionSizePx`.
  */
-export function hitsRoi(roi: RoiAnnotation, at: XY, slop: number): boolean {
+export function hitsRoi(roi: RoiAnnotation, at: XY, slop: number, scale = 1): boolean {
+  if (roi.geometry.kind === "text") {
+    const { x, y } = roi.geometry.at;
+    const { width, height } = captionSizePx(roi.geometry.text);
+    return (
+      at[0] >= x - slop &&
+      at[0] <= x + width * scale + slop &&
+      at[1] >= y - slop &&
+      at[1] <= y + height * scale + slop
+    );
+  }
   if (roi.geometry.kind === "point") {
     const { x, y } = roi.geometry.at;
     return Math.hypot(at[0] - x, at[1] - y) <= slop;
@@ -94,7 +109,7 @@ export function roiAt(rois: RoiAnnotation[], at: XY, scale: number): RoiAnnotati
   const slop = HIT_SLOP_PX * Math.max(scale, Number.EPSILON);
   for (let i = rois.length - 1; i >= 0; i--) {
     const roi = rois[i] as RoiAnnotation;
-    if (hitsRoi(roi, at, slop)) return roi;
+    if (hitsRoi(roi, at, slop, scale)) return roi;
   }
   return null;
 }

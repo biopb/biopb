@@ -117,6 +117,13 @@ export function decodeRoiGeometry(value: unknown): RoiGeometry | null {
     const p = obj(roi.polyline);
     return { kind: "polyline", points: decodePoints(p.points), width: num(p.width) };
   }
+  if (roi.text !== undefined) {
+    const t = obj(roi.text);
+    const text = str(t.text);
+    // A caption with no text has nothing to draw or select; the store refuses to
+    // write one, so this is a row from something that did not go through it.
+    return text === "" ? null : { kind: "text", at: decodePoint(t.at), text };
+  }
   return null;
 }
 
@@ -145,6 +152,8 @@ export function encodeRoiGeometry(geometry: RoiGeometry): Json {
       return {
         polyline: { points: geometry.points.map(encodePoint), width: geometry.width },
       };
+    case "text":
+      return { text: { at: encodePoint(geometry.at), text: geometry.text } };
   }
 }
 
