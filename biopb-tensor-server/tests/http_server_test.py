@@ -3888,6 +3888,10 @@ class TestTree:
         assert r.status_code == 200
         return r.json()
 
+    def test_a_limit_beyond_the_ceiling_is_refused(self, tc):
+        assert self._get(tc, limit=10_001).status_code == 422
+        assert self._get(tc, limit=10_000).status_code == 200
+
     def test_top_level(self, tc):
         level = self._level(tc)
         assert level["key"] == ""

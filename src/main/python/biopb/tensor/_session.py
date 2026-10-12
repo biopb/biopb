@@ -964,6 +964,8 @@ class CatalogClient:
     def children(self, key: str = "", limit: int = 2000) -> dict:
         """Backs TensorFlightClient.catalog_children; see that method for the
         documentation."""
+        if limit < 1:
+            raise ValueError(f"catalog_children: limit must be positive, got {limit}")
         action = flight.Action(
             "catalog_children", json.dumps({"key": key, "limit": limit}).encode()
         )

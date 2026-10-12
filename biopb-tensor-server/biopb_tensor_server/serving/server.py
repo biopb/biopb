@@ -1354,12 +1354,15 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 "catalog_children takes a string key and a positive integer limit"
             )
-        level = self._require_catalog().catalog_children(
-            key, min(limit, catalog_tree.MAX_LIMIT)
-        )
-        return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        try:
+            level = self._require_catalog().catalog_children(
+                key, min(limit, catalog_tree.MAX_LIMIT)
+            )
+            return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        except UnicodeError:
+            raise flight.FlightServerError("catalog_children takes a text key")
 
     def _registered(self, source_id: str) -> Optional[SourceAdapter]:
         """``SourceRegistry.get_registered``, its refusals as Flight errors: an

@@ -1432,10 +1432,14 @@ public class TensorFlightClient implements AutoCloseable {
      * @param limit at most this many folders and sources together (folders first);
      *        more than the server allows is clamped
      * @return the level; a source's row is a {@link #query} on its id
+     * @throws IllegalArgumentException if {@code limit} is below 1
      * @throws UnsupportedOperationException if the server predates this call
      * @throws IOException if the action fails
      */
     public CatalogChildren catalogChildren(String key, int limit) throws IOException {
+        if (limit < 1) {
+            throw new IllegalArgumentException("catalogChildren: limit must be positive, got " + limit);
+        }
         Map<String, Object> request = new HashMap<>();
         request.put("key", key == null ? "" : key);
         request.put("limit", limit);

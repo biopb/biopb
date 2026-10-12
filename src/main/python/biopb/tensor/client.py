@@ -276,6 +276,7 @@ class TensorFlightClient:
             A source's row is ``query(...)`` on its ``source_id``.
 
         Raises:
+            ValueError: If *limit* is below 1.
             NotImplementedError: If the server predates this call.
             FlightServerError: If the server refuses it.
 

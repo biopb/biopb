@@ -93,11 +93,25 @@ class TestCatalogChildren:
         assert level["truncated"] is True
 
     @pytest.mark.parametrize(
-        "key,limit", [("", 0), ("", -1), (5, 10), ("", "ten"), ("", True)]
+        "body",
+        [
+            b"[]",
+            b"not json",
+            b'{"key": 5}',
+            b'{"limit": "ten"}',
+            b'{"limit": true}',
+            b'{"limit": 0}',
+            b'{"key": "\\ud800"}',
+        ],
     )
-    def test_a_malformed_request_is_refused(self, client, key, limit):
+    def test_a_malformed_request_is_refused(self, client, body):
+        action = flight.Action("catalog_children", body)
         with pytest.raises(flight.FlightServerError, match="catalog_children"):
-            client.catalog_children(key, limit)
+            list(client._client.do_action(action))
+
+    def test_a_limit_below_one_is_refused_before_the_call(self, client):
+        with pytest.raises(ValueError, match="limit"):
+            client.catalog_children("", 0)
 
     def test_it_is_advertised(self, client):
         names = {a.type for a in client._client.list_actions()}

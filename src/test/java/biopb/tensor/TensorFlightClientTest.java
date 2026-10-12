@@ -650,6 +650,15 @@ public class TensorFlightClientTest {
     }
 
     @Test
+    public void testCatalogChildrenRefusesALimitBelowOne() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertThrows(IllegalArgumentException.class, () -> client.catalogChildren("", 0));
+            }
+        }
+    }
+
+    @Test
     public void testCatalogChildrenAgainstAnOldServerSaysSo() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {

@@ -1993,6 +1993,8 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
 # The server answers a level (``catalog_children``: folders, and the names and ids
 # of the sources); the sidecar adds the descriptors of those sources.
 _TREE_LIMIT = 2000
+# The most a level may ask for: its sources' descriptors are fetched by id.
+_TREE_LIMIT_MAX = 10_000
 # How many (route, query) pairs the sidecar remembers an answer's generation for.
 _TREE_SEEN_MAX = 4096
 
@@ -2149,7 +2151,7 @@ async def _tree_response(request: Request, build: Callable[[Any], Any]) -> Respo
 async def get_tree(
     request: Request,
     key: str = Query(""),
-    limit: int = Query(_TREE_LIMIT, ge=1),
+    limit: int = Query(_TREE_LIMIT, ge=1, le=_TREE_LIMIT_MAX),
 ) -> Response:
     """One level of the source tree: the folders and sources directly under *key*.
 
@@ -2166,7 +2168,7 @@ async def get_tree(
 async def reveal_in_tree(
     request: Request,
     source_id: str = Query(...),
-    limit: int = Query(_TREE_LIMIT, ge=1),
+    limit: int = Query(_TREE_LIMIT, ge=1, le=_TREE_LIMIT_MAX),
 ) -> Response:
     """Every level from the top down to the one holding *source_id*, in one
     request: ``{levels: [<level>...], descriptor}``."""
