@@ -1171,9 +1171,8 @@ class MetadataDatabase:
                 epoch BIGINT NOT NULL DEFAULT 0
             )
         """)
-        # A file written before the tree columns existed keeps its rows: the
-        # columns are added here and filled below, once the roots are known, rather
-        # than dropping a catalog that took a long scan to build.
+        # Tree columns are added to an older file here and filled below, once the
+        # roots are known.
         for column in ("tree_dir", "tree_name"):
             conn.execute(
                 f"ALTER TABLE source_catalog ADD COLUMN IF NOT EXISTS {column} "
@@ -1208,8 +1207,7 @@ class MetadataDatabase:
         self._root_urls = dict(
             conn.execute("SELECT root_id, root_url FROM catalog_roots").fetchall()
         )
-        # Rows the columns were added to, or whose fill an earlier open did not
-        # finish: a source with a path always has a name.
+        # Rows without a tree position: a source with a path always has a name.
         if conn.execute(
             "SELECT 1 FROM source_catalog WHERE tree_name = '' "
             "AND rel NOT IN ('', '.') LIMIT 1"
@@ -1853,6 +1851,31 @@ class MetadataDatabase:
         return url
 
     @staticmethod
+    def _internal_place(url: str) -> List[str]:
+        """``_INTERNAL_PLACE`` values for a source under the built-in root, whose
+        ``rel`` is its *url*."""
+        return [url, *tree_columns("", url)]
+
+    def _upsert_root(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        root_id: str,
+        root_url: str,
+        persisted: bool,
+    ) -> None:
+        """Write a root row, and move its rows' tree columns if its url changed.
+        Inside the caller's transaction and write lock."""
+        old = self._stored_root_url(conn, root_id)
+        conn.execute(
+            "INSERT INTO catalog_roots (root_id, root_url, persisted) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
+            [root_id, root_url, persisted],
+        )
+        if old != root_url:
+            self._retree_root(conn, root_id, root_url)
+
+    @staticmethod
     def _retree_root(
         conn: duckdb.DuckDBPyConnection, root_id: str, root_url: str
     ) -> None:
@@ -1890,7 +1913,7 @@ class MetadataDatabase:
         ``rel``. Without a claim in it the claim columns are NULL.
         """
         if record is None:
-            location = [INTERNAL_ROOT_ID, url, *tree_columns("", url)]
+            location = [INTERNAL_ROOT_ID, *self._internal_place(url)]
             claim_values = [None] * 5
         else:
             location = [
@@ -1968,7 +1991,7 @@ class MetadataDatabase:
         values = row[:1] + row[2:] + self._placement(record, url, payload)
         if record is None:
             update_set, upsert_set = _LISTING_SET, _LISTING_UPSERT_SET
-            set_values = row[2:] + [url, *tree_columns("", url)]
+            set_values = row[2:] + self._internal_place(url)
         else:
             update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
@@ -2209,33 +2232,19 @@ class MetadataDatabase:
                     [ids],
                 )
                 for root_id, root_url in roots:
-                    old = self._stored_root_url(conn, root_id)
-                    conn.execute(
-                        "INSERT INTO catalog_roots (root_id, root_url, persisted) "
-                        "VALUES (?, ?, TRUE) "
-                        "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
-                        [root_id, root_url],
-                    )
-                    if old != root_url:
-                        self._retree_root(conn, root_id, root_url)
+                    self._upsert_root(conn, root_id, root_url, True)
             self._root_urls = {**self._root_urls, **dict(roots)}
 
     def ensure_root(self, root_id: str, root_url: str) -> None:
         """Record a root that is not persisted (a drop, an upstream) before a source
         under it is written, since the view shows a row only against its root. It
         goes at the next open with the rows under it."""
+        if self._root_urls.get(root_id) == root_url:
+            return
         conn = self._get_connection()
         with self._write_lock:
             with self._catalog_txn(conn):
-                old = self._stored_root_url(conn, root_id)
-                conn.execute(
-                    "INSERT INTO catalog_roots (root_id, root_url, persisted) "
-                    "VALUES (?, ?, FALSE) "
-                    "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
-                    [root_id, root_url],
-                )
-                if old != root_url:
-                    self._retree_root(conn, root_id, root_url)
+                self._upsert_root(conn, root_id, root_url, False)
             self._root_urls[root_id] = root_url
 
     def _prepare_imported(
