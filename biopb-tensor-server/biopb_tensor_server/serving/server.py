@@ -1247,6 +1247,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 # key rather than a redefinition -- `annotations_persisted` is
                 # already on the wire and means what it says.
                 "catalog_persisted": db is not None and db.store_path is not None,
+                # Names the catalog's content: it changes when a source row is
+                # written or removed, so a caller holding what it read under
+                # one value knows it is current while the value stays (``null``
+                # with no catalog; absent on servers that predate it).
+                "catalog_generation": None if db is None else db.catalog_generation,
             }
             if self._external_location:
                 # Omitted rather than null when unset, so an old client -- which

@@ -3754,23 +3754,9 @@ _PATH_PARTS = [
 
 
 def _tree_path_of(url: str) -> list:
-    import duckdb
-    from biopb_tensor_server.serving.http_server import (
-        _TREE_BODY_SQL,
-        _TREE_PATH_SQL,
-        _dec,
-    )
+    from biopb_tensor_server.serving.tree_paths import dec, tree_parts
 
-    row = (
-        duckdb.connect()
-        .execute(
-            f"WITH t AS (SELECT {_TREE_BODY_SQL} AS b FROM (SELECT ? AS source_url))"
-            f" SELECT {_TREE_PATH_SQL} FROM t",
-            [url],
-        )
-        .fetchone()
-    )
-    return [_dec(part) for part in row[0].split("\x01")] if row[0] else []
+    return [dec(part) for part in tree_parts(url)]
 
 
 class TestTreePath:
@@ -3810,7 +3796,9 @@ def _tree_catalog(tmp_path, urls, pending=(), empty=(), **db_kwargs):
         if not url:
             # A source with no url at all: an upload.
             db._get_connection().execute(
-                "UPDATE source_catalog SET rel = '' WHERE source_id = ?", [sid]
+                "UPDATE source_catalog SET rel = '', tree_dir = '', tree_name = '' "
+                "WHERE source_id = ?",
+                [sid],
             )
     for sid, url in dict(pending).items():
         db.sync_pending_source(SourceClaim("zarr", url, sid), url)
@@ -4119,6 +4107,77 @@ class TestTreeLiveCatalog:
         assert stale.status_code == 200
         assert stale.headers["ETag"] != before.headers["ETag"]
         assert [s["name"] for s in stale.json()["sources"]] == ["a.zarr", "b.zarr"]
+
+    @staticmethod
+    def _count_queries(app):
+        """The catalog queries the sidecar has sent so far, as a growing list."""
+        client = app.state.sidecar.get_client()
+        sent = []
+        ask = client.query
+
+        def counted(sql, **kwargs):
+            sent.append(sql)
+            return ask(sql, **kwargs)
+
+        client.query = counted
+        return sent
+
+    def test_a_held_level_of_an_unchanged_catalog_is_revalidated_without_a_query(
+        self, tmp_path
+    ):
+        with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (_, loc):
+            app = create_app(flight_location=loc, token=_TOKEN)
+            with TestClient(app) as tc:
+                headers = _bearer(_TOKEN)
+                first = tc.get("/api/tree", params={"key": "d"}, headers=headers)
+                sent = self._count_queries(app)
+                again = tc.get(
+                    "/api/tree",
+                    params={"key": "d"},
+                    headers={**headers, "If-None-Match": first.headers["ETag"]},
+                )
+                asked_for_304 = list(sent)
+                unconditional = tc.get(
+                    "/api/tree", params={"key": "d"}, headers=headers
+                )
+        assert again.status_code == 304
+        assert again.headers["ETag"] == first.headers["ETag"]
+        assert asked_for_304 == []
+        assert sent  # one that holds nothing is answered with the body
+        assert unconditional.status_code == 200
+        assert unconditional.json() == first.json()
+
+    def test_a_write_elsewhere_costs_one_query_and_leaves_the_etag(self, tmp_path):
+        import zarr
+        from biopb_tensor_server import ZarrAdapter
+
+        with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (server, loc):
+            app = create_app(flight_location=loc, token=_TOKEN)
+            with TestClient(app) as tc:
+                headers = _bearer(_TOKEN)
+                first = tc.get("/api/tree", params={"key": "d"}, headers=headers)
+                held = {**headers, "If-None-Match": first.headers["ETag"]}
+                z = zarr.open_array(str(tmp_path / "a.zarr"), mode="r")
+                other = ZarrAdapter(z, "o", ["y", "x"])
+                other._catalog_url = "file:///other/o.zarr"
+                register_and_catalog(server, "o", other)
+                sent = self._count_queries(app)
+                moved_on = tc.get("/api/tree", params={"key": "d"}, headers=held)
+                asked = len(sent)
+                settled = tc.get("/api/tree", params={"key": "d"}, headers=held)
+        # The catalog changed, the level did not: asked once, still a 304, and
+        # the next one is answered from the generation alone.
+        assert moved_on.status_code == 304
+        assert asked > 0
+        assert settled.status_code == 304
+        assert len(sent) == asked
+
+    def test_the_server_reports_the_generation(self, tmp_path):
+        with _tree_catalog(tmp_path, {"a": "file:///d/a.zarr"}) as (server, loc):
+            app = create_app(flight_location=loc, token=_TOKEN)
+            with TestClient(app):
+                health = app.state.sidecar.get_client().health_check()
+        assert health["catalog_generation"] == server.metadata_db.catalog_generation
 
     def test_the_servers_own_cap_marks_the_level_truncated(self, tmp_path):
         urls = {f"s{i}": f"file:///d/{i}.zarr" for i in range(4)}
