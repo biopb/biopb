@@ -588,8 +588,8 @@ def test_search_finds_a_literal_in_either_tier(store):
     ship(store, "arch/one", "# One\n\nraises BIOPB_X_ERROR when bad\n")
     _docs.write_doc("mine", "# Mine\n\nalso BIOPB_X_ERROR here\n", None, None)
     out = _docs.search_docs("biopb_x_error")
-    assert "arch/one:3:" in out
-    assert "mine:3:" in out
+    assert "arch/one:3 [One]" in out
+    assert "mine:3 [Mine]" in out
 
 
 def test_search_narrows_to_a_prefix_and_survives_a_bad_regex(store):
@@ -639,3 +639,10 @@ def test_an_ambiguous_section_returns_the_outline(store):
     ship(store, "long", "# T\n\n## Auth one\n\nx\n\n## Auth two\n\ny\n")
     out = _docs.read_doc("long", "auth")
     assert "Auth one" in out and "Auth two" in out and "ambiguous" in out
+
+
+def test_a_search_hit_names_its_section(store):
+    ship(store, "long", LONG)
+    out = _docs.search_docs("b body")
+    assert "long:15 [B]: b body" in out
+    assert "[B]" in out

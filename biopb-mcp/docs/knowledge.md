@@ -285,7 +285,7 @@ A collection line in the index (`- architecture/: …`) names every doc under
 its prefix, so none of them lands in the *New shipped docs* tail.
 `read_doc("architecture/")` lists one level of it, ids with descriptions, and
 `search_docs(pattern, prefix)` greps every doc in both tiers for a literal (an
-exception name, a config key, a log line), returning `id:line: text`.
+exception name, a config key, a log line), returning `id:line [section]: text`.
 
 `architecture/` is the repo's own design docs, copied in by
 `tools/sync_architecture_docs.py` (`--check` in the test suite): the sources

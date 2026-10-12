@@ -844,7 +844,10 @@ MAX_SEARCH_HITS = 40
 
 
 def search_docs(pattern: str, prefix: str = "") -> str:
-    """Lines matching *pattern* across both tiers, as ``id:line: text``.
+    """Lines matching *pattern* across both tiers, as ``id:line [heading]: text``.
+
+    The heading is the nearest one above the line: pass it as ``read_doc``'s
+    *section* to read the part of the doc the hit sits in.
 
     Case-insensitive regular expression; a pattern that does not compile is
     searched as the literal string, since the agent usually means a literal
@@ -865,11 +868,16 @@ def search_docs(pattern: str, prefix: str = "") -> str:
         meta = describe(doc_id)
         if meta is None:
             continue
-        for n, line in enumerate(meta["body"].splitlines(), 1):
+        lines = meta["body"].splitlines()
+        heads = None
+        for n, line in enumerate(lines, 1):
             if rx.search(line):
                 total += 1
                 if len(hits) < MAX_SEARCH_HITS:
-                    hits.append(f"{doc_id}:{n}: {line.strip()[:200]}")
+                    heads = _headings(lines) if heads is None else heads
+                    under = [text for i, _, text in heads if i < n]
+                    where = f" [{under[-1]}]" if under else ""
+                    hits.append(f"{doc_id}:{n}{where}: {line.strip()[:200]}")
     if not hits:
         return f"No doc matches '{pattern}'."
     more = (

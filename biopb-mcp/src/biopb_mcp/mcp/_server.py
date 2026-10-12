@@ -558,9 +558,9 @@ async def search_docs(pattern: str, prefix: str = "") -> str:
     """Search every doc in the knowledge store for a pattern.
 
     Case-insensitive; a regular expression, or the literal text if it does not
-    compile. Returns `id:line: text` hits -- use it for an exception name, a
+    compile. Returns `id:line [section]: text` hits -- use it for an exception name, a
     config key, a log line. `prefix` narrows to a collection, e.g.
-    `architecture/`. Read a hit's doc with `read_doc(id)`.
+    `architecture/`. Read a hit's part with `read_doc(id, section)`.
     """
     return await asyncio.to_thread(_docs.search_docs, pattern, prefix)
 
