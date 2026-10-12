@@ -1365,6 +1365,9 @@ function Invoke-BiopbInstall {
     # ignored). Bio-Formats stays opt-in: an explicit -Bioformats from a front-end
     # wins, else the env var, default OFF (it pulls a Java toolchain on first use).
     $InstallBioformats = if ($PSBoundParameters.ContainsKey('Bioformats')) { [bool]$Bioformats } else { $env:BIOPB_INSTALL_BIOFORMATS -eq '1' }
+    # The napari viewer is installed by default; BIOPB_INSTALL_NAPARI=0 skips it
+    # (biopb-mcp without the [napari] extra).
+    $InstallNapari = $env:BIOPB_INSTALL_NAPARI -ne '0'
 
     # ===== 1. Install uv (if needed) =====
     Report-Step 1 "Ensuring build tools..."
@@ -1499,7 +1502,7 @@ function Invoke-BiopbInstall {
     if (-not $versions -or "$($versions.install_schema)" -ne "$script:InstallSchema") {
         throw "Release $($release.tag_name) is not supported by this installer. Install it with the installer published alongside it: https://github.com/$ReleaseRepo/releases/download/$($release.tag_name)/install.ps1"
     }
-    if (-not $versions.biopb -or -not $versions.napari -or -not $versions.release) {
+    if (-not $versions.biopb -or ($InstallNapari -and -not $versions.napari) -or -not $versions.release) {
         throw "Release $($release.tag_name) has an incomplete versions.json."
     }
     $napariReq   = "napari[all]==$($versions.napari)"
@@ -1551,7 +1554,8 @@ function Invoke-BiopbInstall {
     Report-Ok "Wheel checksums verified"
 
     # Direct file:// references pin each package to this exact wheel.
-    $mcpReq    = "biopb-mcp[napari] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
+    $mcpExtra  = if ($InstallNapari) { "[napari]" } else { "" }
+    $mcpReq    = "biopb-mcp$mcpExtra @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
     $biopbReq  = "biopb[tensor,shim]==$($versions.biopb)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
@@ -1566,12 +1570,16 @@ function Invoke-BiopbInstall {
         "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
-    Report-Info "including biopb-mcp + $napariReq"
     $installArgs += @(
         "--with", $mcpReq,
-        "--with", $napariReq,
         "--with-executables-from", "biopb-mcp"
     )
+    if ($InstallNapari) {
+        Report-Info "including biopb-mcp + $napariReq"
+        $installArgs += @("--with", $napariReq)
+    } else {
+        Report-Info "including biopb-mcp (napari skipped: BIOPB_INSTALL_NAPARI=0)"
+    }
     # biopb-control (control plane): `biopb control …` runs through the core CLI (which
     # spawns `python -m biopb_control`), so it just needs to be importable here;
     # --with-executables-from also links the standalone `biopb-control` script.
