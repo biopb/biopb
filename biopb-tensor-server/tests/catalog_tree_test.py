@@ -272,6 +272,7 @@ class TestGeneration:
             if name not in exempt
             and runs.search(inspect.getsource(fn))
             and "_catalog_written(" not in inspect.getsource(fn)
+            and "_catalog_txn(" not in inspect.getsource(fn)
         ]
         assert forgot == []
 

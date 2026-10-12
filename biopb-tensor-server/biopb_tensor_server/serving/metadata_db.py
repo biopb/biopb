@@ -48,6 +48,7 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -1171,18 +1173,11 @@ class MetadataDatabase:
         # A file written before the tree columns existed keeps its rows: the
         # columns are added here and filled below, once the roots are known, rather
         # than dropping a catalog that took a long scan to build.
-        have = {
-            r[0]
-            for r in conn.execute(
-                "SELECT column_name FROM duckdb_columns() "
-                "WHERE table_name = 'source_catalog'"
-            ).fetchall()
-        }
         for column in ("tree_dir", "tree_name"):
-            if column not in have:
-                conn.execute(
-                    f"ALTER TABLE source_catalog ADD COLUMN {column} TEXT DEFAULT ''"
-                )
+            conn.execute(
+                f"ALTER TABLE source_catalog ADD COLUMN IF NOT EXISTS {column} "
+                "TEXT DEFAULT ''"
+            )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_roots (
                 root_id TEXT PRIMARY KEY,
@@ -1701,15 +1696,9 @@ class MetadataDatabase:
                 )
             )
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 for sql, params in statements:
                     conn.execute(sql, params)
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def sync_mirrored_removed(self, source_ids: Sequence[str]) -> None:
         """Drop the rows of mirrored sources in one transaction.
@@ -1722,8 +1711,7 @@ class MetadataDatabase:
             return
         conn = self._get_connection()
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 for i in range(0, len(source_ids), self._PENDING_CHUNK):
                     chunk = list(source_ids[i : i + self._PENDING_CHUNK])
                     conn.execute(
@@ -1731,11 +1719,6 @@ class MetadataDatabase:
                         f"({', '.join('?' * len(chunk))})",
                         chunk,
                     )
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def bind_registry(self, registry: Any) -> None:
         """List tensors through *registry*, which holds the ones attached to a source,
@@ -1823,6 +1806,19 @@ class MetadataDatabase:
         generations mean equal content.
         """
         return f"{self.run_epoch}.{self._generation}"
+
+    @contextmanager
+    def _catalog_txn(self, conn: duckdb.DuckDBPyConnection) -> Iterator[None]:
+        """A write transaction on the catalog, for a caller holding the write lock:
+        rolled back on an error, committed and then counted in the generation."""
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            yield
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        self._catalog_written()
 
     def _catalog_written(self) -> None:
         """Advance the generation. After the write is committed, never before: a
@@ -1970,8 +1966,7 @@ class MetadataDatabase:
             update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 updated = conn.execute(
                     f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
                     set_values + [source_id],
@@ -1988,11 +1983,6 @@ class MetadataDatabase:
                     )
                 if also is not None:
                     also(conn)
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def sync_pending_source(
         self,
@@ -2062,15 +2052,9 @@ class MetadataDatabase:
         conn = self._get_connection()
         statements = self._pending_inserts(rows, datetime.now())
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 for sql, params in statements:
                     conn.execute(sql, params)
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def restorable_rows(self) -> List[Dict[str, Any]]:
         """The rows with a claim, which a restore rebuilds claims from, without the
@@ -2142,8 +2126,7 @@ class MetadataDatabase:
         conn = self._get_connection()
         ids = list(source_ids)
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 conn.execute(
                     "DELETE FROM source_catalog WHERE source_id IN (SELECT unnest(?::VARCHAR[]))",
                     [ids],
@@ -2153,11 +2136,6 @@ class MetadataDatabase:
                     "AND starts_with(set_name, ?)",
                     [ids, RESERVED_SET_PREFIX],
                 )
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def rewrite_row_roots(self, rows: Sequence[Tuple[str, str, str]]) -> None:
         """Re-attribute persisted rows to the roots a restore found them under:
@@ -2166,8 +2144,7 @@ class MetadataDatabase:
             return
         conn = self._get_connection()
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 for source_id, root_id, rel in rows:
                     tree_dir, tree_name = tree_columns(self._root_url(root_id), rel)
                     conn.execute(
@@ -2175,11 +2152,6 @@ class MetadataDatabase:
                         "tree_dir = ?, tree_name = ? WHERE source_id = ?",
                         [root_id, rel, tree_dir, tree_name, source_id],
                     )
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
 
     def confirm_root(self, root_id: str) -> None:
         """Record that this run's walk of a root finished: every row under it that a
@@ -2223,8 +2195,7 @@ class MetadataDatabase:
         conn = self._get_connection()
         ids = [root_id for root_id, _ in roots]
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 conn.execute(
                     "DELETE FROM catalog_roots WHERE persisted AND root_id NOT IN "
                     "(SELECT unnest(?::VARCHAR[]))",
@@ -2240,12 +2211,7 @@ class MetadataDatabase:
                     )
                     if old != root_url:
                         self._retree_root(conn, root_id, root_url)
-                conn.execute("COMMIT")
-                self._catalog_written()
-                self._root_urls = {**self._root_urls, **dict(roots)}
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            self._root_urls = {**self._root_urls, **dict(roots)}
 
     def ensure_root(self, root_id: str, root_url: str) -> None:
         """Record a root that is not persisted (a drop, an upstream) before a source
@@ -2253,8 +2219,7 @@ class MetadataDatabase:
         goes at the next open with the rows under it."""
         conn = self._get_connection()
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
+            with self._catalog_txn(conn):
                 old = self._stored_root_url(conn, root_id)
                 conn.execute(
                     "INSERT INTO catalog_roots (root_id, root_url, persisted) "
@@ -2264,11 +2229,6 @@ class MetadataDatabase:
                 )
                 if old != root_url:
                     self._retree_root(conn, root_id, root_url)
-                conn.execute("COMMIT")
-                self._catalog_written()
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
             self._root_urls[root_id] = root_url
 
     def _prepare_imported(

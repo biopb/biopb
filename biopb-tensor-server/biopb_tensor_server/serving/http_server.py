@@ -357,9 +357,7 @@ class _SidecarContext:
         self.jobs = _SourceJobs()
         # ``(generation, etag)`` of the last answer to each tree request, so one
         # that has not changed is revalidated without a query (``_tree_response``).
-        self.tree_seen: collections.OrderedDict[str, Tuple[str, str]] = (
-            collections.OrderedDict()
-        )
+        self.tree_seen: Dict[str, Tuple[str, str]] = {}
 
     def get_client(self) -> TensorFlightClient:
         """Return the Flight client, connecting on first use."""
@@ -2041,8 +2039,8 @@ def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, An
     sources.
     """
     segs = _segments(key)
+    here = _dir_sql(segs) if segs else "''"
     if segs:
-        here = _dir_sql(segs)
         # The folder itself, and everything below it: a range on ``dir``.
         near = f"(dir = {here} OR (dir >= {here} || chr(1) AND dir < {here} || chr(2)))"
         rest = (
@@ -2085,11 +2083,10 @@ def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, An
         truncated = True
     elif direct:
         budget = limit - len(folders)
-        dir_is = f"dir = {_dir_sql(segs)}" if segs else "dir = ''"
         source_table = client.query(
             f"SELECT {client.source_row_columns()}, t.name AS name FROM"
             " (SELECT source_id, CASE WHEN name = '' THEN source_id ELSE name END"
-            f" AS name FROM source_tree WHERE visible AND {dir_is}"
+            f" AS name FROM source_tree WHERE visible AND dir = {here}"
             f" ORDER BY name, source_id LIMIT {budget + 1}) t"
             " JOIN sources USING (source_id) ORDER BY t.name, source_id"
         )
@@ -2112,10 +2109,6 @@ def _tree_level(client: Any, key: str, limit: int = _TREE_LIMIT) -> Dict[str, An
     }
 
 
-def _is_prefix(segs: List[str], path: List[str]) -> bool:
-    return path[: len(segs)] == segs
-
-
 def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, Any]]:
     """Every level from the top down to the one holding *source_id*, with its
     descriptor; ``None`` when the catalog has no such (visible) source."""
@@ -2127,7 +2120,7 @@ def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, 
     if not found:
         return None
     _add_unresolved_reasons(client, found, f"AND source_id = {sql_literal(source_id)}")
-    path = found[0]["tdir"].split(SEP) if found[0]["tdir"] else []
+    path = found[0]["tdir"]
     levels = []
     key = ""
     while True:
@@ -2136,7 +2129,12 @@ def _tree_reveal(client: Any, source_id: str, limit: int) -> Optional[Dict[str, 
         if any(s["descriptor"]["source_id"] == source_id for s in level["sources"]):
             break
         below = next(
-            (f for f in level["folders"] if _is_prefix(_segments(f["key"]), path)),
+            (
+                f
+                for f in level["folders"]
+                if path == (at := SEP.join(_segments(f["key"])))
+                or path.startswith(at + SEP)
+            ),
             None,
         )
         # A level cut by its limit may have lost the way down: stop there; the
@@ -2162,12 +2160,16 @@ def _held_etags(request: Request) -> List[str]:
     return [t.strip() for t in request.headers.get("if-none-match", "").split(",")]
 
 
+def _not_modified(etag: str) -> Response:
+    return Response(status_code=304, headers={"ETag": etag})
+
+
 def _etag_response(request: Request, body: bytes) -> Response:
     """*body* under a strong ETag of its bytes; 304 for a caller holding it."""
     etag = _etag_of(body)
     held = _held_etags(request)
     if etag in held or "*" in held:
-        return Response(status_code=304, headers={"ETag": etag})
+        return _not_modified(etag)
     return Response(body, media_type="application/json", headers={"ETag": etag})
 
 
@@ -2210,13 +2212,12 @@ async def _tree_response(request: Request, build: Callable[[Any], Any]) -> Respo
             and seen[1] in _held_etags(request)
         ):
             ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-            return Response(status_code=304, headers={"ETag": seen[1]})
+            return _not_modified(seen[1])
         body = await run_in_threadpool(lambda: _json_bytes(build(client)))
         if generation is not None:
+            if len(ctx.tree_seen) >= _TREE_SEEN_MAX:
+                ctx.tree_seen.clear()
             ctx.tree_seen[slot] = (generation, _etag_of(body))
-            ctx.tree_seen.move_to_end(slot)
-            while len(ctx.tree_seen) > _TREE_SEEN_MAX:
-                ctx.tree_seen.popitem(last=False)
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
         return _etag_response(request, body)
     except HTTPException:
