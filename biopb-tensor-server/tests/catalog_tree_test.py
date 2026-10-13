@@ -264,6 +264,7 @@ class TestGeneration:
             "_create_source_catalog",
             "confirm_root",
             "_retree_root",
+            "_upsert_root",
             "_pending_inserts",
         }
         forgot = [

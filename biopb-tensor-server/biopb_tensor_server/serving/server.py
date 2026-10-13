@@ -121,11 +121,8 @@ from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.ticket_seal import DEFAULT_SEAL_TTL, TicketSealer
 from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.activity import ActivityTracker
-from biopb_tensor_server.serving.metadata_db import (
-    MetadataDatabase,
-    NumpyEncoder,
-    is_reserved_set,
-)
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.serving.roi_store import is_reserved_set
 from biopb_tensor_server.serving.upload_manager import (
     DEFAULT_UPLOAD_TTL,
     UploadManager,

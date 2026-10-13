@@ -14,11 +14,8 @@ from datetime import datetime, timedelta
 import pytest
 from biopb.image import ROI, Point, Polygon
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb_tensor_server.serving.metadata_db import (
-    RESERVED_SET_PREFIX,
-    MetadataDatabase,
-    is_reserved_set,
-)
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.roi_store import RESERVED_SET_PREFIX, is_reserved_set
 from google.protobuf import json_format
 
 ARRAY_ID = "zarr_a1b2c3/Image:0"
