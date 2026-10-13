@@ -43,26 +43,41 @@ public final class Connection implements AutoCloseable {
     private static final String[] UNREACHABLE_MARKERS = {
         "unavailable", "refused", "failed to connect", "deadline", "timed out", "timeout" };
 
-    /**
-     * Where first-use trust remembers pins. Process-wide and in memory: pins last
-     * until the JVM exits (see {@link TlsPinStore} for why there is no file).
-     */
-    private static final TlsPinStore PROCESS_PINS = TlsPinStore.inMemory();
-
     private final DataPlaneDiscovery discovery;
     private final LongConsumer sleeper;
+    /** Where first-use trust remembers pins; null is the shared file in the state directory. */
+    private final TlsPinStore pins;
 
     private volatile TensorFlightClient client;
     private volatile String url;
     private volatile String lastMessage = "";
 
     public Connection() {
-        this(new DataPlaneDiscovery(DiscoveryEnvironment.system()), Connection::sleepMillis);
+        this(new DataPlaneDiscovery(DiscoveryEnvironment.system()), Connection::sleepMillis, null);
+    }
+
+    /**
+     * A connection whose first-use pins go to {@code pins} instead of the file the
+     * Python SDK shares, e.g. {@link TlsPinStore#inMemory()} to keep none on disk.
+     */
+    public Connection(TlsPinStore pins) {
+        this(new DataPlaneDiscovery(DiscoveryEnvironment.system()), Connection::sleepMillis, pins);
     }
 
     Connection(DataPlaneDiscovery discovery, LongConsumer sleeper) {
+        this(discovery, sleeper, null);
+    }
+
+    private Connection(DataPlaneDiscovery discovery, LongConsumer sleeper, TlsPinStore pins) {
         this.discovery = discovery;
         this.sleeper = sleeper;
+        this.pins = pins;
+    }
+
+    private TlsPinStore pinStore() {
+        return pins != null
+                ? pins
+                : new FileTlsPinStore(discovery.environment().stateDir().resolve("tls-known-hosts.json"));
     }
 
     /** The live client, or null until a {@link #connect} succeeds (and again after one fails). */
@@ -172,7 +187,7 @@ public final class Connection implements AutoCloseable {
         DataPlaneDiscovery.TlsAnchor anchor = discovery.dataPlaneTrust(target, origin == Origin.CONTROL);
         Location location = LocationUris.parse(target);
         TlsTrust trust = TlsTrusts.isTlsLocation(location)
-                ? TlsTrusts.resolve(location, anchor.caPem, anchor.fingerprint, PROCESS_PINS)
+                ? TlsTrusts.resolve(location, anchor.caPem, anchor.fingerprint, pinStore())
                 : TlsTrust.NONE;
         TensorFlightClient opened = new TensorFlightClient(location, DEFAULT_CACHE_BYTES, token, trust);
         try {
