@@ -6,12 +6,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * Where trust-on-first-use remembers the certificate it pinned, keyed by
  * {@code host:port}.
  *
- * <p>Deliberately an interface the caller supplies. Python keeps its pins in a
- * file under the user's state directory; sharing that file would make a pin set
- * by one SDK apply to the other, but it is a cross-language on-disk contract
- * (location and format) that has not been decided, and this SDK does not invent
- * it quietly (biopb/biopb#1070). A caller that wants pins to outlive the process
- * implements this over whatever it keeps state in.
+ * <p>{@link FileTlsPinStore} is the store {@link Connection} uses: the file the
+ * Python SDK keeps under the state directory, so a pin made by either SDK holds
+ * for both. {@link #inMemory()} is for a caller that wants pins to last no longer
+ * than the process.
  */
 public interface TlsPinStore {
 
