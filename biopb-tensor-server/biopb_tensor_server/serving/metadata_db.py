@@ -1625,15 +1625,7 @@ class MetadataDatabase(RoiStoreMixin):
                     [ids],
                 )
                 for root_id, root_url in roots:
-                    old = self._stored_root_url(conn, root_id)
-                    conn.execute(
-                        "INSERT INTO catalog_roots (root_id, root_url, persisted) "
-                        "VALUES (?, ?, TRUE) "
-                        "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
-                        [root_id, root_url],
-                    )
-                    if old != root_url:
-                        self._retree_root(conn, root_id, root_url)
+                    self._upsert_root(conn, root_id, root_url, persisted=True)
             self._root_urls = {**self._root_urls, **dict(roots)}
 
     def ensure_root(self, root_id: str, root_url: str) -> None:
@@ -1643,16 +1635,31 @@ class MetadataDatabase(RoiStoreMixin):
         conn = self._get_connection()
         with self._write_lock:
             with self._catalog_txn(conn):
-                old = self._stored_root_url(conn, root_id)
-                conn.execute(
-                    "INSERT INTO catalog_roots (root_id, root_url, persisted) "
-                    "VALUES (?, ?, FALSE) "
-                    "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
-                    [root_id, root_url],
-                )
-                if old != root_url:
-                    self._retree_root(conn, root_id, root_url)
+                self._upsert_root(conn, root_id, root_url, persisted=False)
             self._root_urls[root_id] = root_url
+
+    def _upsert_root(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        root_id: str,
+        root_url: str,
+        *,
+        persisted: bool,
+    ) -> None:
+        """Write a ``catalog_roots`` row and re-tree its rows if its url moved.
+
+        The caller holds the write lock and a catalog transaction. A conflict
+        updates only the url: ``persisted`` and ``epoch`` stay as they were.
+        """
+        old = self._stored_root_url(conn, root_id)
+        conn.execute(
+            "INSERT INTO catalog_roots (root_id, root_url, persisted) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
+            [root_id, root_url, persisted],
+        )
+        if old != root_url:
+            self._retree_root(conn, root_id, root_url)
 
     def _prepare_imported(
         self,
