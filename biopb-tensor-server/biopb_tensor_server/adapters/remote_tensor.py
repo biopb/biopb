@@ -63,7 +63,12 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     TensorReadOption,
 )
-from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from biopb.tensor.ticket_pb2 import (
+    ChunkBounds,
+    PutCommand,
+    SetUploadStatus,
+    TensorTicket,
+)
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
@@ -1264,6 +1269,91 @@ class RemoteTensorAdapter(TensorAdapter):
             return data
         data, _ = compute_fn()
         return data
+
+    # ------------------------------------------------------------------ uploads
+    #
+    # An upload onto a mirror goes to the upstream that owns the source, as reads
+    # do. The mirror keeps no upload record: the tensor becomes part of the
+    # upstream's row, and the mirror lists it at its next re-list.
+
+    def forward_add_tensor(self, req_desc: TensorDescriptor) -> TensorDescriptor:
+        """Forward an ``add_tensor`` to the upstream; answer its descriptor localized.
+
+        *req_desc* names its tensor ``<scheme>://<mirror id>/...``; only the source
+        prefix is rewritten, so a field and a label set take the same path. The
+        upstream's refusal (not in write mode, a read-only token, a taken name)
+        is raised as it came.
+        """
+        if self._upstream_source_id == SCRATCH_SOURCE_ID:
+            raise flight.FlightServerError(
+                f"add_tensor: {self.source_id!r} is another server's scratch "
+                f"source, whose tensors expire on that server's clock. Upload to "
+                f"that server directly, or use {SCRATCH_SOURCE_ID!r} here."
+            )
+        scheme, _, local_id = req_desc.array_id.partition("://")
+        up = TensorDescriptor()
+        up.CopyFrom(req_desc)
+        up.array_id = f"{scheme}://{self._to_upstream_array_id(local_id)}"
+        answer = self._upstream_action("add_tensor", up.SerializeToString())
+        return self._localize_forwarded_descriptor(TensorDescriptor.FromString(answer))
+
+    def forward_set_upload_status(self, req: SetUploadStatus) -> bytes:
+        """Forward a ``set_upload_status`` (a discard included); the upstream's reply."""
+        up = SetUploadStatus()
+        up.CopyFrom(req)
+        up.array_id = self._to_upstream_array_id(req.array_id)
+        return self._upstream_action("set_upload_status", up.SerializeToString())
+
+    def check_write_ticket(self, chunk_id: bytes) -> None:
+        """Reject a chunk write this mirror cannot route, before any I/O.
+
+        Not :meth:`check_chunk_version`: that compares the envelope's
+        ``content_version`` with this mirror's current one, which moves when the
+        parent re-syncs -- another upload finishing on it would make a producer's
+        tickets stale here that the upstream still accepts. The upstream judges
+        the inner ticket against its own version; only the envelope's shape and
+        epoch are this mirror's to check.
+        """
+        if not is_proxy_envelope(chunk_id):
+            raise flight.FlightServerError(
+                f"proxy source {self.source_id} received a non-envelope chunk_id; "
+                f"re-open the tensor to refresh."
+            )
+        if peel_proxy_envelope(chunk_id)[1] != current_epoch():
+            raise StaleChunkError(
+                f"chunk_id for {self.array_id!r} was minted under another serving "
+                "epoch; re-request the write plan (GetFlightInfo).",
+                reason="stale_content_version",
+            )
+
+    def forward_chunk_put(
+        self, chunk_id: bytes, reader: flight.MetadataRecordBatchReader
+    ) -> None:
+        """Forward one chunk write to the upstream, under the envelope's inner ticket."""
+        inner = peel_proxy_envelope(chunk_id)[3]
+        ticket = (
+            inner
+            if envelope_inner_is_ticket(chunk_id)
+            else TensorTicket(chunk_id=inner).SerializeToString()
+        )
+        table = reader.read_all()
+        command = PutCommand(chunk_ticket=ticket).SerializeToString()
+        writer, ack = self.client._client.do_put(
+            flight.FlightDescriptor.for_command(command),
+            table.schema,
+            options=self.client._call_options,
+        )
+        with writer:
+            writer.write_table(table)
+            writer.done_writing()
+            ack.read()
+
+    def _upstream_action(self, action_type: str, body: bytes) -> bytes:
+        """One Flight action on the upstream; the body of its single reply."""
+        results = self.client._client.do_action(
+            flight.Action(action_type, body), options=self.client._call_options
+        )
+        return next(iter(results)).body.to_pybytes()
 
     def _upstream_record_batch(self, upstream_chunk_id: bytes) -> pa.RecordBatch:
         """do_get one chunk from the upstream, as a single unified RecordBatch."""
