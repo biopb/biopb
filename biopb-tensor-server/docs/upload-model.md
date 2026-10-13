@@ -74,6 +74,24 @@ unless it names one.
   misplaced inside a root, is that both zarr claims decline a directory
   carrying the member block (`is_upload_subsystem_store`).
 
+## Mirrored sources
+
+An upload onto a mirror (`type: tensor-server`) is forwarded to the upstream that
+owns the source, with the mirror's credentials for it. `add_tensor` and
+`set_upload_status` (a discard included) are forwarded with the source prefix
+rewritten to the upstream's id, and the answer rewritten back. A chunk write
+takes the ticket a mirrored read plan carries: the proxy envelope, whose inner is
+the upstream's own ticket, is forwarded to the upstream's DoPut. The mirror checks
+only the envelope's shape and epoch; its `content_version` moves whenever the
+parent re-syncs, and the upstream judges the inner ticket against its own.
+
+The mirror keeps no upload record and needs no `write_dir`. The tensor is listed
+on the mirror after the upstream re-lists it and the mirror's next re-list reads
+the new `indexed_at`; until then `upload_status` and reads by id work through the
+mirror. An upstream that is not in write mode, or whose token cannot write,
+refuses with its own error. The upstream's scratch source is never mirrored, so
+a scratch result goes to the upstream directly or to this server's own `scratch`.
+
 ## Store formats
 
 Two member layouts for an uploaded field, chosen by the scheme on

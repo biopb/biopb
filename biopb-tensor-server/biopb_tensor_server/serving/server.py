@@ -1051,19 +1051,16 @@ class TensorFlightServer(flight.FlightServerBase):
         """The chunk_id a DoPut ticket names, or the refusal.
 
         The ticket is a ``FlightEndpoint.ticket`` from this tensor's own read
-        plan, echoed back whole -- so the two things a write must not be are
-        checked here, where the bytes are still a ticket:
-
-        - a **scaled** ticket, which names a downsampled view. There is no
-          store behind one; writing it would either land under an id no read
-          ever asks for or overwrite the full-resolution chunk with reduced
-          pixels.
-        - a **proxy envelope**, whose inner is another server's opaque token.
-          A mirror serves what it fetched, so there is nothing local to write.
+        plan, echoed back whole -- so what a write must not be is checked here,
+        where the bytes are still a ticket: a **scaled** ticket, which names a
+        downsampled view. There is no store behind one; writing it would either
+        land under an id no read ever asks for or overwrite the full-resolution
+        chunk with reduced pixels.
 
         The version and epoch check is the adapter's
         (:meth:`TensorAdapter.check_chunk_version`), run by the caller once the
-        ticket has routed -- the same gate a read passes.
+        ticket has routed -- the same gate a read passes. A mirror's ticket is a
+        proxy envelope instead, forwarded to the upstream (``check_write_ticket``).
         """
         ticket = self._parse(TensorTicket(), ticket_bytes, "DoPut chunk ticket")
         if ticket.WhichOneof("payload") != "chunk_id":
@@ -1072,12 +1069,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 "as GetFlightInfo minted it."
             )
         chunk_id = ticket.chunk_id
-        if is_proxy_envelope(chunk_id):
-            raise flight.FlightServerError(
-                "DoPut: this tensor is served from another server; its chunks "
-                "are not writable here."
-            )
-        if is_scaled_chunk(chunk_id):
+        # A proxy envelope is a mirror's write plan: its inner is the upstream's
+        # own ticket, forwarded there, and the upstream refuses a scaled one.
+        if not is_proxy_envelope(chunk_id) and is_scaled_chunk(chunk_id):
             raise flight.FlightServerError(
                 "DoPut: a scaled ticket is not writable. Plan the write with "
                 "GetFlightInfo carrying no scale_hint."
@@ -1286,6 +1280,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError(
                     unsettable_state_message(UploadStatusPb.State.Name(req.state))
                 )
+            mirror = self.uploads.mirror_of(req.array_id)
+            if mirror is not None:
+                yield mirror.forward_set_upload_status(req)
+                return
             status = self.uploads.set_status(req.array_id, state, req.reason)
             reply = UploadStatusPb()
             _copy_upload_status(reply, status)
@@ -2147,8 +2145,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 # The read path's gate, on the write path: a ticket minted
                 # before a re-registration names bytes this source no longer
                 # serves, and writing under it would land the chunk in the
-                # next upload's cache namespace (biopb/biopb#178).
-                adapter.check_chunk_version(chunk_id)
+                # next upload's cache namespace (biopb/biopb#178). A mirror's
+                # ticket is judged by the upstream it is forwarded to.
+                if is_proxy_envelope(chunk_id):
+                    adapter.check_write_ticket(chunk_id)
+                else:
+                    adapter.check_chunk_version(chunk_id)
             except TensorResolutionError as e:
                 raise to_flight_error(e) from e
             self.uploads.write_chunk(adapter, chunk_id, reader)

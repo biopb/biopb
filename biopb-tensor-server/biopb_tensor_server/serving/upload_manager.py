@@ -82,6 +82,7 @@ from biopb_tensor_server.core.chunk import (
     MAX_ARROW_BATCH_BYTES,
     estimate_chunk_bytes,
     get_bounds_from_chunk_id,
+    is_proxy_envelope,
 )
 from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
@@ -624,14 +625,19 @@ class UploadManager:
         """
         self._require_canonical_axes(req_desc)
         self._require_bounded_grid(req_desc)
+        scheme, sep, rest = req_desc.array_id.partition("://")
+        source_id, _, field = rest.partition("/")
+        # The upstream owns a mirrored source's tensors, so it owns the upload;
+        # this server keeps no record of it and needs no write_dir for it.
+        mirror = self.mirror_of(source_id) if sep and source_id else None
+        if mirror is not None:
+            return mirror.forward_add_tensor(req_desc)
         if self._write_dir is None:
             raise flight.FlightServerError(
                 "add_tensor: write_dir is not configured, so there is nowhere "
                 "to put a tensor"
             )
 
-        scheme, sep, rest = req_desc.array_id.partition("://")
-        source_id, _, field = rest.partition("/")
         if not sep or not source_id or not field:
             raise flight.FlightServerError(
                 f"add_tensor: {req_desc.array_id!r} names no tensor. Use {_ID_GRAMMAR}."
@@ -647,12 +653,6 @@ class UploadManager:
                 f"already serves; it does not create one. Use "
                 f"{SCRATCH_SOURCE_ID!r} for a result that belongs to no source "
                 f"of yours."
-            )
-        if parent.source_type == "tensor-server":
-            raise flight.FlightServerError(
-                f"add_tensor: {source_id!r} is a mirror of another server's source, "
-                f"which owns its tensors. Upload to that server, or use "
-                f"{SCRATCH_SOURCE_ID!r} for a result of your own."
             )
 
         if split_label_field(field) is not None:
@@ -741,6 +741,21 @@ class UploadManager:
         logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
         return SCRATCH_SOURCE_ID
 
+    def mirror_of(self, array_id: str) -> Optional[Any]:
+        """The mirror adapter whose upstream owns the upload *array_id* names, or None.
+
+        For the verbs addressed by array_id alone (``set_upload_status``): a
+        mirror holds no upload record, so the source prefix is the only thing
+        that says the call belongs upstream.
+        """
+        try:
+            adapter = self._registry.get_registered(array_id.partition("/")[0])
+        except (SourceUnresolvedError, TensorResolutionError):
+            return None
+        if adapter is not None and adapter.source_type == "tensor-server":
+            return adapter
+        return None
+
     def write_chunk(
         self,
         adapter: Any,
@@ -755,6 +770,9 @@ class UploadManager:
         plan's own and no alignment grammar is left for the write path to
         enforce.
 
+        A mirror's chunk (a proxy envelope) is forwarded to its upstream, which
+        owns everything below.
+
         Each source format still owns what it does with the chunk, and an
         upload that is discarded or sealed refuses. Adapters stay
         transport-agnostic, so their errors become Flight errors here.
@@ -765,6 +783,9 @@ class UploadManager:
         message (biopb/biopb#1). Which of the two it was rides in
         ``extra_info``.
         """
+        if is_proxy_envelope(chunk_id):
+            adapter.forward_chunk_put(chunk_id, reader)
+            return
         table = reader.read_all()
         data_column = table.column(0)
 
