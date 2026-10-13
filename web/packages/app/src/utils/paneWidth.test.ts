@@ -4,7 +4,20 @@ import {
   MIN_CONTROL_WIDTH,
   MIN_SIDEBAR_WIDTH,
   clampPaneWidth,
+  panesFit,
 } from "./paneWidth";
+
+describe("panesFit", () => {
+  it("fits once the canvas keeps its minimum", () => {
+    expect(panesFit(320 + 320 + 16 + MIN_CANVAS_WIDTH, 320, 320)).toBe(true);
+    expect(panesFit(320 + 320 + 16 + MIN_CANVAS_WIDTH - 1, 320, 320)).toBe(false);
+  });
+
+  it("does not fit a phone or an upright tablet", () => {
+    expect(panesFit(390, 320, 320)).toBe(false);
+    expect(panesFit(768, 320, 320)).toBe(false);
+  });
+});
 
 describe("clampPaneWidth", () => {
   it("passes a width that leaves room for the other pane and the canvas", () => {

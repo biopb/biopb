@@ -17,6 +17,7 @@ self-signed leaves generated once, valid 2020-2120, never used by anything real.
 
 import calendar
 import ssl
+from pathlib import Path
 
 import pyarrow.flight as flight
 import pytest
@@ -108,6 +109,36 @@ def test_pin_store_roundtrip(tmp_path):
     _tls._save_pin(store, "b:2", b"pem-b")
     pins = _tls._load_pins(store)
     assert pins == {"a:1": "pem-a", "b:2": "pem-b"}
+
+
+_SHARED_PINS = Path(__file__).parent.parent / "resources" / "tls" / "known-hosts.json"
+
+
+def test_pin_store_file_is_the_one_java_reads():
+    """``known-hosts.json`` is the shared fixture of the pin-store contract: the
+    Java SDK's ``FileTlsPinStoreTest`` reads the same file, and a pin Python
+    adds to it keeps the shape Java parses (an object of host:port -> PEM)."""
+    pins = _tls._load_pins(_SHARED_PINS)
+    assert set(pins) == {"pinned.example:8815", "other.example:8815"}
+    assert all(v.startswith("-----BEGIN CERTIFICATE-----") for v in pins.values())
+
+
+def test_a_pin_python_adds_keeps_the_others(tmp_path):
+    store = tmp_path / "known.json"
+    store.write_bytes(_SHARED_PINS.read_bytes())
+    _tls._save_pin(store, "new.example:1", b"pem-new")
+    pins = _tls._load_pins(store)
+    assert pins["new.example:1"] == "pem-new"
+    assert len(pins) == 3
+
+
+@pytest.mark.parametrize("garbage", ["", "{not json", "[1, 2]"])
+def test_save_pin_refuses_to_replace_a_corrupt_store(tmp_path, garbage):
+    store = tmp_path / "known.json"
+    store.write_text(garbage, encoding="utf-8")
+    with pytest.raises(OSError, match="known.json"):
+        _tls._save_pin(store, "a:1", b"pem-a")
+    assert store.read_text(encoding="utf-8") == garbage
 
 
 def test_load_pins_tolerates_missing_and_garbage(tmp_path):

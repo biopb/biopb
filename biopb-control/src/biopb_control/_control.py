@@ -114,7 +114,7 @@ from biopb._config import locations as _locations
 from biopb._control import _agents, _endpoints
 from biopb._lifecycle import sessions as _sessions
 from biopb._lifecycle.daemon import detach_kwargs
-from biopb._security import web_auth as _web_auth
+from biopb._security import credentials as _credentials, web_auth as _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -170,27 +170,22 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 # (biopb-mcp ``mcp/_chat_api.py``). A chat turn runs arbitrary code in the
 # session kernel. Kept out of the set above rather than added to it, because the
 # two are gated differently and the difference is the whole point: `api` is
-# always proxied, `chat` only when this control is loopback-bound.
+# always proxied, `chat` only where the caller is trusted (see
+# `_session_proxy_roots`).
 #
 # Why a separate root at all. The allowlist exists to keep the child's /mcp — an
 # RCE on the same port — off this origin. An execute route folded into `api`
 # would put arbitrary code back through exactly that hole, silently: the
 # allowlist would still be there, still enforced, and no longer true. A distinct
-# root keeps the statement checkable — `api` always, `chat` local-mode only,
-# `/mcp` never — and makes "is RCE reachable from the browser?" one boolean.
-# The chat's *reads* live under `api`: a conversation is a read like the job
-# list.
+# root keeps the statement checkable. The chat's *reads* live under `api`: a
+# conversation is a read like the job list.
 #
-# That boolean assumes the root is **POST-only**, and `session_proxy` enforces
-# it rather than trusting the child to: the CSRF gate skips safe methods, so a
-# cross-site GET to any proxied root is forwarded unchecked.
+# That assumes the root is **POST-only**, and `session_proxy` enforces it rather
+# than trusting the child to: the CSRF gate skips safe methods, so a cross-site
+# GET to any proxied root is forwarded unchecked.
 #
-# Known limitation: this reads the control's own **bind**, so a loopback control
-# deliberately published by a reverse proxy (the topology biopb-mcp CLAUDE.md
-# points at for untrusted networks) reads as local and gets the chat route. That
-# operator is already responsible for the token in front of the data plane; a
-# control-side opt-out flag is the follow-up if the reverse-proxy topology stops
-# being the exception.
+# Which auth modes offer it is `_session_proxy_roots`'s call; the control never
+# reads its bind for this.
 _SESSION_CHAT_ROOT = "chat"
 
 # The execute-capable roots, which `session_proxy` narrows to POST (above).
@@ -199,38 +194,73 @@ _SESSION_CHAT_ROOT = "chat"
 _SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
 # The session's MCP endpoint, for an agent attaching from another machine. It
-# runs arbitrary code in the kernel, so it is the opposite of `chat`: served only where the control **enforces a token**,
-# whatever its bind, so it is never reachable unauthenticated. A tokenless
-# control does not proxy it (a local agent reaches the session's own port); a
-# loopback control with a token does, which is what an SSH tunnel to it needs. A
-# request carries the token in a header, which a hostile page cannot set, so the
-# CSRF gate has nothing to add and the methods are not narrowed (streamable-http
-# uses POST, GET and DELETE).
+# runs arbitrary code in the kernel, so it is served only where the control
+# **enforces a token** and the caller is trusted (a loopback bind, or a separate
+# exec token), so it is never reachable unauthenticated. A tokenless control does
+# not proxy it (a local agent reaches the session's own port); a loopback control
+# with a token does, which is what an SSH tunnel to it needs. A request carries
+# the token in a header, which a hostile page cannot set, so the CSRF gate has
+# nothing to add and the methods are not narrowed (streamable-http uses POST, GET
+# and DELETE).
 _SESSION_MCP_ROOT = "mcp"
 
 # Roots whose GET stream is idle by design, so the proxy sets no read timeout.
 _SESSION_STREAM_ROOTS = frozenset({_SESSION_MCP_ROOT})
 
 
+AUTH_MODES = ("none", "token", "split")
+
+# The roots `--hide` may name: the ones that run code in a session's kernel.
+EXEC_ROOTS = frozenset({_SESSION_CHAT_ROOT, _SESSION_MCP_ROOT})
+
+
+def infer_auth(token: str | None, exec_token: str | None) -> str:
+    """The auth mode implied by the credentials supplied: an exec token means
+    ``split``, a token alone ``token``, neither ``none``. ``none`` is only ever
+    *chosen* (the launcher requires ``--auth none`` to say so)."""
+    if exec_token:
+        return "split"
+    return "token" if token else "none"
+
+
+def validate_auth(auth: str, token: str | None, exec_token: str | None) -> str | None:
+    """Why *auth* does not fit the credentials given, or ``None`` if it does."""
+    if auth not in AUTH_MODES:
+        return f"--auth takes {', '.join(AUTH_MODES)}, not {auth!r}"
+    if auth == "none":
+        return "--auth none takes no token" if token or exec_token else None
+    if not token:
+        return f"--auth {auth} needs a token"
+    if auth == "token":
+        return "--auth token takes no exec token" if exec_token else None
+    if not exec_token or exec_token == token:
+        return "--auth split needs an exec token different from the token"
+    return None
+
+
 def _session_proxy_roots(
-    loopback_bound: bool, token_enforced: bool = False
+    auth: str, hide: frozenset[str] = frozenset()
 ) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
     guard and the thing it guards cannot disagree about what is reachable.
 
-    The flag is computed from the bind, not from any feature switch, and it
-    gates every execute-capable root together. Whether a given one is actually served
-    is the child's own decision (``observe.chat_enabled``), which is the half
-    this control does not and should not know.
+    ``api`` is always proxied. Which execute roots exist follows the operator's
+    explicit auth mode, never the bind address: ``none`` offers ``chat`` only
+    (``mcp`` needs a token to enforce), ``token`` and ``split`` offer both.
+    ``hide`` removes execute roots the operator does not want served at all.
+
+    Whether a given root is actually served is the child's own decision
+    (``observe.chat_enabled``), which is the half this control does not and
+    should not know.
     """
-    roots = _SESSION_ALLOWED_ROOTS
-    if loopback_bound:
-        roots = roots | {_SESSION_CHAT_ROOT}
-    if token_enforced:
-        roots = roots | {_SESSION_MCP_ROOT}
-    return roots
+    roots = set(_SESSION_ALLOWED_ROOTS)
+    if _SESSION_CHAT_ROOT not in hide:
+        roots.add(_SESSION_CHAT_ROOT)
+    if auth != "none" and _SESSION_MCP_ROOT not in hide:
+        roots.add(_SESSION_MCP_ROOT)
+    return frozenset(roots)
 
 
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
@@ -259,6 +289,19 @@ _LOG_TAIL_MAX_LINES = 2000
 _LOG_TAIL_MAX_BYTES = 512 * 1024
 
 
+def _session_root(path: str) -> str | None:
+    """The root segment of ``/session/<id>/<root>/...``, or ``None`` for any
+    other path (not ``/session/<id>/observe``'s shell, not a bare
+    ``/session/<id>``). Session ids are slash-free."""
+    if not path.startswith("/session/"):
+        return None
+    rest = path[len("/session/") :]  # "<id>/<sub_path...>"
+    slash = rest.find("/")
+    if slash == -1:
+        return None  # bare /session/<id>
+    return rest[slash + 1 :].split("/")[0]
+
+
 def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
     """True for ``/session/<id>/<root>/...`` where ``<root>`` is in *roots* —
     i.e. exactly what ``session_proxy`` forwards to the child.
@@ -266,16 +309,35 @@ def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
     Takes the *same* root set the proxy's own gate uses, so the guard and the
     thing it guards cannot drift: any path the proxy would forward (including a
     bare ``/session/<id>/api`` with no further segment) is gated, and a root
-    added to the set is covered on both sides at once. Not
-    ``/session/<id>/observe`` (the SPA shell), and not a bare ``/session/<id>``.
+    added to the set is covered on both sides at once.
     """
-    if not path.startswith("/session/"):
+    root = _session_root(path)
+    return root is not None and root in roots
+
+
+# Safe verbs never change a session, so a viewing token may use them.
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+# The control's own routes that start or change what runs on the host, so they
+# need the exec credential like a session's writes do. (The algorithm verbs are
+# not here: they only start or stop entries the user registered, and `register`
+# adds a url, never code.)
+_EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new"})
+
+
+def _needs_exec(method: str, path: str) -> bool:
+    """Whether a request needs the exec credential: the control routes above, the
+    execute roots outright, and any write under ``api`` (kernel interrupt and
+    restart, job cancel, shutdown, the lease). Reads under ``api`` are the
+    observe page and stay with the viewing token. Everything unknown defaults
+    to exec, so a verb added to the child later is gated until classified."""
+    if path in _EXEC_CONTROL_PATHS:
+        return True
+    root = _session_root(path)
+    if root is None:
         return False
-    rest = path[len("/session/") :]  # "<id>/<sub_path...>" (session ids are slash-free)
-    slash = rest.find("/")
-    if slash == -1:
-        return False  # bare /session/<id>
-    return rest[slash + 1 :].split("/")[0] in roots
+    return root != "api" or method not in _READ_METHODS
 
 
 # --- publishing this origin under a path prefix (biopb/biopb#728) ---------- #
@@ -540,10 +602,10 @@ class _ControlAuthMiddleware:
     ``session_roots`` is the proxy's own root set, so whatever that forwards is
     what this gates — including ``/session/<id>/chat/*`` when the control is
     loopback-bound, which is the one path where the request being gated runs
-    arbitrary code. Note the gate is **necessary but not sufficient** there: it
-    judges the caller, not the topology, and would happily authorize an execute
-    on a public origin. What keeps chat off a public origin is that the root is
-    not proxied there at all (:func:`_session_proxy_roots`).
+    arbitrary code. With an exec token it also tells the two credentials apart:
+    a viewing token is refused (403) on the execute roots and on any write under
+    a session's ``api`` (:func:`_needs_exec`). Which roots exist at all is
+    :func:`_session_proxy_roots`'s call, not the gate's.
     """
 
     def __init__(
@@ -551,18 +613,23 @@ class _ControlAuthMiddleware:
         app: ASGIApp,
         token: str | None,
         session_roots=_SESSION_ALLOWED_ROOTS,
+        exec_token: str | None = None,
     ) -> None:
         self.app = app
         self._token = token
+        self._exec_token = exec_token
         self._session_roots = session_roots
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and self._guarded(scope["path"]):
             get = Headers(scope=scope).get
-            denial = self._deny(scope["method"], get)
+            carried = self._scope_of(get)
+            denial = self._deny(scope["method"], scope["path"], get, carried)
             if denial is not None:
                 await denial(scope, receive, send)
                 return
+            # For /api/scope: which credential this request carried.
+            scope["biopb.scope"] = carried
         await self.app(scope, receive, send)
 
     def _guarded(self, path: str) -> bool:
@@ -570,12 +637,33 @@ class _ControlAuthMiddleware:
             return True
         return _is_proxied_session_path(path, self._session_roots)
 
-    def _deny(self, method: str, get: _web_auth.HeaderGetter) -> Response | None:
+    def _scope_of(self, get: _web_auth.HeaderGetter) -> str | None:
+        """``"exec"``, ``"view"`` or ``None`` (no valid token). With one token
+        (or none) that credential is exec: there is nothing to tell apart."""
+        if not self._token:
+            return "exec"
+        if self._exec_token and _web_auth.token_valid(get, self._exec_token):
+            return "exec"
+        if _web_auth.token_valid(get, self._token):
+            return "view" if self._exec_token else "exec"
+        return None
+
+    def _deny(
+        self, method: str, path: str, get: _web_auth.HeaderGetter, scope: str | None
+    ) -> Response | None:
         """The response to send if the request is refused, else ``None``."""
         if self._token:
-            if not _web_auth.token_valid(get, self._token):
+            if scope is None:
                 return JSONResponse(
                     {"error": "invalid or missing token"}, status_code=401
+                )
+            if scope == "view" and _needs_exec(method, path):
+                return JSONResponse(
+                    {
+                        "error": "this token can view but not run code or change "
+                        "a session; use the exec token"
+                    },
+                    status_code=403,
                 )
         elif not _web_auth.host_is_loopback(get("host")):
             return JSONResponse({"error": "invalid Host header"}, status_code=421)
@@ -811,6 +899,7 @@ def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
     screen the control happened to start under.
     """
     env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
+    _credentials.scrub_control_secrets(env)
     if display is not None:
         for key in _DISPLAY_ENV:
             env.pop(key, None)
@@ -1017,9 +1106,11 @@ def build_app(
     data_web_url: str,
     token: str | None = None,
     static_dir: str | Path | None = None,
-    loopback_bound: bool = False,
     url_prefix: str | None = None,
     algorithms: AlgorithmPlane | None = None,
+    exec_token: str | None = None,
+    auth: str | None = None,
+    hide: frozenset[str] = frozenset(),
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -1034,14 +1125,16 @@ def build_app(
     that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
 
-    ``loopback_bound`` proxies ``/session/<id>/chat/*``, whose turns **execute
-    code in that session's kernel**. Default off, and the decision is the
-    caller's because only it knows this control's bind address:
-    :func:`serve_control_api` derives it from a loopback bind, so a
-    network-reachable control never carries an execute route however it is
-    configured downstream. Deliberately *not* delegated to the session child —
-    the proxy hop strips Host and Origin, so the child cannot tell a browser
-    from this trusted loopback hop and cannot make this call.
+    ``auth`` is the operator's explicit choice of credential regime, which alone
+    decides whether the execute roots (``/session/<id>/chat/*`` and ``/mcp``, whose
+    requests **run code in that session's kernel**) exist: ``none`` (no token;
+    ``chat`` only), ``token`` (one token for everything) or ``split`` (``token``
+    views, ``exec_token`` additionally runs code and changes sessions). ``None``
+    infers it from the credentials given. The bind address is deliberately not
+    consulted: a loopback control behind a reverse proxy is as reachable as a public
+    one. ``hide`` removes execute roots from whichever mode. The control decides,
+    not the session child: the proxy hop strips Host and Origin, so the child
+    cannot tell a browser from this trusted hop.
 
     ``url_prefix`` publishes this origin under a path prefix (``/node/<host>/
     <port>`` — an Open OnDemand interactive app) rather than at ``/``: requests
@@ -1051,8 +1144,16 @@ def build_app(
 
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
+
+    ``exec_token`` (``split`` mode) is a second secret, distinct from ``token``:
+    only it may run code in a session or change one -- ``chat``, ``mcp`` and every
+    write under a session's ``api``. In ``token`` mode ``token`` is both.
     """
-    session_roots = _session_proxy_roots(loopback_bound, bool(token))
+    if auth is None:
+        auth = infer_auth(token, exec_token)
+    if problem := validate_auth(auth, token, exec_token):
+        raise ValueError(problem)
+    session_roots = _session_proxy_roots(auth, hide)
     if algorithms is None:
         algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
@@ -1106,8 +1207,8 @@ def build_app(
         # `chat_proxied` rides the same public probe for the same reason: the
         # observe page must know whether to offer the chat composer before it
         # renders one, and a composer whose every POST 404s is worse than none.
-        # It follows the bind alone, so it discloses nothing a caller cannot
-        # already infer from reaching this endpoint.
+        # It follows the operator's auth mode and --hide, so it discloses nothing
+        # a caller cannot already infer from reaching this endpoint.
         return JSONResponse(
             {
                 "control": "ok",
@@ -1257,6 +1358,11 @@ def build_app(
             }
         )
 
+    def api_scope(request: Request) -> JSONResponse:
+        # What the presented token may do, for a page deciding which controls to
+        # offer. Enforcement is the middleware's; this only reports it.
+        return JSONResponse({"scope": request.scope.get("biopb.scope")})
+
     async def api_sessions(_request: Request) -> JSONResponse:
         # The live MCP sessions, newest first, projected to what the dashboard
         # needs — the id, when it started, its loopback port, the control-relative
@@ -1280,7 +1386,7 @@ def build_app(
                 # mounts it (only a session whose mode serves it does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
-                "chat": probe["chat"] and loopback_bound,
+                "chat": probe["chat"] and _SESSION_CHAT_ROOT in session_roots,
                 "holder": probe["holder"],
             }
             for rec, probe in zip(records, probes, strict=True)
@@ -1709,7 +1815,8 @@ def build_app(
         target = base + "/" + sub_path
         if request.url.query:
             target = f"{target}?{request.url.query}"
-        # Drop Host AND Origin: httpx sets Host from the target (127.0.0.1:<port>,
+        # Drop Host AND Origin, and the caller's credential (the control's to
+        # check, not the child's): httpx sets Host from the target (127.0.0.1:<port>,
         # matching the child's loopback Host allowlist) and an absent Origin
         # passes the child's Origin guard, so the trusted control->child hop is
         # accepted whatever external host the browser used. Everything else
@@ -1717,7 +1824,7 @@ def build_app(
         headers = [
             (k, v)
             for k, v in request.headers.raw
-            if k.lower() not in (b"host", b"origin")
+            if k.lower() not in (b"host", b"origin", b"authorization", b"x-biopb-token")
         ]
         body = await request.body()
         # /mcp's GET stream carries server notifications and can sit idle for as
@@ -1797,6 +1904,7 @@ def build_app(
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/api/status", api_status, methods=["GET"]),
+        Route("/api/scope", api_scope, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/sessions/new", api_session_new, methods=["POST"]),
         Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
@@ -1851,7 +1959,12 @@ def build_app(
     if url_prefix:
         middleware.append(Middleware(_URLPrefixMiddleware, prefix=url_prefix))
     middleware.append(
-        Middleware(_ControlAuthMiddleware, token=token, session_roots=session_roots)
+        Middleware(
+            _ControlAuthMiddleware,
+            token=token,
+            session_roots=session_roots,
+            exec_token=exec_token,
+        )
     )
     return Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
@@ -1869,6 +1982,21 @@ class _ControlServer:
 
     def shutdown(self) -> None:
         self._server.should_exit = True
+
+
+def _warn_exec_under_view_token(host: str, auth: str, hide: frozenset[str]) -> None:
+    """Say so when ``chat``/``mcp`` ride the one access token on a listener other
+    machines can reach. The token views pixels and is carried in browser URLs, so
+    there it is also a shell; ``split`` (an exec token) or ``--hide`` closes that.
+    A warning only: the mode is the operator's choice, never inferred from the bind."""
+    served = EXEC_ROOTS - hide
+    if auth == "token" and served and _web_auth.host_is_public_bind(host):
+        logger.warning(
+            "this control is reachable from other machines and serves %s under "
+            "the one access token, which can also view data and is carried in "
+            "browser URLs: use --auth split with an exec token, or --hide them",
+            " and ".join(sorted(served)),
+        )
 
 
 def serve_control_api(
@@ -1893,31 +2021,24 @@ def serve_control_api(
     if data_web_url is None:
         data_web_url = _loopback_url(spec.web_host, spec.web_port)
 
-    # The data-plane token gates the control's own /api/* too (single
-    # origin). None in local mode -> the gate falls back to a loopback Host check
-    # instead.
-    #
-    # The execute-capable roots (arbitrary code in a session's kernel) ride this
-    # origin only when the origin is same-machine. Derived from *this* listener's bind
-    # through the shared predicate, not from --remote or the plane's bind: what
-    # decides is who can reach this web front. Deliberately not gated by the
-    # token instead — the data-plane token authorizes reading pixels and is
-    # readable from the local credential file by design (biopb/biopb#470); fine
-    # for viewing, and not a credential to trade for a shell. A remote execute
-    # route, if ever wanted, needs its own.
-    loopback_bound = not _web_auth.host_is_public_bind(host)
+    # The data-plane token gates the control's own /api/* too (single origin).
+    # None in ``none`` mode -> the gate falls back to a loopback Host check
+    # instead. Which execute roots this origin carries is the operator's explicit
+    # ``spec.auth``, not this listener's bind (see build_app).
+    auth = spec.auth or infer_auth(spec.token, spec.exec_token)
+    _warn_exec_under_view_token(host, auth, spec.hide)
     app = build_app(
         supervisor,
         ensure_timeout,
         data_web_url,
         token=spec.token,
         static_dir=spec.static_dir,
-        loopback_bound=loopback_bound,
         url_prefix=spec.url_prefix,
         algorithms=algorithms,
+        exec_token=spec.exec_token,
+        auth=auth,
+        hide=spec.hide,
     )
-    if not loopback_bound:
-        logger.info("session chat disabled: control bound to %s (not loopback)", host)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":

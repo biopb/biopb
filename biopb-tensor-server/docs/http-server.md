@@ -99,8 +99,9 @@ ask `/api/tile_info/{array_id}` for it.
 gates its pixels), but a `cache:` upload has no catalog row at all — reach one
 through `/api/tile_info/{array_id}`.
 
-**The tree is built per level.** A source's place comes from its `source_url`
-alone: `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
+**The tree is built per level.** A source's place is stored with its catalog
+row (`source_tree`: `dir`, `name`; `serving/tree_paths.py` holds the rules), from
+its url: `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
 roots at the endpoint `scheme://host` (an empty host, as in `file:///`, is just
 the path), anything else is the string itself; empty segments are dropped. A
 source with no path sits at the top, named by its `source_id`. A level lists
@@ -111,7 +112,15 @@ folder's `key` is its full path and is what `?key=` takes. A resolved source
 with no tensor is hidden; an unresolved one is shown, since it is read when
 opened. `descriptor` has the shape of a
 `/api/sources/query` row of the `sources` view. `truncated` says that `limit` or the server's row cap cut the
-level. The query lives behind `_tree_level` and reads only the `sources` view.
+level. The server answers a level itself (the `catalog_children` action: folders,
+and the names and ids of the sources); the sidecar adds one `sources` query for
+those sources' descriptors.
+
+The `ETag` is of the body. The sidecar also remembers, per request, the
+catalog generation (the server's `health` `catalog_generation`) it last
+answered under: a caller holding that body while the generation has not moved
+is answered `304` with no query, and one whose generation moved but whose level
+did not still gets a `304` from the one query it costs.
 
 ### ROI annotations
 

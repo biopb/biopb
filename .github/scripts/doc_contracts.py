@@ -68,12 +68,14 @@ def doc_files() -> list[Path]:
     is told it exists -- and it is usually banked because its evidence is thin,
     which is exactly when a green gate would read as an endorsement. The rule is
     a name test rather than an import because this runs before any env exists.
+    The `architecture/` copies of the repo's own docs declare no packages.
     """
     return sorted(
         p
         for p in DOCS_DIR.rglob("*.md")
         if p.stem != "index"
         and not any(part.startswith("_") for part in p.relative_to(DOCS_DIR).parts)
+        and p.relative_to(DOCS_DIR).parts[0] != "architecture"
     )
 
 

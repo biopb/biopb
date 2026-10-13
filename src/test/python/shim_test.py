@@ -930,7 +930,15 @@ class TestRemote:
 
     URL = "https://lab.example:8813"
 
-    def _remote(self, monkeypatch, health=None, sessions=(), new=None, denied=False):
+    def _remote(
+        self,
+        monkeypatch,
+        health=None,
+        sessions=(),
+        new=None,
+        denied=False,
+        viewing=False,
+    ):
         env = SimpleNamespace(calls=[], headers=[], mcp=None)
         health = {"mcp_proxied": True} if health is None else health
 
@@ -941,6 +949,8 @@ class TestRemote:
             env.headers.append(headers)
             if denied and path != "/health":
                 return 401, {"error": "invalid or missing token"}
+            if viewing and method == "POST":
+                return 403, {"error": "this token can view but not run code"}
             if path == "/health":
                 return 200, health
             if path == "/api/sessions":
@@ -1005,6 +1015,18 @@ class TestRemote:
         binding, env = self._remote(monkeypatch, denied=True)
         (text,) = self._drive(binding, lambda: binding.attach("auto"))
         assert "refused the token" in text
+
+    def test_a_viewing_token_is_told_to_use_the_exec_token(self, monkeypatch):
+        # A control with a separate exec token refuses the lease (403, not 401);
+        # the user must hear that this token views, not that it is wrong.
+        binding, env = self._remote(monkeypatch, viewing=True)
+        (text,) = self._drive(binding, lambda: binding.attach("s1"))
+        assert "viewing only" in text and "exec token" in text
+
+    def test_a_viewing_token_cannot_launch_either(self, monkeypatch):
+        binding, env = self._remote(monkeypatch, viewing=True)
+        (text,) = self._drive(binding, lambda: binding.attach("new"))
+        assert "viewing only" in text
 
     def test_the_listing_asks_the_control_and_each_session(self, monkeypatch):
         binding, env = self._remote(

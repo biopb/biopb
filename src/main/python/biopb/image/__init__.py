@@ -35,6 +35,7 @@ from biopb.image.bindata_pb2 import BinData
 from biopb.image.image_data_pb2 import ImageAnnotation, ImageData, Pixels, Tensor
 from biopb.image.roi_pb2 import (
     ROI,
+    Caption,
     Ellipse,
     Mask,
     Mesh,
@@ -59,6 +60,7 @@ __all__ = [
     "Arg",
     "BinData",
     "Call",
+    "Caption",
     "Ellipse",
     "Event",
     "ImageAnnotation",

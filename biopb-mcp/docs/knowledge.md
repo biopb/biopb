@@ -281,11 +281,20 @@ place, so grouping by first segment is a change to that place alone;
 `read_doc` keeps a single positional `id`, leaving room for an optional
 `section` later without a new tool or call-site change.
 
-None of that — collection listings, section reads, full-text search over
-the doc set — is built. The gap it would close: a listing answers "what
-exists", not a troubleshooting question that starts from a literal (an
-exception name, a config key, a log line), which is a grep-shaped search
-over prose, not a ranking problem, at this corpus size.
+A collection line in the index (`- architecture/: …`) names every doc under
+its prefix, so none of them lands in the *New shipped docs* tail.
+`read_doc("architecture/")` lists one level of it, ids with descriptions, and
+`search_docs(pattern, prefix)` greps every doc in both tiers for a literal (an
+exception name, a config key, a log line), returning `id#heading (Lnn): text`.
+
+`architecture/` is the repo's own design docs, copied in by
+`tools/sync_architecture_docs.py` (`--check` in the test suite): the sources
+keep relative markdown links for GitHub, and the copy rewrites each to
+`[[id]]`, or to plain text where the target is not copied. It is reference
+prose, not procedures, so the body cap and the dependency gates skip it.
+`read_doc("id#section")` reads part of a long doc: a heading (to the next one
+of the same or higher level), `toc` for the headings with line numbers, or a
+line range `120-180`. A search hit's `id#heading` is such an id.
 
 ## 8. Open risks
 

@@ -96,6 +96,67 @@ html, body {
 .pane-splitter:focus-visible::after { background: #4f8ef7; }
 .pane-splitter:focus-visible { outline: none; }
 
+/* Too narrow for both panes beside a usable canvas (HomePage decides, by
+   `panesFit`): the canvas takes the whole width and the panes float over it,
+   collapsed until their handle is pressed. Fixed to the viewport rather than
+   the shell, so a pane is as tall as the screen under the top bar. */
+.app-shell.floating { grid-template-columns: minmax(0, 1fr); }
+.app-shell.floating .app-main { grid-column: 1; grid-row: 2; }
+.app-shell.floating .pane-splitter { display: none; }
+.app-shell.floating .app-sidebar,
+.app-shell.floating .control-column {
+  position: fixed;
+  top: 44px;
+  bottom: 30px;
+  width: min(var(--sidebar-w, 320px), 88vw);
+  z-index: 50;
+  box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+  visibility: hidden;
+  transition: transform 0.18s ease, visibility 0s linear 0.18s;
+}
+.app-shell.floating .app-sidebar { left: 0; transform: translateX(-100%); }
+.app-shell.floating .control-column {
+  right: 0;
+  width: min(var(--control-w, 320px), 88vw);
+  transform: translateX(100%);
+}
+.app-shell.floating .app-sidebar.open,
+.app-shell.floating .control-column.open {
+  transform: none;
+  visibility: visible;
+  transition: transform 0.18s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell.floating .app-sidebar,
+  .app-shell.floating .control-column { transition: none; }
+}
+
+/* The tab that opens a floating pane, on the screen edge it slides from. */
+.pane-handle {
+  position: fixed;
+  top: 50%;
+  z-index: 60;
+  width: 22px;
+  height: 56px;
+  margin-top: -28px;
+  padding: 0;
+  background: #1a1f2e;
+  border: 1px solid #2d3748;
+  color: #cbd5e1;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.pane-handle:hover,
+.pane-handle:focus-visible { border-color: #4f8ef7; color: #fff; outline: none; }
+.pane-handle-left { left: 0; border-left: none; border-radius: 0 8px 8px 0; }
+.pane-handle-right { right: 0; border-right: none; border-radius: 8px 0 0 8px; }
+/* Riding the open pane's edge, so the same tab closes it. */
+.app-shell.floating .app-sidebar.open ~ .pane-handle-left { left: min(var(--sidebar-w, 320px), 88vw); }
+.app-shell.floating .pane-handle-right:has(+ .control-column.open) {
+  right: min(var(--control-w, 320px), 88vw);
+}
+
 .source-tree { padding: 0; flex: 1; }
 
 .tree-item {
@@ -293,6 +354,20 @@ html, body {
 .admin-content {
   flex: 1; overflow-y: auto; min-width: 0;
   padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: 1rem;
+}
+/* Phone width: the nav becomes a strip of tabs above the content instead of a
+   220px column beside it, and the top bar wraps instead of clipping. */
+@media (max-width: 700px) {
+  .admin-shell { grid-template-rows: auto minmax(0, 1fr); }
+  .admin-shell .app-topbar { flex-wrap: wrap; min-height: 44px; padding: 0.4rem 0.75rem; gap: 0.5rem; }
+  .admin-main { flex-direction: column; }
+  .admin-nav {
+    width: auto; flex-direction: row; overflow: auto hidden;
+    border-right: none; border-bottom: 1px solid #2d3748; padding: 0.4rem;
+  }
+  .admin-nav-item { width: auto; white-space: nowrap; }
+  .admin-content { padding: 0.9rem 0.75rem; }
+  .admin-content code { overflow-wrap: anywhere; }
 }
 .admin-panel { display: flex; flex-direction: column; gap: 1rem; max-width: 900px; }
 .admin-panel-head { display: flex; flex-direction: column; gap: 0.35rem; }
@@ -765,6 +840,13 @@ html, body {
 }
 .roi-tool:hover { background: #1e2435; color: #e2e8f0; }
 .roi-tool.active { border-color: #38bdf8; color: #38bdf8; }
+/* Sized by its rows (the strip is narrow), and not user-resizable so it cannot
+   widen it. */
+.roi-caption-input {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 4px;
+  box-sizing: border-box; color: #cbd5e1; display: block; font: inherit;
+  font-size: 12px; margin-top: 4px; resize: none; width: 100%;
+}
 .roi-draft-status {
   align-items: center; color: #94a3b8; display: flex; font-size: 11px;
   gap: 6px; padding: 4px 2px 2px;

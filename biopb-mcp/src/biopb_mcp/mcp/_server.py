@@ -538,12 +538,31 @@ async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wi
     -- the catalog of everything readable, with the agent's own hooks -- and is
     worth re-reading when the session's handshake copy has gone stale.
 
+    A long doc can be read in part: `read_doc("<id>#<heading>")`, `<id>#toc` for
+    the headings with line numbers, or `<id>#120-180` for a line range. A
+    `search_docs` hit starts with exactly such an id.
+
     A doc links another as `[[other-id]]`; follow one with another `read_doc`.
+
+    `read_doc("<collection>/")` lists the docs under a collection the index names
+    (`architecture/`); `search_docs` finds a literal across all of them.
 
     `read_doc("<id>@diff")` shows your local copy of a shipped doc against the
     shipped text -- what an upgrade changed that your copy hides.
     """
     return await asyncio.to_thread(_docs.read_doc, id)
+
+
+@mcp.tool()
+async def search_docs(pattern: str, prefix: str = "") -> str:
+    """Search every doc in the knowledge store for a pattern.
+
+    Case-insensitive; a regular expression, or the literal text if it does not
+    compile. Returns `id#heading (Lnn): text` hits -- use it for an exception name, a
+    config key, a log line. `prefix` narrows to a collection, e.g.
+    `architecture/`. Pass the hit's `id#heading` to `read_doc` to read that part.
+    """
+    return await asyncio.to_thread(_docs.search_docs, pattern, prefix)
 
 
 @mcp.tool()

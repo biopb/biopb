@@ -353,6 +353,20 @@ def _resolve_url(
     return f"{scheme or 'grpc'}://127.0.0.1:{port}", "default"
 
 
+def resolve_control_token() -> Optional[str]:
+    """The credential a local client sends to **this machine's control**.
+
+    The control's exec token (the owner-only file a ``split`` control writes) when
+    there is one, else the data-plane token. A same-user process can already run
+    code on this machine, so it is safe to hand it the strongest credential; the
+    viewing token stays for sharing. Only for the control's own address: the
+    data plane does not know the exec token.
+    """
+    from .._security.credentials import CONTROL_EXEC_CREDENTIAL, read_credential
+
+    return read_credential(CONTROL_EXEC_CREDENTIAL) or resolve_data_plane_token()
+
+
 def resolve_data_plane_token(
     explicit: Optional[str] = None, *, allow_credential_file: bool = True
 ) -> Optional[str]:

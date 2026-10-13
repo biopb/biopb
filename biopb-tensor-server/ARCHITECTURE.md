@@ -100,7 +100,7 @@ id or a byte-prefix sniff -- and the arm names the flight:
 
 | Flight | Data | GetFlightInfo | DoGet ticket | DoPut command |
 |---|---|---|---|---|
-| `catalog` | public: the DuckDB tables (`sources`, `decode_rates`, `rois`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
+| `catalog` | public: the DuckDB tables (`sources`, `source_tree`, `decode_rates`, `rois`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
 | `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted), or `chunk_ref` (a plan's stub + a grid index) | `PutCommand.chunk` (writable servers) |
 | `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.tensor._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
 
@@ -154,7 +154,10 @@ takes full access, except `chunk_locate`, which is a read of one tensor
 
 Custom `do_action` verbs: `health` (reports `protocol`),
 `add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
-`add_source`, `remove_source` (below), and `roi_prune`.
+`add_source`, `remove_source` (below), `roi_prune`, and `catalog_children`: one
+level of the catalog tree (`{key, limit}` in, `{key, folders, sources, truncated}`
+out as JSON; `serving/catalog_tree.py`), which the SDKs wrap and the sidecar's
+tree routes build on. It needs the full-access token like the other verbs.
 
 #### Server-advertised pyramid (`TensorDescriptor.pyramid`)
 

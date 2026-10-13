@@ -120,8 +120,8 @@ The control speaks plain HTTP with no TLS, so a prefix published through a
 portal puts the access token on the wire in the clear unless the portal
 terminates TLS in front of it.
 
-The chat root is gated on the control's own bind
-(`loopback_bound = not host_is_public_bind`), independent of the prefix: a
-loopback-bound control published through a portal still reads as local and
-still carries it — which for an OnDemand deployment is also the
-intent, since the portal authenticates the job's owner.
+Which execute roots (`chat`, `mcp`) the control carries follows its explicit
+`--auth` mode, independent of the prefix and of the bind. A control published
+through a portal says so by the mode its launcher chose: `token` or `split` for an
+OnDemand deployment (the portal authenticates the job's owner, who holds the
+token), and `--hide` removes a root outright.

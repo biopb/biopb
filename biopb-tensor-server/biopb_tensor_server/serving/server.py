@@ -17,7 +17,8 @@ or a byte-prefix sniff):
   takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
 
 Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
-resolve, runtime source add / remove, and annotation pruning.
+resolve, runtime source add / remove, annotation pruning, and one level of the
+catalog tree.
 """
 
 import hmac
@@ -118,12 +119,10 @@ from biopb_tensor_server.core.read_mask import (
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.ticket_seal import DEFAULT_SEAL_TTL, TicketSealer
+from biopb_tensor_server.serving import catalog_tree
 from biopb_tensor_server.serving.activity import ActivityTracker
-from biopb_tensor_server.serving.metadata_db import (
-    MetadataDatabase,
-    NumpyEncoder,
-    is_reserved_set,
-)
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.serving.roi_store import is_reserved_set
 from biopb_tensor_server.serving.upload_manager import (
     DEFAULT_UPLOAD_TTL,
     UploadManager,
@@ -1052,19 +1051,16 @@ class TensorFlightServer(flight.FlightServerBase):
         """The chunk_id a DoPut ticket names, or the refusal.
 
         The ticket is a ``FlightEndpoint.ticket`` from this tensor's own read
-        plan, echoed back whole -- so the two things a write must not be are
-        checked here, where the bytes are still a ticket:
-
-        - a **scaled** ticket, which names a downsampled view. There is no
-          store behind one; writing it would either land under an id no read
-          ever asks for or overwrite the full-resolution chunk with reduced
-          pixels.
-        - a **proxy envelope**, whose inner is another server's opaque token.
-          A mirror serves what it fetched, so there is nothing local to write.
+        plan, echoed back whole -- so what a write must not be is checked here,
+        where the bytes are still a ticket: a **scaled** ticket, which names a
+        downsampled view. There is no store behind one; writing it would either
+        land under an id no read ever asks for or overwrite the full-resolution
+        chunk with reduced pixels.
 
         The version and epoch check is the adapter's
         (:meth:`TensorAdapter.check_chunk_version`), run by the caller once the
-        ticket has routed -- the same gate a read passes.
+        ticket has routed -- the same gate a read passes. A mirror's ticket is a
+        proxy envelope instead, forwarded to the upstream (``check_write_ticket``).
         """
         ticket = self._parse(TensorTicket(), ticket_bytes, "DoPut chunk ticket")
         if ticket.WhichOneof("payload") != "chunk_id":
@@ -1073,12 +1069,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 "as GetFlightInfo minted it."
             )
         chunk_id = ticket.chunk_id
-        if is_proxy_envelope(chunk_id):
-            raise flight.FlightServerError(
-                "DoPut: this tensor is served from another server; its chunks "
-                "are not writable here."
-            )
-        if is_scaled_chunk(chunk_id):
+        # A proxy envelope is a mirror's write plan: its inner is the upstream's
+        # own ticket, forwarded there, and the upstream refuses a scaled one.
+        if not is_proxy_envelope(chunk_id) and is_scaled_chunk(chunk_id):
             raise flight.FlightServerError(
                 "DoPut: a scaled ticket is not writable. Plan the write with "
                 "GetFlightInfo carrying no scale_hint."
@@ -1159,6 +1152,10 @@ class TensorFlightServer(flight.FlightServerBase):
             flight.ActionType(
                 "roi_prune",
                 "Report (or with apply, delete) annotations whose source is gone",
+            ),
+            flight.ActionType(
+                "catalog_children",
+                "One level of the catalog tree: the folders and sources under a folder",
             ),
         ]
 
@@ -1247,6 +1244,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 # key rather than a redefinition -- `annotations_persisted` is
                 # already on the wire and means what it says.
                 "catalog_persisted": db is not None and db.store_path is not None,
+                # Names the catalog's content: it changes when a source row is
+                # written or removed, so a caller holding what it read under
+                # one value knows it is current while the value stays (``null``
+                # with no catalog; absent on servers that predate it).
+                "catalog_generation": None if db is None else db.catalog_generation,
             }
             if self._external_location:
                 # Omitted rather than null when unset, so an old client -- which
@@ -1278,6 +1280,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError(
                     unsettable_state_message(UploadStatusPb.State.Name(req.state))
                 )
+            mirror = self.uploads.mirror_of(req.array_id)
+            if mirror is not None:
+                yield mirror.forward_set_upload_status(req)
+                return
             status = self.uploads.set_status(req.array_id, state, req.reason)
             reply = UploadStatusPb()
             _copy_upload_status(reply, status)
@@ -1316,9 +1322,42 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             req = RoiPruneRequest.FromString(action.body.to_pybytes())
             yield self._handle_roi_prune(req)
+        elif action.type == "catalog_children":
+            self._authorize(context)
+            yield self._handle_catalog_children(action.body.to_pybytes())
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _handle_catalog_children(self, body: bytes) -> bytes:
+        """``{"key": <folder>, "limit": <n>}`` (both optional) to the level under
+        that folder, as JSON: ``{key, folders: [{name, key}], sources: [{name,
+        source_id}], truncated}``. The sources are ids; their rows are one
+        ``sources`` query away."""
+        try:
+            req = json.loads(body) if body else {}
+        except ValueError:
+            req = None
+        if not isinstance(req, dict):
+            raise flight.FlightServerError("catalog_children takes a JSON object")
+        key = req.get("key", "")
+        limit = req.get("limit", catalog_tree.DEFAULT_LIMIT)
+        if (
+            not isinstance(key, str)
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+        ):
+            raise flight.FlightServerError(
+                "catalog_children takes a string key and a positive integer limit"
+            )
+        try:
+            level = self._require_catalog().catalog_children(key, limit)
+        except UnicodeError:
+            raise flight.FlightServerError("catalog_children takes a text key")
+        return json.dumps(level, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
 
     def _registered(self, source_id: str) -> Optional[SourceAdapter]:
         """``SourceRegistry.get_registered``, its refusals as Flight errors: an
@@ -2106,8 +2145,12 @@ class TensorFlightServer(flight.FlightServerBase):
                 # The read path's gate, on the write path: a ticket minted
                 # before a re-registration names bytes this source no longer
                 # serves, and writing under it would land the chunk in the
-                # next upload's cache namespace (biopb/biopb#178).
-                adapter.check_chunk_version(chunk_id)
+                # next upload's cache namespace (biopb/biopb#178). A mirror's
+                # ticket is judged by the upstream it is forwarded to.
+                if is_proxy_envelope(chunk_id):
+                    adapter.check_write_ticket(chunk_id)
+                else:
+                    adapter.check_chunk_version(chunk_id)
             except TensorResolutionError as e:
                 raise to_flight_error(e) from e
             self.uploads.write_chunk(adapter, chunk_id, reader)

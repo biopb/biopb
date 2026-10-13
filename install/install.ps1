@@ -199,7 +199,11 @@ function Show-Summary {
     Write-Inf "Your AI agent launches biopb-shim over stdio - just start your agent"
     Write-Inf "(Claude Code/Desktop, Cursor, opencode), then prompt it:"
     Write-Cmd "  start biopb and report status"
-    Write-Inf "That brings up the napari viewer and the data plane."
+    if ($env:BIOPB_INSTALL_NAPARI -eq '0') {
+        Write-Inf "That brings up the data plane."
+    } else {
+        Write-Inf "That brings up the napari viewer and the data plane."
+    }
     Write-Host ""
 
     if ($Result.WebappInstalled) {

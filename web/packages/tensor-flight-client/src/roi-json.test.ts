@@ -164,10 +164,15 @@ describe("encodeRoiAnnotation", () => {
       { kind: "ellipse", center: { x: 2, y: 2 }, radius: { x: 1, y: 3 }, rotation: -1.25 },
       GEOM,
       { kind: "polyline", points: [{ x: 0, y: 0 }, { x: 9, y: 9 }], width: 2.5 },
+      { kind: "text", at: { x: 3, y: 4 }, text: "late\nstage" },
     ];
     for (const arm of arms) {
       expect(decodeRoiGeometry(encodeRoiGeometry(arm))).toEqual(arm);
     }
+  });
+
+  it("drops a caption with no text rather than draw nothing selectable", () => {
+    expect(decodeRoiGeometry({ text: { at: { x: 1, y: 1 } } })).toBeNull();
   });
 
   it("round-trips a version token so an edit does not erase it", () => {

@@ -178,7 +178,9 @@ export function useRoiAuthoring(
     () =>
       buildDraftLayers({
         draft,
-        cursor: draftCursor,
+        // A caption draft has no trailing segment; the pointer would only
+        // rebuild its text layer on every move.
+        cursor: draft?.tool === "text" ? null : draftCursor,
         closeable: isCompletable(draft),
         polylineWidth,
       }),

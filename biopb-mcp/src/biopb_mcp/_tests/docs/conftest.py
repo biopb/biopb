@@ -29,8 +29,19 @@ def shipped_files(directory: Path = DOCS_DIR) -> list[Path]:
     return sorted(directory.rglob("*.md"))
 
 
+#: The repo's own architecture docs, copied in by tools/sync_architecture_docs.py.
+#: Reference prose about biopb itself, not procedures: no body cap, and no
+#: dependency contracts or satisfiability to prove.
+ARCHITECTURE = "architecture"
+
+
+def is_architecture(path: Path, directory: Path = DOCS_DIR) -> bool:
+    return path.relative_to(directory).parts[0] == ARCHITECTURE
+
+
 def offered_files(directory: Path = DOCS_DIR) -> list[Path]:
-    """The docs the release lists: `_`-prefixed banked ones and the index out.
+    """The docs the release lists: `_`-prefixed banked ones, the index and the
+    architecture collection (listed as one `architecture/` line) out.
 
     A banked doc ships and reads back by id, but no session is told it exists,
     so nothing downstream may assert about it -- a package gate proving its
@@ -42,6 +53,7 @@ def offered_files(directory: Path = DOCS_DIR) -> list[Path]:
         for p in shipped_files(directory)
         if doc_id_of(p, directory) != _docs.INDEX_ID
         and not any(part.startswith("_") for part in p.relative_to(directory).parts)
+        and not is_architecture(p, directory)
     ]
 
 

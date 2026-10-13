@@ -140,10 +140,17 @@ class TestShapeKinds:
             (2.0, 5.0),
         ]
 
-    def test_a_label_becomes_a_point_carrying_its_text(self):
-        annotation, _ = _one(_meta(_shape("labels", x=7, y=8, text="mitotic")))
-        assert (annotation.roi.point.x, annotation.roi.point.y) == (7.0, 8.0)
-        assert annotation.label == "mitotic"
+    def test_a_label_becomes_a_caption(self):
+        annotation, _ = _one(_meta(_shape("labels", x=7, y=8, text="mitotic\r\nlate")))
+        assert annotation.roi.WhichOneof("shape") == "text"
+        assert (annotation.roi.text.at.x, annotation.roi.text.at.y) == (7.0, 8.0)
+        assert annotation.roi.text.text == "mitotic\nlate"
+        # The text is the geometry; the label stays the ROI's own name.
+        assert annotation.label == ""
+
+    def test_a_label_without_text_still_marks_its_place(self):
+        annotation, _ = _one(_meta(_shape("labels", x=7, y=8, text="  ")))
+        assert annotation.roi.WhichOneof("shape") == "point"
 
     def test_a_polyline_has_no_geometric_width(self):
         """OME's stroke_width is display styling, not the band a brush covered."""
@@ -790,7 +797,7 @@ class TestOpenTimeClear:
     def test_a_catalog_from_a_newer_build_is_left_untouched(self, tmp_path):
         """The refusal promises exactly that, so the clear must come after it."""
         from biopb_tensor_server.core.errors import AnnotationStoreError
-        from biopb_tensor_server.serving.metadata_db import _ROI_SCHEMA_VERSION
+        from biopb_tensor_server.serving.roi_store import _ROI_SCHEMA_VERSION
 
         store = tmp_path / "catalog.duckdb"
         db = MetadataDatabase(store_path=store)

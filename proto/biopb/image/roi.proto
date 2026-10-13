@@ -84,6 +84,20 @@ message Polyline {
   float width = 2;
 }
 
+// A piece of text written on the image: a note, not a region.
+//
+// Distinct from RoiAnnotation.label, which names the CLASS of an ROI ("mitotic",
+// repeated over hundreds of them). This is content to be read on the image, and
+// it is the whole point of the shape -- an empty one marks nothing.
+message Caption {
+  // Top-left of the text block. Lines run down and right from here.
+  Point at = 1;
+
+  // UTF-8, '\n' between lines. No wrapping: a line break is where the writer put
+  // one. Size and colour are display choices and live in props_json.
+  string text = 2;
+}
+
 // A closed 3D shape repesented by triangular meshes.
 //
 message Mesh {
@@ -122,5 +136,7 @@ message ROI {
     Mask mask = 6;
 
     Polyline polyline = 7;
+
+    Caption text = 8;
   }
 }

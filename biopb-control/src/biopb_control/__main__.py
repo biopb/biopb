@@ -88,6 +88,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "a command line is world-readable via `ps`)",
     )
     run.add_argument(
+        "--auth",
+        choices=("none", "token", "split"),
+        default=None,
+        help="credential regime (or BIOPB_CONTROL_AUTH). none: no token, local use "
+        "only; token: one token for everything; split: the token views, an exec "
+        "token (--exec-token) also runs code in a session. Implied by the "
+        "credentials given; without a token it must be said: --auth none.",
+    )
+    run.add_argument(
+        "--exec-token",
+        default=None,
+        help="split mode's second token, for what runs code in a session or changes "
+        "one (chat, mcp, session writes). Prefer BIOPB_CONTROL_EXEC_TOKEN in the "
+        "env. Implies --auth split.",
+    )
+    run.add_argument(
+        "--hide",
+        default=None,
+        help="comma-separated execute roots this control must not proxy at all "
+        "(chat, mcp) (or BIOPB_CONTROL_HIDE).",
+    )
+    run.add_argument(
         "--remote",
         action="store_true",
         help="deprecated and redundant: a public --grpc-host already says the "
@@ -141,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
     # TLS proxy.
     from biopb._control._endpoints import control_host, control_port
-    from biopb._security import web_auth as _web_auth
+    from biopb._security import credentials as _credentials, web_auth as _web_auth
 
     resolved_control_host = args.control_host or control_host()
 
@@ -170,6 +192,46 @@ def main(argv: list[str] | None = None) -> int:
             "token (set BIOPB_TENSOR_TOKEN or pass --token). Bind --grpc-host and "
             "--control-host to loopback (127.0.0.1) for a tokenless local "
             "deployment.",
+            file=sys.stderr,
+        )
+        return 2
+
+    exec_token = (
+        args.exec_token or os.environ.get(_credentials.ENV_CONTROL_EXEC_TOKEN) or ""
+    ).strip() or None
+    if exec_token and not _web_auth.valid_token(exec_token):
+        print(
+            "biopb-control: the exec token must be 16-128 URL-safe characters "
+            "([A-Za-z0-9_-]).",
+            file=sys.stderr,
+        )
+        return 2
+
+    from ._control import EXEC_ROOTS, infer_auth, validate_auth
+
+    auth = args.auth or os.environ.get(_credentials.ENV_CONTROL_AUTH) or None
+    if auth is None:
+        if not token and not exec_token:
+            print(
+                "biopb-control: say how this control is authenticated: set "
+                "BIOPB_TENSOR_TOKEN (--token), or pass --auth none to run without "
+                "a token, for use on this machine only.",
+                file=sys.stderr,
+            )
+            return 2
+        auth = infer_auth(token, exec_token)
+    if problem := validate_auth(auth, token, exec_token):
+        print(f"biopb-control: {problem}.", file=sys.stderr)
+        return 2
+
+    hide_arg = args.hide
+    if hide_arg is None:
+        hide_arg = os.environ.get(_credentials.ENV_CONTROL_HIDE)
+    hide = frozenset(n.strip() for n in (hide_arg or "").split(",") if n.strip())
+    if hide - EXEC_ROOTS:
+        print(
+            f"biopb-control: --hide takes {' and '.join(sorted(EXEC_ROOTS))}, "
+            f"not {sorted(hide - EXEC_ROOTS)}.",
             file=sys.stderr,
         )
         return 2
@@ -241,6 +303,9 @@ def main(argv: list[str] | None = None) -> int:
         log_level=args.log_level,
         server_log=Path(args.server_log) if args.server_log else None,
         token=token,
+        auth=auth,
+        exec_token=exec_token,
+        hide=hide,
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,

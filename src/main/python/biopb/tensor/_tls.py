@@ -609,7 +609,21 @@ def _load_pins(store: Path) -> Dict[str, str]:
 def _save_pin(store: Path, key: str, pem: bytes) -> None:
     """Add ``key -> pem`` to the pin store, written owner-only and atomically."""
     store.parent.mkdir(parents=True, exist_ok=True)
-    pins = _load_pins(store)
+    # A file that exists but cannot be read as an object is not replaced: that
+    # would drop every other host's pin, and re-pin a changed certificate unseen.
+    try:
+        with open(store, encoding="utf-8") as f:
+            pins = json.load(f)
+    except FileNotFoundError:
+        pins = {}
+    except (ValueError, OSError) as e:
+        raise OSError(
+            f"cannot read the TLS pin store {store}: {e}; fix or remove it"
+        ) from e
+    if not isinstance(pins, dict):
+        raise OSError(
+            f"the TLS pin store {store} is not a JSON object; fix or remove it"
+        )
     pins[key] = pem.decode("ascii")
     # Atomic replace so a concurrent reader never sees a half-written file.
     fd, tmp = tempfile.mkstemp(dir=store.parent, prefix=".tls-", suffix=".tmp")

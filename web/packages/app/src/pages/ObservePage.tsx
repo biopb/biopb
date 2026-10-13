@@ -21,6 +21,7 @@ import {
   clampChatWidth,
   defaultChatWidth,
 } from "../utils/chatPaneWidth";
+import { useCanExec, execTitle, NEEDS_EXEC } from "../hooks/useCanExec";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
 
@@ -126,6 +127,7 @@ export default function ObservePage() {
   // Terminal, once true: the id does not resolve and never will again, so the
   // page stops polling and stops offering anything that acts on the kernel.
   const [ended, setEnded] = useState(false);
+  const canExec = useCanExec();
   useDocumentTitle(
     `BioPB mcp - ${ended ? "ended" : "observe"}${sessionId ? ` · ${sessionId}` : ""}`,
   );
@@ -586,11 +588,13 @@ export default function ObservePage() {
                 has none to destroy. */}
             <button
               className="danger"
-              disabled={pane !== "session"}
+              disabled={pane !== "session" || !canExec}
               title={
-                pane === "session"
-                  ? "Hard-restart this session's kernel"
-                  : "A verification's kernel is built for its run and discarded after it — there is nothing here to restart"
+                !canExec
+                  ? NEEDS_EXEC
+                  : pane === "session"
+                    ? "Hard-restart this session's kernel"
+                    : "A verification's kernel is built for its run and discarded after it — there is nothing here to restart"
               }
               onClick={restart}
             >
@@ -616,7 +620,12 @@ export default function ObservePage() {
           </div>
         ) : null}
         {showChat && chatStatus ? (
-          <ChatPane base={base} status={chatStatus} pollMs={pollMs} />
+          <ChatPane
+            base={base}
+            status={chatStatus}
+            pollMs={pollMs}
+            canExec={canExec}
+          />
         ) : null}
         {showChat && chatStatus ? (
           // Pointer events rather than mouse: capture keeps the drag alive when
@@ -696,6 +705,7 @@ export default function ObservePage() {
                     detail={details[e.job.job_id]}
                     onToggle={() => toggle(e.job.job_id)}
                     onInterrupt={() => interrupt(e.job.job_id)}
+                    canInterrupt={canExec}
                   />
                 ),
               )
@@ -755,6 +765,7 @@ export function JobRow({
   detail,
   onToggle,
   onInterrupt,
+  canInterrupt = true,
 }: {
   job: JobSummary;
   open: boolean;
@@ -764,6 +775,8 @@ export function JobRow({
   detail: JobDetail | undefined;
   onToggle: () => void;
   onInterrupt: () => void;
+  /** False for a token that can only view: the button stays, disabled. */
+  canInterrupt?: boolean;
 }) {
   const outRef = useRef<HTMLPreElement | null>(null);
   // Whether the user is parked at the bottom of the output; a live job then keeps
@@ -833,7 +846,8 @@ export function JobRow({
           // is the one mistake the placement makes possible.
           <button
             className="job-stop"
-            title="Interrupt this cell"
+            disabled={!canInterrupt}
+            title={execTitle(canInterrupt, "Interrupt this cell")}
             onClick={(e) => {
               e.stopPropagation();
               onInterrupt();
@@ -955,6 +969,12 @@ const OBS_CSS = `
     .obs-page main.with-chat .work { height: auto; display: block; }
     .obs-page main.with-chat #jobs { overflow-y: visible; }
     .obs-page .splitter { display: none; }
+  }
+  @media (max-width: 640px) {
+    .obs-page header { flex-wrap: wrap; row-gap: 6px; }
+    .obs-page header button.primary { min-width: 0; }
+    .obs-page main { padding: 10px; }
+    .obs-page .row { flex-wrap: wrap; }
   }
   .obs-page .job { border: 1px solid #333; border-radius: 5px; margin-bottom: 8px; overflow: hidden; }
   /* A new cell arrives where it will sit rather than being there between two

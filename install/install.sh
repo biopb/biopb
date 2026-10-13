@@ -953,7 +953,7 @@ _precompile_bytecode() {
     # single file fails to compile (e.g. a vendored py2-only module) — harmless
     # here, so we don't treat it as a failure.
     "$py" -m compileall -q -j 0 "$site" >/dev/null 2>&1 || true
-    _ok "Bytecode precompiled (first viewer launch will be faster)"
+    _ok "Bytecode precompiled (first launch will be faster)"
 }
 
 # Keep the installed release's own installer (its install.sh asset, stamped with
@@ -1321,6 +1321,9 @@ install_biopb() {
     # overridable for scripted installs via env var:
     #   BIOPB_INSTALL_BIOFORMATS=1  add Bio-Formats (Java fetched on first use)
     if [ "${BIOPB_INSTALL_BIOFORMATS:-0}" = "1" ]; then INSTALL_BIOFORMATS=1; else INSTALL_BIOFORMATS=0; fi
+    # The napari viewer (and its Qt stack) is installed by default.
+    #   BIOPB_INSTALL_NAPARI=0  skip it: biopb-mcp without the [napari] extra
+    if [ "${BIOPB_INSTALL_NAPARI:-1}" = "0" ]; then INSTALL_NAPARI=0; else INSTALL_NAPARI=1; fi
 
     # ===== Non-interactive / unmanned mode =====
     # BIOPB_NONINTERACTIVE=1 suppresses every prompt so the installer can run
@@ -1484,12 +1487,14 @@ install_biopb() {
     napari_pin=$(_manifest_field napari "$versions_json")
     sdk_pin=$(_manifest_field biopb "$versions_json")
     RELEASE_VERSION=$(_manifest_field release "$versions_json")
-    if [ -z "$napari_pin" ] || [ -z "$sdk_pin" ] || [ -z "$RELEASE_VERSION" ]; then
+    if { [ "$INSTALL_NAPARI" = "1" ] && [ -z "$napari_pin" ]; } || [ -z "$sdk_pin" ] || [ -z "$RELEASE_VERSION" ]; then
         _err "Release $RELEASE_TAG has an incomplete versions.json."
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
     fi
     napari_req="napari[all]==$napari_pin"
+    local mcp_extra="[napari]"
+    if [ "$INSTALL_NAPARI" = "0" ]; then mcp_extra=""; fi
     local mcp_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
@@ -1520,7 +1525,7 @@ install_biopb() {
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
     # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
     # SDK is pinned exactly to its PyPI release.
-    mcp_req="biopb-mcp[napari] @ file://$mcp_whl"
+    mcp_req="biopb-mcp$mcp_extra @ file://$mcp_whl"
     biopb_req="biopb[tensor,shim]==$sdk_pin"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
@@ -1545,12 +1550,16 @@ install_biopb() {
         --with "$tensor_req"
         --with-executables-from biopb-tensor-server
     )
-    _info "  including biopb-mcp + $napari_req"
     install_args+=(
         --with "$mcp_req"
-        --with "$napari_req"
         --with-executables-from biopb-mcp
     )
+    if [ "$INSTALL_NAPARI" = "1" ]; then
+        _info "  including biopb-mcp + $napari_req"
+        install_args+=(--with "$napari_req")
+    else
+        _info "  including biopb-mcp (napari skipped: BIOPB_INSTALL_NAPARI=0)"
+    fi
     # biopb-control (control plane): supervises the data plane. `biopb control …` is
     # exposed through the core `biopb` CLI, which spawns `python -m biopb_control`,
     # so it only needs to be importable in this shared env; --with-executables-from
@@ -1876,11 +1885,19 @@ install_biopb() {
     fi
     _info "Then prompt it:"
     _cmd "start biopb and report status"
-    _info "That brings up the napari viewer and the data plane."
+    if [ "${INSTALL_NAPARI:-1}" = "0" ]; then
+        _info "That brings up the data plane."
+    else
+        _info "That brings up the napari viewer and the data plane."
+    fi
     _info "Keep the agent session running while you work."
     echo ""
 
-    printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+    if [ "${INSTALL_NAPARI:-1}" = "0" ]; then
+        printf "  %s2. Check your data.%s Confirm it appears in the web interface (run: biopb dashboard).\n" "${BOLD}" "${RESET}"
+    else
+        printf "  %s2. Check your data.%s Confirm it appears in the napari Tensor Browser panel.\n" "${BOLD}" "${RESET}"
+    fi
     echo ""
 
     printf "  %s3. Prompt away!%s Ask the agent to load, segment, or measure your images.\n" "${BOLD}" "${RESET}"

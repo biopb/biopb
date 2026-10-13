@@ -131,6 +131,18 @@ def run_control(
             # Best-effort: a client that then can't find the credential degrades to
             # an actionable auth error, which is better than failing control startup.
             logger.warning("could not write the local credential file: %s", exc)
+    # `split`: same-user local clients get the exec token too, in a file of its
+    # own (the data plane would reject it), so the shim can still launch a session
+    # and the SDK reach the control's other exec routes. Any file left by an
+    # earlier split run is dropped, or it would shadow this run's credential.
+    _credentials.remove_credential(_credentials.CONTROL_EXEC_CREDENTIAL)
+    if spec.exec_token:
+        try:
+            _credentials.write_credential(
+                spec.exec_token, _credentials.CONTROL_EXEC_CREDENTIAL
+            )
+        except OSError as exc:
+            logger.warning("could not write the local exec credential: %s", exc)
 
     # Publish the endpoint we actually bound so clients can find a control that
     # `--base-port` moved off 8813 (biopb/biopb#614 follow-up). This is the one
@@ -206,6 +218,7 @@ def run_control(
     # token behind (a crash can't run this; the next control start overwrites it).
     if spec.token:
         _credentials.remove_credential()
+    _credentials.remove_credential(_credentials.CONTROL_EXEC_CREDENTIAL)
     # Retract the endpoint too, so discovery does not point clients at a dead
     # port. A crash leaves it behind, which is why the record carries a pid and
     # every consumer probes rather than trusting it.

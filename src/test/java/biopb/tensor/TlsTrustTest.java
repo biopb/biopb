@@ -159,6 +159,23 @@ public class TlsTrustTest {
     }
 
     @Test
+    public void aFilePinHoldsTheServerToItAfterARestart() throws Exception {
+        Location location = serve("server");
+        Path pinFile = dir.resolve("tls-known-hosts.json");
+        TlsTrusts.resolve(location, null, null, new FileTlsPinStore(pinFile));
+        String key = "localhost:" + server.getPort();
+        Assert.assertTrue(Files.readString(pinFile).contains(key));
+
+        // A new store over the file is a new process: it trusts what the first pinned...
+        TlsTrusts.resolve(location, null, null, new FileTlsPinStore(pinFile));
+
+        // ...and refuses a certificate that is not it.
+        new FileTlsPinStore(pinFile).put(key, new String(pem("othername"), StandardCharsets.US_ASCII));
+        Assert.assertThrows(TlsPinMismatchException.class,
+                () -> TlsTrusts.resolve(location, null, null, new FileTlsPinStore(pinFile)));
+    }
+
+    @Test
     public void trustOnFirstUseWithoutAStoreIsRefused() throws Exception {
         Location location = serve("server");
         Assert.assertThrows(IllegalArgumentException.class,

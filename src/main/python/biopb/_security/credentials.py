@@ -23,6 +23,25 @@ logger = logging.getLogger(__name__)
 # The data-plane credential file, in the state tree beside the pid / sentinel files.
 _CREDENTIAL_NAME = "tensor-server.token"
 
+# The control's exec token in ``split`` mode, for same-user local clients: they
+# can already run code as this user, so holding it grants them nothing new. The
+# data plane never sees it, so it is a separate file from the data-plane token.
+CONTROL_EXEC_CREDENTIAL = "control-exec.token"
+
+# What an operator sets to choose the control's credential regime (see
+# ``biopb_control._control``): the exec token, the mode, and roots to hide.
+ENV_CONTROL_EXEC_TOKEN = "BIOPB_CONTROL_EXEC_TOKEN"
+ENV_CONTROL_AUTH = "BIOPB_CONTROL_AUTH"
+ENV_CONTROL_HIDE = "BIOPB_CONTROL_HIDE"
+
+
+def scrub_control_secrets(env: dict) -> dict:
+    """*env* without the control's exec token, for any child it spawns: the data
+    plane, a session's kernel and an algorithm server run code the exec token is
+    not for. Mutates and returns *env*."""
+    env.pop(ENV_CONTROL_EXEC_TOKEN, None)
+    return env
+
 
 def credential_file(name: str = _CREDENTIAL_NAME) -> Path:
     """Path to a local credential file (default: the data plane's).

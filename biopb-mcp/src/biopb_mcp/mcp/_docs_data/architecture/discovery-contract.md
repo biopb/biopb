@@ -1,0 +1,99 @@
+---
+description: "Finding the data plane: the discovery contract: How a client on this machine finds the tensor (data) plane and the token for it."
+---
+
+# Finding the data plane: the discovery contract
+
+How a client on this machine finds the tensor (data) plane and the token for
+it. It is files, environment variables and two HTTP calls, so any language can
+implement it; the private `biopb._control` is the Python one, and
+`biopb.tensor.Connection` is its public face: it finds the plane and dials it.
+The Java SDK's `biopb.tensor.Connection` is the other implementation, with the
+same reads in the same order, and it keeps trust-on-first-use pins in the same
+file.
+
+## State directory
+
+`$BIOPB_STATE_HOME/biopb` when set (it must be absolute), else
+`~/.local/state/biopb`, on every platform. `XDG_*` is not read.
+
+## The control
+
+Host and port, each resolved on its own: `BIOPB_CONTROL_HOST` /
+`BIOPB_CONTROL_PORT`, then `control.json` in the state directory
+(`{"host", "port", …}`, written by a serving control and left behind by a
+crashed one, so a hint to probe, not proof), then `127.0.0.1:8813`. A client
+connects to a wildcard bind (`0.0.0.0`, `::`) over loopback.
+
+A control behind a reverse proxy also publishes how the *user's browser* reaches
+it, which is not the address above, as `user_url`: the origin (`--public-origin` /
+`BIOPB_PUBLIC_ORIGIN`, e.g. `https://portal.example.edu`) followed by the path
+prefix (`--url-prefix` / `BIOPB_URL_PREFIX`, e.g. `/node/<host>/<port>`), or the
+bare prefix when no origin was given. `user_base_url()` (in `biopb._control`) returns it, else
+the connect URL: a link to hand a person, where `base_url()` is for this
+machine's own requests. Nothing routes or authorizes on it.
+
+## The plane's address
+
+First answer wins:
+
+1. `$BIOPB_TENSOR_URL`;
+2. the control's `GET /health` (unauthenticated): `data_plane.grpc_url`;
+3. `127.0.0.1:8815`, scheme probed off the socket.
+
+A client that reads data stops at 2: no control means no plane to connect to
+(#628), and `Connection` says so. Step 3 is for diagnostics, the `biopb tensor`
+commands.
+
+## The token
+
+First answer wins: `$BIOPB_TENSOR_TOKEN`, then `tensor-server.token` in the
+state directory (owner-only, one line) **only when the address came from the
+control**, else none. It goes to the control as the `X-Biopb-Token` header and
+to the plane as a Flight bearer token.
+
+## Starting the plane
+
+`POST /api/data_plane/ensure?client_timeout=<seconds>`, with the token header
+when there is one. The control answers before `client_timeout`; a 200 carries
+`{"data_plane": {…, "grpc_url"}}`.
+
+## A local TLS plane
+
+For a loopback `grpcs://` address the client verifies the certificate the plane
+presents against a SHA-256 fingerprint it reads locally: `tls-served.json` in
+the state directory, keyed by port, else the digest of `tls/server-cert.pem`. A
+local TLS plane with neither is an error, not a fallback to trust-on-first-use.
+
+## A remote TLS plane
+
+An address that bypassed the control (`$BIOPB_TENSOR_URL`, a flag) is trusted as
+`$BIOPB_TENSOR_TLS_CA` (a PEM file: a private CA, or the server's own
+certificate) or `$BIOPB_TENSOR_TLS_FINGERPRINT` (its SHA-256, as `cert init`
+prints it) say, else on first use ([TOFU pin store](#tofu-pin-store)). Both check
+every connect and skip the pin store; with both set the CA wins. A configured anchor also wins over the local
+record for a loopback address, but never applies to a plane the control named.
+
+## TOFU pin store
+
+`tls-known-hosts.json` in the state directory: a JSON object mapping `host:port`
+to the certificate pinned on first use, as a PEM string. Both SDKs read and write
+it, so a pin made by one holds for the other. A different certificate later for a
+pinned `host:port` is a pin mismatch (`TlsPinMismatchError` in Python,
+`TlsPinMismatchException` in Java), never a re-pin; remove the entry to accept a
+legitimately rotated certificate.
+
+A missing, unreadable or malformed file reads as an empty store. A write reads
+the file again, adds the entry, and replaces the file atomically (a temp file in
+the same directory, then a rename), `0600` on POSIX. It refuses to replace a file
+that exists but is not a JSON object, since that would drop every other host's
+pin: Python raises, and Java logs a warning and keeps the pin in memory for the
+process, as it does when the directory cannot be written at all. Two processes pinning at the same
+moment can lose one of the pins; it is pinned again on its next first use.
+
+## Stability
+
+The files, variables, header, query parameter and the `data_plane.grpc_url`
+field above are the contract: fields are added, never renamed or removed, and a
+change is an SDK release. The rest of `/health` (for example `auth_required`,
+`chat_proxied`) is the web UI's and is not part of it.

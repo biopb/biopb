@@ -28,6 +28,7 @@ import {
   type LiveOutput,
   type ToolCallItem,
 } from "../utils/chatThread";
+import { NEEDS_EXEC } from "../hooks/useCanExec";
 import { escAction, recallAction, sendsOnEnter } from "../utils/chatKeys";
 import {
   abandon,
@@ -59,10 +60,13 @@ export default function ChatPane({
   base,
   status,
   pollMs,
+  canExec = true,
 }: {
   base: string;
   status: ChatStatus;
   pollMs: number;
+  /** False for a token that can only view: every control stays, disabled. */
+  canExec?: boolean;
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // Who is answering. Held here rather than read from the once-probed status
@@ -364,11 +368,21 @@ export default function ChatPane({
         <button
           className="chat-new"
           onClick={compact}
-          title="Summarise the older part of the conversation for the model. The thread is not changed."
+          disabled={!canExec}
+          title={
+            canExec
+              ? "Summarise the older part of the conversation for the model. The thread is not changed."
+              : NEEDS_EXEC
+          }
         >
           compact
         </button>
-        <button className="chat-new" onClick={startNew} title="Start a new conversation">
+        <button
+          className="chat-new"
+          onClick={startNew}
+          disabled={!canExec}
+          title={canExec ? "Start a new conversation" : NEEDS_EXEC}
+        >
           new
         </button>
       </div>
@@ -463,9 +477,13 @@ export default function ChatPane({
         <div className="chat-input">
           <textarea
             value={text}
-            disabled={!status.ready}
+            disabled={!status.ready || !canExec}
             placeholder={
-              status.ready ? "Ask about this session…" : "chat is unavailable"
+              !canExec
+                ? NEEDS_EXEC
+                : status.ready
+                  ? "Ask about this session…"
+                  : "chat is unavailable"
             }
             onChange={(e) => {
               setText(e.target.value);
@@ -503,7 +521,7 @@ export default function ChatPane({
             className="chat-send"
             aria-label="Send message"
             title="Send (Enter)"
-            disabled={!status.ready || sending || !text.trim()}
+            disabled={!status.ready || !canExec || sending || !text.trim()}
             onClick={onEnter}
           >
             ↩

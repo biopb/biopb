@@ -3,6 +3,7 @@ import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-
 import {
   ELLIPSE_SEGMENTS,
   buildRoiLayers,
+  buildDraftLayers,
   buildSelectionLayers,
   currentPlaneFor,
   roiLayerId,
@@ -12,6 +13,7 @@ import {
   setColor,
   visibleRois,
 } from "./roiLayers";
+import { hitsRoi } from "./roiHitTest";
 import { roiSetCounts } from "./roiSets";
 
 function roi(over: Partial<RoiAnnotation> & { geometry: RoiGeometry }): RoiAnnotation {
@@ -413,5 +415,119 @@ describe("planeFromSelection", () => {
 
   it("is empty before the grid is known", () => {
     expect(planeFromSelection(null, { z: 3 })).toEqual({});
+  });
+});
+
+describe("a caption", () => {
+  const CAPTION: RoiGeometry = { kind: "text", at: { x: 5, y: 6 }, text: "late\nstage" };
+  const note = roi({ roiId: "n", geometry: CAPTION });
+  type Layer = {
+    id: string;
+    props: {
+      data: Array<{ text: string }>;
+      pickable: boolean;
+      sizeUnits: string;
+      background?: boolean;
+      outlineColor: number[];
+      getBackgroundColor: number[];
+    };
+  };
+
+  it("is drawn by its own text layer and by no other", () => {
+    const layers = buildRoiLayers({
+      rois: [note],
+      currentPlane: {},
+      visibleSets: null,
+      visible: true,
+    }) as Layer[];
+    expect(layers.map((l) => l.id)).toEqual([roiLayerId("captions")]);
+    const [layer] = layers;
+    expect(layer!.props.data).toHaveLength(1);
+    expect(layer!.props.pickable).toBe(false);
+    // Screen-sized, so it stays readable as the user zooms.
+    expect(layer!.props.sizeUnits).toBe("pixels");
+  });
+
+  it("draws no marker: it has neither ring nor path", () => {
+    expect(roiRing(CAPTION)).toBeNull();
+    expect(roiPath(CAPTION)).toBeNull();
+  });
+
+  it("is drawn beside the other kinds without taking their layers", () => {
+    const layers = buildRoiLayers({
+      rois: [note, roi({ roiId: "p", geometry: POINT })],
+      currentPlane: {},
+      visibleSets: null,
+      visible: true,
+    }) as Layer[];
+    expect(layers.map((l) => l.id)).toEqual([roiLayerId("points"), roiLayerId("captions")]);
+  });
+
+  it("stays legible on any pixels: opaque outline, half-transparent backing", () => {
+    const [layer] = buildRoiLayers({
+      rois: [note],
+      currentPlane: {},
+      visibleSets: null,
+      visible: true,
+    }) as Layer[];
+    expect(layer!.props.outlineColor[3]).toBe(255);
+    expect(layer!.props.background).toBe(true);
+    // Neither invisible nor opaque: an opaque box would hide the pixels the
+    // caption is about.
+    const alpha = layer!.props.getBackgroundColor[3]!;
+    expect(alpha).toBeGreaterThan(0);
+    expect(alpha).toBeLessThan(255);
+  });
+
+  it("draws a selected caption's border with no second backing or glyphs", () => {
+    const [layer] = buildSelectionLayers(note) as Layer[];
+    expect(layer!.props.getBackgroundColor[3]).toBe(0);
+  });
+
+  it("is emphasised with a border on one datum", () => {
+    const [layer] = buildSelectionLayers(note) as Layer[];
+    expect(layer!.id).toContain("-#detail#");
+    expect(layer!.props.data).toHaveLength(1);
+    expect(layer!.props.background).toBe(true);
+  });
+
+  it("previews the draft as the user types, with a prompt before the first character", () => {
+    const options = { cursor: null, closeable: false, polylineWidth: 4 };
+    const empty = buildDraftLayers({
+      ...options,
+      draft: { tool: "text", points: [[5, 6]], text: "" },
+    }) as Layer[];
+    expect(empty).toHaveLength(1);
+    expect(empty[0]!.props.data[0]!.text).toMatch(/^Type text/);
+    const typed = buildDraftLayers({
+      ...options,
+      draft: { tool: "text", points: [[5, 6]], text: "hello" },
+    }) as Layer[];
+    expect(typed[0]!.props.data[0]!.text).toBe("hello");
+  });
+});
+
+// Every kind the viewer can author must be drawn, and must be found by a click.
+// `roiRing`/`roiPath`/`hitsRoi` fall through to null/false for a kind they do not
+// know, so a kind added to the union compiles and then silently vanishes from the
+// canvas; this is what notices.
+describe("every geometry kind", () => {
+  const KINDS: RoiGeometry[] = [
+    { kind: "point", at: { x: 10, y: 10 } },
+    { kind: "rectangle", topLeft: { x: 8, y: 8 }, bottomRight: { x: 12, y: 12 } },
+    { kind: "ellipse", center: { x: 10, y: 10 }, radius: { x: 3, y: 2 }, rotation: 0 },
+    { kind: "polygon", points: [{ x: 8, y: 8 }, { x: 12, y: 8 }, { x: 10, y: 13 }] },
+    { kind: "polyline", points: [{ x: 8, y: 10 }, { x: 12, y: 10 }], width: 2 },
+    { kind: "text", at: { x: 9, y: 9 }, text: "note" },
+  ];
+
+  it.each(KINDS.map((g) => [g.kind, g] as const))("%s is drawn, selectable and hit", (_k, g) => {
+    const one = roi({ geometry: g });
+    expect(
+      buildRoiLayers({ rois: [one], currentPlane: {}, visibleSets: null, visible: true }),
+    ).not.toHaveLength(0);
+    expect(buildSelectionLayers(one)).not.toHaveLength(0);
+    expect(hitsRoi(one, [10, 10], 1)).toBe(true);
+    expect(hitsRoi(one, [500, 500], 1)).toBe(false);
   });
 });
