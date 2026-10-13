@@ -797,7 +797,7 @@ class TestOpenTimeClear:
     def test_a_catalog_from_a_newer_build_is_left_untouched(self, tmp_path):
         """The refusal promises exactly that, so the clear must come after it."""
         from biopb_tensor_server.core.errors import AnnotationStoreError
-        from biopb_tensor_server.serving.metadata_db import _ROI_SCHEMA_VERSION
+        from biopb_tensor_server.serving.roi_store import _ROI_SCHEMA_VERSION
 
         store = tmp_path / "catalog.duckdb"
         db = MetadataDatabase(store_path=store)
