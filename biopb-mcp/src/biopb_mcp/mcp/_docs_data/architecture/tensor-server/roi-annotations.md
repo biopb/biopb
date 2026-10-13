@@ -6,7 +6,7 @@ description: "ROI annotations: Experimental. The ROI annotation schema and wire 
 
 **Experimental.** The ROI annotation schema and wire types may still change without notice.
 
-A user draws 2-D ROIs (points, polygons, rectangles, ellipses, polylines) on
+A user draws 2-D ROIs (points, polygons, rectangles, ellipses, polylines, text) on
 a tensor in the viewer SPA; they persist across restarts in a `rois` table
 in the tensor server's DuckDB catalog, reached over a small Flight action
 set and re-exposed by the HTTP sidecar.
@@ -22,7 +22,10 @@ geometry is `biopb.image.ROI` (`proto/biopb/image/roi.proto`), reused as-is;
 `RoiAnnotation`, is new.
 
 Only the 2-D vector arms are accepted: `point`, `rectangle`, `ellipse`,
-`polygon`, `polyline`. A `mask` (a `BinData` bitmap, hundreds of KB, past
+`polygon`, `polyline`, `text`. A `text` ROI (`Caption`) is a note written on
+the image: its text is non-empty, at most 2000 characters, newlines normalised
+to `\n`, and its bbox is its anchor, because the text's extent depends on font
+and zoom. A `mask` (a `BinData` bitmap, hundreds of KB, past
 "annotation scale") or `mesh` (3-D, where plane pinning has no meaning) is
 rejected but stays in the proto, so accepting one later needs no wire
 change.
@@ -68,7 +71,7 @@ CREATE TABLE rois (
                                          -- and anchors re-attach. NULL until first seen
     set_name   TEXT NOT NULL DEFAULT 'default',
     label      TEXT,                    -- user class/name
-    shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline
+    shape_kind TEXT NOT NULL,           -- point|rectangle|ellipse|polygon|polyline|text
     plane      MAP(UINTEGER, UINTEGER), -- axis -> index; absent key = all indices
     bbox       DOUBLE[4],               -- [x0,y0,x1,y1], level-0 px, derived server-side
     geometry   TEXT NOT NULL,           -- biopb.image.ROI as canonical proto3 JSON
