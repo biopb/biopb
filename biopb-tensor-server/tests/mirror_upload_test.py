@@ -172,3 +172,68 @@ def test_an_upstream_scratch_source_is_not_uploadable_through_a_mirror(tmp_path)
                 dim_labels=["y", "x"],
             )
         )
+
+
+class TestWriteTicketChecks:
+    """What the mirror itself judges of a write ticket; the upstream judges the rest."""
+
+    @staticmethod
+    def _adapter():
+        # Never dialed.
+        return RemoteTensorAdapter("lab__img", "grpc://localhost:1", "img")
+
+    @staticmethod
+    def _bounds():
+        from biopb.tensor.ticket_pb2 import ChunkBounds
+
+        return ChunkBounds(start=[0, 0], stop=[4, 4])
+
+    def _chunk_id(self):
+        from biopb_tensor_server.core.chunk import encode_chunk_id
+
+        return encode_chunk_id("img", self._bounds())
+
+    def test_a_current_envelope_passes_whatever_the_mirrors_version(self):
+        from biopb_tensor_server.core.chunk import encode_proxy_envelope
+
+        envelope = encode_proxy_envelope(
+            self._chunk_id(), "lab__img", b"a-version-the-mirror-no-longer-has"
+        )
+        self._adapter().check_write_ticket(envelope)
+
+    def test_a_bare_chunk_id_is_refused(self):
+        with pytest.raises(flight.FlightServerError, match="non-envelope"):
+            self._adapter().check_write_ticket(self._chunk_id())
+
+    def test_a_foreign_epoch_is_stale(self, monkeypatch):
+        from biopb_tensor_server.core import chunk
+        from biopb_tensor_server.core.errors import StaleChunkError
+
+        monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", 2)
+        envelope = chunk.encode_proxy_envelope(self._chunk_id(), "lab__img", None)
+        monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", 3)
+        with pytest.raises(StaleChunkError):
+            self._adapter().check_write_ticket(envelope)
+
+    def test_a_scaled_inner_is_refused(self):
+        from biopb_tensor_server.core.chunk import (
+            encode_chunk_id_with_scale,
+            encode_proxy_envelope,
+        )
+
+        scaled = encode_chunk_id_with_scale("img", self._bounds(), (2, 2))
+        envelope = encode_proxy_envelope(scaled, "lab__img", None)
+        with pytest.raises(flight.FlightServerError, match="scaled"):
+            self._adapter().check_write_ticket(envelope)
+
+
+def test_a_status_change_on_an_upstream_scratch_mirror_is_refused():
+    from biopb.tensor.ticket_pb2 import SetUploadStatus
+
+    adapter = RemoteTensorAdapter(
+        "lab__scratch", "grpc://localhost:1", SCRATCH_SOURCE_ID
+    )
+    with pytest.raises(flight.FlightServerError, match="scratch"):
+        adapter.forward_set_upload_status(
+            SetUploadStatus(array_id="lab__scratch/@fields/x")
+        )

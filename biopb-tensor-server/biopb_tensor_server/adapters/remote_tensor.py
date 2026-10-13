@@ -90,6 +90,7 @@ from biopb_tensor_server.core.chunk import (
     envelope_inner_is_ticket,
     expand_identity,
     is_proxy_envelope,
+    is_scaled_chunk,
     peel_proxy_envelope,
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
@@ -1284,12 +1285,7 @@ class RemoteTensorAdapter(TensorAdapter):
         upstream's refusal (not in write mode, a read-only token, a taken name)
         is raised as it came.
         """
-        if self._upstream_source_id == SCRATCH_SOURCE_ID:
-            raise flight.FlightServerError(
-                f"add_tensor: {self.source_id!r} is another server's scratch "
-                f"source, whose tensors expire on that server's clock. Upload to "
-                f"that server directly, or use {SCRATCH_SOURCE_ID!r} here."
-            )
+        self._require_not_upstream_scratch("add_tensor")
         scheme, _, local_id = req_desc.array_id.partition("://")
         up = TensorDescriptor()
         up.CopyFrom(req_desc)
@@ -1299,10 +1295,25 @@ class RemoteTensorAdapter(TensorAdapter):
 
     def forward_set_upload_status(self, req: SetUploadStatus) -> bytes:
         """Forward a ``set_upload_status`` (a discard included); the upstream's reply."""
+        self._require_not_upstream_scratch("set_upload_status")
         up = SetUploadStatus()
         up.CopyFrom(req)
         up.array_id = self._to_upstream_array_id(req.array_id)
         return self._upstream_action("set_upload_status", up.SerializeToString())
+
+    def _require_not_upstream_scratch(self, verb: str) -> None:
+        """Refuse an upload verb on a mirror of the upstream's scratch source.
+
+        The mirror enumerators never produce one; this covers a hand-built
+        adapter. Its tensors expire on the upstream's clock, so the producer is
+        sent there.
+        """
+        if self._upstream_source_id == SCRATCH_SOURCE_ID:
+            raise flight.FlightServerError(
+                f"{verb}: {self.source_id!r} is another server's scratch source, "
+                f"whose tensors expire on that server's clock. Upload to that "
+                f"server directly, or use {SCRATCH_SOURCE_ID!r} here."
+            )
 
     def check_write_ticket(self, chunk_id: bytes) -> None:
         """Reject a chunk write this mirror cannot route, before any I/O.
@@ -1319,11 +1330,19 @@ class RemoteTensorAdapter(TensorAdapter):
                 f"proxy source {self.source_id} received a non-envelope chunk_id; "
                 f"re-open the tensor to refresh."
             )
-        if peel_proxy_envelope(chunk_id)[1] != current_epoch():
+        _route, epoch, _version, inner = peel_proxy_envelope(chunk_id)
+        if epoch != current_epoch():
             raise StaleChunkError(
                 f"chunk_id for {self.array_id!r} was minted under another serving "
                 "epoch; re-request the write plan (GetFlightInfo).",
                 reason="stale_content_version",
+            )
+        # A scaled ticket names a downsampled view with no store behind it; the
+        # upstream refuses one too, but a write is not left to a peer's check.
+        if not envelope_inner_is_ticket(chunk_id) and is_scaled_chunk(inner):
+            raise flight.FlightServerError(
+                "DoPut: a scaled ticket is not writable. Plan the write with "
+                "GetFlightInfo carrying no scale_hint."
             )
 
     def forward_chunk_put(
