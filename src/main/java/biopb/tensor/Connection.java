@@ -46,7 +46,7 @@ public final class Connection implements AutoCloseable {
     private final DataPlaneDiscovery discovery;
     private final LongConsumer sleeper;
     /** Where first-use trust remembers pins; null is the shared file in the state directory. */
-    private final TlsPinStore pins;
+    private TlsPinStore pins;
 
     private volatile TensorFlightClient client;
     private volatile String url;
@@ -74,10 +74,12 @@ public final class Connection implements AutoCloseable {
         this.pins = pins;
     }
 
-    private TlsPinStore pinStore() {
-        return pins != null
-                ? pins
-                : new FileTlsPinStore(discovery.environment().stateDir().resolve("tls-known-hosts.json"));
+    /** The store for this connection, made on first use so one pin that could not be written is held on every dial. */
+    private synchronized TlsPinStore pinStore() {
+        if (pins == null) {
+            pins = new FileTlsPinStore(discovery.environment().stateDir().resolve("tls-known-hosts.json"));
+        }
+        return pins;
     }
 
     /** The live client, or null until a {@link #connect} succeeds (and again after one fails). */

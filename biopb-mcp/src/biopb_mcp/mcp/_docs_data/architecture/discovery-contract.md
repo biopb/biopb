@@ -83,9 +83,12 @@ pinned `host:port` is a pin mismatch (`TlsPinMismatchError` in Python,
 `TlsPinMismatchException` in Java), never a re-pin; remove the entry to accept a
 legitimately rotated certificate.
 
-A missing, unreadable or malformed file is an empty store. A write reads the file
-again, adds the entry, and replaces the file atomically (a temp file in the same
-directory, then a rename), `0600` on POSIX. Two processes pinning at the same
+A missing, unreadable or malformed file reads as an empty store. A write reads
+the file again, adds the entry, and replaces the file atomically (a temp file in
+the same directory, then a rename), `0600` on POSIX. It refuses to replace a file
+that exists but is not a JSON object, since that would drop every other host's
+pin: Python raises, and Java logs a warning and keeps the pin in memory for the
+process, as it does when the directory cannot be written at all. Two processes pinning at the same
 moment can lose one of the pins; it is pinned again on its next first use.
 
 ## Stability

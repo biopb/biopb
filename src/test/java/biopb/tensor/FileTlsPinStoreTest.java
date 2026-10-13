@@ -83,9 +83,28 @@ public class FileTlsPinStoreTest {
             Assert.assertNull(garbage, store.get("a:1"));
         }
 
-        Files.write(file, "not json".getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    public void aCorruptFileIsNotReplacedAndThePinIsHeldInMemory() throws IOException {
+        Files.createDirectories(file.getParent());
+        for (String garbage : new String[] {"", "not json", "[1, 2]", "{\"a:1\": "}) {
+            Files.write(file, garbage.getBytes(StandardCharsets.UTF_8));
+            FileTlsPinStore store = new FileTlsPinStore(file);
+            store.put("a:1", "pem-a");
+            Assert.assertEquals(garbage, new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
+            Assert.assertEquals("held for this store", "pem-a", store.get("a:1"));
+            Assert.assertNull("not for another process", new FileTlsPinStore(file).get("a:1"));
+        }
+    }
+
+    @Test
+    public void anUnwritableDirectoryDoesNotFailThePin() throws IOException {
+        // A file where the state directory should be: nothing can be created under it.
+        Path blocker = tmp.newFile("state-is-a-file").toPath();
+        FileTlsPinStore store = new FileTlsPinStore(blocker.resolve("tls-known-hosts.json"));
         store.put("a:1", "pem-a");
-        Assert.assertEquals("a put replaces a corrupt file", "pem-a", store.get("a:1"));
+        Assert.assertEquals("pem-a", store.get("a:1"));
     }
 
     @Test
