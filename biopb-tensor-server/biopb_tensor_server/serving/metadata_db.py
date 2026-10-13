@@ -1,38 +1,33 @@
-"""DuckDB metadata database for efficient source filtering.
+"""The server's catalog: a DuckDB database of sources, queryable with SQL.
 
-Provides indexed SQL queries against source metadata for large catalogs
-(>100k sources). Replaces O(n) in-memory scans with indexed DuckDB queries.
-
-Database Schema:
-- sources table with indexed fields (source_id, source_url)
-- JSON column for full metadata access via DuckDB JSON operators
-- Shape summary column for quick size estimates
-- rois table: user-drawn ROI annotations, one row per ROI, anchored on the
-  unversioned array_id
-- decode_rates table: measured full-resolution decode throughput per array_id,
-  the input for cache.cheap_decode_mbps (core/retention.py)
+Tables:
+- ``source_catalog`` and ``catalog_roots``: one row per source and the roots they
+  sit under. Private; the published views read them.
+- ``sources`` and ``source_tree``: the public views (``metadata_json`` for DuckDB
+  JSON operators, a ``tensors`` struct list per source, and each source's place in
+  the catalog tree).
+- ``rois``: user-drawn ROI annotations, one row per ROI, anchored on the
+  unversioned array_id. Its code is in :mod:`roi_store`.
+- ``decode_rates``: measured full-resolution decode throughput per array_id, the
+  input for cache.cheap_decode_mbps (core/retention.py).
 
 Persistence:
 - In memory by default. Given a store_path the connection is file-backed, which
-  is how annotations and decode rates survive a restart.
-- `sources` rides along because DuckDB has one database per connection and the
-  sandbox below blocks ATTACH. It is truncated on open, and the rois table's
-  derived columns are recomputed there.
+  is how annotations, decode rates and (with ``restore_sources``) the source rows
+  survive a restart. The catalog shares the file because DuckDB has one database
+  per connection and the sandbox below blocks ATTACH.
 - The decode rates live here rather than beside the cache segments they describe
   because the cache directory is the operator's to delete: clearing it should
   cost the bytes, not the measurements that took a run to collect.
 
 Security Model:
-- DuckDB connection runs with enable_external_access=False, so all file/network
+- The connection runs with enable_external_access=False, so all file/network
   access (read_csv, read_text, glob, COPY, ATTACH, extension loading) is blocked
   at the engine level. This is the primary defense against file exfiltration.
-- Only the 'sources', 'rois' and 'decode_rates' tables are accessible
-  (keyword/table denylist; defense in depth). 'rois' and 'decode_rates' are
-  readable here for analysis; every write goes through put_rois/delete_rois or
-  save_decode_rates, never through this surface.
-- Forbidden keywords: INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, TRUNCATE, EXECUTE
-- No subqueries referencing external tables
-- Query timeout enforced
+- ``query`` takes one SELECT over ``ALLOWED_TABLES`` and ``ALLOWED_TABLE_FUNCTIONS``,
+  checked on DuckDB's own parse of it (``_validate_query``). ``rois`` and
+  ``decode_rates`` are readable for analysis; every write goes through
+  put_rois/delete_rois or save_decode_rates, never through this surface.
 
 Usage:
     db = MetadataDatabase()
@@ -306,10 +301,10 @@ class _ImportedRoisFailed(Exception):
 
 
 class MetadataDatabase(RoiStoreMixin):
-    """In-memory DuckDB for source metadata filtering.
+    """The catalog database: DuckDB, in memory or in a file.
 
-    Thread-safe: All operations are protected by a lock.
-    Lazy initialization: Database created on first access.
+    Writes take one lock; reads use their own cursors and take none. The
+    connection is opened on first use (or by :meth:`open`).
 
     The metadata DB is mandatory (biopb/biopb#225): it is the canonical
     source-browsing surface (``client.query``), so there is no
@@ -322,6 +317,10 @@ class MetadataDatabase(RoiStoreMixin):
             human-scale: it is the line between an annotation store and an
             object store, and it is what lets the read path be a single
             whole-set fetch.
+        store_path: The file backing the catalog; None keeps it in memory.
+        annotations_enabled: Serve the ``rois`` table and import a file's ROIs.
+        checkpoint_threshold_mb: DuckDB's checkpoint threshold for the file.
+        restore_sources: Keep ``source_catalog`` across a restart.
 
     Example:
         db = MetadataDatabase()
@@ -397,8 +396,6 @@ class MetadataDatabase(RoiStoreMixin):
             "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
         )
 
-        # Pending query results for DoGet (stored by ticket)
-
     def _get_connection(self) -> duckdb.DuckDBPyConnection:
         """Lazy initialization of DuckDB connection.
 
@@ -414,7 +411,7 @@ class MetadataDatabase(RoiStoreMixin):
                     # makes long enough to matter.
                     conn = self._open_database()
                     self._create_schema(conn)
-                    self._reset_derived_state(conn)
+                    self._rederive_roi_columns(conn)
                     self._conn = conn
                     self._initialized = True
                     logger.info(
@@ -439,14 +436,11 @@ class MetadataDatabase(RoiStoreMixin):
     def _connect(self, target: str) -> duckdb.DuckDBPyConnection:
         """Open *target* with external access disabled.
 
-        Disabling it is the real defense against file exfiltration via read_csv
-        / read_text / glob / COPY / ATTACH etc., which the keyword denylist in
-        _validate_query cannot reliably cover (e.g. comma-joins like `FROM
-        sources, read_text('/etc/passwd')` slip past the FROM-only table check).
-        Once disabled it cannot be re-enabled within a running instance, so a
-        `SET enable_external_access=true` in a query is rejected. The server
-        itself needs no external access: it only does parameterized
-        INSERT/DELETE and JSON-operator SELECTs.
+        Disabling it is the defense against file exfiltration via read_csv /
+        read_text / glob / COPY / ATTACH etc., behind the checks in
+        _validate_query. Once disabled it cannot be re-enabled within a running
+        instance, so a `SET enable_external_access=true` in a query is rejected.
+        The server itself needs no external access.
 
         It does not stop DuckDB opening its OWN database file, which is what
         makes a persistent catalog possible without reopening the sandbox.
@@ -540,14 +534,10 @@ class MetadataDatabase(RoiStoreMixin):
         return self._get_connection().cursor()
 
     def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Create the sources and rois tables and their indexes.
+        """Create the catalog tables and views, `rois` and `decode_rates`.
 
-        `sources` is dropped first. It is scan output -- discovery repopulates
-        it, and it was being truncated on open anyway -- so rebuilding it makes
-        a change to its columns free, where IF NOT EXISTS against an older file
-        would silently keep the old shape.
-
-        `rois` cannot be rebuilt, so it is versioned instead: see
+        The views are dropped and rebuilt on every open, so a change to their
+        columns is free. `rois` cannot be rebuilt, so it is versioned instead: see
         :meth:`_reconcile_roi_schema`.
         """
         # `sources` is a view over `source_catalog`, so it goes first. An older
@@ -567,13 +557,11 @@ class MetadataDatabase(RoiStoreMixin):
         conn.execute(_source_tree_view_ddl())
         conn.execute(_confirmation_view_ddl(self.run_epoch))
 
-        # User-drawn ROI annotations, one row per ROI. A sibling table,
-        # deliberately NOT a field inside a source row: sources.metadata_json is
-        # adapter-produced and rewritten by the INSERT OR REPLACE in
-        # sync_source_added(), so an annotation parked there would be destroyed
-        # by the next rescan. Whether the annotations predate this build has to
-        # be asked before the CREATE, which is what makes them indistinguishable
-        # afterwards.
+        # User-drawn ROI annotations, one row per ROI. A sibling table, not a
+        # field of a source row: a source row is rewritten by every
+        # sync_source_added(), which would destroy an annotation parked there.
+        # Whether the table predates this build is asked before the CREATE, which
+        # makes the two cases indistinguishable afterwards.
         had_rois = bool(
             conn.execute(
                 "SELECT 1 FROM duckdb_tables() WHERE table_name = 'rois'"
@@ -623,7 +611,7 @@ class MetadataDatabase(RoiStoreMixin):
             "('decode_rates_schema_version', ?)",
             [str(_DECODE_RATES_SCHEMA_VERSION)],
         )
-        logger.debug("Created sources, rois and decode_rates tables and indexes")
+        logger.debug("Created the catalog, rois and decode_rates tables")
 
     def _create_source_catalog(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create ``source_catalog``: one row per source, whatever kind it is.
@@ -678,26 +666,18 @@ class MetadataDatabase(RoiStoreMixin):
                 -- every other row; metadata_json stays the source's own
                 -- metadata, never an error.
                 unresolved_error VARCHAR,
-                -- Full per-tensor structural info (biopb/biopb#224): one struct
-                -- per tensor, so multi-field / HCS sources are queryable per
-                -- tensor. This is the sole home of shape/dtype -- there is no
-                -- scalar projection column -- so a source-wide answer means
-                -- `tensors[1].dtype` (DuckDB is 1-indexed), empty on an
-                -- unresolved source. Only cheap/structural fields
-                -- (already in the lean ListFlights descriptor) are stored
-                -- here -- the expensive/lazy fields (metadata_json, pyramid,
-                -- physical_scale) are deliberately left out, filled only by
-                -- GetFlightInfo. A single nested column (not a
-                -- child table) keeps the whole row a single-statement upsert, so
-                -- shrinking a source's tensor set can't leave ghost rows and a
-                -- read never straddles a torn sources-tensors join. Unresolved
-                -- cloud sources carry an empty list. Query per tensor with
-                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
-                -- The transfer chunk_shape is deliberately NOT here: it is the
-                -- read plan of the adapter bound to a specific tensor, not a
-                -- catalog fact, and a source-level listing that names one is
-                -- guessing for a scene it never selected (biopb/biopb#812).
-                -- GetFlightInfo answers it, per resolved tensor.
+                -- One struct per tensor (biopb/biopb#224), so multi-field / HCS
+                -- sources are queryable per tensor with UNNEST(tensors) or
+                -- list_filter(tensors, t -> ...). The sole home of shape/dtype:
+                -- a source-wide answer means `tensors[1].dtype` (DuckDB is
+                -- 1-indexed). Empty on an unresolved source.
+                -- Only the cheap structural fields are stored; the lazy ones
+                -- (metadata_json, pyramid, physical_scale) and the transfer
+                -- chunk_shape, which is the read plan of an adapter bound to one
+                -- tensor and not a catalog fact (biopb/biopb#812), come from
+                -- GetFlightInfo. A nested column rather than a child table keeps
+                -- a row a single-statement upsert, so a shrinking tensor set
+                -- leaves no ghost rows.
                 tensors STRUCT(
                     array_id VARCHAR,
                     dim_labels VARCHAR[],
@@ -953,7 +933,7 @@ class MetadataDatabase(RoiStoreMixin):
         adapter: SourceAdapter,
         record: Optional[CatalogRecord] = None,
     ) -> None:
-        """Sync a source to the metadata database (INSERT OR REPLACE upsert).
+        """Write a source's row to the catalog (an upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a
         previously-unresolved cloud source, again when it resolves (the upsert
@@ -979,19 +959,10 @@ class MetadataDatabase(RoiStoreMixin):
         """
         conn = self._get_connection()
 
-        # Read the row's fields off the adapter. This is the ONLY place a
-        # source's catalog row is built, so `SourceRegistry.catalog_tensors` is where the
-        # "no chunk_shape on a catalog entry" invariant is enforced
-        # (biopb/biopb#812).
         source_url = adapter.catalog_url
         source_type = adapter.source_type
         catalog = self._catalog_tensors(source_id, adapter)
-
-        # Full per-tensor structural info (biopb/biopb#224): one struct per
-        # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
-        # pyramid, physical_scale) are omitted -- they belong to the
-        # tensor-bound adapter GetFlightInfo binds. Unresolved cloud sources
-        # have no tensors -> empty list.
+        # Structural fields only; see the `tensors` column.
         tensors = self._tensor_rows(catalog)
 
         # Every source with a claim is persisted; the payload only lets a
@@ -1003,13 +974,10 @@ class MetadataDatabase(RoiStoreMixin):
         if record is not None and record.claim is not None and not record.cloud:
             payload = adapter.catalog_payload()
 
-        # The file's metadata and ROIs (#951), built together by the adapter:
-        # the FORMAT decides whether its file carries annotations, because the
-        # server does not police what registration_record returns -- a `rois` key in
-        # an EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
-        # format meant by it. A server that does not serve the annotation actions
-        # does not parse a file's ROIs either: the rows would be unreadable
-        # through every surface, so the work and the storage buy nothing.
+        # The file's metadata and ROIs (#951), built together by the adapter: the
+        # format decides whether its file carries annotations, since a `rois` key
+        # in an EMD's original_metadata means whatever that format meant by it. A
+        # server not serving the annotation actions does not parse them either.
         registration = adapter.registration_record(
             [(t.array_id, list(t.dim_labels)) for t in catalog],
             import_rois=self._annotations_enabled,
@@ -1032,10 +1000,10 @@ class MetadataDatabase(RoiStoreMixin):
             source_type,
             indexed_at,
             metadata_json,
-            True,  # a source with an adapter is resolved; ``sync_pending_source`` writes the rest
-            None,  # ... and sets the reason
+            True,  # is_resolved: an adapter backs the row
+            None,  # unresolved_reason
             tensors,
-            None,
+            None,  # unresolved_error
         ]
 
         def replace_rois(c: duckdb.DuckDBPyConnection) -> None:
@@ -1751,26 +1719,19 @@ class MetadataDatabase(RoiStoreMixin):
         return sink.getvalue().to_pybytes()
 
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
-        """Return a source's stored metadata as a dict, or ``None`` when empty.
+        """A source's stored metadata as a dict, or ``None`` when it has none.
 
-        The catalog stores ``json.dumps(adapter.registration_record)`` -- the **raw**
-        dict, no envelope -- so the serve path can read metadata back with a
-        cheap local ``SELECT`` instead of recomputing it on the adapter
-        (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
-        the local mirror row directly, never ``adapter.registration_record``). The
-        stored JSON is parsed here so callers get a ready dict.
+        The catalog stores the raw ``adapter.registration_record`` dict as JSON, so
+        the serve path reads metadata back with a local ``SELECT`` rather than
+        recomputing it (biopb/biopb#253), and a remote proxy needs no upstream RPC.
 
-        Returns ``None`` when the source has no usable stored metadata -- which is
-        a legitimate answer, not a failure, so the serve path leaves
-        ``metadata_json`` empty:
-        - the source is absent, or its metadata is SQL NULL (empty is stored as
-          NULL),
-        - the stored value is not valid JSON / not a JSON object.
+        ``None`` is a legitimate answer, not a failure: the source is absent, its
+        metadata is NULL (empty is stored as NULL), or the stored value is not a
+        JSON object.
 
-        **Raises** on a genuine DuckDB read error. The catalog is the mandatory,
-        authoritative source of serve-path metadata (there is no adapter
-        fallback), so a read failure must surface as a failed request rather than
-        be masked as "no metadata". Uses ``cursor()`` for a thread-safe read.
+        **Raises** on a DuckDB read error. The catalog is the only source of
+        serve-path metadata, so a read failure must surface as a failed request
+        rather than be masked as "no metadata".
         """
         try:
             cursor = self._get_cursor()

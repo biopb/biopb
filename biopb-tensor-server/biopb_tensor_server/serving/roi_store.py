@@ -1,9 +1,9 @@
 """The ROI annotation store: schema, migrations, validation and the methods.
 
-User-drawn annotations live in the ``rois`` table of the same DuckDB file as the
-source catalog, so the methods here are a mixin of :class:`MetadataDatabase`
-rather than a store of their own: they share its connection and its write lock,
-and read the catalog's ``sources`` view only to stamp a sighting.
+User-drawn annotations live in the ``rois`` table of the catalog's DuckDB file,
+so the methods are a mixin of :class:`MetadataDatabase`, which owns the
+connection and the write lock. They read the catalog's ``sources`` view only to
+stamp a sighting.
 """
 
 from __future__ import annotations
@@ -38,9 +38,8 @@ logger = logging.getLogger(__name__)
 # Shape of the `rois` table. Bump on any change to it and add the matching entry
 # to _ROI_MIGRATIONS, whose keys are the version each step upgrades FROM.
 #
-# `sources` is deliberately exempt: it is scan output, so it is dropped and
-# recreated on every open and its columns are always this build's. Only the
-# annotations are old enough to need carrying forward.
+# The catalog tables are exempt: they are rebuilt at open (SOURCE_CATALOG_FORMAT),
+# so only the annotations need carrying forward.
 _ROI_SCHEMA_VERSION = 2
 
 
@@ -97,7 +96,7 @@ _ROI_MIGRATIONS: Dict[int, Callable[[duckdb.DuckDBPyConnection], None]] = {
 }
 
 # The `rois` DDL, module level because the schema self-check builds a throwaway
-# copy from it (_expected_roi_columns) rather than keeping a second hand-written
+# copy from it (_verify_roi_columns) rather than keeping a second hand-written
 # column list that the edit forgetting to bump the version would also forget.
 _ROIS_DDL = """
 CREATE TABLE IF NOT EXISTS rois (
@@ -130,8 +129,8 @@ CREATE TABLE IF NOT EXISTS rois (
     -- Grouping key: the "layer" ("nuclei", "hand-drawn").
     set_name TEXT NOT NULL DEFAULT 'default',
     label TEXT,
-    -- point|rectangle|ellipse|polygon, denormalized from the geometry
-    -- for filtering. mask/mesh are rejected on write.
+    -- The geometry's oneof arm (see _ACCEPTED_SHAPES), denormalized for
+    -- filtering.
     shape_kind TEXT NOT NULL,
     -- Sparse plane pin, WIRE AXIS INDEX -> index on that axis. A
     -- dimension ABSENT from the map applies at every index of it, so
@@ -176,25 +175,15 @@ CREATE TABLE IF NOT EXISTS rois (
 # ROI annotation helpers
 # ---------------------------------------------------------------------------
 
-# Only the 2-D vector arms of biopb.image.ROI are stored. `mask` carries a
-# BinData bitmap -- one ROI can be hundreds of KB, so a few thousand of them
-# stop being "annotation scale" in the one dimension the row cap is trying to
-# bound -- and `mesh` is 3-D, where plane pinning has no meaning. Both belong to
-# instance segmentation, which is a label tensor, not this table. The proto
-# keeps every arm, so accepting them later is additive.
 # A client may name its own roi_id, and it becomes half the primary key. Bound
 # it so a pathological key cannot be planted in the catalog.
 _MAX_ROI_ID_LEN = 128
 
 # The HTTP sidecar publishes a content-versioned array_id (`source@token[/field]`,
 # biopb/biopb#780). Per the identity policy in descriptor.proto that form exists
-# ONLY above the Flight wire -- "no adapter, chunk_id, catalog row or descriptor
-# ever carries it" -- but nothing used to enforce it, and the read routes only
-# get it right as a side effect of resolving a descriptor
-# (`_tensor_desc_by_array_id` strips and validates in one step). A store keyed by
-# array_id never resolves anything, so a missed strip was silent: the annotation
-# filed itself under a phantom tensor whose id is never minted again once content
-# changes, with a source_id matching no catalog row.
+# ONLY above the Flight wire. A store keyed by array_id never resolves a
+# descriptor, so a missed strip would be silent: the annotation would file itself
+# under a phantom tensor whose id is never minted again once content changes.
 _VERSION_SEP = "@"
 
 
@@ -214,6 +203,12 @@ def _require_bare_array_id(array_id: str) -> None:
         )
 
 
+# Only the 2-D vector arms of biopb.image.ROI are stored. `mask` carries a
+# BinData bitmap -- one ROI can be hundreds of KB, so a few thousand of them
+# stop being "annotation scale" in the one dimension the row cap is trying to
+# bound -- and `mesh` is 3-D, where plane pinning has no meaning. Both belong to
+# instance segmentation, which is a label tensor, not this table. The proto
+# keeps every arm, so accepting them later is additive.
 _ACCEPTED_SHAPES: Set[str] = {
     "point",
     "rectangle",
@@ -515,11 +510,9 @@ class RoiStoreMixin:
     ) -> None:
         """Bring an existing `rois` table up to this build's shape, or refuse.
 
-        Persistence is what makes this necessary: the schema used to be rebuilt
-        every boot, so changing it cost nothing. Now the file outlives the code,
-        and `CREATE TABLE IF NOT EXISTS` against an older one is a silent no-op
-        -- the server starts, reports SERVING, and every annotation read and
-        write then fails on a missing column.
+        The file outlives the code, and `CREATE TABLE IF NOT EXISTS` against an
+        older one is a silent no-op -- the server starts, reports SERVING, and
+        every annotation read and write then fails on a missing column.
         """
         row = conn.execute(
             "SELECT value FROM catalog_meta WHERE key = 'roi_schema_version'"
@@ -584,26 +577,13 @@ class RoiStoreMixin:
                 f"missing rather than un-run. The file is untouched."
             )
 
-    def _reset_derived_state(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Recompute what a formula owns, once the tables exist.
-
-        Clearing `sources` used to happen here; _create_schema drops and
-        recreates the table instead, which does the same job and additionally
-        keeps its columns current.
-
-        Runs on every open, so a fresh in-memory catalog and a reopened file
-        take one path -- against an empty table it does nothing.
-        """
-        self._rederive_roi_columns(conn)
-
     def _rederive_roi_columns(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Recompute `shape_kind` and `bbox` from each row's stored geometry.
 
         `geometry` is the annotation; these two are `_roi_bbox` output cached in
-        columns for the SQL surface. Deriving them again at open is what keeps
-        that cache honest across a change to the formula -- adding rotation to
-        Ellipse (biopb#935) moved every rotated ellipse's box, and this is the
-        difference between that landing on restart and it needing a migration.
+        columns for the SQL surface. Deriving them again at every open keeps that
+        cache honest across a change to the formula without a migration. Against
+        an empty table it does nothing.
         """
         rows = conn.execute("SELECT array_id, roi_id, geometry FROM rois").fetchall()
         if not rows:
@@ -726,13 +706,11 @@ class RoiStoreMixin:
         conn = self._get_connection()
         source_id = array_id.split("/")[0]
 
-        # The write lock serializes writers; it does NOT make the batch atomic,
-        # because DuckDB autocommits each statement. Without an explicit
-        # transaction a failure partway left the rows written so far behind, and
-        # a concurrent reader (list_rois uses its own cursor and takes no lock)
-        # watched a layer appear row by row. Cursors see the pre-commit snapshot,
-        # so wrapping the whole body gives both all-or-nothing recovery and an
-        # all-or-nothing view.
+        # The write lock serializes writers but does not make the batch atomic:
+        # DuckDB autocommits each statement. The explicit transaction gives both
+        # all-or-nothing recovery and an all-or-nothing view to a concurrent
+        # reader (list_rois takes no lock, and its cursor sees the pre-commit
+        # snapshot).
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
@@ -884,16 +862,10 @@ class RoiStoreMixin:
 
         * refreshes ``source_url`` to whatever the catalog now calls the source,
           which also backfills the NULL a write could not resolve. The catalog's
-          answer wins because this column is a human-readable *label* for a
-          source_id, not an identifier -- nothing matches on it (this statement
-          joins on source_id) -- and a label is only useful if it says what the
-          source is called now. Since the write happens only on presence, the
-          stored value freezes by itself at the last sighting, which is the one a
-          report should show; it used to freeze at the FIRST, so a source that was
-          renamed and later vanished got reported under a name the catalog had
-          abandoned long before it went away. A catalog row that names nothing
-          (NULL or empty) leaves the stored label alone -- an unnamed source is
-          not a rename.
+          answer wins because this column is a *label* for a source_id, not an
+          identifier, and since it is written only on presence it freezes at the
+          last sighting, which is the name a report should show. A catalog row
+          that names nothing (NULL or empty) leaves the stored label alone.
         * stamps ``last_seen_at``. :meth:`mark_sources_seen` is this statement
           over the whole catalog; the difference is only its gate, which a
           *presence* observation does not need -- a conclusion about absence
