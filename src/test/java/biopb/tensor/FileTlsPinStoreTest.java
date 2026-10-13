@@ -42,7 +42,8 @@ public class FileTlsPinStoreTest {
 
     private String resource(String name) throws IOException {
         try (InputStream in = FileTlsPinStoreTest.class.getResourceAsStream("/tls/" + name)) {
-            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            // A Windows checkout may have turned the PEM files' newlines into CRLF.
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8).replace("\r\n", "\n");
         }
     }
 
