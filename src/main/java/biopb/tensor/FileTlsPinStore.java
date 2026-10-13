@@ -31,6 +31,9 @@ public final class FileTlsPinStore implements TlsPinStore {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
+    /** Shared by every store in the process: {@link Connection} makes one per dial. */
+    private static final Object WRITE_LOCK = new Object();
+
     private final Path file;
 
     /** A store over {@code file}; it is created on the first {@link #put}. */
@@ -44,7 +47,13 @@ public final class FileTlsPinStore implements TlsPinStore {
     }
 
     @Override
-    public synchronized void put(String hostPort, String pem) {
+    public void put(String hostPort, String pem) {
+        synchronized (WRITE_LOCK) {
+            write(hostPort, pem);
+        }
+    }
+
+    private void write(String hostPort, String pem) {
         Map<String, String> pins = load();
         pins.put(hostPort, pem);
         JsonObject out = new JsonObject();
