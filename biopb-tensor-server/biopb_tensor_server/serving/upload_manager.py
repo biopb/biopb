@@ -770,6 +770,9 @@ class UploadManager:
         plan's own and no alignment grammar is left for the write path to
         enforce.
 
+        A mirror's chunk (a proxy envelope) is forwarded to its upstream, which
+        owns everything below.
+
         Each source format still owns what it does with the chunk, and an
         upload that is discarded or sealed refuses. Adapters stay
         transport-agnostic, so their errors become Flight errors here.
