@@ -11,10 +11,11 @@
  * in.
  */
 
-import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PathLayer, PolygonLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
 import { pinnableAxes, planePinFor, roiVisibleOnPlane, sliderAxes } from "@biopb/tensor-flight-client";
 import type { RoiAnnotation, RoiGeometry, TileInfo } from "@biopb/tensor-flight-client";
 import { vivLayerId, vivSelection, type SliceIndices } from "./vivUtils";
+import { CAPTION_LINE_HEIGHT, CAPTION_SIZE_PX } from "./roiCaption";
 import { CLOSE_HANDLE_PX, type RoiDraft } from "./roiDraft";
 import { isSetShown } from "./roiSets";
 
@@ -104,7 +105,65 @@ const AREA_ALPHA = 40;
 const POINT_AREA_ALPHA = 90;
 const OUTLINE_ALPHA = 230;
 const OUTLINE_PX = 1.5;
+/** Caption text outline width, in SDF pixels, and its backing's opacity (0-255). */
+const CAPTION_OUTLINE_WIDTH = 4;
+const CAPTION_BACKING_ALPHA = 140;
 const SELECTED_OUTLINE_PX = 3;
+
+/** The geometry's text and anchor, for the layers that draw captions. */
+interface CaptionDatum {
+  at: XY;
+  text: string;
+  color: [number, number, number, number];
+  /** Border drawn round the block: how a selected caption is emphasised. */
+  border?: [number, number, number, number];
+}
+
+/**
+ * A layer of captions.
+ *
+ * Screen-sized, like the point marker, so it stays readable as the user zooms.
+ * The block's top-left is the anchor and lines run down from it. Over
+ * microscopy there is no background to choose a colour against, so the text
+ * has an opaque dark outline and sits on a half-transparent dark backing:
+ * legible on any pixels, with the image still showing through. A thinner or
+ * more transparent outline disappears into sensor noise; a fully opaque
+ * backing would hide the pixels the caption is about.
+ * `characterSet: "auto"` builds the glyph atlas from the text itself, so
+ * non-Latin captions render rather than falling back to blanks.
+ */
+function captionLayer(id: string, data: CaptionDatum[], pickable = false): unknown {
+  const bordered = data.some((d) => d.border);
+  return new TextLayer({
+    id,
+    data,
+    pickable,
+    getPosition: (d: CaptionDatum) => d.at,
+    getText: (d: CaptionDatum) => d.text,
+    getColor: (d: CaptionDatum) => d.color,
+    getSize: CAPTION_SIZE_PX,
+    sizeUnits: "pixels",
+    lineHeight: CAPTION_LINE_HEIGHT,
+    getTextAnchor: "start",
+    getAlignmentBaseline: "top",
+    characterSet: "auto",
+    fontSettings: { sdf: true },
+    // A bordered layer is the selection's, drawn over the overlay's own copy of
+    // the text, so its glyphs are invisible: drawn twice they would composite
+    // into a bolder caption than the unselected ones.
+    outlineWidth: bordered ? 0 : CAPTION_OUTLINE_WIDTH,
+    outlineColor: [0, 0, 0, 255],
+    background: true,
+    backgroundPadding: [3, 2],
+    getBackgroundColor: [0, 0, 0, bordered ? 0 : CAPTION_BACKING_ALPHA],
+    ...(bordered
+      ? {
+          getBorderColor: (d: CaptionDatum) => d.border ?? [0, 0, 0, 0],
+          getBorderWidth: SELECTED_OUTLINE_PX,
+        }
+      : {}),
+  });
+}
 
 export function setColor(setName: string): [number, number, number] {
   let hash = 0;
@@ -250,6 +309,15 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
     .map((roi) => ({ roi, path: roiPath(roi.geometry) }))
     .filter((entry): entry is { roi: RoiAnnotation; path: XY[] } => entry.path !== null);
   const points = shown.filter((roi) => roi.geometry.kind === "point");
+  const captions: CaptionDatum[] = [];
+  for (const roi of shown) {
+    if (roi.geometry.kind !== "text") continue;
+    captions.push({
+      at: [roi.geometry.at.x, roi.geometry.at.y],
+      text: roi.geometry.text,
+      color: [...setColor(roi.setName), 255],
+    });
+  }
 
   const layers: unknown[] = [];
 
@@ -330,6 +398,10 @@ export function buildRoiLayers(options: RoiLayerOptions): unknown[] {
     );
   }
 
+  if (captions.length > 0) {
+    layers.push(captionLayer(roiLayerId("captions"), captions));
+  }
+
   return layers;
 }
 
@@ -363,6 +435,22 @@ export function buildSelectionLayers(roi: RoiAnnotation | null): unknown[] {
           d.geometry.kind === "point" ? [d.geometry.at.x, d.geometry.at.y] : [0, 0],
         getLineColor: SELECTED_COLOR,
       }),
+    ];
+  }
+
+  if (roi.geometry.kind === "text") {
+    // The block gets a border; the text underneath is already drawn by the
+    // overlay, and drawn again here only because a border belongs to a layer
+    // of text.
+    return [
+      captionLayer(roiLayerId("selection-caption"), [
+        {
+          at: [roi.geometry.at.x, roi.geometry.at.y],
+          text: roi.geometry.text,
+          color: [0, 0, 0, 0],
+          border: SELECTED_COLOR,
+        },
+      ]),
     ];
   }
 
@@ -433,6 +521,23 @@ export interface DraftLayerOptions {
 export function buildDraftLayers(options: DraftLayerOptions): unknown[] {
   const { draft, cursor, closeable, polylineWidth } = options;
   if (!draft || draft.points.length === 0) return [];
+
+  if (draft.tool === "text") {
+    const at = draft.points[0] as XY;
+    const typed = draft.text;
+    // The prompt stands where the text will, so the click visibly landed. It is
+    // not a marker: it is the placeholder of the field the user is about to type
+    // in, and it goes away with the first character.
+    return [
+      captionLayer(roiLayerId("draft-caption"), [
+        {
+          at,
+          text: typed === "" ? "Type text\u2026" : typed,
+          color: typed === "" ? [250, 204, 21, 140] : DRAFT_COLOR,
+        },
+      ]),
+    ];
+  }
 
   // A polyline previews as the band it will become -- same world units, same
   // area alpha -- because the width is the pixels it claims, and tracing at a

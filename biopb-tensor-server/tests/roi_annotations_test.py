@@ -15,10 +15,20 @@ from unittest import mock
 import duckdb
 import pyarrow.flight as flight
 import pytest
-from biopb.image import ROI, Ellipse, Mask, Point, Polygon, Polyline, Rectangle
+from biopb.image import (
+    ROI,
+    Caption,
+    Ellipse,
+    Mask,
+    Point,
+    Polygon,
+    Polyline,
+    Rectangle,
+)
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.errors import AnnotationStoreError
+from biopb_tensor_server.core.registration import MAX_CAPTION_LEN
 from biopb_tensor_server.serving import metadata_db
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from google.protobuf import json_format
@@ -228,6 +238,36 @@ class TestStore:
         stroke = ROI(polyline=Polyline(points=[Point(x=1, y=1)]))
         with pytest.raises(ValueError, match="at least 2 points"):
             db.put_rois(ARRAY_ID, [_annotation(roi=stroke)])
+
+    def test_caption_round_trips_with_newlines_normalised(self):
+        db = MetadataDatabase()
+        note = ROI(text=Caption(at=Point(x=4, y=5), text="mitotic\r\nlate\rstage"))
+        sent = _annotation(roi=note, label="note")
+        db.put_rois(ARRAY_ID, [sent])
+
+        (got,), _ = db.list_rois(ARRAY_ID)
+        assert got.roi.WhichOneof("shape") == "text"
+        assert got.roi.text.text == "mitotic\nlate\nstage"
+        assert (got.roi.text.at.x, got.roi.text.at.y) == (4, 5)
+        # The caller's message is not edited under it.
+        assert "\r" in sent.roi.text.text
+        row = db._get_cursor().execute("SELECT shape_kind, bbox FROM rois").fetchone()
+        assert row[0] == "text"
+        # The anchor alone: the text's extent depends on font and zoom.
+        assert list(row[1]) == [4, 5, 4, 5]
+
+    @pytest.mark.parametrize("text", ["", "  \n\t"])
+    def test_a_blank_caption_is_refused(self, text):
+        db = MetadataDatabase()
+        note = ROI(text=Caption(at=Point(x=1, y=1), text=text))
+        with pytest.raises(ValueError, match="empty"):
+            db.put_rois(ARRAY_ID, [_annotation(roi=note)])
+
+    def test_an_overlong_caption_is_refused(self):
+        db = MetadataDatabase()
+        note = ROI(text=Caption(text="x" * (MAX_CAPTION_LEN + 1)))
+        with pytest.raises(ValueError, match="longer than"):
+            db.put_rois(ARRAY_ID, [_annotation(roi=note)])
 
     def test_degenerate_polygon_is_refused(self):
         db = MetadataDatabase()

@@ -16,11 +16,11 @@ export interface RoiPoint {
 }
 
 /**
- * The five 2-D vector arms the server accepts. `mask` and `mesh` exist in
+ * The six 2-D vector arms the server accepts. `mask` and `mesh` exist in
  * `biopb.image.ROI` but are rejected by the store -- instance segmentation is a
  * label tensor, not an annotation set.
  */
-export type RoiShapeKind = "point" | "rectangle" | "ellipse" | "polygon" | "polyline";
+export type RoiShapeKind = "point" | "rectangle" | "ellipse" | "polygon" | "polyline" | "text";
 
 export type RoiGeometry =
   | { kind: "point"; at: RoiPoint }
@@ -29,7 +29,13 @@ export type RoiGeometry =
   | { kind: "ellipse"; center: RoiPoint; radius: RoiPoint; rotation: number }
   | { kind: "polygon"; points: RoiPoint[] }
   /** `width` is geometry, not styling: the stroke has real extent in pixels. */
-  | { kind: "polyline"; points: RoiPoint[]; width: number };
+  | { kind: "polyline"; points: RoiPoint[]; width: number }
+  /**
+   * A note written on the image. `at` is the top-left of the text block and
+   * `text` is non-empty, with `\n` between lines. Its extent depends on the font
+   * and the zoom, so it has no pixel box beyond the anchor.
+   */
+  | { kind: "text"; at: RoiPoint; text: string };
 
 export interface RoiAnnotation {
   roiId: string;

@@ -29,11 +29,21 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.image.roi_pb2 import ROI, Ellipse, Point, Polygon, Polyline, Rectangle
+from biopb.image.roi_pb2 import (
+    ROI,
+    Caption,
+    Ellipse,
+    Point,
+    Polygon,
+    Polyline,
+    Rectangle,
+)
 
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.registration import (
+    MAX_CAPTION_LEN,
     RegistrationRecord,
+    normalize_caption,
     strip_mask_bindata,
 )
 
@@ -201,6 +211,8 @@ def _coords(roi: ROI) -> Tuple[float, ...]:
     if kind == "ellipse":
         e = roi.ellipse
         return (e.center.x, e.center.y, e.radius.x, e.radius.y, e.rotation)
+    if kind == "text":
+        return (roi.text.at.x, roi.text.at.y)
     points = roi.polygon.points if kind == "polygon" else roi.polyline.points
     return tuple(v for p in points for v in (p.x, p.y))
 
@@ -230,7 +242,15 @@ def _geometry(kind: str, shape: Mapping[str, Any]) -> Optional[ROI]:
         return float(shape.get(key) or 0.0)
 
     if kind in ("points", "labels"):
-        return ROI(point=_pt(_map(m, f("x"), f("y"))))
+        at = _pt(_map(m, f("x"), f("y")))
+        text = (
+            normalize_caption(str(shape.get("text") or "")) if kind == "labels" else ""
+        )
+        # A label with no text still marks a place. Cut at the store's bound
+        # rather than lose the whole set to it.
+        if text.strip():
+            return ROI(text=Caption(at=at, text=text[:MAX_CAPTION_LEN]))
+        return ROI(point=at)
 
     if kind == "lines":
         # No Line arm in roi.proto, and a 2-point polyline is the same geometry.
@@ -510,7 +530,11 @@ def _annotation(
         set_name=OME_SET_NAME,
         # str(): a name is text in the schema but this dict came from a file,
         # and proto refuses a non-string outright.
-        label=str(ome_roi.get("name") or shape.get("text") or ""),
+        label=str(
+            ome_roi.get("name")
+            or ("" if geometry.HasField("text") else shape.get("text"))
+            or ""
+        ),
         roi=geometry,
         props_json=_props(ome_roi, shape) or "",
         rev=1,

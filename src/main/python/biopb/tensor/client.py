@@ -589,9 +589,10 @@ class TensorFlightClient:
         Geometry is ``biopb.image.ROI`` in LEVEL-0 pixel coordinates -- a shape
         drawn on a downsampled level must be scaled up by the caller. Only the
         2-D vector arms are accepted (point / rectangle / ellipse / polygon /
-        polyline -- the scribble stroke, whose ``width`` is geometry and widens
-        its bounding box); a mask or mesh is refused, because instance
-        segmentation belongs in a label tensor.
+        polyline / text); a polyline is the scribble stroke, whose ``width`` is
+        geometry and widens its bounding box, and a text is a non-empty
+        ``Caption`` anchored at its top-left. A mask or mesh is refused, because
+        instance segmentation belongs in a label tensor.
 
         An annotation with an empty ``roi_id`` is created (the server mints a
         uuid4); one that names an existing id is updated. The batch is applied

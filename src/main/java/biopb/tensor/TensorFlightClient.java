@@ -930,7 +930,7 @@ public class TensorFlightClient implements AutoCloseable {
      * <p>Geometry is {@code biopb.image.ROI} in LEVEL-0 pixel coordinates -- a
      * shape drawn on a downsampled level must be scaled up by the caller. Only
      * the 2-D vector arms are accepted (point / rectangle / ellipse / polygon /
-     * polyline); a mask or mesh is refused, because instance segmentation
+     * polyline / text); a mask or mesh is refused, because instance segmentation
      * belongs in a label tensor.
      *
      * <p>An annotation with an empty {@code roi_id} is created (the server mints

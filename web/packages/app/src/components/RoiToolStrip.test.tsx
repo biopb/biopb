@@ -10,6 +10,7 @@ const render = (over: Partial<RoiToolStripViewProps> = {}) =>
       polylineWidth={4}
       onSetTool={() => {}}
       onSetPolylineWidth={() => {}}
+      onSetDraftText={() => {}}
       onFinish={() => {}}
       onCancel={() => {}}
       {...over}
@@ -58,5 +59,40 @@ describe("RoiToolStripView", () => {
 
   it("always offers Cancel while drawing", () => {
     expect(render({ draft: { tool: "polygon", points: [[0, 0]] } })).toContain("Cancel");
+  });
+});
+
+describe("the text tool", () => {
+  it("offers itself, and says where to click while nothing is placed", () => {
+    expect(render()).toContain('title="Text (click where it goes, then type)"');
+    expect(render({ tool: "text" })).toContain("Click the image where the text goes.");
+    expect(render({ tool: "polygon" })).not.toContain("where the text goes");
+  });
+
+  it("asks for the text once the anchor is placed, and shows what is typed", () => {
+    const html = render({
+      tool: "text",
+      draft: { tool: "text", points: [[1, 1]], text: "late\nstage" },
+    });
+    expect(html).toContain("<textarea");
+    expect(html).toContain("late\nstage");
+    expect(html).toContain('maxLength="2000"');
+    // No point count: a caption has one anchor and the count would only confuse.
+    expect(html).not.toContain("points");
+  });
+
+  it("holds Finish until there is text", () => {
+    const blank = render({ tool: "text", draft: { tool: "text", points: [[1, 1]], text: "" } });
+    expect(blank).toMatch(/<button[^>]*disabled=""[^>]*>Finish/);
+    const typed = render({ tool: "text", draft: { tool: "text", points: [[1, 1]], text: "x" } });
+    expect(typed).not.toMatch(/<button[^>]*disabled=""[^>]*>Finish/);
+  });
+
+  it("shows no text box for the other tools", () => {
+    const html = render({
+      tool: "polygon",
+      draft: { tool: "polygon", points: [[0, 0], [1, 1]] },
+    });
+    expect(html).not.toContain("<textarea");
   });
 });

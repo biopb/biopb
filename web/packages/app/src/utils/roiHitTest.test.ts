@@ -180,3 +180,53 @@ describe("roiAt", () => {
     expect(roiAt(point, [justOutside, 0], 4)?.roiId).toBe("r");
   });
 });
+
+describe("a caption", () => {
+  const at = { x: 100, y: 100 };
+  const one = roi({ kind: "text", at, text: "mitotic" });
+  const three = roi({ kind: "text", at, text: "a\nb\nc" });
+
+  it("hits anywhere in its block, which grows down and right from the anchor", () => {
+    expect(hitsRoi(one, [105, 108], 0)).toBe(true);
+    expect(hitsRoi(one, [99, 99], 0)).toBe(false);
+    expect(hitsRoi(one, [100, 90], 0)).toBe(false);
+    expect(hitsRoi(one, [60, 100], 0)).toBe(false);
+  });
+
+  it("is taller with more lines", () => {
+    // Below one line, inside three.
+    expect(hitsRoi(one, [101, 140], 0)).toBe(false);
+    expect(hitsRoi(three, [101, 140], 0)).toBe(true);
+  });
+
+  it("is a fixed size on screen, so it covers more image the further out the user zooms", () => {
+    // A point 80 image px to the right: 80 screen px at scale 1, 8 at scale 0.1.
+    expect(hitsRoi(one, [180, 105], 0, 1)).toBe(false);
+    expect(hitsRoi(one, [180, 105], 0, 20)).toBe(true);
+  });
+
+  it("gives its edge the slop", () => {
+    expect(hitsRoi(one, [97, 101], 5)).toBe(true);
+    expect(hitsRoi(one, [97, 101], 1)).toBe(false);
+  });
+
+  it("is found by roiAt at the scale the click came through", () => {
+    expect(roiAt([one], [104, 104], 1)?.roiId).toBe("r");
+    expect(roiAt([one], [300, 300], 1)).toBeNull();
+  });
+
+  it("counts emoji and astral CJK as a full em too", () => {
+    const emoji = roi({ kind: "text", at, text: "\u{1F600}\u{1F600}\u{1F600}" });
+    const plain = roi({ kind: "text", at, text: "abc" });
+    expect(hitsRoi(emoji, [138, 105], 0)).toBe(true);
+    expect(hitsRoi(plain, [138, 105], 0)).toBe(false);
+  });
+
+  it("counts a wide character as a full em", () => {
+    const wide = roi({ kind: "text", at, text: "细胞核" });
+    const narrow = roi({ kind: "text", at, text: "abc" });
+    // 3 em against 1.8 em: x = 138 is inside the first block only.
+    expect(hitsRoi(wide, [138, 105], 0)).toBe(true);
+    expect(hitsRoi(narrow, [138, 105], 0)).toBe(false);
+  });
+});
