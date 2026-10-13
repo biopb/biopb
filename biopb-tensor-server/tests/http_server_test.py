@@ -3801,8 +3801,7 @@ def _tree_catalog(tmp_path, urls, pending=(), empty=(), **db_kwargs):
         if not url:
             # A source with no url at all: an upload.
             db._get_connection().execute(
-                "UPDATE source_catalog SET rel = '', tree_dir = '', tree_name = '' "
-                "WHERE source_id = ?",
+                "UPDATE source_catalog SET rel = '' WHERE source_id = ?",
                 [sid],
             )
     for sid, url in dict(pending).items():

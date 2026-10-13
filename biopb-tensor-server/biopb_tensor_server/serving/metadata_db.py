@@ -80,7 +80,7 @@ from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
 from biopb_tensor_server.serving import catalog_tree
-from biopb_tensor_server.serving.tree_paths import tree_columns
+from biopb_tensor_server.serving.tree_paths import parts_sql
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -104,13 +104,8 @@ _SOURCE_COLUMNS = (
 # none of the roots the server knows (the scratch source, one registered through the
 # API) is under the built-in root with no url of its own, whose rows' ``rel`` is the
 # whole url.
-#
-# ``tree_dir`` and ``tree_name`` are the same url's place in the catalog tree (see
-# ``tree_paths``), kept beside it so a level of the tree is a lookup on them rather
-# than a rewrite of every url. They are a function of the root's url and ``rel``,
-# so they are rewritten when either changes.
 INTERNAL_ROOT_ID = "internal"
-_LOCATION_COLUMN_NAMES = ("root_id", "rel", "tree_dir", "tree_name")
+_LOCATION_COLUMN_NAMES = ("root_id", "rel")
 # The claim, the columns a source with no claim leaves NULL (bar the last).
 _CLAIM_COLUMN_NAMES = (
     "primary_path",
@@ -145,27 +140,25 @@ _UPDATE_SET = ", ".join(f"{c} = ?" for c in _ALL_COLUMN_NAMES[1:])
 # The same, for an ``INSERT ... ON CONFLICT DO UPDATE`` that finds the row there.
 _UPSERT_SET = ", ".join(f"{c} = excluded.{c}" for c in _ALL_COLUMN_NAMES[1:])
 # A write without a record sets the public columns and leaves the location and the
-# claim alone, bar the ``rel`` of a row under the built-in root, which is its url
-# (and so its place in the tree).
+# claim alone, bar the ``rel`` of a row under the built-in root, which is its url.
 _LISTING_COLUMN_NAMES = _ROW_COLUMN_NAMES[2:]
-_INTERNAL_PLACE = ("rel", "tree_dir", "tree_name")
-_LISTING_SET = ", ".join(f"{c} = ?" for c in _LISTING_COLUMN_NAMES) + "".join(
-    f", {c} = CASE WHEN root_id = '{INTERNAL_ROOT_ID}' THEN ? ELSE {c} END"
-    for c in _INTERNAL_PLACE
+_LISTING_SET = (
+    ", ".join(f"{c} = ?" for c in _LISTING_COLUMN_NAMES)
+    + f", rel = CASE WHEN root_id = '{INTERNAL_ROOT_ID}' THEN ? ELSE rel END"
 )
-_LISTING_UPSERT_SET = ", ".join(
-    f"{c} = excluded.{c}" for c in _LISTING_COLUMN_NAMES
-) + "".join(
-    f", {c} = CASE WHEN source_catalog.root_id = '{INTERNAL_ROOT_ID}' "
-    f"THEN excluded.{c} ELSE source_catalog.{c} END"
-    for c in _INTERNAL_PLACE
+_LISTING_UPSERT_SET = (
+    ", ".join(f"{c} = excluded.{c}" for c in _LISTING_COLUMN_NAMES)
+    + f", rel = CASE WHEN source_catalog.root_id = '{INTERNAL_ROOT_ID}' "
+    "THEN excluded.rel ELSE source_catalog.rel END"
 )
 # ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
 # (alias ``r``): the url is the root's, then the row's path beneath it.
-_VIEW_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
-    "source_url",
+_SOURCE_URL_SQL = (
     "CASE WHEN r.root_url = '' THEN c.rel WHEN c.rel = '.' THEN r.root_url "
-    "ELSE r.root_url || '/' || c.rel END AS source_url",
+    "ELSE r.root_url || '/' || c.rel END"
+)
+_VIEW_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
+    "source_url", f"{_SOURCE_URL_SQL} AS source_url"
 ).replace("source_id", "c.source_id", 1)
 # A row shows against its root only: one whose root is gone is not listed.
 _VIEW_FROM = "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id"
@@ -188,9 +181,13 @@ def _source_tree_view_ddl() -> str:
     a viewer lists the source, which a resolved source holding no tensor is not.
     Like ``sources``, a row shows only against its root."""
     return (
-        "CREATE VIEW source_tree AS SELECT c.source_id, c.tree_dir AS dir, "
-        "c.tree_name AS name, (NOT c.is_resolved OR len(c.tensors) > 0) AS visible "
-        + _VIEW_FROM
+        "CREATE VIEW source_tree AS SELECT source_id, "
+        "array_to_string(list_slice(parts, 1, -2), chr(1)) AS dir, "
+        "coalesce(list_extract(parts, -1), '') AS name, visible FROM ("
+        f"SELECT source_id, {parts_sql('url')} AS parts, visible FROM ("
+        f"SELECT c.source_id, {_SOURCE_URL_SQL} AS url, "
+        "(NOT c.is_resolved OR len(c.tensors) > 0) AS visible "
+        f"{_VIEW_FROM}))"
     )
 
 
@@ -828,9 +825,6 @@ class MetadataDatabase:
         self._initialized = False
         # Lists a source's tensors; see bind_registry.
         self._registry: Any = None
-        # Each root's url, which a row's place in the tree depends on. Kept in step
-        # with ``catalog_roots`` by whatever writes it.
-        self._root_urls: Dict[str, str] = {}
         # Counts the writes that change what ``sources`` shows; see
         # ``catalog_generation``.
         self._generation = 0
@@ -1152,10 +1146,6 @@ class MetadataDatabase:
                 -- it; the view makes `source_url` of the two.
                 root_id TEXT NOT NULL,
                 rel TEXT NOT NULL,
-                -- Its place in the catalog tree, from the root's url and `rel`
-                -- (`tree_paths`): the folder, and the name in it.
-                tree_dir TEXT NOT NULL DEFAULT '',
-                tree_name TEXT NOT NULL DEFAULT '',
                 -- The claim, as `SourceClaim` holds it. NULL under a root that is
                 -- not persisted.
                 primary_path TEXT,
@@ -1171,13 +1161,6 @@ class MetadataDatabase:
                 epoch BIGINT NOT NULL DEFAULT 0
             )
         """)
-        # Tree columns are added to an older file here and filled below, once the
-        # roots are known.
-        for column in ("tree_dir", "tree_name"):
-            conn.execute(
-                f"ALTER TABLE source_catalog ADD COLUMN IF NOT EXISTS {column} "
-                "TEXT DEFAULT ''"
-            )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS catalog_roots (
                 root_id TEXT PRIMARY KEY,
@@ -1204,16 +1187,6 @@ class MetadataDatabase:
             "VALUES (?, '', FALSE)",
             [INTERNAL_ROOT_ID],
         )
-        self._root_urls = dict(
-            conn.execute("SELECT root_id, root_url FROM catalog_roots").fetchall()
-        )
-        # Rows without a tree position: a source with a path always has a name.
-        if conn.execute(
-            "SELECT 1 FROM source_catalog WHERE tree_name = '' "
-            "AND rel NOT IN ('', '.') LIMIT 1"
-        ).fetchone():
-            for root_id, root_url in self._root_urls.items():
-                self._retree_root(conn, root_id, root_url)
         row = conn.execute(
             "SELECT value FROM catalog_meta WHERE key = 'run_epoch'"
         ).fetchone()
@@ -1839,66 +1812,15 @@ class MetadataDatabase:
         ).fetchone()
         return None if row is None else row[0]
 
-    def _root_url(self, root_id: str) -> str:
-        """A root's url, for the place its rows take in the tree; "" for a root the
-        catalog does not hold, whose rows the view does not show."""
-        url = self._root_urls.get(root_id)
-        if url is None:
-            url = self._stored_root_url(self._get_cursor(), root_id)
-            if url is None:
-                return ""
-            self._root_urls[root_id] = url
-        return url
-
     @staticmethod
-    def _internal_place(url: str) -> List[str]:
-        """``_INTERNAL_PLACE`` values for a source under the built-in root, whose
-        ``rel`` is its *url*."""
-        return [url, *tree_columns("", url)]
-
     def _upsert_root(
-        self,
-        conn: duckdb.DuckDBPyConnection,
-        root_id: str,
-        root_url: str,
-        persisted: bool,
+        conn: duckdb.DuckDBPyConnection, root_id: str, root_url: str, persisted: bool
     ) -> None:
-        """Write a root row, and move its rows' tree columns if its url changed.
-        Inside the caller's transaction and write lock."""
-        old = self._stored_root_url(conn, root_id)
         conn.execute(
             "INSERT INTO catalog_roots (root_id, root_url, persisted) "
             "VALUES (?, ?, ?) "
             "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
             [root_id, root_url, persisted],
-        )
-        if old != root_url:
-            self._retree_root(conn, root_id, root_url)
-
-    @staticmethod
-    def _retree_root(
-        conn: duckdb.DuckDBPyConnection, root_id: str, root_url: str
-    ) -> None:
-        """Rewrite the tree columns of every row under a root whose url changed (an
-        alias edited, a root that arrived after its rows). Inside the caller's
-        transaction; a no-op for a root with no rows."""
-        rows = conn.execute(
-            "SELECT source_id, rel FROM source_catalog WHERE root_id = ?", [root_id]
-        ).fetchall()
-        if not rows:
-            return
-        ids, dirs, names = [], [], []
-        for source_id, rel in rows:
-            tree_dir, tree_name = tree_columns(root_url, rel)
-            ids.append(source_id)
-            dirs.append(tree_dir)
-            names.append(tree_name)
-        conn.execute(
-            "UPDATE source_catalog SET tree_dir = v.d, tree_name = v.n FROM "
-            "(SELECT unnest(?::VARCHAR[]) AS id, unnest(?::VARCHAR[]) AS d, "
-            "unnest(?::VARCHAR[]) AS n) v WHERE source_catalog.source_id = v.id "
-            "AND (tree_dir IS DISTINCT FROM v.d OR tree_name IS DISTINCT FROM v.n)",
-            [ids, dirs, names],
         )
 
     def _placement(
@@ -1913,14 +1835,10 @@ class MetadataDatabase:
         ``rel``. Without a claim in it the claim columns are NULL.
         """
         if record is None:
-            location = [INTERNAL_ROOT_ID, *self._internal_place(url)]
+            location = [INTERNAL_ROOT_ID, url]
             claim_values = [None] * 5
         else:
-            location = [
-                record.root_id,
-                record.rel,
-                *tree_columns(self._root_url(record.root_id), record.rel),
-            ]
+            location = [record.root_id, record.rel]
             claim = record.claim
             claim_values = (
                 [None] * 5
@@ -1991,7 +1909,7 @@ class MetadataDatabase:
         values = row[:1] + row[2:] + self._placement(record, url, payload)
         if record is None:
             update_set, upsert_set = _LISTING_SET, _LISTING_UPSERT_SET
-            set_values = row[2:] + self._internal_place(url)
+            set_values = row[2:] + [url]
         else:
             update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
@@ -2176,11 +2094,10 @@ class MetadataDatabase:
         with self._write_lock:
             with self._catalog_txn(conn):
                 for source_id, root_id, rel in rows:
-                    tree_dir, tree_name = tree_columns(self._root_url(root_id), rel)
                     conn.execute(
-                        "UPDATE source_catalog SET root_id = ?, rel = ?, "
-                        "tree_dir = ?, tree_name = ? WHERE source_id = ?",
-                        [root_id, rel, tree_dir, tree_name, source_id],
+                        "UPDATE source_catalog SET root_id = ?, rel = ? "
+                        "WHERE source_id = ?",
+                        [root_id, rel, source_id],
                     )
 
     def confirm_root(self, root_id: str) -> None:
@@ -2233,19 +2150,17 @@ class MetadataDatabase:
                 )
                 for root_id, root_url in roots:
                     self._upsert_root(conn, root_id, root_url, True)
-            self._root_urls = {**self._root_urls, **dict(roots)}
 
     def ensure_root(self, root_id: str, root_url: str) -> None:
         """Record a root that is not persisted (a drop, an upstream) before a source
         under it is written, since the view shows a row only against its root. It
         goes at the next open with the rows under it."""
-        if self._root_urls.get(root_id) == root_url:
-            return
         conn = self._get_connection()
         with self._write_lock:
+            if self._stored_root_url(conn, root_id) == root_url:
+                return
             with self._catalog_txn(conn):
                 self._upsert_root(conn, root_id, root_url, False)
-            self._root_urls[root_id] = root_url
 
     def _prepare_imported(
         self,

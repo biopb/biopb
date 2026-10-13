@@ -99,9 +99,8 @@ ask `/api/tile_info/{array_id}` for it.
 gates its pixels), but a `cache:` upload has no catalog row at all — reach one
 through `/api/tile_info/{array_id}`.
 
-**The tree is built per level.** A source's place is stored with its catalog
-row (`source_tree`: `dir`, `name`; `serving/tree_paths.py` holds the rules), from
-its url: `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
+**The tree is built per level.** A source's place is computed from its url by the
+`source_tree` view (`dir`, `name`; `serving/tree_paths.py` holds the rules): `dnd://` is stripped (backslashes become `/`), `scheme://host/path`
 roots at the endpoint `scheme://host` (an empty host, as in `file:///`, is just
 the path), anything else is the string itself; empty segments are dropped. A
 source with no path sits at the top, named by its `source_id`. A level lists

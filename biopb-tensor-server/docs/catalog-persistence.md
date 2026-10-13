@@ -380,9 +380,7 @@ from the rest, and one view publishes both:
   source of truth.
 - **`source_catalog`**: one row per source. The public row columns; `root_id` and `rel` (the
   forward-slashed path under the root, `.` for the root itself; for a row under the built-in
-  root, its whole url) in place of `source_url`; `tree_dir` and `tree_name`, the row's place
-  in the catalog tree (`serving/tree_paths.py`), computed where the row is written from the
-  root's url and `rel` and rewritten when a root's url changes; and, for a source under a persisted root,
+  root, its whole url) in place of `source_url`; and, for a source under a persisted root,
   the private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
   claim-time signature, the adapter `payload`, and the `epoch` of its last write.
   A row is resolved, pending, `needs_recall` or failed. A source has a claim when
@@ -393,8 +391,9 @@ from the rest, and one view publishes both:
   `rel`), which is what `Roots.display_url` gives a local claim and what a mirror's adapter
   shows, so an alias edit of a local root is one `catalog_roots` row and no source row can
   carry a stale url. A row whose root is gone is not listed.
-- **`source_tree(source_id, dir, name, visible)`**: a second published view, a lookup table
-  for browsing. `dir` is the folder's segments joined by `chr(1)` (`''` is the top; the
+- **`source_tree(source_id, dir, name, visible)`**: a second published view, for
+  browsing, computed from the same `source_url` expression so an alias edit moves the tree
+  with it (`tree_paths.parts_sql`). `dir` is the folder's segments joined by `chr(1)` (`''` is the top; the
   endpoint of a `scheme://host` url is one segment, its `://` spelled `chr(2)`), so byte
   order is component order; `name` is the last segment. `visible` is `NOT is_resolved OR
   len(tensors) > 0`: a resolved source with no tensor is not listed. Like `sources`, a row
@@ -437,8 +436,7 @@ queries. It is on `health` and in a query result's schema metadata, and it is wh
 
 **Versioning.** `SOURCE_CATALOG_FORMAT` (in `catalog_meta`) drops `source_catalog` and
 `catalog_roots` at open on a mismatch or a missing key: a rebuild. There is no per-row or
-per-adapter version. A column added to `source_catalog` is added to an existing file at open
-(`ALTER TABLE`) and filled from the roots, as `tree_dir` and `tree_name` were. An additive payload change needs none (a payload missing a key is a
+per-adapter version. An additive payload change needs none (a payload missing a key is a
 miss and the claim is parsed); bump it only when a field changes meaning. Downgrading needs
 one manual step: an older build runs `DROP TABLE IF EXISTS sources` at open, which fails on
 the view, so `DROP VIEW sources` on the file lets it open. The file also holds user ROI

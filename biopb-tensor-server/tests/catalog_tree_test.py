@@ -1,5 +1,5 @@
-"""Where each source sits in the catalog tree (``source_tree``), kept beside the
-row, and the generation that names the catalog's content."""
+"""Where each source sits in the catalog tree (``source_tree``), and the generation
+that names the catalog's content."""
 
 import inspect
 import re
@@ -14,10 +14,8 @@ from biopb_tensor_server.serving.metadata_db import (
 )
 from biopb_tensor_server.serving.tree_paths import (
     SEP,
-    catalog_url,
-    dec,
     enc,
-    tree_columns,
+    parts_sql,
     tree_parts,
 )
 
@@ -37,7 +35,7 @@ def _place(db, source_id):
     return row["dir"], row["name"]
 
 
-class TestTreeColumns:
+class TestSourceTree:
     def test_a_listing_takes_its_place_from_its_url(self):
         db = MetadataDatabase()
         _add(db, "a", "file:///data/exp/a.zarr")
@@ -129,49 +127,6 @@ class TestTreeColumns:
         }
         assert visible == {"a": False, "p": True}
 
-    def test_a_catalog_from_before_the_columns_keeps_its_rows(self, tmp_path):
-        store = tmp_path / "catalog.duckdb"
-        db = MetadataDatabase(store_path=store)
-        db.open()
-        db.sync_roots([("r", "file:///lab")])
-        _add(db, "a", "x", CatalogRecord(None, {}, "r", "d/a.zarr"))
-        db.close()
-
-        raw = duckdb.connect(str(store))
-        for view in ("source_tree", "sources", "source_confirmation"):
-            raw.execute(f"DROP VIEW {view}")
-        raw.execute("ALTER TABLE source_catalog DROP COLUMN tree_dir")
-        raw.execute("ALTER TABLE source_catalog DROP COLUMN tree_name")
-        raw.close()
-
-        db = MetadataDatabase(store_path=store)
-        db.open()
-        try:
-            assert db.query("SELECT source_id FROM sources").num_rows == 1
-            assert _place(db, "a") == (f"lab{SEP}d", "a.zarr")
-        finally:
-            db.close()
-
-    def test_an_unfinished_fill_is_finished_at_the_next_open(self, tmp_path):
-        store = tmp_path / "catalog.duckdb"
-        db = MetadataDatabase(store_path=store)
-        db.open()
-        db.sync_roots([("r", "file:///lab")])
-        _add(db, "a", "x", CatalogRecord(None, {}, "r", "d/a.zarr"))
-        db.close()
-
-        # The columns exist but a crash left them unfilled.
-        raw = duckdb.connect(str(store))
-        raw.execute("UPDATE source_catalog SET tree_dir = '', tree_name = ''")
-        raw.close()
-
-        db = MetadataDatabase(store_path=store)
-        db.open()
-        try:
-            assert _place(db, "a") == (f"lab{SEP}d", "a.zarr")
-        finally:
-            db.close()
-
 
 class TestTreePaths:
     def test_only_a_leading_endpoint_is_one(self):
@@ -185,19 +140,35 @@ class TestTreePaths:
             "img.tif",
         ]
 
-    def test_catalog_url_is_the_views_source_url(self):
-        assert catalog_url("", "a/b") == "a/b"
-        assert catalog_url("file:///r", ".") == "file:///r"
-        assert catalog_url("file:///r", "a/b") == "file:///r/a/b"
-
-    def test_columns_split_the_last_segment_off(self):
-        assert tree_columns("", "file:///a/b/c.zarr") == (f"a{SEP}b", "c.zarr")
-        assert tree_columns("", "file:///c.zarr") == ("", "c.zarr")
-        assert tree_columns("", "") == ("", "")
-
-    def test_an_endpoint_is_one_segment(self):
-        assert tree_parts("grpc://h:1/a") == ["grpc\x02h:1", "a"]
-        assert dec(tree_parts("grpc://h:1/a")[0]) == "grpc://h:1"
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "",
+            "file:///",
+            "file:///a/b/c.zarr",
+            "file:///c.zarr",
+            "file://host/a/b",
+            "dnd://data/exp//a.zarr/",
+            "dnd://data\\exp\\a.zarr",
+            "dnd://data/http://x/img.tif",
+            "grpc://h:1/a",
+            "grpc://h:1",
+            "grpc:///a",
+            "a://",
+            "x://b://c",
+            "rel/path/",
+            "/abs//path/",
+            "a:b://c/d",
+            "plain",
+        ],
+    )
+    def test_the_sql_follows_the_python_rules(self, url):
+        got = (
+            duckdb.connect()
+            .execute(f"SELECT {parts_sql('u')} FROM (SELECT ? AS u)", [url])
+            .fetchone()[0]
+        )
+        assert got == tree_parts(url)
 
 
 def _writers():
@@ -263,9 +234,8 @@ class TestGeneration:
         exempt = {
             "_create_source_catalog",
             "confirm_root",
-            "_retree_root",
-            "_upsert_root",
             "_pending_inserts",
+            "_upsert_root",
         }
         forgot = [
             name

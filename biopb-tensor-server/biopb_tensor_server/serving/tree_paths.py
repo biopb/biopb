@@ -1,8 +1,9 @@
 """Where a source's url sits in the catalog tree.
 
-The one place the rules live on the server. The catalog stores each row's folder
-and name (``source_tree``), computed here when the row is written; the viewer's
-tree routes read them back and never parse a url.
+The one place the rules live on the server. The ``source_tree`` view computes each
+row's folder and name from its url with :func:`parts_sql`; the viewer's tree routes
+read them back and never parse a url. :func:`tree_parts` is the same rules in
+Python, the reference the SQL is tested against.
 
 The rules are the browser's ``getPathParts``:
 
@@ -19,7 +20,7 @@ contains it, so byte order of the joined strings is component order (with ``/``,
 ``://`` is ``\\x02`` so it stays one segment; :func:`dec` spells it back.
 """
 
-from typing import List, Tuple
+from typing import List
 
 ENDPOINT_MARK = "\x02"
 SEP = "\x01"
@@ -62,18 +63,20 @@ def tree_parts(url: str) -> List[str]:
     return [s for s in body.split("/") if s]
 
 
-def catalog_url(root_url: str, rel: str) -> str:
-    """A source's url: its root's, then its path beneath it (the ``sources`` view's
-    ``source_url``)."""
-    if not root_url:
-        return rel
-    return root_url if rel == "." else f"{root_url}/{rel}"
-
-
-def tree_columns(root_url: str, rel: str) -> Tuple[str, str]:
-    """``(dir, name)`` of the source at *rel* under *root_url*: its folder's
-    segments joined, and its own last segment. Both ``""`` for a url with no path."""
-    parts = tree_parts(catalog_url(root_url, rel))
-    if not parts:
-        return "", ""
-    return SEP.join(parts[:-1]), parts[-1]
+def parts_sql(url: str) -> str:
+    """:func:`tree_parts` as a SQL expression over the url expression *url*: a
+    ``VARCHAR[]`` of the segments. The ``source_tree`` view computes a row's place
+    from this, so the tree follows a root's url with nothing to keep in step; the
+    two spellings of the rules are checked against each other in the tests."""
+    scheme = "'^[^/]+://'"
+    body = (
+        f"CASE WHEN starts_with({url}, 'file:///') THEN substr({url}, 9) "
+        f"WHEN starts_with({url}, 'dnd://') "
+        f"THEN replace(substr({url}, 7), chr(92), '/') "
+        f"WHEN regexp_matches({url}, {scheme}) THEN CASE "
+        f"WHEN regexp_matches({url}, '^[^/]+://(/|$)') "
+        f"THEN regexp_replace({url}, {scheme}, '') "
+        f"ELSE regexp_replace({url}, '^([^/]+)://', '\\1' || chr(2)) END "
+        f"ELSE {url} END"
+    )
+    return f"list_filter(string_split({body}, '/'), x -> x <> '')"
