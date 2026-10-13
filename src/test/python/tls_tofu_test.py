@@ -132,6 +132,15 @@ def test_a_pin_python_adds_keeps_the_others(tmp_path):
     assert len(pins) == 3
 
 
+@pytest.mark.parametrize("garbage", ["", "{not json", "[1, 2]"])
+def test_save_pin_refuses_to_replace_a_corrupt_store(tmp_path, garbage):
+    store = tmp_path / "known.json"
+    store.write_text(garbage, encoding="utf-8")
+    with pytest.raises(OSError, match="known.json"):
+        _tls._save_pin(store, "a:1", b"pem-a")
+    assert store.read_text(encoding="utf-8") == garbage
+
+
 def test_load_pins_tolerates_missing_and_garbage(tmp_path):
     assert _tls._load_pins(tmp_path / "absent.json") == {}
     bad = tmp_path / "bad.json"
