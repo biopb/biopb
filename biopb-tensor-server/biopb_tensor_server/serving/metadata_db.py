@@ -74,13 +74,11 @@ from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.serving import catalog_tree
-from biopb_tensor_server.serving.roi_store import (  # noqa: F401 -- re-exported
+from biopb_tensor_server.serving.roi_store import (
     _ROIS_DDL,
     RESERVED_SET_PREFIX,
     RoiStoreMixin,
-    UnseenRois,
     _prepare_roi,
-    is_reserved_set,
 )
 from biopb_tensor_server.serving.tree_paths import tree_columns
 

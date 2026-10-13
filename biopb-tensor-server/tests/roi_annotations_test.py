@@ -872,7 +872,7 @@ class TestSidecarRoutes:
         class _FakeFlightClient:
             def list_rois(self, array_id, set_name=""):
                 from biopb.image.annotation_pb2 import RoiListResult, RoiSetInfo
-                from biopb_tensor_server.serving.metadata_db import is_reserved_set
+                from biopb_tensor_server.serving.roi_store import is_reserved_set
 
                 rois, truncated = db.list_rois(array_id, set_name)
                 return RoiListResult(
@@ -911,7 +911,7 @@ class TestSidecarRoutes:
     def test_the_listing_names_a_server_owned_set_it_does_not_return(
         self, client_and_app
     ):
-        from biopb_tensor_server.serving.metadata_db import RESERVED_SET_PREFIX
+        from biopb_tensor_server.serving.roi_store import RESERVED_SET_PREFIX
 
         client, db = client_and_app
         now = datetime.now()
