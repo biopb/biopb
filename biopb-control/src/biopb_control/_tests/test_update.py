@@ -1,5 +1,7 @@
 """The update check: release selection, the baseline marker, and fail-open."""
 
+import sys
+
 import pytest
 
 from biopb_control import _update
@@ -150,11 +152,17 @@ class TestStartInstall:
     def test_runs_the_pinned_installer_unattended(self, spawned, monkeypatch):
         _update.start_install(_update.UpdateInfo("0.6.6", "0.7.0", "u"))
         ((argv, kwargs),) = spawned
-        assert _update.INSTALL_SH_URL in " ".join(argv)
+        url = (
+            _update.INSTALL_PS1_URL
+            if sys.platform == "win32"
+            else _update.INSTALL_SH_URL
+        )
+        assert url in " ".join(argv)
         assert kwargs["env"]["BIOPB_NONINTERACTIVE"] == "1"
         assert "BIOPB_INSTALL_RC" not in kwargs["env"]
         assert kwargs["env"][_update.ENV_RESULT] == str(_update.result_file())
-        assert kwargs["start_new_session"] is True  # outlives this control
+        # Detached, so it outlives this control.
+        assert kwargs.get("start_new_session") or kwargs.get("creationflags")
 
     def test_a_candidate_install_asks_for_candidates(self, spawned):
         _update.start_install(_update.UpdateInfo("0.7.0rc1", "0.7.0rc2", "u"))
