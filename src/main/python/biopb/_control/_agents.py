@@ -516,12 +516,13 @@ class ClientBackend(ABC):
 
     # -- launching a session ------------------------------------------------ #
 
-    def launch_argv(self) -> Optional[list]:
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
         """The command that opens a web or remote session, or ``None`` if this
-        client has no such surface."""
+        client has no such surface. *remote* is the operator's opt-in to reach it
+        from other devices, for a client whose local form is not already that."""
         return None
 
-    def stop_argv(self) -> Optional[list]:
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
         """The command that ends a ``oneshot`` launch, or ``None`` if there is
         nothing to end."""
         return None
@@ -647,7 +648,7 @@ class ClaudeCode(CliManagedClient):
     def config_path(self) -> Optional[Path]:
         return Path.home() / ".claude.json"
 
-    def launch_argv(self) -> Optional[list]:
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
         # One session per process, so stopping the process ends that one
         # conversation; `default` is the permission mode, never a bypass.
         return [
@@ -731,10 +732,10 @@ class CodexCli(CliManagedClient):
     def config_path(self) -> Optional[Path]:
         return self._home() / "config.toml"
 
-    def launch_argv(self) -> Optional[list]:
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
         return [self.exe, "app-server", "daemon", "enable-remote-control"]
 
-    def stop_argv(self) -> Optional[list]:
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
         return [self.exe, "app-server", "daemon", "disable-remote-control"]
 
     def _standalone(self) -> Path:
@@ -825,6 +826,11 @@ class Opencode(JsonConfigClient):
     has_launch = True
     ready_pattern = re.compile(r"https?://\S+")  # `opencode serve` names its URL
 
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
+        # The service is machine-wide and left up, except when this launch put it
+        # on the internet: stopping it is the only way to take it back off.
+        return [self.exe, "service", "stop"] if remote else None
+
     def launch_hint(self) -> Optional[str]:
         if self.can_launch():
             return None
@@ -878,14 +884,16 @@ class Opencode(JsonConfigClient):
         # to stop, so a launch there is a command that returns.
         return "oneshot" if _opencode_major() == 2 else "child"
 
-    def launch_argv(self) -> Optional[list]:
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
         major = _opencode_major()
         if major is None:
             return None
         if major >= 2:
-            # Prints a one-time link for the loopback service. Never `--remote`
-            # (reaches the internet) or `--yes`.
-            return [self.exe, "pair"]
+            # A one-time link for the loopback service. `--remote` pairs through
+            # opencode's tunnel, which exposes the server to the internet, and
+            # `--yes` accepts that where there is no terminal to ask: only on the
+            # operator's opt-in.
+            return [self.exe, "pair", *(["--remote", "--yes"] if remote else [])]
         # `serve` is `web` without opening a browser, which the dashboard does
         # for every client.
         return [self.exe, "serve", "--hostname", "127.0.0.1", "--port", "0"]

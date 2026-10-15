@@ -924,10 +924,10 @@ class _FakeClient:
     def __init__(self, relay=False):
         self.relay = relay
 
-    def launch_argv(self):
+    def launch_argv(self, *, remote=False):
         return [sys.executable, "-c", "print('link: http://127.0.0.1:1/x')"]
 
-    def stop_argv(self):
+    def stop_argv(self, *, remote=False):
         return [sys.executable, "-c", "print('off')"]
 
 

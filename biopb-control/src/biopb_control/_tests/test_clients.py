@@ -25,10 +25,10 @@ class _Backend:
         self.ready_pattern = ready
         self._stop = stop
 
-    def launch_argv(self):
+    def launch_argv(self, *, remote=False):
         return list(self._argv)
 
-    def stop_argv(self):
+    def stop_argv(self, *, remote=False):
         return self._stop
 
 

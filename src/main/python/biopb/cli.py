@@ -1085,8 +1085,9 @@ _OPT_ALLOW_RELAY_CLIENTS = typer.Option(
     "--allow-relay-clients",
     envvar="BIOPB_CONTROL_RELAY_CLIENTS",
     help="Let the dashboard launch Claude Code and Codex remote sessions, which "
-    "other devices reach through the vendor's relay. Off by default: the client "
-    "it starts is an agent with a shell.",
+    "other devices reach through the vendor's relay, and start opencode 2 with "
+    "`pair --remote`, which exposes its server to the internet. Off by default: "
+    "the client it starts is an agent with a shell.",
 )
 _OPT_GRPC_EXTERNAL_LOCATION = typer.Option(
     None,

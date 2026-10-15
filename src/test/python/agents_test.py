@@ -356,6 +356,16 @@ def test_opencode_launches_by_version_and_never_exposes_the_service(home, monkey
     assert opencode.launch_kind == "child"
     monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
     assert opencode.launch_argv() == ["opencode", "pair"]
+    assert opencode.stop_argv() is None  # the service is not ours to stop
+    # Only on the operator's opt-in does it go to the internet, and then
+    # stopping the service is how it comes back off.
+    assert opencode.launch_argv(remote=True) == [
+        "opencode",
+        "pair",
+        "--remote",
+        "--yes",
+    ]
+    assert opencode.stop_argv(remote=True) == ["opencode", "service", "stop"]
     assert opencode.launch_kind == "oneshot"
     monkeypatch.setattr(_agents, "_opencode_major", lambda: None)
     assert opencode.launch_argv() is None and not opencode.can_launch()

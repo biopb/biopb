@@ -136,7 +136,7 @@ class ClientLauncher:
         reason = self.blocked(_agents.status(client_id))
         if reason is not None:
             raise LaunchRefused(reason)
-        argv = backend.launch_argv()
+        argv = backend.launch_argv(remote=self._relay_clients)
         with self._lock:
             if client_id in self._pending:
                 return _failed("a launch is already in progress")
@@ -225,7 +225,7 @@ class ClientLauncher:
         if child is not None:
             child.stop()
             return {"stopped": True}
-        argv = backend.stop_argv()
+        argv = backend.stop_argv(remote=self._relay_clients)
         if not argv:
             return {"stopped": True, "note": "nothing to stop; its service stays up"}
         code, output = _run(argv)

@@ -270,9 +270,10 @@ environment is the control's minus the exec token.
 
 opencode 2 sits between: it listens on loopback by default, and `pair --remote`
 or `service set hostname 0.0.0.0` reach beyond it. The control starts the local
-form only (`pair` with no flag) and never passes `--remote` or `--yes`; exposing
-the service to the internet is the user's own step, the way an operator opts in
-to a relay client.
+form (`pair` with no flag) unless the operator passed `--allow-relay-clients`, the
+same opt-in as the relay clients; then it runs `pair --remote --yes`, since there
+is no terminal to confirm on, and the dashboard's Stop runs `service stop`, the
+only way to take the exposure back off. `--remote` is unmeasured.
 
 For Claude Code, pin `--permission-mode default`; never `bypassPermissions`.
 

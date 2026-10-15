@@ -113,7 +113,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-relay-clients",
         action="store_true",
         help="let the dashboard launch Claude Code and Codex remote sessions, "
-        "which other devices reach through the vendor's relay (or "
+        "which other devices reach through the vendor's relay, and start opencode "
+        "2 with `pair --remote`, which exposes its server to the internet (or "
         "BIOPB_CONTROL_RELAY_CLIENTS=1).",
     )
     run.add_argument(
