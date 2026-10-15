@@ -285,6 +285,13 @@ def control_pid_file() -> Path:
     return state_dir() / "control.pid"
 
 
+def control_start_options_file() -> Path:
+    """The options the last ``control start`` resolved (``state/biopb/control-start.json``),
+    which ``control restart`` replays. Holds no secret: a token lives in a credential
+    file beside it."""
+    return state_dir() / "control-start.json"
+
+
 def control_runtime_file() -> Path:
     """Where a *serving* control publishes its endpoint (``state/biopb/control.json``).
 
