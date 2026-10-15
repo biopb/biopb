@@ -609,7 +609,7 @@ export default function DashboardPage() {
         </div>
 
         <div className="card">
-          <h2>
+          <h2 className="with-actions">
             Algorithm plane
             <button className="mini" onClick={pollAlgos}>
               ↻
@@ -617,6 +617,17 @@ export default function DashboardPage() {
             <button className="mini" disabled={algosBusy} onClick={registerRemote}>
               Register remote
             </button>
+            {/* The script entries' install and server output; a url entry has none. */}
+            <span className="head-links">
+              <a
+                className="head-link"
+                href={withBase("/logs?source=algorithms")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
           </h2>
           <ul>
             {algos == null ? (
