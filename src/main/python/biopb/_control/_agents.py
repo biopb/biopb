@@ -453,6 +453,9 @@ class ClientBackend(ABC):
     #: whether a launched session is reachable from other devices through a
     #: relay, which an operator opts in to rather than inheriting
     relay: bool = False
+    #: what a ``child`` launch prints once it is usable; ``None`` if it prints
+    #: nothing reliable, and staying up is the signal
+    ready_pattern: Optional[re.Pattern] = None
 
     @abstractmethod
     def config_path(self) -> Optional[Path]:
@@ -788,8 +791,10 @@ def _opencode_major() -> Optional[int]:
 class Opencode(JsonConfigClient):
     id = "opencode"
     name = "opencode"
+    exe = "opencode"
     parent_key = "mcp"
     entry_style = "opencode"
+    ready_pattern = re.compile(r"https?://\S+")  # `opencode web` names its URL
 
     def parent_path(self) -> tuple:
         """Where this machine's opencode reads servers from: by the installed
@@ -829,7 +834,7 @@ class Opencode(JsonConfigClient):
         return jsonc if jsonc.exists() else base / "opencode.json"
 
     def is_installed(self) -> bool:
-        return shutil.which("opencode") is not None or super().is_installed()
+        return shutil.which(self.exe) is not None or super().is_installed()
 
     @property
     def launch_kind(self) -> str:
@@ -844,8 +849,8 @@ class Opencode(JsonConfigClient):
         if major >= 2:
             # Prints a one-time link for the loopback service. Never `--remote`
             # (reaches the internet) or `--yes`.
-            return ["opencode", "pair"]
-        return ["opencode", "web", "--hostname", "127.0.0.1", "--port", "0"]
+            return [self.exe, "pair"]
+        return [self.exe, "web", "--hostname", "127.0.0.1", "--port", "0"]
 
 
 # --------------------------------------------------------------------------- #

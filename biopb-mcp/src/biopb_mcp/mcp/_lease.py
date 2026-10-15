@@ -69,9 +69,14 @@ def _fire(changes):
             fn(previous, new)
 
 
+def _clear_locked():
+    """Forget the holder."""
+    global _holder, _token, _client
+    _holder = _token = _client = None
+
+
 def _expire_locked(now):
     """Drop a lapsed holder; returns the change to announce, if any."""
-    global _holder, _token, _client
     if _holder is None:
         return []
     probe = _busy_probes.get(_holder)
@@ -79,7 +84,8 @@ def _expire_locked(now):
         return []
     if now - _renewed < TTL[_holder]:
         return []
-    previous, _holder, _token, _client = _holder, None, None, None
+    previous = _holder
+    _clear_locked()
     return [(previous, None)]
 
 
@@ -146,13 +152,12 @@ def renew(token):
 
 def release(token):
     """Give up *token*'s lease; False if it held none."""
-    global _holder, _token, _client
     now = time.monotonic()
     with _lock:
         changes = _expire_locked(now)
         ok = _token is not None and _token == token
         if ok:
             changes.append((_holder, None))
-            _holder, _token, _client = None, None, None
+            _clear_locked()
     _fire(changes)
     return ok

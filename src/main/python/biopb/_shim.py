@@ -41,6 +41,7 @@ initialize ``instructions`` field, has no lifetime guard when the server dies,
 and floats its dependencies.
 """
 
+import functools
 import json
 import logging
 import os
@@ -120,6 +121,7 @@ def _find_client_process():
     return None
 
 
+@functools.cache
 def _client_identity():
     """``{pid, create_time, name}`` of the MCP client, or ``None`` if unknown.
 

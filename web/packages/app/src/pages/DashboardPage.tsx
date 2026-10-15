@@ -426,7 +426,7 @@ export default function DashboardPage() {
     [pollAgents],
   );
 
-  const launchClient = useCallback(
+  const runClientAction = useCallback(
     async (id: string, name: string, act: "launch" | "stop") => {
       setAgentsBusy(true);
       setClientMsg(null);
@@ -435,25 +435,7 @@ export default function DashboardPage() {
           withBase("/api/agents/") + encodeURIComponent(id) + "/" + act,
           { method: "POST" },
         );
-        const res = await r.json().catch(() => ({}));
-        if (res.error || res.state === "failed") {
-          const where = res.log_path ? `\n\nFull log: ${res.log_path}` : "";
-          const out = res.log ? `\n\n${res.log}` : "";
-          setClientMsg({ err: true, text: `${res.error}${out}${where}` });
-        } else if (act === "stop") {
-          setClientMsg({ err: !res.stopped, text: res.note || `${name} stopped.` });
-        } else {
-          const head =
-            res.state === "starting"
-              ? `${name} is still starting.`
-              : res.already
-                ? `${name} is already running.`
-                : `${name} started.`;
-          setClientMsg({
-            err: false,
-            text: res.log ? `${head}\n\n${res.log}` : head,
-          });
-        }
+        setClientMsg(describeClientResult(await r.json().catch(() => ({})), name, act));
       } catch (e) {
         setClientMsg({ err: true, text: String(e) });
       } finally {
@@ -659,7 +641,7 @@ export default function DashboardPage() {
                   busy={agentsBusy}
                   canExec={canExec}
                   onAction={agentAction}
-                  onLaunch={launchClient}
+                  onLaunch={runClientAction}
                 />
               ))
             )}
@@ -848,6 +830,29 @@ function AlgoRow({
   );
 }
 
+// What a client launch or stop answered, as the note under the list: the
+// client's own output (it holds the URL or link) leads, a failure names its log.
+function describeClientResult(
+  res: { error?: string; state?: string; already?: boolean; stopped?: boolean; note?: string; log?: string; log_path?: string },
+  name: string,
+  act: "launch" | "stop",
+): { err: boolean; text: string } {
+  if (res.error || res.state === "failed") {
+    const where = res.log_path ? `\n\nFull log: ${res.log_path}` : "";
+    const out = res.log ? `\n\n${res.log}` : "";
+    return { err: true, text: `${res.error}${out}${where}` };
+  }
+  if (act === "stop")
+    return { err: !res.stopped, text: res.note || `${name} stopped.` };
+  const head =
+    res.state === "starting"
+      ? `${name} is still starting.`
+      : res.already
+        ? `${name} is already running.`
+        : `${name} started.`;
+  return { err: false, text: res.log ? `${head}\n\n${res.log}` : head };
+}
+
 // The agent-client buttons for one row. not_installed rows get none; a
 // registered row offers Unregister, plus an amber "Re-register (update)" only
 // when the stored command drifted from the current biopb-mcp location — a plain
@@ -880,26 +885,21 @@ function AgentRowView({
       <span className="state">{label}</span>
       <span className="agent-btns">
         {a.state === "registered" && a.can_launch ? (
-          a.running ? (
-            <button
-              disabled={busy || !canExec}
-              title={execTitle(canExec, `Stop the ${a.name} session started here`)}
-              onClick={() => onLaunch(a.id, a.name, "stop")}
-            >
-              Stop session
-            </button>
-          ) : (
-            <button
-              disabled={busy || !canExec || !!a.launch_blocked}
-              title={
-                a.launch_blocked ||
-                execTitle(canExec, `Open a ${a.name} session you can drive from a browser`)
-              }
-              onClick={() => onLaunch(a.id, a.name, "launch")}
-            >
-              Start session
-            </button>
-          )
+          <button
+            disabled={busy || !canExec || (!a.running && !!a.launch_blocked)}
+            title={
+              (!a.running && a.launch_blocked) ||
+              execTitle(
+                canExec,
+                a.running
+                  ? `Stop the ${a.name} session started here`
+                  : `Open a ${a.name} session you can drive from a browser`,
+              )
+            }
+            onClick={() => onLaunch(a.id, a.name, a.running ? "stop" : "launch")}
+          >
+            {a.running ? "Stop session" : "Start session"}
+          </button>
         ) : null}
         {a.state === "not_installed" ? null : a.state === "registered" ? (
           <>

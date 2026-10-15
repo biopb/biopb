@@ -919,6 +919,7 @@ class _FakeClient:
     id = "fake"
     name = "Fake"
     launch_kind = "oneshot"
+    ready_pattern = None
 
     def __init__(self, relay=False):
         self.relay = relay
@@ -928,9 +929,6 @@ class _FakeClient:
 
     def stop_argv(self):
         return [sys.executable, "-c", "print('off')"]
-
-    def can_launch(self):
-        return True
 
 
 def _fake_status(client):
@@ -1718,13 +1716,13 @@ def test_same_second_launches_do_not_share_a_log(tmp_path, monkeypatch):
     # The uniquifier earns its keep only here: a bare timestamp would put two
     # launches inside one second back into one file and reintroduce the
     # interleaving in miniature.
-    from biopb_control import _control
+    from biopb_control import _logs
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setattr(_control.time, "strftime", lambda *_a: "20260827-090413")
+    monkeypatch.setattr(_logs.time, "strftime", lambda *_a: "20260827-090413")
     paths = []
     for _ in range(3):
-        fh, path = _control._open_viewer_log()
+        fh, path = _logs.open_log("viewer")
         fh.close()
         paths.append(path)
     assert len({str(p) for p in paths}) == 3
@@ -1733,16 +1731,16 @@ def test_same_second_launches_do_not_share_a_log(tmp_path, monkeypatch):
 def test_old_launch_logs_are_pruned(tmp_path, monkeypatch):
     # Retention matches the shim's per-session logs: a couple of past attempts
     # to look back over, not an unbounded pile of Qt chatter.
-    from biopb_control import _control
+    from biopb_control import _logs
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setattr(_control, "_VIEWER_LOG_KEEP", 3)
+    monkeypatch.setattr(_logs, "KEEP", 3)
     made = []
     for i in range(6):
         # Distinct names *and* distinct mtimes, so "newest N" is well-defined
         # without depending on how fast the loop runs.
-        monkeypatch.setattr(_control.time, "strftime", lambda *_a, i=i: f"2026082{i}")
-        fh, path = _control._open_viewer_log()
+        monkeypatch.setattr(_logs.time, "strftime", lambda *_a, i=i: f"2026082{i}")
+        fh, path = _logs.open_log("viewer")
         fh.close()
         os.utime(path, (1000 + i, 1000 + i))
         made.append(path)

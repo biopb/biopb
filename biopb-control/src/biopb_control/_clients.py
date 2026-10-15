@@ -16,21 +16,18 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-import secrets
 import subprocess
 import threading
-import time
+from typing import Optional
 
-from biopb._config import locations as _locations
 from biopb._control import _agents
 from biopb._lifecycle import OwnedChild
 from biopb._security import credentials as _credentials
 
+from . import _logs
+
 logger = logging.getLogger(__name__)
 
-#: Newest client logs kept per client.
-LOG_KEEP = 5
 #: Bytes of output returned to the dashboard.
 LOG_TAIL = 4000
 #: Seconds a ``child`` launch waits for its readiness line, before reporting
@@ -42,102 +39,90 @@ GRACE = 3.0
 ONESHOT_TIMEOUT = 60.0
 _POLL = 0.2
 
-#: What a ``child`` prints once it is usable. opencode names its URL; the relay
-#: clients print nothing that is a reliable signal.
-_READY = {"opencode": re.compile(r"https?://\S+")}
 
-_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
-
-
-def clean(text: str) -> str:
-    """Output for display: no ANSI escapes, no logo lines (a line with nothing
-    alphanumeric on it is box-drawing)."""
-    lines = _ANSI.sub("", text).replace("\r", "").split("\n")
-    kept = [ln for ln in lines if not ln.strip() or any(c.isalnum() for c in ln)]
-    return "\n".join(kept).strip()
+class LaunchRefused(Exception):
+    """The launch is not allowed here; carries the reason."""
 
 
 def _client_env() -> dict:
     """The control's environment minus the control's own secrets: the client is
     an agent with a shell, and must not inherit the credential that gates it."""
-    env = dict(os.environ)
-    _credentials.scrub_control_secrets(env)
-    return env
+    return _credentials.scrub_control_secrets(os.environ.copy())
 
 
-def _open_log(client_id: str):
-    """``(handle, path)`` for this launch's log, or ``(None, None)``: a client
-    that starts without a log beats one that does not start."""
+def _run(argv: list) -> tuple[int, str]:
+    """Run a command to completion; ``(exit code, cleaned output)``. ``-1`` when
+    it could not run, with the reason as the output."""
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        log_dir = _locations.mcp_viewer_log_dir()
-        stem = f"client-{client_id}-"
-        old = sorted(
-            log_dir.glob(stem + "*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+        done = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=ONESHOT_TIMEOUT,
+            env=_client_env(),
+            **kwargs,
         )
-        for path in old[max(LOG_KEEP - 1, 0) :]:
-            path.unlink(missing_ok=True)
-        path = (
-            log_dir
-            / f"{stem}{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}.log"
-        )
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        return os.fdopen(fd, "wb", buffering=0), path
-    except OSError:
-        logger.warning("No log for the %s launch; discarding output", client_id)
-        return None, None
-
-
-def _tail(path) -> str:
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return ""
-    return clean(data.decode("utf-8", "replace"))[-LOG_TAIL:]
-
-
-class _Launch:
-    """What the control holds of one launched client."""
-
-    def __init__(self, kind, child=None, log_path=None):
-        self.kind = kind  # "child" | "oneshot"
-        self.child = child
-        self.log_path = log_path
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, str(exc)
+    return done.returncode, _logs.clean(done.stdout + "\n" + done.stderr)[-LOG_TAIL:]
 
 
 class ClientLauncher:
-    """Launch and stop clients; thread-safe, one launch per client id."""
+    """Launch and stop clients; thread-safe, one launch per client id.
 
-    def __init__(self):
+    *chat_served* is whether this control serves the ``chat`` execute root, and
+    *relay_clients* whether the operator allowed clients reachable from other
+    devices: a launch starts an agent with a shell, so it needs the first, and a
+    relay client needs the second as well.
+    """
+
+    def __init__(self, *, chat_served: bool, relay_clients: bool):
+        self._chat_served = chat_served
+        self._relay_clients = relay_clients
         self._lock = threading.Lock()
-        self._launches: dict[str, _Launch] = {}
+        # client id -> the owned child, or None for a ``oneshot`` we ran
+        self._launches: dict[str, Optional[OwnedChild]] = {}
+        self._pending: set[str] = set()
 
-    # -- state ------------------------------------------------------------- #
+    def blocked(self, agent: dict) -> Optional[str]:
+        """Why *agent* (an ``_agents.status`` dict) may not be launched, or
+        ``None``. The verb enforces the same answer the dashboard shows."""
+        if not agent.get("can_launch"):
+            return "not launchable here"
+        if not self._chat_served:
+            return "this control does not serve the execute roots"
+        if agent.get("relay") and not self._relay_clients:
+            return (
+                "reachable from other devices; "
+                "start the control with --allow-relay-clients"
+            )
+        return None
 
-    def running(self, client_id: str) -> bool:
-        """Whether a client this control launched is still up (a ``oneshot`` is
-        up until stopped here)."""
+    def running_ids(self) -> set:
+        """Clients this control launched that are still up (a ``oneshot`` is up
+        until stopped here)."""
         with self._lock:
-            return self._running_locked(client_id)
+            self._prune_locked()
+            return set(self._launches)
 
-    def _running_locked(self, client_id: str) -> bool:
-        launch = self._launches.get(client_id)
-        if launch is None:
-            return False
-        if launch.kind == "child" and not launch.child.alive():
-            del self._launches[client_id]
-            return False
-        return True
+    def _prune_locked(self) -> None:
+        for client_id, child in list(self._launches.items()):
+            if child is not None and not child.alive():
+                del self._launches[client_id]
 
     def stop_all(self) -> None:
         """Stop every owned child, for control shutdown. A ``oneshot`` service is
         left as it is."""
         with self._lock:
-            launches = list(self._launches.values())
+            children = [c for c in self._launches.values() if c is not None]
             self._launches.clear()
-        for launch in launches:
-            if launch.child is not None:
-                launch.child.stop()
+        for child in children:
+            child.stop()
 
     # -- launch ------------------------------------------------------------ #
 
@@ -145,26 +130,35 @@ class ClientLauncher:
         """Start *client_id*; ``{"state": started|starting|failed, ...}``.
 
         Only ``failed`` carries ``error``; every state carries the output so far
-        as ``log`` and its file as ``log_path``.
+        as ``log`` and its file as ``log_path``. Raises :class:`LaunchRefused`.
         """
         backend = _agents.backend(client_id)
+        reason = self.blocked(_agents.status(client_id))
+        if reason is not None:
+            raise LaunchRefused(reason)
         argv = backend.launch_argv()
-        if not argv or not backend.can_launch():
-            return _failed("this client cannot be launched here")
         with self._lock:
-            if self._running_locked(client_id):
-                return {
-                    "state": "started",
-                    "already": True,
-                    "log": "",
-                    "log_path": None,
-                }
+            if client_id in self._pending:
+                return _failed("a launch is already in progress")
+            self._prune_locked()
+            if client_id in self._launches:
+                return {**_ok("started", "", None), "already": True}
+            self._pending.add(client_id)
+        try:
             if backend.launch_kind == "oneshot":
-                return self._run_oneshot(client_id, argv)
-            return self._spawn_child(client_id, argv)
+                result, child = self._run_oneshot(argv), None
+            else:
+                result, child = self._spawn_child(backend, client_id, argv)
+            if result["state"] != "failed":
+                with self._lock:
+                    self._launches[client_id] = child
+            return result
+        finally:
+            with self._lock:
+                self._pending.discard(client_id)
 
-    def _spawn_child(self, client_id: str, argv: list) -> dict:
-        log_fh, log_path = _open_log(client_id)
+    def _spawn_child(self, backend, client_id: str, argv: list):
+        log_fh, log_path = _logs.open_log(f"client-{client_id}")
         logger.info("Launching %s: %s (log: %s)", client_id, " ".join(argv), log_path)
         child = OwnedChild(
             argv,
@@ -175,49 +169,44 @@ class ClientLauncher:
             child.spawn()
         except OSError as exc:
             logger.exception("Could not launch %s", client_id)
-            return _failed(str(exc), log_path=log_path)
+            return _failed(str(exc), log_path=log_path), None
         finally:
             if log_fh is not None:
                 log_fh.close()  # the child holds its own dup
-        ready = _READY.get(client_id)
-        start = time.monotonic()
-        while True:
-            code = child.poll()
-            output = _tail(log_path) if log_path else ""
-            if code is not None:
-                return _failed(
-                    f"{client_id} exited with code {code} before it was ready",
-                    log=output,
-                    log_path=log_path,
-                )
-            elapsed = time.monotonic() - start
-            if (ready and ready.search(output)) or (not ready and elapsed >= GRACE):
-                self._launches[client_id] = _Launch("child", child, log_path)
-                return _ok("started", output, log_path)
-            if elapsed >= READY_TIMEOUT:
-                # Alive, just quiet: keep it and say so, as a slow session is.
-                self._launches[client_id] = _Launch("child", child, log_path)
-                return _ok("starting", output, log_path)
-            time.sleep(_POLL)
 
-    def _run_oneshot(self, client_id: str, argv: list) -> dict:
-        logger.info("Running %s: %s", client_id, " ".join(argv))
-        try:
-            done = subprocess.run(
-                argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=ONESHOT_TIMEOUT,
-                env=_client_env(),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            return _failed(str(exc))
-        output = clean(done.stdout + "\n" + done.stderr)[-LOG_TAIL:]
-        if done.returncode != 0:
-            return _failed(f"{argv[0]} exited with code {done.returncode}", log=output)
-        self._launches[client_id] = _Launch("oneshot")
+        def output() -> str:
+            return _logs.tail(log_path, LOG_TAIL) if log_path else ""
+
+        # A client that names itself ready is waited for; one that does not is
+        # started once it has stayed up for a moment.
+        ready = backend.ready_pattern
+        deadline = READY_TIMEOUT if ready else GRACE
+        waited = 0.0
+        while waited < deadline:
+            try:
+                code = child.wait(_POLL)
+            except subprocess.TimeoutExpired:
+                code = None
+            if code is not None:
+                return (
+                    _failed(
+                        f"{client_id} exited with code {code} before it was ready",
+                        log=output(),
+                        log_path=log_path,
+                    ),
+                    None,
+                )
+            waited += _POLL
+            if ready and ready.search(output()):
+                return _ok("started", output(), log_path), child
+        # Alive; a client with a readiness line that never came is only slow.
+        return _ok("starting" if ready else "started", output(), log_path), child
+
+    def _run_oneshot(self, argv: list) -> dict:
+        logger.info("Running %s", " ".join(argv))
+        code, output = _run(argv)
+        if code != 0:
+            return _failed(f"{argv[0]} exited with code {code}", log=output)
         return _ok("started", output, None)
 
     # -- stop -------------------------------------------------------------- #
@@ -230,31 +219,18 @@ class ClientLauncher:
         """
         backend = _agents.backend(client_id)
         with self._lock:
-            launch = self._launches.get(client_id)
-            if launch is None:
+            if client_id not in self._launches:
                 return {"stopped": False, "error": "not started from this control"}
-            del self._launches[client_id]
-        if launch.kind == "child":
-            launch.child.stop()
+            child = self._launches.pop(client_id)
+        if child is not None:
+            child.stop()
             return {"stopped": True}
         argv = backend.stop_argv()
         if not argv:
             return {"stopped": True, "note": "nothing to stop; its service stays up"}
-        try:
-            done = subprocess.run(
-                argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=ONESHOT_TIMEOUT,
-                env=_client_env(),
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            return {"stopped": False, "error": str(exc)}
-        output = clean(done.stdout + "\n" + done.stderr)[-LOG_TAIL:]
-        if done.returncode != 0:
-            return {"stopped": False, "error": output or f"exit {done.returncode}"}
+        code, output = _run(argv)
+        if code != 0:
+            return {"stopped": False, "error": output or f"exit {code}"}
         return {"stopped": True, "log": output}
 
 
@@ -263,9 +239,4 @@ def _ok(state: str, log: str, log_path) -> dict:
 
 
 def _failed(error: str, *, log: str = "", log_path=None) -> dict:
-    return {
-        "state": "failed",
-        "error": error,
-        "log": log,
-        "log_path": str(log_path) if log_path else None,
-    }
+    return {**_ok("failed", log, log_path), "error": error}

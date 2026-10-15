@@ -130,8 +130,9 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import _logs
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
-from ._clients import ClientLauncher
+from ._clients import ClientLauncher, LaunchRefused
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
     MAX_PNG_BYTES,
@@ -847,15 +848,6 @@ _SESSION_POLL_INTERVAL = 0.25
 # config) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
 
-# How many past launches' logs to keep: enough to look back over a couple of
-# failed attempts, not an unbounded pile of Qt chatter.
-_VIEWER_LOG_KEEP = 5
-
-# Cap on same-second name collisions before giving up on a log for this launch.
-# Two dashboard launches inside one second is already a double-click; a hundred
-# is a bug, and a session that starts without a log beats one that does not.
-_VIEWER_LOG_ATTEMPTS = 100
-
 
 # The only variables a launch's ``display`` may set: where a viewer window can
 # appear. Anything else a client could send is an environment injection into a
@@ -919,81 +911,6 @@ def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
     return env
 
 
-def _prune_viewer_logs(log_dir, keep: int) -> None:
-    """Keep only the newest *keep* launch logs. Best-effort.
-
-    *keep* is passed rather than defaulted from the module constant: a default
-    argument binds once at definition, so the constant would be frozen into this
-    signature and could never be overridden.
-
-    Run before this launch's file exists, so the count it leaves room for
-    includes the one about to be created. A prune failure never affects the
-    launch.
-    """
-    try:
-        logs = sorted(
-            log_dir.glob("viewer-*.log"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        return
-    for old in logs[max(keep - 1, 0) :]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-
-def _open_viewer_log():
-    """Create this launch's own logfile; return ``(handle, path)``.
-
-    **One file per launch**, not one shared file appended to. A shared log
-    interleaves concurrent viewers, and lines that cannot be attributed to a
-    process are no use for diagnosing a session that is still running — which is
-    the case the failure tail does not cover. The shim reached the same
-    conclusion for its per-session logs.
-
-    Exclusive-create rather than a bare timestamp: two launches in the same
-    second would otherwise land on one name and reintroduce the interleaving in
-    miniature. On any failure the caller still spawns, with the child's output
-    discarded — a viewer that starts without a log beats one that does not start.
-    """
-    try:
-        log_dir = _locations.mcp_viewer_log_dir()
-    except OSError:
-        logger.warning("No viewer log dir; discarding child output", exc_info=True)
-        return None, None
-    _prune_viewer_logs(log_dir, _VIEWER_LOG_KEEP)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for n in range(1, _VIEWER_LOG_ATTEMPTS + 1):
-        suffix = "" if n == 1 else f"-{n}"
-        path = log_dir / f"viewer-{stamp}{suffix}.log"
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            continue
-        except OSError:
-            break
-        # Binary + unbuffered, like every other owned-child log here: the fd is
-        # inherited by the child (and its kernel), which emits arbitrary bytes
-        # from native Qt/GL/dask writers, so it must not be a text wrapper.
-        return os.fdopen(fd, "wb", buffering=0), path
-    logger.warning("Could not create a viewer log in %s; discarding output", log_dir)
-    return None, None
-
-
-def _viewer_log_tail(path) -> str:
-    """This launch's own output. The whole file *is* this launch, so no anchor
-    is needed — that is what one file per launch buys."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return ""
-    return data.decode("utf-8", "replace").strip()[-_VIEWER_LOG_TAIL:]
-
-
 def _is_our_launch(rec: dict, launch_token: str) -> bool:
     """Whether session record ``rec`` is the session this launch just spawned.
 
@@ -1041,7 +958,7 @@ def _launch_session(
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
-    log_fh, log_path = _open_viewer_log()
+    log_fh, log_path = _logs.open_log("viewer")
     argv = _session_argv(start_kernel)
     logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
     # Two additions ride on the environment: the per-launch token we recognise
@@ -1091,7 +1008,7 @@ def _launch_session(
             return {
                 "state": "failed",
                 "error": f"the session exited with code {code} before it started",
-                "log": _viewer_log_tail(log_path) if log_path else "",
+                "log": _logs.tail(log_path, _VIEWER_LOG_TAIL) if log_path else "",
                 # Named so a tail that was truncated, or empty because no log
                 # could be opened, still leads somewhere.
                 "log_path": str(log_path) if log_path else None,
@@ -1442,17 +1359,22 @@ def build_app(
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    launcher = ClientLauncher(
+        chat_served=_SESSION_CHAT_ROOT in session_roots, relay_clients=relay_clients
+    )
+
     def api_agents(_request: Request) -> JSONResponse:
         # The supported MCP clients and whether biopb is registered with each.
         # Reads are subprocess-free (biopb._control._agents), so the dashboard can poll
         # this without spawning anything; still sync (filesystem), so Starlette
         # runs it in the threadpool.
         try:
+            running = launcher.running_ids()
             agents = [
                 {
                     **agent,
-                    "running": launcher.running(agent["id"]),
-                    "launch_blocked": _launch_blocked(agent),
+                    "running": agent["id"] in running,
+                    "launch_blocked": launcher.blocked(agent),
                 }
                 for agent in _agents.statuses()
             ]
@@ -1461,73 +1383,35 @@ def build_app(
             logger.exception("api/agents failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
-    def _launch_blocked(agent: dict) -> str | None:
-        # Why the dashboard may not launch this client, or None. The same test
-        # gates the verb, so a button and its gate cannot drift apart.
-        if not agent.get("can_launch"):
-            return "not launchable here"
-        if _SESSION_CHAT_ROOT not in session_roots:
-            return "this control does not serve the execute roots"
-        if agent.get("relay") and not relay_clients:
-            return "reachable from other devices; start the control with --allow-relay-clients"
-        return None
-
-    def _launch_gate(request: Request) -> tuple[str | None, JSONResponse | None]:
-        agent_id = request.path_params["agent_id"]
+    def _agent_call(request: Request, action, key: str | None = None) -> JSONResponse:
+        # One client verb. A bad request (unknown client, unparseable client
+        # config) is the caller's fault -> 400; a launch the operator has not
+        # allowed -> 403; anything else -> 500. Register/unregister write user
+        # config files (Claude Code via its CLI) and launch/stop start or end an
+        # agent with a shell, so all are token-gated /api/* verbs.
         try:
-            agent = _agents.status(agent_id)
-        except _agents.AgentError as exc:
-            return None, JSONResponse({"error": str(exc)}, status_code=400)
-        reason = _launch_blocked(agent)
-        if reason is not None:
-            return None, JSONResponse({"error": reason}, status_code=403)
-        return agent_id, None
-
-    def agent_launch(request: Request) -> JSONResponse:
-        # Sync: it spawns and then waits (bounded) for the client to say it is up.
-        agent_id, refused = _launch_gate(request)
-        if refused is not None:
-            return refused
-        try:
-            return JSONResponse(launcher.launch(agent_id))
-        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
-            logger.exception("client launch failed")
-            return JSONResponse({"error": str(exc)}, status_code=500)
-
-    def agent_stop(request: Request) -> JSONResponse:
-        # Stopping needs no launch gate beyond the verb's own exec credential: it
-        # only ends a client this control started.
-        try:
-            agent_id = request.path_params["agent_id"]
-            _agents.backend(agent_id)
-            return JSONResponse(launcher.stop(agent_id))
+            result = action(request.path_params["agent_id"])
+            return JSONResponse({key: result} if key else result)
         except _agents.AgentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
-            logger.exception("client stop failed")
-            return JSONResponse({"error": str(exc)}, status_code=500)
-
-    def _agent_action(request: Request, action) -> JSONResponse:
-        # Register/unregister biopb with one client, returning its fresh status.
-        # A bad request (unknown client, unparseable client config) is the
-        # caller's fault -> 400; anything else -> 500. Both write user config
-        # files (Claude Code via its CLI), so these are token-gated /api/* verbs.
-        agent_id = request.path_params["agent_id"]
-        try:
-            return JSONResponse({"agent": action(agent_id)})
-        except _agents.AgentError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
+        except LaunchRefused as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("agent %s failed", getattr(action, "__name__", "action"))
             return JSONResponse({"error": str(exc)}, status_code=500)
 
-    launcher = ClientLauncher()
-
     def agent_register(request: Request) -> JSONResponse:
-        return _agent_action(request, _agents.register)
+        return _agent_call(request, _agents.register, "agent")
 
     def agent_unregister(request: Request) -> JSONResponse:
-        return _agent_action(request, _agents.unregister)
+        return _agent_call(request, _agents.unregister, "agent")
+
+    def agent_launch(request: Request) -> JSONResponse:
+        # Sync: it spawns and then waits (bounded) for the client to say it is up.
+        return _agent_call(request, launcher.launch)
+
+    def agent_stop(request: Request) -> JSONResponse:
+        return _agent_call(request, launcher.stop)
 
     viewer = ViewerBroker()
 
