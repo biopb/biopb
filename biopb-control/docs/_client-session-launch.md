@@ -2,7 +2,7 @@
 
 Status: **implemented** — `biopb._control._agents` (`launch_argv`, `can_launch`),
 `biopb_control/_clients.py` (the launcher), `POST /api/agents/<id>/launch|stop`, and
-the dashboard's *Start session* button. Where the build differs from the design
+the dashboard's *Start* button. Where the build differs from the design
 below, the section says so.
 
 The dashboard already knows which MCP clients are installed and whether biopb is
@@ -24,7 +24,7 @@ it runs until stopped from the dashboard). Launching a client therefore starts a
 
 | client | mechanism | where the UI is | what the control owns |
 |---|---|---|---|
-| **opencode 1** | `opencode web --hostname 127.0.0.1 --port 0` | a loopback HTTP server; opencode opens the browser itself | a foreground child |
+| **opencode 1** | `opencode serve --hostname 127.0.0.1 --port 0` | a loopback HTTP server | a foreground child |
 | **opencode 2** | `opencode pair` (no `web` command) | a loopback service; a one-time link signs the browser in | nothing — a machine-global background service |
 | **Claude Code** | `claude remote-control --spawn session` | claude.ai/code or the Claude mobile app, over an outbound relay | a foreground child |
 | **Codex CLI** | `codex app-server daemon enable-remote-control` | ChatGPT, over an outbound relay, after a pairing code | nothing — a machine-global daemon |
@@ -37,8 +37,9 @@ button.
 The version decides the invocation (`opencode --version`, the probe
 `_agents` already uses to pick the config shape).
 
-**opencode 1** runs `opencode web` as a foreground child that serves one loopback
-listener and opens the browser itself.
+**opencode 1** runs `opencode serve` as a foreground child that serves the web UI
+on one loopback listener. `opencode web` is the same server but opens a browser
+itself, which the dashboard does for every client instead.
 
 **opencode 2** has no `web` command. Its CLI talks to a background service
 (`opencode service start|status|stop`) that starts on demand, on a loopback port it
@@ -328,9 +329,9 @@ launch contract is `_launch_session`'s, which already solves this shape:
   session launches, not an `alert()`.
 
 **Show the tail on success too, not only on failure.** opencode 1 prints its URL
-there (`Web interface:      http://127.0.0.1:<port>/`), which is what the user
-needs if the browser-open did not land — and it is where the unsecured-server
-warning lives. opencode 2's `pair` prints the one-time link and `serve` its
+there (`opencode server listening on http://127.0.0.1:<port>`), which the
+dashboard opens in a new tab and shows for when that is blocked — and it is where
+the unsecured-server warning lives. opencode 2's `pair` prints the one-time link and `serve` its
 generated password; those are credentials (see [Security](#security)). Strip ANSI
 and the ASCII logo for display.
 

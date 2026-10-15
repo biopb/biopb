@@ -430,13 +430,22 @@ export default function DashboardPage() {
     async (id: string, name: string, act: "launch" | "stop") => {
       setAgentsBusy(true);
       setClientMsg(null);
+      // Opened now, while the click still counts as a user gesture (a tab opened
+      // after the launch returns would be blocked), and pointed at the client's
+      // link once it prints one.
+      const tab = act === "launch" ? window.open("", "_blank") : null;
       try {
         const r = await sessionFetch(
           withBase("/api/agents/") + encodeURIComponent(id) + "/" + act,
           { method: "POST" },
         );
-        setClientMsg(describeClientResult(await r.json().catch(() => ({})), name, act));
+        const res = await r.json().catch(() => ({}));
+        setClientMsg(describeClientResult(res, name, act));
+        const url = res.state === "failed" ? null : firstUrl(res.log);
+        if (tab && url) tab.location.href = url;
+        else tab?.close();
       } catch (e) {
+        tab?.close();
         setClientMsg({ err: true, text: String(e) });
       } finally {
         await pollAgents();
@@ -653,11 +662,11 @@ export default function DashboardPage() {
           ) : null}
           <p className="note">
             Registers biopb-mcp with the client. Restart the client after
-            (un)registering for the change to take effect. A session you start
-            here is the client's own: it ends when the control restarts, and the
-            agent in it attaches to a biopb session. Claude Code and Codex are
-            reached through their vendor&apos;s relay; Claude Code stores the
-            transcript server-side while remote control is connected.
+            (un)registering for the change to take effect. A client you start
+            here ends when the control restarts, and its agent attaches to a
+            biopb session. Claude Code and Codex are reached through their
+            vendor&apos;s relay; Claude Code stores the transcript server-side
+            while remote control is connected.
           </p>
         </div>
 
@@ -830,6 +839,13 @@ function AlgoRow({
   );
 }
 
+// The first link in a client's output: the page it serves, or the one-time link
+// that signs a browser in.
+function firstUrl(text?: string): string | null {
+  const found = text?.match(/https?:\/\/[^\s"'<>]+/);
+  return found ? found[0] : null;
+}
+
 // What a client launch or stop answered, as the note under the list: the
 // client's own output (it holds the URL or link) leads, a failure names its log.
 function describeClientResult(
@@ -892,13 +908,13 @@ function AgentRowView({
               execTitle(
                 canExec,
                 a.running
-                  ? `Stop the ${a.name} session started here`
-                  : `Open a ${a.name} session you can drive from a browser`,
+                  ? `Stop the ${a.name} started here`
+                  : `Start ${a.name} and open it in a browser tab`,
               )
             }
             onClick={() => onLaunch(a.id, a.name, a.running ? "stop" : "launch")}
           >
-            {a.running ? "Stop session" : "Start session"}
+            {a.running ? "Stop" : "Start"}
           </button>
         ) : null}
         {a.state === "not_installed" ? null : a.state === "registered" ? (

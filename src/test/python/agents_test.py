@@ -337,7 +337,7 @@ def test_opencode_launches_by_version_and_never_exposes_the_service(home, monkey
     monkeypatch.setattr(_agents, "_opencode_major", lambda: 1)
     assert opencode.launch_argv() == [
         "opencode",
-        "web",
+        "serve",
         "--hostname",
         "127.0.0.1",
         "--port",

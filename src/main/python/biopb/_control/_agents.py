@@ -850,7 +850,9 @@ class Opencode(JsonConfigClient):
             # Prints a one-time link for the loopback service. Never `--remote`
             # (reaches the internet) or `--yes`.
             return [self.exe, "pair"]
-        return [self.exe, "web", "--hostname", "127.0.0.1", "--port", "0"]
+        # `serve` is `web` without opening a browser, which the dashboard does
+        # for every client.
+        return [self.exe, "serve", "--hostname", "127.0.0.1", "--port", "0"]
 
 
 # --------------------------------------------------------------------------- #
