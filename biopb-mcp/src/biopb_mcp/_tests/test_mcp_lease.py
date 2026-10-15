@@ -23,6 +23,20 @@ def test_a_free_session_is_taken_and_reported():
     assert _lease.snapshot()["holder"] == "agent"
 
 
+def test_the_snapshot_names_the_client_until_the_lease_ends():
+    who = {"pid": 7, "create_time": 1, "name": "claude"}
+    _lease.acquire("agent", "a", client=who)
+    assert _lease.snapshot()["client"] == who
+    _lease.release("a")
+    assert _lease.snapshot() == {"holder": None}
+
+
+def test_a_lapsed_lease_forgets_its_client(fresh):
+    _lease.acquire("agent", "a", client={"pid": 7, "create_time": None, "name": "x"})
+    fresh["now"] += _lease.TTL["agent"] + 1
+    assert _lease.snapshot() == {"holder": None}
+
+
 def test_the_other_kind_is_refused_while_the_lease_lives():
     _lease.acquire("agent", "a")
     refused = _lease.acquire("chat", _lease.CHAT_TOKEN)

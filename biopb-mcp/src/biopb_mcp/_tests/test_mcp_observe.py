@@ -570,6 +570,26 @@ def test_an_agent_takes_the_lease_and_status_shows_it(client, lease):
     assert "viewer" in status
 
 
+def test_the_lease_keeps_what_the_holder_says_it_is(client, lease):
+    who = {"pid": 7, "create_time": 5, "name": "opencode", "junk": "dropped"}
+    client.post(
+        "/api/lease/acquire",
+        json={"token": "t1", "client": who},
+        headers={"content-type": "application/json"},
+    )
+    held = client.get("/api/status").json()["lease"]["client"]
+    assert held == {"pid": 7, "create_time": 5, "name": "opencode"}
+
+
+def test_a_malformed_client_is_ignored_not_refused(client, lease):
+    r = client.post(
+        "/api/lease/acquire",
+        json={"token": "t1", "client": "not-a-dict"},
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 200 and "client" not in r.json()
+
+
 def test_a_held_session_is_refused_with_who_holds_it(client, lease):
     _post(client, "/api/lease/acquire", token="t1")
     r = _post(client, "/api/lease/acquire", token="t2")

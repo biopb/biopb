@@ -352,6 +352,20 @@ async def _lease_token(request):
     return token, payload, None
 
 
+def _lease_client(raw):
+    """The holder's self-description, cut down to what the lease keeps, or
+    ``None`` if it is not one: it is only ever displayed."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("pid"), int):
+        return None
+    create_time = raw.get("create_time")
+    name = raw.get("name")
+    return {
+        "pid": raw["pid"],
+        "create_time": create_time if isinstance(create_time, int) else None,
+        "name": name[:64] if isinstance(name, str) else None,
+    }
+
+
 async def _api_lease_acquire(request):
     """Take the agent lease for ``token``; 409 with the holder if it is held.
 
@@ -361,7 +375,12 @@ async def _api_lease_acquire(request):
     token, payload, err = await _lease_token(request)
     if err is not None:
         return err
-    result = _lease.acquire("agent", token, force=bool(payload.get("force")))
+    result = _lease.acquire(
+        "agent",
+        token,
+        force=bool(payload.get("force")),
+        client=_lease_client(payload.get("client")),
+    )
     return JSONResponse(result, status_code=200 if result["ok"] else 409)
 
 

@@ -130,7 +130,9 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import _logs
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
+from ._clients import ClientLauncher, LaunchRefused
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
     MAX_PNG_BYTES,
@@ -325,6 +327,10 @@ _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # adds a url, never code.)
 _EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new"})
 
+# Launching a client starts an agent with a shell; stopping it is the same verb's
+# other half.
+_CLIENT_LAUNCH_PATH = re.compile(r"/api/agents/[^/]+/(launch|stop)")
+
 
 def _needs_exec(method: str, path: str) -> bool:
     """Whether a request needs the exec credential: the control routes above, the
@@ -332,7 +338,7 @@ def _needs_exec(method: str, path: str) -> bool:
     restart, job cancel, shutdown, the lease). Reads under ``api`` are the
     observe page and stay with the viewing token. Everything unknown defaults
     to exec, so a verb added to the child later is gated until classified."""
-    if path in _EXEC_CONTROL_PATHS:
+    if path in _EXEC_CONTROL_PATHS or _CLIENT_LAUNCH_PATH.fullmatch(path):
         return True
     root = _session_root(path)
     if root is None:
@@ -762,6 +768,7 @@ _PROBE_UNKNOWN = {
     "kernel": "unknown",
     "chat": False,
     "holder": None,
+    "client": None,
 }
 
 
@@ -800,6 +807,8 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
             # agent choosing a session to attach to needs, and the dashboard
             # can show.
             "holder": (health.get("lease") or {}).get("holder"),
+            # The holder's own account of its process, when it gave one.
+            "client": (health.get("lease") or {}).get("client"),
         }
     except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
         return dict(_PROBE_UNKNOWN)
@@ -838,15 +847,6 @@ _SESSION_POLL_INTERVAL = 0.25
 # before registering. That tail is the whole diagnosis (a broken install, a bad
 # config) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
-
-# How many past launches' logs to keep: enough to look back over a couple of
-# failed attempts, not an unbounded pile of Qt chatter.
-_VIEWER_LOG_KEEP = 5
-
-# Cap on same-second name collisions before giving up on a log for this launch.
-# Two dashboard launches inside one second is already a double-click; a hundred
-# is a bug, and a session that starts without a log beats one that does not.
-_VIEWER_LOG_ATTEMPTS = 100
 
 
 # The only variables a launch's ``display`` may set: where a viewer window can
@@ -911,81 +911,6 @@ def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
     return env
 
 
-def _prune_viewer_logs(log_dir, keep: int) -> None:
-    """Keep only the newest *keep* launch logs. Best-effort.
-
-    *keep* is passed rather than defaulted from the module constant: a default
-    argument binds once at definition, so the constant would be frozen into this
-    signature and could never be overridden.
-
-    Run before this launch's file exists, so the count it leaves room for
-    includes the one about to be created. A prune failure never affects the
-    launch.
-    """
-    try:
-        logs = sorted(
-            log_dir.glob("viewer-*.log"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        return
-    for old in logs[max(keep - 1, 0) :]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-
-def _open_viewer_log():
-    """Create this launch's own logfile; return ``(handle, path)``.
-
-    **One file per launch**, not one shared file appended to. A shared log
-    interleaves concurrent viewers, and lines that cannot be attributed to a
-    process are no use for diagnosing a session that is still running — which is
-    the case the failure tail does not cover. The shim reached the same
-    conclusion for its per-session logs.
-
-    Exclusive-create rather than a bare timestamp: two launches in the same
-    second would otherwise land on one name and reintroduce the interleaving in
-    miniature. On any failure the caller still spawns, with the child's output
-    discarded — a viewer that starts without a log beats one that does not start.
-    """
-    try:
-        log_dir = _locations.mcp_viewer_log_dir()
-    except OSError:
-        logger.warning("No viewer log dir; discarding child output", exc_info=True)
-        return None, None
-    _prune_viewer_logs(log_dir, _VIEWER_LOG_KEEP)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for n in range(1, _VIEWER_LOG_ATTEMPTS + 1):
-        suffix = "" if n == 1 else f"-{n}"
-        path = log_dir / f"viewer-{stamp}{suffix}.log"
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            continue
-        except OSError:
-            break
-        # Binary + unbuffered, like every other owned-child log here: the fd is
-        # inherited by the child (and its kernel), which emits arbitrary bytes
-        # from native Qt/GL/dask writers, so it must not be a text wrapper.
-        return os.fdopen(fd, "wb", buffering=0), path
-    logger.warning("Could not create a viewer log in %s; discarding output", log_dir)
-    return None, None
-
-
-def _viewer_log_tail(path) -> str:
-    """This launch's own output. The whole file *is* this launch, so no anchor
-    is needed — that is what one file per launch buys."""
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return ""
-    return data.decode("utf-8", "replace").strip()[-_VIEWER_LOG_TAIL:]
-
-
 def _is_our_launch(rec: dict, launch_token: str) -> bool:
     """Whether session record ``rec`` is the session this launch just spawned.
 
@@ -1033,7 +958,7 @@ def _launch_session(
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
-    log_fh, log_path = _open_viewer_log()
+    log_fh, log_path = _logs.open_log("viewer")
     argv = _session_argv(start_kernel)
     logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
     # Two additions ride on the environment: the per-launch token we recognise
@@ -1083,7 +1008,7 @@ def _launch_session(
             return {
                 "state": "failed",
                 "error": f"the session exited with code {code} before it started",
-                "log": _viewer_log_tail(log_path) if log_path else "",
+                "log": _logs.tail(log_path, _VIEWER_LOG_TAIL) if log_path else "",
                 # Named so a tail that was truncated, or empty because no log
                 # could be opened, still leads somewhere.
                 "log_path": str(log_path) if log_path else None,
@@ -1111,6 +1036,7 @@ def build_app(
     exec_token: str | None = None,
     auth: str | None = None,
     hide: frozenset[str] = frozenset(),
+    relay_clients: bool = False,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -1141,6 +1067,11 @@ def build_app(
     under it are stripped before routing and the served SPA shell is rewritten to
     point back at it. ``None`` (the default) is the plain root origin and changes
     nothing. It is normalized here, the single consumer.
+
+    ``relay_clients`` lets the dashboard launch a client that is reachable from
+    other devices through a relay (Claude Code, Codex): the operator's opt-in, as
+    a local client's launch needs only the ``chat`` root. Either is refused where
+    ``chat`` is hidden, because the client it starts is an agent with a shell.
 
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
@@ -1278,19 +1209,11 @@ def build_app(
                 status_code=500,
             )
 
-    def api_data_plane_logs(request: Request) -> JSONResponse:
-        # The dashboard /logs page polls this: the tail of the data-plane
-        # subprocess's stdout/stderr log (the file the supervisor writes the tensor
-        # server to). Read is bounded in both lines and bytes (see _tail_file), so
+    def _tail_response(path, n: int, note: str | None = None) -> JSONResponse:
+        # The tail of one log file, bounded in lines and bytes (see _tail_file) so
         # tailing a huge log stays cheap; no-store so each poll sees fresh output.
         # Never raises -- a bad read degrades to an error field, not a 500 trace.
-        try:
-            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
-        except (TypeError, ValueError):
-            n = _LOG_TAIL_DEFAULT_LINES
-        n = max(1, min(n, _LOG_TAIL_MAX_LINES))
         headers = {"Cache-Control": "no-store"}
-        path = supervisor.log_path
         if path is None:
             return JSONResponse(
                 {
@@ -1298,8 +1221,7 @@ def build_app(
                     "exists": False,
                     "lines": [],
                     "truncated": False,
-                    "note": "data plane logs to the control's stderr "
-                    "(no log file configured)",
+                    "note": note,
                 },
                 headers=headers,
             )
@@ -1326,7 +1248,7 @@ def build_app(
                 headers=headers,
             )
         except OSError as exc:
-            logger.info("data plane log read failed: %s", exc)
+            logger.info("log read failed: %s", exc)
             return JSONResponse(
                 {
                     "path": str(path),
@@ -1337,6 +1259,40 @@ def build_app(
                 status_code=500,
                 headers=headers,
             )
+
+    def _log_lines(request: Request) -> int:
+        try:
+            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
+        except (TypeError, ValueError):
+            n = _LOG_TAIL_DEFAULT_LINES
+        return max(1, min(n, _LOG_TAIL_MAX_LINES))
+
+    def api_data_plane_logs(request: Request) -> JSONResponse:
+        # The dashboard /logs page polls this: the tail of the data-plane
+        # subprocess's stdout/stderr log (the file the supervisor writes the tensor
+        # server to).
+        return _tail_response(
+            supervisor.log_path,
+            _log_lines(request),
+            "data plane logs to the control's stderr (no log file configured)",
+        )
+
+    def api_sessions_logs(request: Request) -> JSONResponse:
+        # The newest session this control launched (a session started elsewhere
+        # writes its own log).
+        return _tail_response(
+            _logs.latest("viewer"),
+            _log_lines(request),
+            "no session has been started from this dashboard yet",
+        )
+
+    def api_agents_logs(request: Request) -> JSONResponse:
+        # The newest agent-client launch log: what the last Start printed.
+        return _tail_response(
+            _logs.latest("client"),
+            _log_lines(request),
+            "no client has been started from this control yet",
+        )
 
     def api_status(_request: Request) -> JSONResponse:
         # What the dashboard polls: the control is up (it answered), the data
@@ -1388,6 +1344,7 @@ def build_app(
                 # both — answered here so the dashboard needs no second probe.
                 "chat": probe["chat"] and _SESSION_CHAT_ROOT in session_roots,
                 "holder": probe["holder"],
+                "client": probe["client"],
             }
             for rec, probe in zip(records, probes, strict=True)
         ]
@@ -1427,36 +1384,59 @@ def build_app(
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
+    launcher = ClientLauncher(
+        chat_served=_SESSION_CHAT_ROOT in session_roots, relay_clients=relay_clients
+    )
+
     def api_agents(_request: Request) -> JSONResponse:
         # The supported MCP clients and whether biopb is registered with each.
         # Reads are subprocess-free (biopb._control._agents), so the dashboard can poll
         # this without spawning anything; still sync (filesystem), so Starlette
         # runs it in the threadpool.
         try:
-            return JSONResponse({"agents": _agents.statuses()})
+            running = launcher.running_ids()
+            agents = [
+                {
+                    **agent,
+                    "running": agent["id"] in running,
+                    "launch_blocked": launcher.blocked(agent),
+                }
+                for agent in _agents.statuses()
+            ]
+            return JSONResponse({"agents": agents})
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/agents failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
-    def _agent_action(request: Request, action) -> JSONResponse:
-        # Register/unregister biopb with one client, returning its fresh status.
-        # A bad request (unknown client, unparseable client config) is the
-        # caller's fault -> 400; anything else -> 500. Both write user config
-        # files (Claude Code via its CLI), so these are token-gated /api/* verbs.
-        agent_id = request.path_params["agent_id"]
+    def _agent_call(request: Request, action, key: str | None = None) -> JSONResponse:
+        # One client verb. A bad request (unknown client, unparseable client
+        # config) is the caller's fault -> 400; a launch the operator has not
+        # allowed -> 403; anything else -> 500. Register/unregister write user
+        # config files (Claude Code via its CLI) and launch/stop start or end an
+        # agent with a shell, so all are token-gated /api/* verbs.
         try:
-            return JSONResponse({"agent": action(agent_id)})
+            result = action(request.path_params["agent_id"])
+            return JSONResponse({key: result} if key else result)
         except _agents.AgentError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        except LaunchRefused as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("agent %s failed", getattr(action, "__name__", "action"))
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     def agent_register(request: Request) -> JSONResponse:
-        return _agent_action(request, _agents.register)
+        return _agent_call(request, _agents.register, "agent")
 
     def agent_unregister(request: Request) -> JSONResponse:
-        return _agent_action(request, _agents.unregister)
+        return _agent_call(request, _agents.unregister, "agent")
+
+    def agent_launch(request: Request) -> JSONResponse:
+        # Sync: it spawns and then waits (bounded) for the client to say it is up.
+        return _agent_call(request, launcher.launch)
+
+    def agent_stop(request: Request) -> JSONResponse:
+        return _agent_call(request, launcher.stop)
 
     viewer = ViewerBroker()
 
@@ -1912,8 +1892,12 @@ def build_app(
         Route("/api/data_plane/restart", data_plane_restart, methods=["POST"]),
         Route("/api/data_plane/logs", api_data_plane_logs, methods=["GET"]),
         Route("/api/agents", api_agents, methods=["GET"]),
+        Route("/api/agents/logs", api_agents_logs, methods=["GET"]),
+        Route("/api/sessions/logs", api_sessions_logs, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
+        Route("/api/agents/{agent_id}/launch", agent_launch, methods=["POST"]),
+        Route("/api/agents/{agent_id}/stop", agent_stop, methods=["POST"]),
         Route("/api/viewer/next", viewer_next, methods=["GET"]),
         Route("/api/viewer/answer/{req}", viewer_answer, methods=["POST"]),
         Route("/api/viewer/show", viewer_show, methods=["POST"]),
@@ -1947,6 +1931,7 @@ def build_app(
         try:
             yield
         finally:
+            launcher.stop_all()
             await proxy_client.aclose()
             await session_client.aclose()
 
@@ -2038,6 +2023,7 @@ def serve_control_api(
         exec_token=spec.exec_token,
         auth=auth,
         hide=spec.hide,
+        relay_clients=spec.relay_clients,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

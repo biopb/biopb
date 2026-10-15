@@ -49,12 +49,24 @@ interface SessionRec {
   // Who the session answers to -- an attached agent, the chat pane, or nobody.
   // Said in the stop confirmation, since stopping takes the kernel from them.
   holder?: string | null;
+  // The holder's own account of its process, when it gave one; display only.
+  client?: { pid: number; name?: string | null } | null;
 }
 interface AgentRec {
   id: string;
   name: string;
   state: string; // "registered" | "installed" | "not_installed"
   drifted?: boolean;
+  // Whether a session can be opened with this client from here, and whether
+  // other devices reach it through a relay. Absent on an older control.
+  can_launch?: boolean;
+  // What would make a client that has a launch surface launchable here.
+  launch_hint?: string | null;
+  relay?: boolean;
+  // A client this control launched, still up.
+  running?: boolean;
+  // Why the launch is refused (null when it is allowed).
+  launch_blocked?: string | null;
 }
 interface AlgoRec {
   name: string;
@@ -93,6 +105,12 @@ export default function DashboardPage() {
   const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
+  // Outcome of the last client launch or stop. Rendered under the list like a
+  // session launch's: it carries the client's output, which holds the link or
+  // URL the user needs and which no dialog shows well.
+  const [clientMsg, setClientMsg] = useState<{ err: boolean; text: string } | null>(
+    null,
+  );
   const [starting, setStarting] = useState(false);
   const canExec = useCanExec();
   // Whether the control proxies a session's /mcp, i.e. remote MCP access is on
@@ -410,6 +428,35 @@ export default function DashboardPage() {
     [pollAgents],
   );
 
+  const runClientAction = useCallback(
+    async (id: string, name: string, act: "launch" | "stop") => {
+      setAgentsBusy(true);
+      setClientMsg(null);
+      // Opened now, while the click still counts as a user gesture (a tab opened
+      // after the launch returns would be blocked), and pointed at the client's
+      // link once it prints one.
+      const tab = act === "launch" ? window.open("", "_blank") : null;
+      try {
+        const r = await sessionFetch(
+          withBase("/api/agents/") + encodeURIComponent(id) + "/" + act,
+          { method: "POST" },
+        );
+        const res = await r.json().catch(() => ({}));
+        setClientMsg(describeClientResult(res, name, act));
+        const url = res.state === "failed" ? null : firstUrl(res.log);
+        if (tab && url) tab.location.href = url;
+        else tab?.close();
+      } catch (e) {
+        tab?.close();
+        setClientMsg({ err: true, text: String(e) });
+      } finally {
+        await pollAgents();
+        setAgentsBusy(false);
+      }
+    },
+    [pollAgents],
+  );
+
   const dpState = dataPlane.state || "unknown";
   // Links stay live as soon as the port is up (a TCP dial succeeds regardless
   // of backend readiness); the badge is what a human reads as "is it up", so
@@ -454,7 +501,34 @@ export default function DashboardPage() {
       </header>
       <main>
         <div className="card">
-          <h2>Data plane</h2>
+          <h2 className="with-actions">
+            Data plane
+            <span className="head-links">
+              {/* These same-origin links keep rel="opener" on purpose: a new tab
+                  copies sessionStorage from its opener, which is how the unlock
+                  token reaches it; noopener (the target=_blank default) would
+                  make each one ask for the token again. */}
+              <a
+                className={"head-link" + (linksOff ? " off" : "")}
+                href={withBase("/admin")}
+                target="_blank"
+                rel="opener"
+              >
+                Config →
+              </a>
+              {/* The data-plane log tail. Available regardless of plane state (a
+                  crashed plane's log is exactly what you want to read), so unlike
+                  the viewer/config links it is never disabled. */}
+              <a
+                className="head-link"
+                href={withBase("/logs")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
+          </h2>
           <div>
             <span
               className={"badge " + displayState}
@@ -523,10 +597,6 @@ export default function DashboardPage() {
             >
               Stop
             </button>
-            {/* These same-origin links keep rel="opener" on purpose: a new tab
-                copies sessionStorage from its opener, which is how the unlock
-                token reaches it; noopener (the target=_blank default) would
-                make each one ask for the token again. */}
             <a
               className={"link" + (linksOff ? " off" : "")}
               href={withBase("/viewer")}
@@ -534,20 +604,6 @@ export default function DashboardPage() {
               rel="opener"
             >
               View Data →
-            </a>
-            <a
-              className={"link" + (linksOff ? " off" : "")}
-              href={withBase("/admin")}
-              target="_blank"
-              rel="opener"
-            >
-              Config →
-            </a>
-            {/* The data-plane log tail. Available regardless of plane state (a
-                crashed plane's log is exactly what you want to read), so unlike
-                the viewer/config links it is never disabled. */}
-            <a className="link" href={withBase("/logs")} target="_blank" rel="opener">
-              Logs →
             </a>
           </div>
         </div>
@@ -586,11 +642,22 @@ export default function DashboardPage() {
         </div>
 
         <div className="card">
-          <h2>
+          <h2 className="with-actions">
             Agent clients
             <button className="mini" onClick={pollAgents}>
               ↻
             </button>
+            {/* What the last Start printed, kept out of the card. */}
+            <span className="head-links">
+              <a
+                className="head-link"
+                href={withBase("/logs?source=agents")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
           </h2>
           <ul>
             {agents == null ? (
@@ -603,14 +670,25 @@ export default function DashboardPage() {
                   key={a.id}
                   a={a}
                   busy={agentsBusy}
+                  canExec={canExec}
                   onAction={agentAction}
+                  onLaunch={runClientAction}
                 />
               ))
             )}
           </ul>
+          {clientMsg ? (
+            <p className={clientMsg.err ? "note err launch" : "note launch"}>
+              {clientMsg.text}
+            </p>
+          ) : null}
           <p className="note">
             Registers biopb-mcp with the client. Restart the client after
-            (un)registering for the change to take effect.
+            (un)registering for the change to take effect. A client you start
+            here ends when the control restarts, and its agent attaches to a
+            biopb session. Claude Code and Codex are reached through their
+            vendor&apos;s relay; Claude Code stores the transcript server-side
+            while remote control is connected.
           </p>
         </div>
 
@@ -625,29 +703,30 @@ export default function DashboardPage() {
             >
               {starting ? "starting…" : "+ new session"}
             </button>
-            {/* biopb-mcp's own global settings (transport/kernel/algorithm
-                servers), served by the control at /api/mcp_config. It sits here
-                rather than in the header because it is what every session in
-                this list was launched with — including the ones the button
-                beside it starts. */}
-            <a
-              className="gear-link"
-              href={withBase("/mcp/admin")}
-              target="_blank"
-              rel="opener"
-            >
-              <svg
-                className="gear-icon"
-                viewBox="0 0 16 16"
-                width="13"
-                height="13"
-                fill="currentColor"
-                aria-hidden="true"
+            <span className="head-links">
+              {/* biopb-mcp's own global settings (transport/kernel/algorithm
+                  servers), served by the control at /api/mcp_config. It sits here
+                  rather than in the header because it is what every session in
+                  this list was launched with — including the ones the button
+                  beside it starts. */}
+              <a
+                className="head-link"
+                href={withBase("/mcp/admin")}
+                target="_blank"
+                rel="opener"
               >
-                <path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.039.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.103-.303c-.066-.019-.176-.011-.299.071a4.909 4.909 0 0 1-.668.386c-.133.066-.194.158-.212.224l-.288 1.107c-.17.645-.716 1.195-1.459 1.259a8.147 8.147 0 0 1-1.402 0c-.743-.064-1.289-.614-1.459-1.259l-.288-1.107c-.018-.066-.079-.158-.212-.224a4.911 4.911 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a7.988 7.988 0 0 1-.704-1.217c-.315-.675-.111-1.422.364-1.891l.814-.806c.049-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.039-.246-.088-.294l-.814-.806C.635 6.045.431 5.298.746 4.623a7.921 7.921 0 0 1 .704-1.218c.428-.609 1.176-.806 1.82-.63l1.103.303c.066.019.176.011.299-.071.214-.143.437-.272.668-.386.133-.066.194-.158.212-.224l.288-1.107C6.01.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm0 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7ZM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z" />
-              </svg>
-              Session settings
-            </a>
+                Config →
+              </a>
+              {/* The newest session this dashboard launched. */}
+              <a
+                className="head-link"
+                href={withBase("/logs?source=sessions")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
           </h2>
           <ul>
             {sessions == null ? (
@@ -667,6 +746,11 @@ export default function DashboardPage() {
                       :{s.port}
                       {when ? " · " + when : ""}
                     </span>
+                    {s.client && s.client.name ? (
+                      <span className="when" title={`pid ${s.client.pid}`}>
+                        held by {s.client.name}
+                      </span>
+                    ) : null}
                     <span className={"kbadge k-" + kernel}>
                       {kernel === "none" ? "no kernel" : "kernel: " + kernel}
                     </span>
@@ -778,6 +862,36 @@ function AlgoRow({
   );
 }
 
+// The first link in a client's output: the page it serves, or the one-time link
+// that signs a browser in. Used to open the tab, not shown in the card.
+function firstUrl(text?: string): string | null {
+  const found = text?.match(/https?:\/\/[^\s"'<>]+/);
+  return found ? found[0] : null;
+}
+
+// What a client launch or stop answered, as the note under the list: the
+// client's own output (it holds the URL or link) leads, a failure names its log.
+function describeClientResult(
+  res: { error?: string; state?: string; already?: boolean; stopped?: boolean; note?: string; log?: string; log_path?: string },
+  name: string,
+  act: "launch" | "stop",
+): { err: boolean; text: string } {
+  if (res.error || res.state === "failed") {
+    // A launch with a log file is read from Logs; one without has only this.
+    const out = res.log && !res.log_path ? `\n\n${res.log}` : "";
+    return { err: true, text: `${res.error}${out}` };
+  }
+  if (act === "stop")
+    return { err: !res.stopped, text: res.note || `${name} stopped.` };
+  const head =
+    res.state === "starting"
+      ? `${name} is still starting.`
+      : res.already
+        ? `${name} is already running.`
+        : `${name} started.`;
+  return { err: false, text: head };
+}
+
 // The agent-client buttons for one row. not_installed rows get none; a
 // registered row offers Unregister, plus an amber "Re-register (update)" only
 // when the stored command drifted from the current biopb-mcp location — a plain
@@ -786,11 +900,15 @@ function AlgoRow({
 function AgentRowView({
   a,
   busy,
+  canExec,
   onAction,
+  onLaunch,
 }: {
   a: AgentRec;
   busy: boolean;
+  canExec: boolean;
   onAction: (id: string, act: "register" | "unregister") => void;
+  onLaunch: (id: string, name: string, act: "launch" | "stop") => void;
 }) {
   const label =
     a.state === "registered"
@@ -805,6 +923,23 @@ function AgentRowView({
       <span className="sid">{a.name}</span>
       <span className="state">{label}</span>
       <span className="agent-btns">
+        {a.state === "registered" && (a.can_launch || a.launch_hint) ? (
+          <button
+            disabled={busy || !canExec || (!a.running && !!a.launch_blocked)}
+            title={
+              (!a.running && a.launch_blocked) ||
+              execTitle(
+                canExec,
+                a.running
+                  ? `Stop the ${a.name} started here`
+                  : `Start ${a.name} and open it in a browser tab`,
+              )
+            }
+            onClick={() => onLaunch(a.id, a.name, a.running ? "stop" : "launch")}
+          >
+            {a.running ? "Stop" : "Start"}
+          </button>
+        ) : null}
         {a.state === "not_installed" ? null : a.state === "registered" ? (
           <>
             {a.drifted ? (
@@ -860,12 +995,13 @@ const DASH_CSS = `
   .ctrl-dash h2.with-actions { display: flex; align-items: center; gap: 8px; }
   .ctrl-dash h2.with-actions .mini { margin-left: 0; }
   .ctrl-dash h2.with-actions > :last-child { margin-left: auto; }
-  /* Cancels the h2's uppercase/tracking: this is a link, not part of the title. */
-  .ctrl-dash a.gear-link { font-size: 12px; color: #8bf; text-decoration: none;
-           display: inline-flex; align-items: center; gap: 5px;
+  /* The links a card heading carries (Config →, Logs →), grouped at its right
+     edge. Cancels the h2's uppercase/tracking: these are links, not the title. */
+  .ctrl-dash .head-links { margin-left: auto; display: flex; gap: 12px; }
+  .ctrl-dash a.head-link { font-size: 12px; color: #8bf; text-decoration: none;
            text-transform: none; letter-spacing: 0; }
-  .ctrl-dash a.gear-link:hover { text-decoration: underline; }
-  .ctrl-dash .gear-icon { flex: none; }
+  .ctrl-dash a.head-link:hover { text-decoration: underline; }
+  .ctrl-dash a.head-link.off { color: #667; pointer-events: none; }
   .ctrl-dash main { padding: 16px; max-width: 760px; }
   .ctrl-dash .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
           background: #161616; }

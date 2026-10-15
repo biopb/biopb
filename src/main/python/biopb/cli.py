@@ -917,6 +917,7 @@ def _control_run_argv(
     url_prefix: Optional[str] = None,
     grpc_external_location: Optional[str] = None,
     tokenless: bool = False,
+    allow_relay_clients: bool = False,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -965,6 +966,8 @@ def _control_run_argv(
         argv += ["--url-prefix", url_prefix]
     if grpc_external_location:
         argv += ["--grpc-external-location", grpc_external_location]
+    if allow_relay_clients:
+        argv.append("--allow-relay-clients")
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
@@ -1077,6 +1080,15 @@ _OPT_DATA_PLANE = typer.Option(
     "control plane starts without it; a client brings it up on demand via the "
     "control API.",
 )
+_OPT_ALLOW_RELAY_CLIENTS = typer.Option(
+    False,
+    "--allow-relay-clients",
+    envvar="BIOPB_CONTROL_RELAY_CLIENTS",
+    help="Let the dashboard launch Claude Code and Codex remote sessions, which "
+    "other devices reach through the vendor's relay, and start opencode 2 with "
+    "`pair --remote`, which exposes its server to the internet. Off by default: "
+    "the client it starts is an agent with a shell.",
+)
 _OPT_GRPC_EXTERNAL_LOCATION = typer.Option(
     None,
     "--grpc-external-location",
@@ -1107,6 +1119,7 @@ def control_start(
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
     grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
+    allow_relay_clients: bool = _OPT_ALLOW_RELAY_CLIENTS,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1199,6 +1212,7 @@ def control_start(
                 url_prefix=url_prefix,
                 grpc_external_location=grpc_external_location,
                 tokenless=_says_tokenless(resolved_token),
+                allow_relay_clients=allow_relay_clients,
             )
 
             log_file = _control_log_file()
@@ -1507,6 +1521,7 @@ def dashboard(
                 remote=remote,
                 url_prefix=None,
                 grpc_external_location=grpc_external_location,
+                allow_relay_clients=False,
             )
         except typer.Exit as started:
             if started.exit_code:
