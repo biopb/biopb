@@ -741,6 +741,26 @@ _tail_log() {
     done
 }
 
+# Record how this run ended in <state>/update-result.json, which the control
+# reads after an update it started (a failed install leaves no control to say so).
+# "running" is written first, so a run that dies leaves a record that is not "ok".
+_write_install_result() {
+    local state_dir="${BIOPB_STATE_HOME:-$HOME/.local/state}/biopb"
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+    printf '{"status": "%s", "version": "%s", "time": "%s"}\n' \
+        "$1" "${RELEASE_VERSION:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$state_dir/update-result.json" 2>/dev/null || true
+}
+
+# Runs on any exit of the install: removes the wheel download dir, and turns a
+# result still "running" (error, set -e, signal) into "failed".
+_install_exit() {
+    local rc=$?
+    rm -rf "${WHEELS_DIR:-}"
+    if [ "${INSTALL_RESULT_DONE:-0}" != "1" ]; then _write_install_result failed; fi
+    return $rc
+}
+
 # Start the control plane (biopb control), which spawns and supervises the data
 # plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
 # Starting now lets the pre-cache warm overviews before the user opens anything.
@@ -775,7 +795,9 @@ _start_control_plane() {
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     local start_out
-    if ! start_out=$("$biopb_cmd" control start 2>&1); then
+    # `restart` rather than `start`: it comes back with the options the previous
+    # control ran with (or the defaults when none were saved).
+    if ! start_out=$("$biopb_cmd" control restart 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
@@ -1411,7 +1433,9 @@ install_biopb() {
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
-    trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
+    INSTALL_RESULT_DONE=0
+    trap _install_exit EXIT
+    _write_install_result running
     # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
     # status, so a failing _urldecode/basename would sail past `set -e` and leave
     # a truncated path to curl into.
@@ -1703,6 +1727,8 @@ install_biopb() {
     # ===== 7. Start the control plane (which owns the data plane) =====
     _step "[7/7] Starting control plane..."
     _start_control_plane
+    INSTALL_RESULT_DONE=1
+    _write_install_result ok
 
     # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
     _install_desktop_shortcut
