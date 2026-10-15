@@ -628,6 +628,8 @@ class ClaudeCode(CliManagedClient):
     # User-scope servers live in ~/.claude.json; read-only here.
     parent_key = "mcpServers"
     relay = True
+    # The link to the session on claude.ai, printed once it is connected.
+    ready_pattern = re.compile(r"https://claude\.ai/\S+")
 
     def config_path(self) -> Optional[Path]:
         return Path.home() / ".claude.json"

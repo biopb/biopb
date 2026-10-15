@@ -317,6 +317,9 @@ def test_claude_code_launches_one_session_without_bypassing_permissions(
         "default",
     ]
     assert client.can_launch() and client.launch_kind == "child"
+    # Started means the link to the session has been printed.
+    out = "Continue coding in the Claude mobile app or https://claude.ai/code/session_01Ab\n"
+    assert client.ready_pattern.search(out).group(0).endswith("session_01Ab")
 
 
 def test_codex_needs_its_standalone_install_to_launch(home, monkeypatch):
