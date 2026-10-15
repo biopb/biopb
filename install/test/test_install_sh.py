@@ -504,6 +504,19 @@ def test_mcp_unmerge_removes_only_the_biopb_entry(tmp_path):
     assert data["theme"] == "dark"
 
 
+def test_mcp_unmerge_follows_a_dotted_parent_path(tmp_path):
+    """opencode 2 keeps servers under mcp.servers."""
+    cfg = tmp_path / "opencode.json"
+    cfg.write_text(
+        json.dumps({"mcp": {"servers": {"biopb": {}, "other": {}}, "keep": {}}})
+    )
+    assert _unmerge(cfg, "mcp.servers") == "removed"
+    assert json.loads(cfg.read_text()) == {
+        "mcp": {"servers": {"other": {}}, "keep": {}}
+    }
+    assert _unmerge(cfg, "mcp.servers") == ""
+
+
 def test_mcp_unmerge_is_silent_when_there_is_nothing_to_remove(tmp_path):
     """Callers report per client off this output, so silence has to mean untouched."""
     cfg = tmp_path / "mcp.json"
