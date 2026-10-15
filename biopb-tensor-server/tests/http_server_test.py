@@ -3254,6 +3254,65 @@ class TestScalePolicyOnSlice:
         # statement of what it got.
         assert r.headers["X-Scale-Hint"] == "4,4,4"
 
+    def _volume_read(self, dtype):
+        td = _make_tensor_desc(
+            array_id="big/Image:0",
+            shape=(1024, 1024, 1024),
+            dim_labels=["z", "y", "x"],
+            dtype=np.dtype(dtype).str,
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="big", tensors=[td]))
+        mock_fc.get_array.return_value = np.full((4, 4, 4), 3, dtype=dtype)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                plan = tc.get("/api/tile_info/big/Image:0").json()["volume"]
+                r = tc.post(
+                    "/api/slice",
+                    json={"array_id": "big/Image:0", "scale_policy": "volume"},
+                )
+        assert r.status_code == 200, r.text
+        return plan, r
+
+    def test_a_float64_volume_ships_as_float32(self):
+        # The texture is float32 whatever arrives, so the extra four bytes per
+        # voxel are pure wire cost.
+        plan, r = self._volume_read("float64")
+        assert r.headers["X-Dtype"] == "float32"
+        assert np.frombuffer(r.content, dtype="float32").tolist() == [3.0] * 64
+        # The plan advertises what the read will send, since the viewer's
+        # size gate reads it before the read is made.
+        assert plan["bytes"] == plan["depth"] * plan["height"] * plan["width"] * 4
+
+    def test_a_volume_in_a_narrower_dtype_is_not_touched(self):
+        plan, r = self._volume_read("uint16")
+        assert r.headers["X-Dtype"] == "uint16"
+        assert plan["bytes"] == plan["depth"] * plan["height"] * plan["width"] * 2
+
+    def test_a_read_that_names_its_own_scale_keeps_its_dtype(self):
+        td = _make_tensor_desc(
+            array_id="f/Image:0",
+            shape=(8, 8, 8),
+            dim_labels=["z", "y", "x"],
+            dtype="<f8",
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="f", tensors=[td]))
+        mock_fc.get_array.return_value = np.zeros((8, 8, 8), dtype="float64")
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post(
+                    "/api/slice",
+                    json={"array_id": "f/Image:0", "scale_hint": [1, 1, 1]},
+                )
+        assert r.headers["X-Dtype"] == "float64"
+
     def test_a_caller_that_chose_gets_its_own_scale_echoed(self, tile_client):
         tc, mock_fc = tile_client
         r = self._post(tc, scale_hint=[1, 1, 1, 2, 2])
