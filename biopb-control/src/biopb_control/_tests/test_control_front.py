@@ -989,6 +989,18 @@ def test_the_clients_log_page_tails_the_newest_launch(control, tmp_path, monkeyp
     assert body["path"] == str(new) and body["lines"] == ["second"]
 
 
+def test_the_sessions_log_page_tails_the_newest_dashboard_launch(
+    control, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("biopb._config.locations.mcp_viewer_log_dir", lambda: tmp_path)
+    body = json.loads(_get(f"{control}/api/sessions/logs")[2])
+    assert body["exists"] is False and "no session" in body["note"]
+    (tmp_path / "client-opencode-1.log").write_text("not a session\n")
+    (tmp_path / "viewer-20261015-1.log").write_text("kernel up\n")
+    body = json.loads(_get(f"{control}/api/sessions/logs")[2])
+    assert body["lines"] == ["kernel up"]
+
+
 def test_launching_an_unknown_client_is_a_bad_request(control):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _post(f"{control}/api/agents/nope/launch")

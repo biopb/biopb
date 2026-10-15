@@ -1277,6 +1277,15 @@ def build_app(
             "data plane logs to the control's stderr (no log file configured)",
         )
 
+    def api_sessions_logs(request: Request) -> JSONResponse:
+        # The newest session this control launched (a session started elsewhere
+        # writes its own log).
+        return _tail_response(
+            _logs.latest("viewer"),
+            _log_lines(request),
+            "no session has been started from this dashboard yet",
+        )
+
     def api_agents_logs(request: Request) -> JSONResponse:
         # The newest agent-client launch log: what the last Start printed.
         return _tail_response(
@@ -1884,6 +1893,7 @@ def build_app(
         Route("/api/data_plane/logs", api_data_plane_logs, methods=["GET"]),
         Route("/api/agents", api_agents, methods=["GET"]),
         Route("/api/agents/logs", api_agents_logs, methods=["GET"]),
+        Route("/api/sessions/logs", api_sessions_logs, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/agents/{agent_id}/launch", agent_launch, methods=["POST"]),

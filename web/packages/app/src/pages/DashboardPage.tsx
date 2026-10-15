@@ -499,7 +499,34 @@ export default function DashboardPage() {
       </header>
       <main>
         <div className="card">
-          <h2>Data plane</h2>
+          <h2 className="with-actions">
+            Data plane
+            <span className="head-links">
+              {/* These same-origin links keep rel="opener" on purpose: a new tab
+                  copies sessionStorage from its opener, which is how the unlock
+                  token reaches it; noopener (the target=_blank default) would
+                  make each one ask for the token again. */}
+              <a
+                className={"head-link" + (linksOff ? " off" : "")}
+                href={withBase("/admin")}
+                target="_blank"
+                rel="opener"
+              >
+                Config →
+              </a>
+              {/* The data-plane log tail. Available regardless of plane state (a
+                  crashed plane's log is exactly what you want to read), so unlike
+                  the viewer/config links it is never disabled. */}
+              <a
+                className="head-link"
+                href={withBase("/logs")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
+          </h2>
           <div>
             <span
               className={"badge " + displayState}
@@ -568,10 +595,6 @@ export default function DashboardPage() {
             >
               Stop
             </button>
-            {/* These same-origin links keep rel="opener" on purpose: a new tab
-                copies sessionStorage from its opener, which is how the unlock
-                token reaches it; noopener (the target=_blank default) would
-                make each one ask for the token again. */}
             <a
               className={"link" + (linksOff ? " off" : "")}
               href={withBase("/viewer")}
@@ -579,20 +602,6 @@ export default function DashboardPage() {
               rel="opener"
             >
               View Data →
-            </a>
-            <a
-              className={"link" + (linksOff ? " off" : "")}
-              href={withBase("/admin")}
-              target="_blank"
-              rel="opener"
-            >
-              Config →
-            </a>
-            {/* The data-plane log tail. Available regardless of plane state (a
-                crashed plane's log is exactly what you want to read), so unlike
-                the viewer/config links it is never disabled. */}
-            <a className="link" href={withBase("/logs")} target="_blank" rel="opener">
-              Logs →
             </a>
           </div>
         </div>
@@ -637,14 +646,16 @@ export default function DashboardPage() {
               ↻
             </button>
             {/* What the last Start printed, kept out of the card. */}
-            <a
-              className="gear-link"
-              href={withBase("/logs?source=agents")}
-              target="_blank"
-              rel="opener"
-            >
-              Logs →
-            </a>
+            <span className="head-links">
+              <a
+                className="head-link"
+                href={withBase("/logs?source=agents")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
           </h2>
           <ul>
             {agents == null ? (
@@ -690,29 +701,30 @@ export default function DashboardPage() {
             >
               {starting ? "starting…" : "+ new session"}
             </button>
-            {/* biopb-mcp's own global settings (transport/kernel/algorithm
-                servers), served by the control at /api/mcp_config. It sits here
-                rather than in the header because it is what every session in
-                this list was launched with — including the ones the button
-                beside it starts. */}
-            <a
-              className="gear-link"
-              href={withBase("/mcp/admin")}
-              target="_blank"
-              rel="opener"
-            >
-              <svg
-                className="gear-icon"
-                viewBox="0 0 16 16"
-                width="13"
-                height="13"
-                fill="currentColor"
-                aria-hidden="true"
+            <span className="head-links">
+              {/* biopb-mcp's own global settings (transport/kernel/algorithm
+                  servers), served by the control at /api/mcp_config. It sits here
+                  rather than in the header because it is what every session in
+                  this list was launched with — including the ones the button
+                  beside it starts. */}
+              <a
+                className="head-link"
+                href={withBase("/mcp/admin")}
+                target="_blank"
+                rel="opener"
               >
-                <path d="M8 0a8.2 8.2 0 0 1 .701.031C9.444.095 9.99.645 10.16 1.29l.288 1.107c.018.066.079.158.212.224.231.114.454.243.668.386.123.082.233.09.299.071l1.103-.303c.644-.176 1.392.021 1.82.63.27.385.506.792.704 1.218.315.675.111 1.422-.364 1.891l-.814.806c-.049.048-.098.147-.088.294.016.257.016.515 0 .772-.01.147.039.246.088.294l.814.806c.475.469.679 1.216.364 1.891a7.977 7.977 0 0 1-.704 1.217c-.428.61-1.176.807-1.82.63l-1.103-.303c-.066-.019-.176-.011-.299.071a4.909 4.909 0 0 1-.668.386c-.133.066-.194.158-.212.224l-.288 1.107c-.17.645-.716 1.195-1.459 1.259a8.147 8.147 0 0 1-1.402 0c-.743-.064-1.289-.614-1.459-1.259l-.288-1.107c-.018-.066-.079-.158-.212-.224a4.911 4.911 0 0 1-.668-.386c-.123-.082-.233-.09-.299-.071l-1.103.303c-.644.176-1.392-.021-1.82-.63a7.988 7.988 0 0 1-.704-1.217c-.315-.675-.111-1.422.364-1.891l.814-.806c.049-.048.098-.147.088-.294a6.214 6.214 0 0 1 0-.772c.01-.147-.039-.246-.088-.294l-.814-.806C.635 6.045.431 5.298.746 4.623a7.921 7.921 0 0 1 .704-1.218c.428-.609 1.176-.806 1.82-.63l1.103.303c.066.019.176.011.299-.071.214-.143.437-.272.668-.386.133-.066.194-.158.212-.224l.288-1.107C6.01.645 6.556.095 7.299.03 7.53.01 7.764 0 8 0Zm0 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7ZM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z" />
-              </svg>
-              Session settings
-            </a>
+                Config →
+              </a>
+              {/* The newest session this dashboard launched. */}
+              <a
+                className="head-link"
+                href={withBase("/logs?source=sessions")}
+                target="_blank"
+                rel="opener"
+              >
+                Logs →
+              </a>
+            </span>
           </h2>
           <ul>
             {sessions == null ? (
@@ -981,12 +993,13 @@ const DASH_CSS = `
   .ctrl-dash h2.with-actions { display: flex; align-items: center; gap: 8px; }
   .ctrl-dash h2.with-actions .mini { margin-left: 0; }
   .ctrl-dash h2.with-actions > :last-child { margin-left: auto; }
-  /* Cancels the h2's uppercase/tracking: this is a link, not part of the title. */
-  .ctrl-dash a.gear-link { font-size: 12px; color: #8bf; text-decoration: none;
-           display: inline-flex; align-items: center; gap: 5px;
+  /* The links a card heading carries (Config →, Logs →), grouped at its right
+     edge. Cancels the h2's uppercase/tracking: these are links, not the title. */
+  .ctrl-dash .head-links { margin-left: auto; display: flex; gap: 12px; }
+  .ctrl-dash a.head-link { font-size: 12px; color: #8bf; text-decoration: none;
            text-transform: none; letter-spacing: 0; }
-  .ctrl-dash a.gear-link:hover { text-decoration: underline; }
-  .ctrl-dash .gear-icon { flex: none; }
+  .ctrl-dash a.head-link:hover { text-decoration: underline; }
+  .ctrl-dash a.head-link.off { color: #667; pointer-events: none; }
   .ctrl-dash main { padding: 16px; max-width: 760px; }
   .ctrl-dash .card { border: 1px solid #333; border-radius: 6px; padding: 14px 16px; margin-bottom: 16px;
           background: #161616; }

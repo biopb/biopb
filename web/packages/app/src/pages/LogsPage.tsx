@@ -36,9 +36,11 @@ function formatBytes(n?: number): string {
 }
 
 export default function LogsPage() {
-  // `?source=agents` is the last agent-client launch; otherwise the data plane.
-  const agents = useSearchParams()[0].get("source") === "agents";
-  const what = agents ? "Agent client" : "Data-plane";
+  // `?source=` picks whose log: the last agent-client launch, the last session
+  // the dashboard launched, or (default) the data plane.
+  const source = useSearchParams()[0].get("source") ?? "data_plane";
+  const what =
+    source === "agents" ? "Agent client" : source === "sessions" ? "Session" : "Data-plane";
   useDocumentTitle(`BioPB control - ${what.toLowerCase()} logs`);
 
   const [data, setData] = useState<LogsResponse | null>(null);
@@ -56,7 +58,7 @@ export default function LogsPage() {
     setLoading(true);
     try {
       const r = await sessionFetch(
-        withBase(`/api/${agents ? "agents" : "data_plane"}/logs?lines=${n}`),
+        withBase(`/api/${source}/logs?lines=${n}`),
         { cache: "no-store" },
       );
       if (!r.ok) {
@@ -73,7 +75,7 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, [agents]);
+  }, [source]);
 
   // Capture a ?token= handed over by the one-time access URL before the first
   // fetch, so a remote-mode deep link to /logs authenticates rather than bouncing.
