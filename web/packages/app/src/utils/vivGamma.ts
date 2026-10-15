@@ -15,12 +15,16 @@
  * since pow(i*c) != pow(i)*c. This is now the only implementation of the curve —
  * the server-side one went with `renderer.py`.
  *
+ * The 3-D layer is the other way round: it applies contrast itself and has no
+ * per-sample hook worth claiming, so {@link gamma3dExtensions} bends the one
+ * value the ray march ends on -- see there.
+ *
  * Interleaved RGB is drawn by a `BitmapLayer`, which Viv constructs with
  * `extensions: []` — gamma does not reach it, exactly as contrast limits do not.
  */
 
 import type { Layer, UpdateParameters } from "@deck.gl/core";
-import { VivLayerExtension } from "@hms-dbmi/viv";
+import { ColorPalette3DExtensions, VivLayerExtension } from "@hms-dbmi/viv";
 
 /**
  * Names the uniform block, its GLSL accessor and the `shaderInputs` key — luma
@@ -75,9 +79,105 @@ export class GammaExtension extends VivLayerExtension {
     // the same implementation through the prototype keeps the call (a no-op
     // today, but the base is free to grow one) without the type gymnastics.
     VivLayerExtension.prototype.updateState.call(this, params, extension);
-    const { gamma = 1 } = this.props as GammaExtensionProps;
-    for (const model of this.getModels()) {
-      model.shaderInputs.setProps({ [MODULE]: { gamma } });
-    }
+    pushGamma(this);
   }
+}
+
+function pushGamma(layer: Layer) {
+  const { gamma = 1 } = layer.props as GammaExtensionProps;
+  for (const model of layer.getModels()) {
+    model.shaderInputs.setProps({ [MODULE]: { gamma } });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 3-D
+// ---------------------------------------------------------------------------
+
+type Rendering = { _BEFORE_RENDER: string; _RENDER: string; _AFTER_RENDER: string };
+
+/** The projection modes' final step: the held max/min, clamped into the colormap. */
+const PROJECTED = /min\(1\.0, ((?:max|min)Val\w*)\)/;
+
+/**
+ * A copy of a 3-D rendering with gamma applied to the value it ends on.
+ *
+ * Max and min projection pick one sample per ray, and gamma is monotonic, so
+ * bending the picked value is the same as bending every sample first -- the
+ * result is exact, and the curve costs one `pow` per pixel instead of one per
+ * step. Additive blending sums the samples, which a curve does not commute
+ * with, so there it bends the finished picture instead: an approximation,
+ * applied to the brightest channel so the hue stays put (per-channel `pow`
+ * would shift it, for the reason given at the top of this file).
+ *
+ * Rewrites Viv's shader text, so it refuses to guess: a Viv whose projection
+ * step no longer matches throws here, at load, rather than rendering
+ * ungammaed with the slider still moving.
+ */
+function withGamma(mode: "mip" | "minip" | "additive", rendering: Rendering): Rendering {
+  const g = `${MODULE}.gamma`;
+  if (mode === "additive") {
+    return {
+      ...rendering,
+      _AFTER_RENDER: `${rendering._AFTER_RENDER}
+  float peak = max(color.r, max(color.g, color.b));
+  if (peak > 0.0) {
+    color.rgb *= pow(min(peak, 1.0), ${g}) / peak;
+  }
+`,
+    };
+  }
+  if (!PROJECTED.test(rendering._AFTER_RENDER)) {
+    throw new Error(`Viv's ${mode} projection no longer ends in a clamped max/min`);
+  }
+  return {
+    ...rendering,
+    _AFTER_RENDER: rendering._AFTER_RENDER.replace(
+      PROJECTED,
+      (_, v: string) => `min(1.0, pow(clamp(${v}, 0.0, 1.0), ${g}))`,
+    ),
+  };
+}
+
+/**
+ * Carries the gamma uniform into the 3-D layer and, being the last extension
+ * with a `rendering`, is the one whose strings the layer compiles.
+ *
+ * Unlike {@link GammaExtension} it claims no `DECKGL_PROCESS_INTENSITY`: the 3-D
+ * layer then keeps its own contrast ramp, which is what the samples must go
+ * through before anything is picked.
+ */
+class Gamma3DExtension extends VivLayerExtension {
+  static override extensionName = "Gamma3DExtension";
+  static defaultProps = GammaExtension.defaultProps;
+
+  rendering: Rendering;
+
+  constructor(rendering: Rendering) {
+    super();
+    this.rendering = rendering;
+  }
+
+  getVivShaderTemplates() {
+    return { modules: [{ name: MODULE, uniformTypes: gammaModule.uniformTypes, fs: gammaModule.fs }] };
+  }
+
+  override updateState(this: Layer, params: UpdateParameters<Layer>, extension: Gamma3DExtension) {
+    VivLayerExtension.prototype.updateState.call(this, params, extension);
+    pushGamma(this);
+  }
+}
+
+/**
+ * The extensions that render `mode` with gamma: Viv's own, then the one that
+ * bends their result. Build once per mode at module scope -- a new array is a
+ * recompile (see `VOLUME_EXTENSIONS`).
+ */
+export function gamma3dExtensions(mode: "mip" | "minip" | "additive"): unknown[] {
+  const base = {
+    mip: new ColorPalette3DExtensions.MaximumIntensityProjectionExtension({}),
+    minip: new ColorPalette3DExtensions.MinimumIntensityProjectionExtension({}),
+    additive: new ColorPalette3DExtensions.AdditiveBlendExtension({}),
+  }[mode];
+  return [base, new Gamma3DExtension(withGamma(mode, (base as unknown as { rendering: Rendering }).rendering))];
 }
