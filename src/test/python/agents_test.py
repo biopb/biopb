@@ -28,6 +28,8 @@ def home(tmp_path, monkeypatch):
     # one set can't have a real Codex install leak into these assertions.
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(_agents, "_mcp_executable", lambda: _CMD)
+    # An opencode on the test machine would otherwise pick the config shape.
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: None)
     return tmp_path
 
 
@@ -258,6 +260,96 @@ def test_opencode_uses_its_own_entry_shape(home):
         "enabled": True,
     }
     assert _agents.status("opencode")["state"] == "registered"
+
+
+# --------------------------------------------------------------------------- #
+# opencode 1 vs 2: servers under ``mcp`` or ``mcp.servers``
+# --------------------------------------------------------------------------- #
+
+_V1_ENTRY = {"type": "local", "command": [_CMD], "enabled": True}
+_V2_ENTRY = {"type": "local", "command": [_CMD]}
+
+
+def _opencode_cfg(home, text=None):
+    cfg = home / ".config" / "opencode" / "opencode.json"
+    cfg.parent.mkdir(parents=True)
+    if text is not None:
+        cfg.write_text(text)
+    return cfg
+
+
+def test_opencode_2_registers_under_mcp_servers(home, monkeypatch):
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
+    cfg = _opencode_cfg(home, '{"theme": "dark"}')
+    s = _agents.register("opencode")
+    data = json.loads(cfg.read_text())
+    assert data["mcp"] == {"servers": {"biopb": _V2_ENTRY}}
+    assert data["theme"] == "dark"
+    assert s["state"] == "registered" and not s["drifted"]
+
+
+def test_opencode_2_moves_a_v1_entry_it_would_ignore(home, monkeypatch):
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
+    cfg = _opencode_cfg(
+        home, json.dumps({"mcp": {"biopb": _V1_ENTRY, "other": {"type": "remote"}}})
+    )
+    # opencode 2 does not read it, so it is not registered
+    assert _agents.status("opencode")["state"] == "installed"
+    _agents.register("opencode")
+    data = json.loads(cfg.read_text())
+    assert data["mcp"] == {"other": {"type": "remote"}, "servers": {"biopb": _V2_ENTRY}}
+
+
+def test_opencode_1_keeps_the_old_place(home, monkeypatch):
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 1)
+    cfg = _opencode_cfg(home)
+    _agents.register("opencode")
+    assert json.loads(cfg.read_text())["mcp"] == {"biopb": _V1_ENTRY}
+
+
+def test_without_a_cli_the_config_shape_decides(home):
+    cfg = _opencode_cfg(home, json.dumps({"mcp": {"servers": {}}}))
+    _agents.register("opencode")
+    assert json.loads(cfg.read_text())["mcp"] == {"servers": {"biopb": _V2_ENTRY}}
+
+
+def test_opencode_unregister_clears_both_places(home, monkeypatch):
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
+    cfg = _opencode_cfg(
+        home,
+        json.dumps(
+            {"mcp": {"biopb": _V1_ENTRY, "servers": {"biopb": _V2_ENTRY, "x": {}}}}
+        ),
+    )
+    _agents.unregister("opencode")
+    assert json.loads(cfg.read_text()) == {"mcp": {"servers": {"x": {}}}}
+
+
+def test_opencode_commented_jsonc_message_names_the_v2_place(home, monkeypatch):
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
+    d = home / ".config" / "opencode"
+    d.mkdir(parents=True)
+    (d / "opencode.jsonc").write_text('{\n  // mine\n  "theme": "dark"\n}\n')
+    with pytest.raises(_agents.AgentError, match='"servers"'):
+        _agents.register("opencode")
+
+
+def test_opencode_major_reads_the_cli_once(tmp_path, monkeypatch):
+    exe = tmp_path / "opencode"
+    exe.write_text("#!/bin/sh\necho 'opencode v2.0.29'\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: str(exe))
+    monkeypatch.setattr(_agents, "_opencode_majors", {})
+    assert _agents._opencode_major() == 2
+    exe_calls = []
+    real_run = _agents.subprocess.run
+    monkeypatch.setattr(
+        _agents.subprocess,
+        "run",
+        lambda *a, **k: exe_calls.append(a) or real_run(*a, **k),
+    )
+    assert _agents._opencode_major() == 2
+    assert exe_calls == []
 
 
 # --------------------------------------------------------------------------- #

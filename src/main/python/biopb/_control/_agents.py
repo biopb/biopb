@@ -106,6 +106,22 @@ def _load_json_object(path: Path) -> dict:
     return data
 
 
+def _dig(data: Optional[dict], path: tuple) -> Optional[dict]:
+    """The object at ``path`` (keys, outermost first) in ``data``, or ``None``."""
+    for key in path:
+        data = data.get(key) if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _drop_biopb(data: dict, path: tuple) -> bool:
+    """Delete biopb's entry at ``path`` in ``data``; whether there was one."""
+    parent = _dig(data, path)
+    if parent is None or "biopb" not in parent:
+        return False
+    del parent["biopb"]
+    return True
+
+
 def _strip_jsonc(text: str) -> str:
     """Best-effort JSONC → JSON so :func:`json.loads` can read an opencode
     ``.jsonc``: drop ``//`` and ``/* */`` comments (outside string literals) and
@@ -501,11 +517,15 @@ class JsonConfigClient(ClientBackend):
         if _jsonc_unmergeable(path):
             raise AgentError(self._manual_edit_message(path, removing=False))
         data = _load_json_object(path)
-        parent = data.get(self.parent_key)
-        if not isinstance(parent, dict):
-            parent = {}
+        for stale in self.stale_paths():
+            _drop_biopb(data, stale)
+        parent = data
+        for key in self.parent_path():
+            child = parent.get(key)
+            if not isinstance(child, dict):
+                child = parent[key] = {}
+            parent = child
         parent["biopb"] = self.entry()
-        data[self.parent_key] = parent
         _write_json_atomic(path, data)
 
     def unregister(self) -> None:
@@ -519,20 +539,34 @@ class JsonConfigClient(ClientBackend):
                 raise AgentError(self._manual_edit_message(path, removing=True))
             return
         data = _load_json_object(path)
-        parent = data.get(self.parent_key)
-        if isinstance(parent, dict) and "biopb" in parent:
-            del parent["biopb"]
+        dropped = [
+            _drop_biopb(data, p) for p in (self.parent_path(), *self.stale_paths())
+        ]
+        if any(dropped):
             _write_json_atomic(path, data)
+
+    def parent_path(self) -> tuple:
+        """The keys, outermost first, down to the object biopb's entry lives in."""
+        return (self.parent_key,)
+
+    def stale_paths(self) -> tuple:
+        """Other places an entry of ours may be left by a different version of
+        the client; written over and removed along with the current one."""
+        return ()
 
     def _manual_edit_message(self, path: Path, *, removing: bool) -> str:
         """The AgentError text shown when biopb can't safely edit a commented
         ``.jsonc``."""
+        where = ".".join(self.parent_path())
         if removing:
             return (
                 f"{path} has comments, so biopb won't rewrite it (that would drop "
-                f'them). Remove the "biopb" key under "{self.parent_key}" by hand.'
+                f'them). Remove the "biopb" key under "{where}" by hand.'
             )
-        snippet = json.dumps({self.parent_key: {"biopb": self.entry()}}, indent=2)
+        snippet: dict = {"biopb": self.entry()}
+        for key in reversed(self.parent_path()):
+            snippet = {key: snippet}
+        snippet = json.dumps(snippet, indent=2)
         return (
             f"{path} has comments, so biopb won't rewrite it (that would drop "
             f"them). Add this entry under the top level by hand:\n{snippet}"
@@ -658,11 +692,76 @@ class Cursor(JsonConfigClient):
         return Path.home() / ".cursor" / "mcp.json"
 
 
+#: opencode 1 keeps servers directly under ``mcp``; opencode 2 under
+#: ``mcp.servers`` and ignores the old place. opencode 1.1 rejects the new one,
+#: so the shape written has to follow the version that will read it.
+_OPENCODE_V1 = ("mcp",)
+_OPENCODE_V2 = ("mcp", "servers")
+
+#: (resolved binary, mtime) -> major version, so status polling runs
+#: ``opencode --version`` once per install rather than once per poll
+_opencode_majors: dict = {}
+
+
+def _opencode_major() -> Optional[int]:
+    """The major version of the ``opencode`` on PATH, or ``None`` if there is
+    none or it will not say."""
+    exe = shutil.which("opencode")
+    if exe is None:
+        return None
+    try:
+        key = (exe, os.stat(exe).st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _opencode_majors:
+        major = None
+        try:
+            out = subprocess.run(
+                [exe, "--version"], capture_output=True, text=True, timeout=10
+            ).stdout
+            found = re.search(r"(\d+)\.\d+", out)
+            major = int(found.group(1)) if found else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _opencode_majors[key] = major
+    return _opencode_majors[key]
+
+
 class Opencode(JsonConfigClient):
     id = "opencode"
     name = "opencode"
     parent_key = "mcp"
     entry_style = "opencode"
+
+    def parent_path(self) -> tuple:
+        """Where this machine's opencode reads servers from: by the installed
+        version, else (no CLI on PATH, e.g. the desktop app) by the shape of the
+        config already there, else the old place."""
+        major = _opencode_major()
+        if major is not None:
+            return _OPENCODE_V2 if major >= 2 else _OPENCODE_V1
+        path = self.config_path()
+        data = _load_json_tolerant(path) if path is not None else None
+        return _OPENCODE_V2 if _dig(data, _OPENCODE_V2) is not None else _OPENCODE_V1
+
+    def stale_paths(self) -> tuple:
+        return tuple(p for p in (_OPENCODE_V1, _OPENCODE_V2) if p != self.parent_path())
+
+    def read_entry(self) -> Optional[dict]:
+        """The entry where this opencode reads it. One left in the other place
+        is not registered: the client ignores it."""
+        path = self.config_path()
+        if path is None or not path.exists():
+            return None
+        parent = _dig(_load_json_tolerant(path), self.parent_path())
+        entry = parent.get("biopb") if parent is not None else None
+        return entry if isinstance(entry, dict) else None
+
+    def entry(self) -> dict:
+        entry = super().entry()
+        if self.parent_path() == _OPENCODE_V2:
+            entry.pop("enabled", None)  # opencode 2 spells it ``disabled``
+        return entry
 
     def config_path(self) -> Optional[Path]:
         """An existing ``opencode.jsonc`` (so no shadow ``.json`` is written

@@ -805,13 +805,16 @@ function Remove-McpClients {
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },
         @{ File = (Join-Path $BiopbHome ".cursor\mcp.json");                     Prop = 'mcpServers'; Label = 'Cursor' },
-        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' }
+        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' },
+        @{ File = $opencode;                                                      Prop = 'mcp.servers'; Label = 'opencode' }
     )
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.File)) { continue }
         try {
             $json = Get-Content -Raw -LiteralPath $t.File | ConvertFrom-Json
-            $container = $json.$($t.Prop)
+            # opencode 1 keeps servers under "mcp", opencode 2 under "mcp.servers".
+            $container = $json
+            foreach ($key in $t.Prop.Split('.')) { if ($container) { $container = $container.$key } }
             if ($container -and ($container.PSObject.Properties.Name -contains 'biopb')) {
                 $container.PSObject.Properties.Remove('biopb')
                 Set-FileUtf8NoBom -Path $t.File -Content ($json | ConvertTo-Json -Depth 20)
