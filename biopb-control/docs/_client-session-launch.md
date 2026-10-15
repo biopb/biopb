@@ -62,8 +62,8 @@ http://127.0.0.1:<port>/auth/connect/<token>
 Two notes on the Claude Code invocation. `remote-control` is not listed in
 `claude --help`'s command table even though it exists; `--remote-control` / `--rc`
 are the *interactive* variants and would need a PTY from the control, which the
-subcommand does not. And `--spawn session` is not optional here — see
-[below](#claude-code-needs---spawn-session).
+subcommand does not. `--spawn session` is the choice of mode — see
+[below](#claude-code-spawn-mode).
 
 ### `can_launch` is one test, declared by the backend
 
@@ -115,9 +115,10 @@ The model is:
 - **`[x]` lives on the session pane**, because one client child holds exactly
   one biopb session.
 
-That last equivalence is the load-bearing one. A session has one lease holder, so
-the number of sessions a client holds is the number of `biopb-shim` processes it
-runs, which follows the client's MCP connection scope. Measured as scope of a
+That last equivalence holds when a client child runs one `biopb-shim`. A session
+has one lease holder, and a shim holds a session only after `attach`, so the
+sessions a client holds are bounded by the shims it runs, which follow the
+client's MCP connection scope. Measured as scope of a
 stdio MCP server, which the shim is:
 
 | client | MCP connection scope | one child ⇒ |
@@ -129,14 +130,19 @@ stdio MCP server, which the shim is:
 opencode 2's scope is unmeasured; its service hosts the servers, so the opencode 1
 result is the expectation, not a fact.
 
-### Claude Code needs `--spawn session`
+### Claude Code: spawn mode
 
 `claude remote-control` defaults to a server hosting many concurrent sessions
 (`--capacity 32`, `--spawn same-dir`), each its own process with its own MCP
-children — so one daemon would give N shims, and each `attach new` N biopb
-sessions and N napari windows. `--spawn session` is the classic single-session
-mode that exits when its session ends. It restores the 1:1 mapping and gives `[x]`
-its natural meaning.
+children, so one daemon runs N shims. That is cheap: a shim starts unbound and
+creates no biopb session or napari window until its agent calls `attach`. Only
+conversations that ask for a session get one.
+
+`--spawn session` is the classic single-session mode that exits when its session
+ends. It remains the better default, though not a requirement: one client child
+is one conversation and holds at most one biopb session, so `[x]` has its natural
+meaning and the lease's client pid names a single holder. The default mode works
+too, but `[x]` then ends every conversation the daemon hosts.
 
 ### Codex is not ours to keep alive
 
