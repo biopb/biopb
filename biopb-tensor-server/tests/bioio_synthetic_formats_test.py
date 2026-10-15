@@ -26,11 +26,11 @@ from biopb_tensor_server.fixtures import (
 # (fixture factory, optional dependency module, expected source_type, scene
 # count). LSM's reduced thumbnail series is deliberately dropped by the native
 # adapter. The full-resolution image is the only exposed scene. The dependency
-# column gates on what the native reader itself needs (readlif / mrc), not a
+# column gates on what the native reader itself needs (liffile / mrc), not a
 # bioio plugin -- none of these four rows reads through BioIO any more.
 FORMATS = [
     pytest.param(create_zeiss_lsm, None, "lsm", 1, id="lsm"),
-    pytest.param(create_leica_lif, "readlif", "lif", 1, id="lif"),
+    pytest.param(create_leica_lif, "liffile", "lif", 1, id="lif"),
     pytest.param(create_zeiss_czi, "pylibCZIrw", "czi", 1, id="czi"),
     pytest.param(create_deltavision_dv, "mrc", "deltavision", 1, id="dv"),
 ]

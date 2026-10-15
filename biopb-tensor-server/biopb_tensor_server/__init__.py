@@ -24,7 +24,7 @@ from biopb_tensor_server.adapters.tifffile_adapter import LsmAdapter, TiffAdapte
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
 # Native phase-3 vendor adapters (biopb/biopb#799): each optional on its own
-# package (readlif / mrc / nd2), independent of the bioio extra below. The
+# package (liffile / mrc / nd2), independent of the bioio extra below. The
 # reader is probed, not just the module -- see adapters/__init__.py.
 try:
     import mrc  # noqa: F401
@@ -33,7 +33,7 @@ try:
 except ImportError:
     DeltaVisionAdapter = None  # type: ignore
 try:
-    import readlif  # noqa: F401
+    import liffile  # noqa: F401
 
     from biopb_tensor_server.adapters.lif import LifAdapter
 except ImportError:

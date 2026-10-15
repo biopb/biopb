@@ -12,7 +12,7 @@ from biopb_tensor_server.core.discovery import (
     LiveLocalContext,
 )
 
-pytest.importorskip("readlif")
+pytest.importorskip("liffile")
 
 from biopb_tensor_server.adapters import (  # noqa: E402
     LifAdapter,
@@ -39,7 +39,7 @@ def _native(path, **kwargs):
     return LifAdapter.create_from_config(_source(path, **kwargs))
 
 
-def test_local_lif_claims_natively_and_reads_through_readlif(tmp_path):
+def test_local_lif_claims_natively_and_reads_through_liffile(tmp_path):
     path, expected = create_leica_lif(
         str(tmp_path), n_t=2, n_z=5, n_c=2, image_shape=(24, 32), bit_depth=16
     )
@@ -58,7 +58,7 @@ def test_local_lif_claims_natively_and_reads_through_readlif(tmp_path):
     # The listing is structural: the grid is the bound image's (biopb/biopb#812).
 
     image = source.get_tensor_adapter(descriptors[0].array_id)
-    # readlif has no ROI -- the native unit is one whole plane.
+    # liffile has no ROI -- the native unit is one whole plane.
     grid = list(image.get_tensor_descriptor().chunk_shape)
     assert grid[-2:] == [24, 32]
 
@@ -118,7 +118,7 @@ def test_read_block_shape_is_full_rank_and_floors_at_one_plane(tmp_path):
     assert tuple(block) == (1, 1, 1, 24, 32)
 
 
-def test_physical_scale_reports_readlif_pixel_size(tmp_path):
+def test_physical_scale_reports_liffile_pixel_size(tmp_path):
     path, _ = create_leica_lif(str(tmp_path), n_z=3, image_shape=(16, 16))
     source = _native(path)
     image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
@@ -205,3 +205,45 @@ def test_unopenable_file_raises_instead_of_falling_back(tmp_path):
     with pytest.raises(Exception) as excinfo:
         LifAdapter.create_from_config(_source(path))
     assert not isinstance(excinfo.value, AssertionError)
+
+
+def test_mosaic_image_gets_a_leading_tile_axis_and_reads_per_tile(tmp_path):
+    path, expected = create_leica_lif(
+        str(tmp_path), n_t=2, n_z=3, n_c=2, image_shape=(8, 12), n_m=3
+    )
+    source = _native(path)
+    descriptor = source.list_tensors()[0]
+    assert list(descriptor.dim_labels) == ["M", "T", "C", "Z", "Y", "X"]
+    assert list(descriptor.shape) == list(expected.shape)
+
+    image = source.get_tensor_adapter(descriptor.array_id)
+    whole = image.get_data(ChunkBounds(start=[0] * 6, stop=list(descriptor.shape)))
+    np.testing.assert_array_equal(whole, expected)
+
+    decimated = image.get_decimated_data(
+        ChunkBounds(start=[0] * 6, stop=list(descriptor.shape)), (2, 1, 1, 2, 1, 1)
+    )
+    np.testing.assert_array_equal(decimated, expected[::2, :, :, ::2])
+
+
+def test_single_plane_image_reads_without_the_missing_axes(tmp_path):
+    path, expected = create_leica_lif(
+        str(tmp_path), n_t=1, n_z=1, n_c=1, image_shape=(6, 7)
+    )
+    source = _native(path)
+    descriptor = source.list_tensors()[0]
+    assert list(descriptor.shape) == [1, 1, 1, 6, 7]
+    image = source.get_tensor_adapter(descriptor.array_id)
+    whole = image.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 6, 7]))
+    np.testing.assert_array_equal(whole, expected)
+
+
+def test_registration_record_carries_the_acquisition_summary(tmp_path):
+    path, _ = create_leica_lif(str(tmp_path), n_c=2, bit_depth=16)
+    source = _native(path)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
+    record = image.registration_record([]).metadata
+    assert record["format"] == "lif"
+    assert record["name"] == "Image0"
+    assert record["channels"] == 2
+    assert record["bit_depth"] == [16, 16]

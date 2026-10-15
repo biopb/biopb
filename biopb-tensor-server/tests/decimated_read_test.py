@@ -28,7 +28,7 @@ DECIMATING = {
     "NikonAdapter": "the step selects frames on T/Z and strides the mmap view",
     "Nd2Adapter": "the step selects frames on P/T/Z and strides the mmap view",
     "DeltaVisionAdapter": "memmap indexing (mrc.DVFile) computes byte offsets",
-    "LifAdapter": "the step skips whole planes on T/C/Z/M readlif would decode",
+    "LifAdapter": "the step skips whole planes on T/C/Z/M liffile would decode",
 }
 
 # Reads the extent and strides it -- the base's own path.
