@@ -295,6 +295,11 @@ def test_status_says_whether_a_client_can_be_launched(home, monkeypatch):
     assert not any(s["can_launch"] for s in by_id.values())
     assert by_id["claude-code"]["relay"] and by_id["codex-cli"]["relay"]
     assert not by_id["opencode"]["relay"]
+    # A client with a launch surface says what is missing; one without says nothing.
+    assert "not found on PATH" in by_id["claude-code"]["launch_hint"]
+    assert "not found on PATH" in by_id["opencode"]["launch_hint"]
+    assert by_id["claude-desktop"]["launch_hint"] is None
+    assert by_id["cursor"]["launch_hint"] is None
 
 
 def test_claude_desktop_and_cursor_have_nothing_to_launch(home, monkeypatch):
@@ -326,10 +331,12 @@ def test_codex_needs_its_standalone_install_to_launch(home, monkeypatch):
     monkeypatch.setattr(_agents.shutil, "which", lambda name: "/usr/bin/" + name)
     codex = _agents.backend("codex-cli")
     assert not codex.can_launch()  # an npm install has the binary, not the daemon
+    assert "Codex's own installer" in codex.launch_hint()
     standalone = home / ".codex" / "packages" / "standalone" / "current" / "codex"
     standalone.parent.mkdir(parents=True)
     standalone.write_text("")
     assert codex.can_launch() and codex.launch_kind == "oneshot"
+    assert codex.launch_hint() is None
     assert codex.launch_argv()[-1] == "enable-remote-control"
     assert codex.stop_argv()[-1] == "disable-remote-control"
 

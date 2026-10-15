@@ -102,8 +102,11 @@ subprocess — because `which("codex")` cannot distinguish an npm install from t
 standalone one the daemon demands. `status()` carries `can_launch` next to
 `state` / `drifted` / `config_path`, and the launch handler re-reads that same
 predicate rather than testing again, so the button and the gate cannot drift
-apart. A `registered` client with `can_launch: False` renders as Register /
-Unregister without a session button — which is exactly right for Claude Desktop.
+apart. A client with no launch surface (Claude Desktop, Cursor) renders as Register /
+Unregister with no Start button. One that has a surface but cannot launch here
+shows a disabled *Start* whose tooltip is `launch_hint` — what is missing (the CLI
+on PATH, Codex's own installer) — the same way a relay client shows the missing
+`--allow-relay-clients`.
 
 What stays out of reach of any cheap check: subscription, org policy, and the
 workspace-trust dialog. Those surface only at launch; see

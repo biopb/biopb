@@ -93,7 +93,7 @@ class ClientLauncher:
         """Why *agent* (an ``_agents.status`` dict) may not be launched, or
         ``None``. The verb enforces the same answer the dashboard shows."""
         if not agent.get("can_launch"):
-            return "not launchable here"
+            return agent.get("launch_hint") or "not launchable here"
         if not self._chat_served:
             return "this control does not serve the execute roots"
         if agent.get("relay") and not self._relay_clients:

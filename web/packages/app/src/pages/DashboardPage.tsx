@@ -60,6 +60,8 @@ interface AgentRec {
   // Whether a session can be opened with this client from here, and whether
   // other devices reach it through a relay. Absent on an older control.
   can_launch?: boolean;
+  // What would make a client that has a launch surface launchable here.
+  launch_hint?: string | null;
   relay?: boolean;
   // A client this control launched, still up.
   running?: boolean;
@@ -921,7 +923,7 @@ function AgentRowView({
       <span className="sid">{a.name}</span>
       <span className="state">{label}</span>
       <span className="agent-btns">
-        {a.state === "registered" && a.can_launch ? (
+        {a.state === "registered" && (a.can_launch || a.launch_hint) ? (
           <button
             disabled={busy || !canExec || (!a.running && !!a.launch_blocked)}
             title={

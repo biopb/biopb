@@ -446,6 +446,11 @@ class ClientBackend(ABC):
     entry_style: str = "stdio"
     #: what the client launches ``biopb-shim`` with; a change shows as drift
     mcp_args: tuple = _MCP_ARGS
+    #: the client's command-line program, where it has one
+    exe: str = ""
+    #: whether the client has a web or remote surface to launch at all; one that
+    #: does not (Claude Desktop, Cursor) never gets a Start button
+    has_launch: bool = False
     #: how a launch runs: ``child`` is a foreground process the caller owns and
     #: stops; ``oneshot`` is a command that returns, leaving a machine-global
     #: service the caller does not own
@@ -525,6 +530,13 @@ class ClientBackend(ABC):
         """Whether :meth:`launch_argv` names something runnable here."""
         argv = self.launch_argv()
         return bool(argv) and shutil.which(argv[0]) is not None
+
+    def launch_hint(self) -> Optional[str]:
+        """What would make this client launchable, for a client that has a launch
+        surface but cannot launch here; ``None`` otherwise."""
+        if not self.has_launch or self.can_launch():
+            return None
+        return f"{self.exe} was not found on PATH"
 
 
 class JsonConfigClient(ClientBackend):
@@ -628,6 +640,7 @@ class ClaudeCode(CliManagedClient):
     # User-scope servers live in ~/.claude.json; read-only here.
     parent_key = "mcpServers"
     relay = True
+    has_launch = True
     # The link to the session on claude.ai, printed once it is connected.
     ready_pattern = re.compile(r"https://claude\.ai/\S+")
 
@@ -708,6 +721,7 @@ class CodexCli(CliManagedClient):
     mcp_args = (*_MCP_ARGS, "--session", "auto")
     launch_kind = "oneshot"
     relay = True
+    has_launch = True
 
     def _home(self) -> Path:
         # $CODEX_HOME relocates the Codex home; read at call time for tests.
@@ -723,11 +737,23 @@ class CodexCli(CliManagedClient):
     def stop_argv(self) -> Optional[list]:
         return [self.exe, "app-server", "daemon", "disable-remote-control"]
 
+    def _standalone(self) -> Path:
+        return self._home() / "packages" / "standalone" / "current" / "codex"
+
     def can_launch(self) -> bool:
         # The daemon runs only from Codex's own installer; `which` cannot tell
         # that install from an npm one.
-        standalone = self._home() / "packages" / "standalone" / "current" / "codex"
-        return super().can_launch() and standalone.exists()
+        return super().can_launch() and self._standalone().exists()
+
+    def launch_hint(self) -> Optional[str]:
+        if not self.has_launch or self.can_launch():
+            return None
+        if shutil.which(self.exe) is None:
+            return super().launch_hint()
+        return (
+            "remote control runs only from Codex's own installer, not an npm "
+            f"install; expected {self._standalone()}"
+        )
 
     def register(self) -> None:
         # `codex mcp add` overwrites an existing entry, so no remove first.
@@ -796,7 +822,15 @@ class Opencode(JsonConfigClient):
     exe = "opencode"
     parent_key = "mcp"
     entry_style = "opencode"
-    ready_pattern = re.compile(r"https?://\S+")  # `opencode web` names its URL
+    has_launch = True
+    ready_pattern = re.compile(r"https?://\S+")  # `opencode serve` names its URL
+
+    def launch_hint(self) -> Optional[str]:
+        if self.can_launch():
+            return None
+        if shutil.which(self.exe) is None:
+            return super().launch_hint()
+        return f"could not read the version from `{self.exe} --version`"
 
     def parent_path(self) -> tuple:
         """Where this machine's opencode reads servers from: by the installed
@@ -920,6 +954,7 @@ def status(client_id: str) -> dict:
         "drifted": drifted,
         "config_path": str(path) if path is not None else None,
         "can_launch": client.can_launch(),
+        "launch_hint": client.launch_hint(),
         "relay": client.relay,
     }
 
