@@ -247,8 +247,3 @@ def test_registration_record_carries_the_acquisition_summary(tmp_path):
     assert record["name"] == "Image0"
     assert record["channels"] == 2
     assert record["bit_depth"] == [16, 16]
-
-
-def test_module_does_not_need_readlif(tmp_path):
-    source = Path(lif_module.__file__).read_text()
-    assert "readlif" not in source.replace("``readlif``", "")

@@ -784,18 +784,17 @@ def create_leica_lif(
 ) -> Tuple[str, np.ndarray]:
     """Create a Leica LIF file.
 
-    readlif ships no writer, so the container is assembled from what its parser
-    reads (readlif ``LifFile.__init__`` / ``LifImage._get_item``)::
+    No LIF writer is available, so the container is assembled from what
+    ``liffile`` parses::
 
         header:  70 00 00 00 | 4 ignored bytes | 2a |
                  int32 xml_len_in_chars | UTF-16 XML
         block:   70 00 00 00 | 4 ignored bytes | 2a | int32 data_len | 2a |
                  int32 name_len_in_chars | UTF-16 name | pixel data
 
-    Two constraints beyond the byte layout: bioio-lif requires ``LUTName`` on
-    every ChannelDescription, and readlif infers channel-before-Z ordering by
-    comparing BytesInc values, so the Z BytesInc must be at least the summed
-    channel BytesInc for the plane order written here.
+    Beyond the byte layout, every ChannelDescription needs ``LUTName`` and its
+    own ``BytesInc`` (the channel's offset within a Z step), and the Z
+    ``BytesInc`` must cover all channels for the plane order written here.
 
     Args:
         tmpdir: Temporary directory to create the file in
@@ -818,8 +817,7 @@ def create_leica_lif(
     plane_bytes = n_x * n_y * (bit_depth // 8)
     z_inc = plane_bytes * n_c
 
-    # Every attribute liffile (bioio-lif 2) reads is written; readlif ignores
-    # the extras.
+    # Every attribute liffile (and so bioio-lif 2) reads is written.
     def dim(dim_id, n, length, bytes_inc):
         return (
             f'<DimensionDescription DimID="{dim_id}" NumberOfElements="{n}" '
@@ -847,7 +845,7 @@ def create_leica_lif(
     )
     xml = (
         # Version 1 is the 4-byte block size written below; liffile reads the
-        # block header by this number (readlif ignores it).
+        # block header by this number.
         '<LMSDataContainerHeader Version="1">'
         '<Element Name="test.lif"><Children>'
         '<Element Name="Image0"><Data><Image><ImageDescription>'
