@@ -142,6 +142,12 @@ class TestRetiredKeys:
         )
         assert config["chat"]["base_url"] == "http://x/v1"
 
+    def test_the_update_settings_went_to_the_control(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir, {"update": {"enabled": False, "skipped_version": "1.0"}}
+        )
+        assert not config.get("update")
+
 
 class TestSaveConfig:
     """Tests for save_config function."""
@@ -194,7 +200,6 @@ class TestDefaultConfig:
             "viewer",
             "services",
             "observe",
-            "update",
         ]
         for key in required_keys:
             assert key in DEFAULT_CONFIG

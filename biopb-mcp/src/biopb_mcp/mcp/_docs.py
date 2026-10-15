@@ -340,9 +340,9 @@ _MANIFEST_NAME = ".shipped-manifest.json"
 
 
 def _installed_version() -> str:
-    from ._update import _running_library_version
+    import biopb_mcp
 
-    return _running_library_version()
+    return getattr(biopb_mcp, "__version__", "") or ""
 
 
 def _manifest_path() -> Path | None:

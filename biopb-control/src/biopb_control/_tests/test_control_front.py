@@ -294,6 +294,7 @@ def test_api_status_reports_control_and_data_plane(control):
     assert payload["control"] == "ok"
     assert "state" in payload["data_plane"]  # the supervisor snapshot
     assert payload["sessions"] == 0  # none registered in this test
+    assert payload["update"] is None  # no update checker in this fixture
 
 
 def test_api_sessions_lists_live_sessions(control, upstream):
@@ -2427,3 +2428,117 @@ def test_a_started_launch_names_the_session_to_connect_to(tmp_path, monkeypatch)
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["port"] == 1234
+
+
+def test_api_status_carries_the_update_answer(upstream, tmp_path, web_bundle):
+    class _Checker:
+        def info(self):
+            return {"current": "0.6.6", "latest": "0.7.0", "url": "u"}
+
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        static_dir=web_bundle,
+    )
+    port = _free_port()
+    server, _thread = serve_control_api(
+        "127.0.0.1",
+        port,
+        DataPlaneSupervisor(spec),
+        ensure_timeout=8.0,
+        data_web_url=upstream,
+        updates=_Checker(),
+    )
+    try:
+        _status, _headers, body = _get(f"http://127.0.0.1:{port}/api/status")
+    finally:
+        server.shutdown()
+    assert json.loads(body)["update"]["latest"] == "0.7.0"
+
+
+class TestApiUpdate:
+    """`POST /api/update` hands the update to the installer, on a control that
+    belongs to one person."""
+
+    @pytest.fixture
+    def serve(self, upstream, tmp_path, web_bundle):
+        from biopb_control._update import UpdateInfo
+
+        class _Checker:
+            def __init__(self, found):
+                self._found = found
+
+            def found(self):
+                return self._found
+
+            def info(self):
+                found = self._found
+                return None if found is None else {"latest": found.latest}
+
+        servers = []
+
+        def _serve(found=True, **spec_kw):
+            spec = DataPlaneSpec(
+                config=tmp_path / "config.json",
+                grpc_host=spec_kw.pop("grpc_host", "127.0.0.1"),
+                grpc_port=_free_port(),
+                server_log=tmp_path / "server.log",
+                static_dir=web_bundle,
+                **spec_kw,
+            )
+            port = _free_port()
+            server, _thread = serve_control_api(
+                "127.0.0.1",
+                port,
+                DataPlaneSupervisor(spec),
+                ensure_timeout=8.0,
+                data_web_url=upstream,
+                updates=_Checker(UpdateInfo("0.6.6", "0.7.0", "u") if found else None),
+            )
+            servers.append(server)
+            return f"http://127.0.0.1:{port}"
+
+        yield _serve
+        for server in servers:
+            server.shutdown()
+
+    @staticmethod
+    def _post_status(url):
+        try:
+            return _post(url)[0]
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_it_starts_the_installer(self, serve, monkeypatch):
+        started = []
+        monkeypatch.setattr(
+            "biopb_control._update.start_install",
+            lambda info: started.append(info.latest) or "/log",
+        )
+        base = serve()
+        assert self._post_status(f"{base}/api/update") == 202
+        assert started == ["0.7.0"]
+
+    def test_status_says_whether_the_update_can_be_applied(self, serve):
+        _s, _h, body = _get(f"{serve()}/api/status")
+        assert json.loads(body)["update"]["installable"] is True
+
+    def test_nothing_to_update_is_a_400(self, serve):
+        assert self._post_status(f"{serve(found=False)}/api/update") == 400
+
+    def test_a_portal_published_control_does_not_update_itself(self, serve):
+        base = serve(url_prefix="/node/h/1")
+        assert self._post_status(f"{base}/api/update") == 403
+        _s, _h, body = _get(f"{base}/api/status")
+        assert json.loads(body)["update"]["installable"] is False
+
+    def test_a_public_control_does_not_update_itself(self, serve):
+        base = serve(grpc_host="0.0.0.0", token="t" * 20)
+        assert self._post_status(f"{base}/api/update") in (401, 403)
+
+    def test_it_needs_the_exec_credential(self):
+        from biopb_control._control import _needs_exec
+
+        assert _needs_exec("POST", "/api/update")
