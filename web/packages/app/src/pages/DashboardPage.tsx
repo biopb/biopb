@@ -49,12 +49,22 @@ interface SessionRec {
   // Who the session answers to -- an attached agent, the chat pane, or nobody.
   // Said in the stop confirmation, since stopping takes the kernel from them.
   holder?: string | null;
+  // The holder's own account of its process, when it gave one; display only.
+  client?: { pid: number; name?: string | null } | null;
 }
 interface AgentRec {
   id: string;
   name: string;
   state: string; // "registered" | "installed" | "not_installed"
   drifted?: boolean;
+  // Whether a session can be opened with this client from here, and whether
+  // other devices reach it through a relay. Absent on an older control.
+  can_launch?: boolean;
+  relay?: boolean;
+  // A client this control launched, still up.
+  running?: boolean;
+  // Why the launch is refused (null when it is allowed).
+  launch_blocked?: string | null;
 }
 interface AlgoRec {
   name: string;
@@ -93,6 +103,12 @@ export default function DashboardPage() {
   const [algosBusy, setAlgosBusy] = useState(false);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
+  // Outcome of the last client launch or stop. Rendered under the list like a
+  // session launch's: it carries the client's output, which holds the link or
+  // URL the user needs and which no dialog shows well.
+  const [clientMsg, setClientMsg] = useState<{ err: boolean; text: string } | null>(
+    null,
+  );
   const [starting, setStarting] = useState(false);
   const canExec = useCanExec();
   // Whether the control proxies a session's /mcp, i.e. remote MCP access is on
@@ -410,6 +426,44 @@ export default function DashboardPage() {
     [pollAgents],
   );
 
+  const launchClient = useCallback(
+    async (id: string, name: string, act: "launch" | "stop") => {
+      setAgentsBusy(true);
+      setClientMsg(null);
+      try {
+        const r = await sessionFetch(
+          withBase("/api/agents/") + encodeURIComponent(id) + "/" + act,
+          { method: "POST" },
+        );
+        const res = await r.json().catch(() => ({}));
+        if (res.error || res.state === "failed") {
+          const where = res.log_path ? `\n\nFull log: ${res.log_path}` : "";
+          const out = res.log ? `\n\n${res.log}` : "";
+          setClientMsg({ err: true, text: `${res.error}${out}${where}` });
+        } else if (act === "stop") {
+          setClientMsg({ err: !res.stopped, text: res.note || `${name} stopped.` });
+        } else {
+          const head =
+            res.state === "starting"
+              ? `${name} is still starting.`
+              : res.already
+                ? `${name} is already running.`
+                : `${name} started.`;
+          setClientMsg({
+            err: false,
+            text: res.log ? `${head}\n\n${res.log}` : head,
+          });
+        }
+      } catch (e) {
+        setClientMsg({ err: true, text: String(e) });
+      } finally {
+        await pollAgents();
+        setAgentsBusy(false);
+      }
+    },
+    [pollAgents],
+  );
+
   const dpState = dataPlane.state || "unknown";
   // Links stay live as soon as the port is up (a TCP dial succeeds regardless
   // of backend readiness); the badge is what a human reads as "is it up", so
@@ -603,14 +657,25 @@ export default function DashboardPage() {
                   key={a.id}
                   a={a}
                   busy={agentsBusy}
+                  canExec={canExec}
                   onAction={agentAction}
+                  onLaunch={launchClient}
                 />
               ))
             )}
           </ul>
+          {clientMsg ? (
+            <p className={clientMsg.err ? "note err launch" : "note launch"}>
+              {clientMsg.text}
+            </p>
+          ) : null}
           <p className="note">
             Registers biopb-mcp with the client. Restart the client after
-            (un)registering for the change to take effect.
+            (un)registering for the change to take effect. A session you start
+            here is the client's own: it ends when the control restarts, and the
+            agent in it attaches to a biopb session. Claude Code and Codex are
+            reached through their vendor&apos;s relay; Claude Code stores the
+            transcript server-side while remote control is connected.
           </p>
         </div>
 
@@ -667,6 +732,11 @@ export default function DashboardPage() {
                       :{s.port}
                       {when ? " · " + when : ""}
                     </span>
+                    {s.client && s.client.name ? (
+                      <span className="when" title={`pid ${s.client.pid}`}>
+                        held by {s.client.name}
+                      </span>
+                    ) : null}
                     <span className={"kbadge k-" + kernel}>
                       {kernel === "none" ? "no kernel" : "kernel: " + kernel}
                     </span>
@@ -786,11 +856,15 @@ function AlgoRow({
 function AgentRowView({
   a,
   busy,
+  canExec,
   onAction,
+  onLaunch,
 }: {
   a: AgentRec;
   busy: boolean;
+  canExec: boolean;
   onAction: (id: string, act: "register" | "unregister") => void;
+  onLaunch: (id: string, name: string, act: "launch" | "stop") => void;
 }) {
   const label =
     a.state === "registered"
@@ -805,6 +879,28 @@ function AgentRowView({
       <span className="sid">{a.name}</span>
       <span className="state">{label}</span>
       <span className="agent-btns">
+        {a.state === "registered" && a.can_launch ? (
+          a.running ? (
+            <button
+              disabled={busy || !canExec}
+              title={execTitle(canExec, `Stop the ${a.name} session started here`)}
+              onClick={() => onLaunch(a.id, a.name, "stop")}
+            >
+              Stop session
+            </button>
+          ) : (
+            <button
+              disabled={busy || !canExec || !!a.launch_blocked}
+              title={
+                a.launch_blocked ||
+                execTitle(canExec, `Open a ${a.name} session you can drive from a browser`)
+              }
+              onClick={() => onLaunch(a.id, a.name, "launch")}
+            >
+              Start session
+            </button>
+          )
+        ) : null}
         {a.state === "not_installed" ? null : a.state === "registered" ? (
           <>
             {a.drifted ? (

@@ -483,6 +483,14 @@ def test_nothing_is_hidden_by_default_and_hide_reads_the_env():
     assert _capture(_BASE_ARGV, env)[1].hide == {"chat"}
 
 
+def test_relay_clients_are_off_unless_the_operator_opts_in():
+    base = _BASE_ARGV + ["--auth", "none"]
+    assert _capture(base, {})[1].relay_clients is False
+    assert _capture(base + ["--allow-relay-clients"], {})[1].relay_clients is True
+    env = {"BIOPB_CONTROL_RELAY_CLIENTS": "1"}
+    assert _capture(base, env)[1].relay_clients is True
+
+
 def test_hide_refuses_an_unknown_root(capsys):
     rc, _spec, _ = _capture(_BASE_ARGV + ["--auth", "none", "--hide", "api"], {})
     assert rc == 2

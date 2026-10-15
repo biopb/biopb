@@ -110,6 +110,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "(chat, mcp) (or BIOPB_CONTROL_HIDE).",
     )
     run.add_argument(
+        "--allow-relay-clients",
+        action="store_true",
+        default=None,
+        help="let the dashboard launch Claude Code and Codex remote sessions, "
+        "which other devices reach through the vendor's relay (or "
+        "BIOPB_CONTROL_RELAY_CLIENTS=1).",
+    )
+    run.add_argument(
         "--remote",
         action="store_true",
         help="deprecated and redundant: a public --grpc-host already says the "
@@ -236,6 +244,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    relay_clients = bool(args.allow_relay_clients) or os.environ.get(
+        _credentials.ENV_CONTROL_RELAY_CLIENTS, ""
+    ).lower() in ("1", "true", "yes")
+
     # BYO TLS material, validated before anything is spawned: a half pair, or
     # material the server cannot read, would otherwise exit 2 inside the
     # supervised child on every spawn, crash-looping with the reason in
@@ -306,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         auth=auth,
         exec_token=exec_token,
         hide=hide,
+        relay_clients=relay_clients,
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,

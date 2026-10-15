@@ -405,6 +405,7 @@ class TestBinding:
     are the fakes."""
 
     def _binding(self, monkeypatch, preselect=None, lease_status=200):
+        monkeypatch.setattr(_shim, "_client_identity", lambda: None)
         env = SimpleNamespace(calls=[], lease_status=lease_status)
 
         def _call_session(
@@ -510,8 +511,15 @@ class TestBinding:
         assert "Attached to session live" in text and "THE GUIDANCE" in text
         base, method, path, body = env.calls[0]
         assert (base, path) == ("http://127.0.0.1:7", "/api/lease/acquire")
-        assert body == {"token": binding.token, "force": False}
+        assert body == {"token": binding.token, "force": False, "client": None}
         assert env.url == "http://127.0.0.1:7/mcp"
+
+    def test_the_lease_names_the_client(self, monkeypatch):
+        who = {"pid": 42, "create_time": 99, "name": "opencode"}
+        binding, env = self._binding(monkeypatch)
+        monkeypatch.setattr(_shim, "_client_identity", lambda: who)
+        self._drive(binding, lambda: binding.attach("live"))
+        assert env.calls[0][3]["client"] == who
 
     def test_attaching_again_to_the_same_session_hands_back_the_rules(
         self, monkeypatch
@@ -939,6 +947,7 @@ class TestRemote:
         denied=False,
         viewing=False,
     ):
+        monkeypatch.setattr(_shim, "_client_identity", lambda: None)
         env = SimpleNamespace(calls=[], headers=[], mcp=None)
         health = {"mcp_proxied": True} if health is None else health
 
@@ -1000,7 +1009,7 @@ class TestRemote:
             base,
             "POST",
             "/api/lease/acquire",
-            {"token": binding.token, "force": False},
+            {"token": binding.token, "force": False, "client": None},
         ) in env.calls
         assert env.mcp == (f"{base}/mcp", {"X-Biopb-Token": "tok-123"})
         assert all(h == {"X-Biopb-Token": "tok-123"} for h in env.headers)

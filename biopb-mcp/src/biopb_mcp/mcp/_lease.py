@@ -33,6 +33,7 @@ _holder = None  # "agent" | "chat" | None
 _token = None
 _since = 0.0
 _renewed = 0.0
+_client = None  # who the holder says it is: {"pid", "create_time", "name"}
 
 # Called as ``fn(previous_kind, new_kind)`` after the holder changed or lapsed,
 # outside the lock. A kind may be None.
@@ -54,9 +55,9 @@ def set_busy_probe(kind, probe):
 
 def _reset():
     """Forget everything, for tests."""
-    global _holder, _token, _since, _renewed
+    global _holder, _token, _since, _renewed, _client
     with _lock:
-        _holder, _token, _since, _renewed = None, None, 0.0, 0.0
+        _holder, _token, _since, _renewed, _client = None, None, 0.0, 0.0, None
     _hooks.clear()
     _busy_probes.clear()
 
@@ -70,7 +71,7 @@ def _fire(changes):
 
 def _expire_locked(now):
     """Drop a lapsed holder; returns the change to announce, if any."""
-    global _holder, _token
+    global _holder, _token, _client
     if _holder is None:
         return []
     probe = _busy_probes.get(_holder)
@@ -78,18 +79,21 @@ def _expire_locked(now):
         return []
     if now - _renewed < TTL[_holder]:
         return []
-    previous, _holder, _token = _holder, None, None
+    previous, _holder, _token, _client = _holder, None, None, None
     return [(previous, None)]
 
 
 def _snapshot_locked(now):
     if _holder is None:
         return {"holder": None}
-    return {
+    snap = {
         "holder": _holder,
         "age": round(now - _since, 1),
         "idle": round(now - _renewed, 1),
     }
+    if _client is not None:
+        snap["client"] = dict(_client)
+    return snap
 
 
 def snapshot():
@@ -102,14 +106,15 @@ def snapshot():
     return snap
 
 
-def acquire(kind, token, force=False):
+def acquire(kind, token, force=False, client=None):
     """Take or refresh the lease for *token*; ``{"ok": bool, **snapshot}``.
 
     The holder asking again with its own token renews. A different holder is
     refused unless *force*, which replaces it; the replaced holder's hook sees
-    the change.
+    the change. *client* is who the holder says it is, recorded when the lease
+    changes hands and shown in the snapshot.
     """
-    global _holder, _token, _since, _renewed
+    global _holder, _token, _since, _renewed, _client
     if kind not in TTL:
         raise ValueError(f"unknown lease kind: {kind!r}")
     now = time.monotonic()
@@ -119,7 +124,7 @@ def acquire(kind, token, force=False):
         if ok:
             if _token != token or _holder != kind:
                 changes.append((_holder, kind))
-                _holder, _token, _since = kind, token, now
+                _holder, _token, _since, _client = kind, token, now, client
             _renewed = now
         snap = _snapshot_locked(now)
     _fire(changes)
@@ -141,13 +146,13 @@ def renew(token):
 
 def release(token):
     """Give up *token*'s lease; False if it held none."""
-    global _holder, _token
+    global _holder, _token, _client
     now = time.monotonic()
     with _lock:
         changes = _expire_locked(now)
         ok = _token is not None and _token == token
         if ok:
             changes.append((_holder, None))
-            _holder, _token = None, None
+            _holder, _token, _client = None, None, None
     _fire(changes)
     return ok

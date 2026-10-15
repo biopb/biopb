@@ -20,6 +20,10 @@ Per client:
   Code rewrites ``~/.claude.json`` constantly, and only Codex's editor keeps
   its TOML comments and sibling servers intact (we have no TOML writer).
 - **unregister** -- the inverse; idempotent.
+- **launch** -- the command that opens a web or remote session with the client
+  (:meth:`ClientBackend.launch_argv`), for the dashboard to run. ``can_launch``
+  is a second predicate beside ``state``: registration is a config read, so a
+  client can be registered with no CLI on the machine.
 
 The registered command is the absolute path to ``biopb-shim`` (GUI clients
 launch it without a shell PATH). If biopb moves, the stored command no longer
@@ -442,6 +446,13 @@ class ClientBackend(ABC):
     entry_style: str = "stdio"
     #: what the client launches ``biopb-shim`` with; a change shows as drift
     mcp_args: tuple = _MCP_ARGS
+    #: how a launch runs: ``child`` is a foreground process the caller owns and
+    #: stops; ``oneshot`` is a command that returns, leaving a machine-global
+    #: service the caller does not own
+    launch_kind: str = "child"
+    #: whether a launched session is reachable from other devices through a
+    #: relay, which an operator opts in to rather than inheriting
+    relay: bool = False
 
     @abstractmethod
     def config_path(self) -> Optional[Path]:
@@ -494,6 +505,23 @@ class ClientBackend(ABC):
         (read as drift) when unreadable."""
         _, _, extract = _dispatch(_SHAPES, self.entry_style, self, "entry style")
         return extract(entry)
+
+    # -- launching a session ------------------------------------------------ #
+
+    def launch_argv(self) -> Optional[list]:
+        """The command that opens a web or remote session, or ``None`` if this
+        client has no such surface."""
+        return None
+
+    def stop_argv(self) -> Optional[list]:
+        """The command that ends a ``oneshot`` launch, or ``None`` if there is
+        nothing to end."""
+        return None
+
+    def can_launch(self) -> bool:
+        """Whether :meth:`launch_argv` names something runnable here."""
+        argv = self.launch_argv()
+        return bool(argv) and shutil.which(argv[0]) is not None
 
 
 class JsonConfigClient(ClientBackend):
@@ -596,9 +624,22 @@ class ClaudeCode(CliManagedClient):
     exe = "claude"
     # User-scope servers live in ~/.claude.json; read-only here.
     parent_key = "mcpServers"
+    relay = True
 
     def config_path(self) -> Optional[Path]:
         return Path.home() / ".claude.json"
+
+    def launch_argv(self) -> Optional[list]:
+        # One session per process, so stopping the process ends that one
+        # conversation; `default` is the permission mode, never a bypass.
+        return [
+            self.exe,
+            "remote-control",
+            "--spawn",
+            "session",
+            "--permission-mode",
+            "default",
+        ]
 
     def register(self) -> None:
         # Idempotent: best-effort remove, then add.
@@ -660,11 +701,28 @@ class CodexCli(CliManagedClient):
     # binds the newest free session (else a new one) before the handshake. Codex
     # cannot choose its session.
     mcp_args = (*_MCP_ARGS, "--session", "auto")
+    launch_kind = "oneshot"
+    relay = True
 
-    def config_path(self) -> Optional[Path]:
+    def _home(self) -> Path:
         # $CODEX_HOME relocates the Codex home; read at call time for tests.
         base = os.environ.get("CODEX_HOME")
-        return (Path(base) if base else Path.home() / ".codex") / "config.toml"
+        return Path(base) if base else Path.home() / ".codex"
+
+    def config_path(self) -> Optional[Path]:
+        return self._home() / "config.toml"
+
+    def launch_argv(self) -> Optional[list]:
+        return [self.exe, "app-server", "daemon", "enable-remote-control"]
+
+    def stop_argv(self) -> Optional[list]:
+        return [self.exe, "app-server", "daemon", "disable-remote-control"]
+
+    def can_launch(self) -> bool:
+        # The daemon runs only from Codex's own installer; `which` cannot tell
+        # that install from an npm one.
+        standalone = self._home() / "packages" / "standalone" / "current" / "codex"
+        return super().can_launch() and standalone.exists()
 
     def register(self) -> None:
         # `codex mcp add` overwrites an existing entry, so no remove first.
@@ -773,6 +831,22 @@ class Opencode(JsonConfigClient):
     def is_installed(self) -> bool:
         return shutil.which("opencode") is not None or super().is_installed()
 
+    @property
+    def launch_kind(self) -> str:
+        # opencode 2 has a background service the CLI talks to; it is not ours
+        # to stop, so a launch there is a command that returns.
+        return "oneshot" if _opencode_major() == 2 else "child"
+
+    def launch_argv(self) -> Optional[list]:
+        major = _opencode_major()
+        if major is None:
+            return None
+        if major >= 2:
+            # Prints a one-time link for the loopback service. Never `--remote`
+            # (reaches the internet) or `--yes`.
+            return ["opencode", "pair"]
+        return ["opencode", "web", "--hostname", "127.0.0.1", "--port", "0"]
+
 
 # --------------------------------------------------------------------------- #
 # The catalog
@@ -808,12 +882,15 @@ def supported() -> list[ClientBackend]:
 
 
 def status(client_id: str) -> dict:
-    """One client's status: ``{id, name, state, drifted, config_path}``.
+    """One client's status: ``{id, name, state, drifted, config_path,
+    can_launch, relay}``.
 
     ``state`` is ``registered`` if the biopb entry is present (regardless of
     detection), else ``installed`` if detected, else ``not_installed``.
     ``drifted`` is set only when ``registered`` and the stored command or
-    arguments no longer match what would be registered now.
+    arguments no longer match what would be registered now. ``can_launch`` is
+    whether the dashboard can open a session with the client; ``relay`` whether
+    that session is reachable from other devices.
     """
     client = _client(client_id)
     path = client.config_path()
@@ -833,7 +910,14 @@ def status(client_id: str) -> dict:
         "state": state,
         "drifted": drifted,
         "config_path": str(path) if path is not None else None,
+        "can_launch": client.can_launch(),
+        "relay": client.relay,
     }
+
+
+def backend(client_id: str) -> ClientBackend:
+    """The client's backend, for a caller that launches it."""
+    return _client(client_id)
 
 
 def statuses() -> list[dict]:

@@ -1,6 +1,9 @@
 # Launching a client session from the dashboard
 
-Status: **proposed** — nothing implemented.
+Status: **implemented** — `biopb._control._agents` (`launch_argv`, `can_launch`),
+`biopb_control/_clients.py` (the launcher), `POST /api/agents/<id>/launch|stop`, and
+the dashboard's *Start session* button. Where the build differs from the design
+below, the section says so.
 
 The dashboard already knows which MCP clients are installed and whether biopb is
 registered with each (`/api/agents`, backed by `biopb._control._agents`). It stops there:
@@ -200,7 +203,8 @@ It records nothing about who is using it, and the shim does not register anythin
 so a session pane cannot say which client holds it or refuse to act on a client
 the control did not start.
 
-The holder is the lease, so that is where the client goes. The shim already finds
+The holder is the lease, so that is where the client goes (built:
+`_shim._client_identity`, `_lease.acquire(client=...)`, `/api/sessions[].client`). The shim already finds
 its client for the Windows death watchdog (`_find_client_process`, which climbs
 past launcher stubs that `os.getppid()` would name), and sends only `{token,
 force}` to `/api/lease/acquire`. Add the client's `pid`, its `create_time`
@@ -214,23 +218,24 @@ Constraints on that value:
   ancestor cannot be read; such a holder is "unknown", never "not ours".
 - **It is not a kill target.** The control holds the client as an `OwnedChild`,
   and a live `Popen` handle cannot be fooled by pid reuse. The pid is for display
-  and provenance: it is how `[x]` recognises a client the control did *not*
-  launch — a user's own `opencode web` in a terminal, or the shared Codex
-  daemon — and offers session-stop only.
-- **A match needs the name too.** Compare pid, `create_time` and process name with
-  the handle the control holds, and refuse on a mismatch.
+  and provenance: the session row says who holds it.
+- **`[x]` is decided by the handle, not the lease.** The process the shim finds
+  is the client's *session* process, which for Claude Code is a descendant of the
+  `remote-control` child the control holds, so the two pids need not match. The
+  control stops a client only if it launched it in this run; a user's own
+  `opencode web` or an already-running Codex daemon is refused.
 
 ## Teardown
 
 Two stops, kept separate because the session outlives its client.
 
-1. `[x]` on a client → is this one the control launched (handle still held,
-   matching the lease holder's pid and `create_time`)? If not, offer "stop this
-   biopb session" and nothing more.
-2. If it is, stop the **client**, through `OwnedChild.stop()`. Its shim exits on
-   stdin EOF or SIGTERM and releases the lease; the session is untouched and free
-   for the next agent. Wait bounded for the lease to show free; escalate only
-   against the client.
+1. `[x]` on a client → did the control launch this one (handle still held)? If
+   not, it is refused; stopping the biopb session is the session pane's job.
+2. If it did, stop the **client**, through `OwnedChild.stop()` (a `oneshot`
+   runs its own stop command: `disable-remote-control` for Codex, nothing for
+   opencode 2, whose service stays up). Its shim exits on stdin EOF or SIGTERM and
+   releases the lease; the session is untouched and free for the next agent. The
+   control does not poll for the lease to show free.
 3. Stopping the **session** is its own action (`/api/sessions`). A shim bound to a
    session that stops is unbound, and its next call says why.
 
@@ -250,6 +255,14 @@ case that makes them worth building. They need their own opt-in — starting an
 agent with shell access on the owner's subscription is a step up from viewing
 data, and it should be enabled deliberately rather than riding a gate that means
 something else.
+
+Built as: every launch needs the `chat` execute root to be served (so
+`--hide chat` closes it, as it closes the chat pane), the verbs
+(`/api/agents/<id>/launch|stop`) take the exec credential in `split` mode, and a
+relay client additionally needs `biopb-control run --allow-relay-clients` (or
+`BIOPB_CONTROL_RELAY_CLIENTS=1`). `/api/agents` reports the reason as
+`launch_blocked`, from the same function the verb enforces. The child's
+environment is the control's minus the exec token.
 
 opencode 2 sits between: it listens on loopback by default, and `pair --remote`
 or `service set hostname 0.0.0.0` reach beyond it. The control starts the local

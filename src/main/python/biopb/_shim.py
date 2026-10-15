@@ -64,6 +64,7 @@ from . import _control
 from ._config import locations as _locations
 from ._control import _launch as _control_launch
 from ._lifecycle import sessions as _sessions, winjob as _winjob
+from ._lifecycle.proc import process_create_time as _process_create_time
 from ._security.credentials import ENV_CONTROL_EXEC_TOKEN as _EXEC_ENV
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,26 @@ def _find_client_process():
         # than risk watching the wrong process. stdin EOF stays the backstop.
         return None
     return None
+
+
+def _client_identity():
+    """``{pid, create_time, name}`` of the MCP client, or ``None`` if unknown.
+
+    Read once, when the lease is taken, so the session can say who holds it. It
+    is provenance for display and for telling a client the control launched from
+    one it did not, never a target to signal.
+    """
+    client = _find_client_process()
+    if client is None:
+        return None
+    try:
+        return {
+            "pid": client.pid,
+            "create_time": _process_create_time(client.pid),
+            "name": client.name(),
+        }
+    except Exception:
+        return None
 
 
 def _is_windows() -> bool:
@@ -618,7 +639,7 @@ class _Binding:
                 base,
                 "POST",
                 "/api/lease/acquire",
-                {"token": self.token, "force": force},
+                {"token": self.token, "force": force, "client": _client_identity()},
             )
         except (OSError, ValueError) as e:
             raise AttachError(f"session {label} is not reachable: {e}") from e

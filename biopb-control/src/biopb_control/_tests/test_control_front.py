@@ -106,6 +106,9 @@ def test_hide_only_removes_execute_roots():
         ("POST", "/session/s1/api/shutdown", True),
         ("POST", "/session/s1/api/lease/acquire", True),
         ("POST", "/api/sessions/new", True),  # starts a process on the host
+        ("POST", "/api/agents/opencode/launch", True),  # an agent with a shell
+        ("POST", "/api/agents/opencode/stop", True),
+        ("POST", "/api/agents/opencode/register", False),
         ("GET", "/api/sessions", False),
         ("POST", "/session/s1/chat/turn", True),
         ("GET", "/session/s1/mcp", True),
@@ -406,6 +409,7 @@ def test_probe_session_maps_child_health(flag, expected):
             "kernel": "ready",
             "chat": expected,
             "holder": "agent" if expected else None,
+            "client": None,
         }
     finally:
         server.shutdown()
@@ -446,6 +450,7 @@ def test_probe_session_flags_default_off_on_an_older_child():
             "kernel": "none",
             "chat": False,
             "holder": None,
+            "client": None,
         }
     finally:
         server.shutdown()
@@ -853,7 +858,11 @@ def test_api_agents_lists_client_status(control, monkeypatch):
     monkeypatch.setattr("biopb._control._agents.statuses", lambda: fake)
     status, _h, body = _get(f"{control}/api/agents")
     assert status == 200
-    assert json.loads(body)["agents"] == fake
+    [agent] = json.loads(body)["agents"]
+    assert {k: agent[k] for k in fake[0]} == fake[0]
+    # Nothing launched it, and a client without `can_launch` is not launchable.
+    assert agent["running"] is False
+    assert agent["launch_blocked"] == "not launchable here"
 
 
 def test_agent_register_passes_id_and_returns_status(control, monkeypatch):
@@ -902,6 +911,104 @@ def test_agent_action_error_is_400(control, monkeypatch):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _post(f"{control}/api/agents/nope/register")
     assert exc.value.code == 400
+
+
+class _FakeClient:
+    """A launchable client whose "launch" is a command that prints and returns."""
+
+    id = "fake"
+    name = "Fake"
+    launch_kind = "oneshot"
+
+    def __init__(self, relay=False):
+        self.relay = relay
+
+    def launch_argv(self):
+        return [sys.executable, "-c", "print('link: http://127.0.0.1:1/x')"]
+
+    def stop_argv(self):
+        return [sys.executable, "-c", "print('off')"]
+
+    def can_launch(self):
+        return True
+
+
+def _fake_status(client):
+    return {
+        "id": client.id,
+        "name": client.name,
+        "state": "registered",
+        "drifted": False,
+        "config_path": None,
+        "can_launch": True,
+        "relay": client.relay,
+    }
+
+
+def _use_fake_client(monkeypatch, client):
+    monkeypatch.setattr("biopb._control._agents.backend", lambda _id: client)
+    monkeypatch.setattr(
+        "biopb._control._agents.status", lambda _id: _fake_status(client)
+    )
+    monkeypatch.setattr(
+        "biopb._control._agents.statuses", lambda: [_fake_status(client)]
+    )
+
+
+def test_a_client_is_launched_and_stopped_through_the_api(control, monkeypatch):
+    _use_fake_client(monkeypatch, _FakeClient())
+    _status, _h, body = _post(f"{control}/api/agents/fake/launch")
+    got = json.loads(body)
+    assert got["state"] == "started" and "http://127.0.0.1:1/x" in got["log"]
+    [agent] = json.loads(_get(f"{control}/api/agents")[2])["agents"]
+    assert agent["running"] is True and agent["launch_blocked"] is None
+    _status, _h, body = _post(f"{control}/api/agents/fake/stop")
+    assert json.loads(body)["stopped"] is True
+    [agent] = json.loads(_get(f"{control}/api/agents")[2])["agents"]
+    assert agent["running"] is False
+
+
+def test_a_relay_client_needs_the_operators_opt_in(control, monkeypatch):
+    _use_fake_client(monkeypatch, _FakeClient(relay=True))
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post(f"{control}/api/agents/fake/launch")
+    assert exc.value.code == 403
+    assert b"--allow-relay-clients" in exc.value.read()
+    [agent] = json.loads(_get(f"{control}/api/agents")[2])["agents"]
+    assert "allow-relay-clients" in agent["launch_blocked"]
+
+
+def test_launching_an_unknown_client_is_a_bad_request(control):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _post(f"{control}/api/agents/nope/launch")
+    assert exc.value.code == 400
+
+
+@pytest.mark.parametrize("relay", [False, True])
+def test_a_launch_follows_the_chat_root(tmp_path, monkeypatch, relay):
+    # `--hide chat` removes the root a launched client's shell is the same
+    # power as, so neither kind of client can be launched there.
+    _use_fake_client(monkeypatch, _FakeClient(relay=relay))
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+    )
+    from starlette.testclient import TestClient
+
+    app = build_app(
+        DataPlaneSupervisor(spec),
+        8.0,
+        f"http://127.0.0.1:{_free_port()}",
+        auth="none",
+        hide=frozenset({"chat"}),
+        relay_clients=True,
+    )
+    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
+        resp = client.post("/api/agents/fake/launch")
+        assert resp.status_code == 403
+        assert "execute roots" in resp.json()["error"]
 
 
 def test_api_agents_is_token_gated(tokened_control, monkeypatch):

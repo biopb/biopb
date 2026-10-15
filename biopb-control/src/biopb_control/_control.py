@@ -131,6 +131,7 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
+from ._clients import ClientLauncher
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 from ._viewer_broker import (
     MAX_PNG_BYTES,
@@ -325,6 +326,10 @@ _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # adds a url, never code.)
 _EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new"})
 
+# Launching a client starts an agent with a shell; stopping it is the same verb's
+# other half.
+_CLIENT_LAUNCH_PATH = re.compile(r"/api/agents/[^/]+/(launch|stop)")
+
 
 def _needs_exec(method: str, path: str) -> bool:
     """Whether a request needs the exec credential: the control routes above, the
@@ -332,7 +337,7 @@ def _needs_exec(method: str, path: str) -> bool:
     restart, job cancel, shutdown, the lease). Reads under ``api`` are the
     observe page and stay with the viewing token. Everything unknown defaults
     to exec, so a verb added to the child later is gated until classified."""
-    if path in _EXEC_CONTROL_PATHS:
+    if path in _EXEC_CONTROL_PATHS or _CLIENT_LAUNCH_PATH.fullmatch(path):
         return True
     root = _session_root(path)
     if root is None:
@@ -762,6 +767,7 @@ _PROBE_UNKNOWN = {
     "kernel": "unknown",
     "chat": False,
     "holder": None,
+    "client": None,
 }
 
 
@@ -800,6 +806,8 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
             # agent choosing a session to attach to needs, and the dashboard
             # can show.
             "holder": (health.get("lease") or {}).get("holder"),
+            # The holder's own account of its process, when it gave one.
+            "client": (health.get("lease") or {}).get("client"),
         }
     except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
         return dict(_PROBE_UNKNOWN)
@@ -1111,6 +1119,7 @@ def build_app(
     exec_token: str | None = None,
     auth: str | None = None,
     hide: frozenset[str] = frozenset(),
+    relay_clients: bool = False,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -1141,6 +1150,11 @@ def build_app(
     under it are stripped before routing and the served SPA shell is rewritten to
     point back at it. ``None`` (the default) is the plain root origin and changes
     nothing. It is normalized here, the single consumer.
+
+    ``relay_clients`` lets the dashboard launch a client that is reachable from
+    other devices through a relay (Claude Code, Codex): the operator's opt-in, as
+    a local client's launch needs only the ``chat`` root. Either is refused where
+    ``chat`` is hidden, because the client it starts is an agent with a shell.
 
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
@@ -1388,6 +1402,7 @@ def build_app(
                 # both — answered here so the dashboard needs no second probe.
                 "chat": probe["chat"] and _SESSION_CHAT_ROOT in session_roots,
                 "holder": probe["holder"],
+                "client": probe["client"],
             }
             for rec, probe in zip(records, probes, strict=True)
         ]
@@ -1433,9 +1448,63 @@ def build_app(
         # this without spawning anything; still sync (filesystem), so Starlette
         # runs it in the threadpool.
         try:
-            return JSONResponse({"agents": _agents.statuses()})
+            agents = [
+                {
+                    **agent,
+                    "running": launcher.running(agent["id"]),
+                    "launch_blocked": _launch_blocked(agent),
+                }
+                for agent in _agents.statuses()
+            ]
+            return JSONResponse({"agents": agents})
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/agents failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def _launch_blocked(agent: dict) -> str | None:
+        # Why the dashboard may not launch this client, or None. The same test
+        # gates the verb, so a button and its gate cannot drift apart.
+        if not agent.get("can_launch"):
+            return "not launchable here"
+        if _SESSION_CHAT_ROOT not in session_roots:
+            return "this control does not serve the execute roots"
+        if agent.get("relay") and not relay_clients:
+            return "reachable from other devices; start the control with --allow-relay-clients"
+        return None
+
+    def _launch_gate(request: Request) -> tuple[str | None, JSONResponse | None]:
+        agent_id = request.path_params["agent_id"]
+        try:
+            agent = _agents.status(agent_id)
+        except _agents.AgentError as exc:
+            return None, JSONResponse({"error": str(exc)}, status_code=400)
+        reason = _launch_blocked(agent)
+        if reason is not None:
+            return None, JSONResponse({"error": reason}, status_code=403)
+        return agent_id, None
+
+    def agent_launch(request: Request) -> JSONResponse:
+        # Sync: it spawns and then waits (bounded) for the client to say it is up.
+        agent_id, refused = _launch_gate(request)
+        if refused is not None:
+            return refused
+        try:
+            return JSONResponse(launcher.launch(agent_id))
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("client launch failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def agent_stop(request: Request) -> JSONResponse:
+        # Stopping needs no launch gate beyond the verb's own exec credential: it
+        # only ends a client this control started.
+        try:
+            agent_id = request.path_params["agent_id"]
+            _agents.backend(agent_id)
+            return JSONResponse(launcher.stop(agent_id))
+        except _agents.AgentError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("client stop failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     def _agent_action(request: Request, action) -> JSONResponse:
@@ -1451,6 +1520,8 @@ def build_app(
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("agent %s failed", getattr(action, "__name__", "action"))
             return JSONResponse({"error": str(exc)}, status_code=500)
+
+    launcher = ClientLauncher()
 
     def agent_register(request: Request) -> JSONResponse:
         return _agent_action(request, _agents.register)
@@ -1914,6 +1985,8 @@ def build_app(
         Route("/api/agents", api_agents, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
+        Route("/api/agents/{agent_id}/launch", agent_launch, methods=["POST"]),
+        Route("/api/agents/{agent_id}/stop", agent_stop, methods=["POST"]),
         Route("/api/viewer/next", viewer_next, methods=["GET"]),
         Route("/api/viewer/answer/{req}", viewer_answer, methods=["POST"]),
         Route("/api/viewer/show", viewer_show, methods=["POST"]),
@@ -1947,6 +2020,7 @@ def build_app(
         try:
             yield
         finally:
+            launcher.stop_all()
             await proxy_client.aclose()
             await session_client.aclose()
 
@@ -2038,6 +2112,7 @@ def serve_control_api(
         exec_token=spec.exec_token,
         auth=auth,
         hide=spec.hide,
+        relay_clients=spec.relay_clients,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

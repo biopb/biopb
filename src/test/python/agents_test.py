@@ -289,6 +289,68 @@ def test_opencode_2_registers_under_mcp_servers(home, monkeypatch):
     assert s["state"] == "registered" and not s["drifted"]
 
 
+def test_status_says_whether_a_client_can_be_launched(home, monkeypatch):
+    _no_binaries(monkeypatch)
+    by_id = {s["id"]: s for s in _agents.statuses()}
+    assert not any(s["can_launch"] for s in by_id.values())
+    assert by_id["claude-code"]["relay"] and by_id["codex-cli"]["relay"]
+    assert not by_id["opencode"]["relay"]
+
+
+def test_claude_desktop_and_cursor_have_nothing_to_launch(home, monkeypatch):
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert _agents.backend("claude-desktop").launch_argv() is None
+    assert not _agents.backend("cursor").can_launch()
+
+
+def test_claude_code_launches_one_session_without_bypassing_permissions(
+    home, monkeypatch
+):
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: "/usr/bin/" + name)
+    client = _agents.backend("claude-code")
+    argv = client.launch_argv()
+    assert argv[1:] == [
+        "remote-control",
+        "--spawn",
+        "session",
+        "--permission-mode",
+        "default",
+    ]
+    assert client.can_launch() and client.launch_kind == "child"
+
+
+def test_codex_needs_its_standalone_install_to_launch(home, monkeypatch):
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: "/usr/bin/" + name)
+    codex = _agents.backend("codex-cli")
+    assert not codex.can_launch()  # an npm install has the binary, not the daemon
+    standalone = home / ".codex" / "packages" / "standalone" / "current" / "codex"
+    standalone.parent.mkdir(parents=True)
+    standalone.write_text("")
+    assert codex.can_launch() and codex.launch_kind == "oneshot"
+    assert codex.launch_argv()[-1] == "enable-remote-control"
+    assert codex.stop_argv()[-1] == "disable-remote-control"
+
+
+def test_opencode_launches_by_version_and_never_exposes_the_service(home, monkeypatch):
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: "/usr/bin/" + name)
+    opencode = _agents.backend("opencode")
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 1)
+    assert opencode.launch_argv() == [
+        "opencode",
+        "web",
+        "--hostname",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ]
+    assert opencode.launch_kind == "child"
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
+    assert opencode.launch_argv() == ["opencode", "pair"]
+    assert opencode.launch_kind == "oneshot"
+    monkeypatch.setattr(_agents, "_opencode_major", lambda: None)
+    assert opencode.launch_argv() is None and not opencode.can_launch()
+
+
 def test_opencode_2_moves_a_v1_entry_it_would_ignore(home, monkeypatch):
     monkeypatch.setattr(_agents, "_opencode_major", lambda: 2)
     cfg = _opencode_cfg(
