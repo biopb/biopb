@@ -24,7 +24,7 @@ from typing import Optional
 from biopb._control import _endpoints
 from biopb._security import credentials as _credentials
 
-from . import _registry
+from . import _registry, _update
 from ._algorithm_plane import AlgorithmPlane
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -97,6 +97,11 @@ def run_control(
         else (lambda: None)
     )
     stop = threading.Event()
+    updates = None
+    if _update.enabled():
+        from . import __version__
+
+        updates = _update.UpdateChecker(__version__)
 
     try:
         server, _api_thread = serve_control_api(
@@ -105,6 +110,7 @@ def run_control(
             supervisor,
             ensure_timeout,
             algorithms=algorithms,
+            updates=updates,
         )
     except OSError as exc:
         logger.error(
@@ -201,6 +207,8 @@ def run_control(
             daemon=True,
         ).start()
 
+    if updates:
+        updates.start()
     logger.info(
         "biopb control ready (control API on %s:%d)", control_host, control_port
     )
@@ -211,6 +219,8 @@ def run_control(
         stop.set()
 
     logger.info("shutting down")
+    if updates:
+        updates.stop()
     server.shutdown()
     algorithms.stop_all()
     supervisor.stop()

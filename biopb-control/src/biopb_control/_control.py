@@ -130,10 +130,11 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import _logs
+from . import _logs, _update
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._clients import ClientLauncher, LaunchRefused
 from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
+from ._update import UpdateChecker
 from ._viewer_broker import (
     MAX_PNG_BYTES,
     ShowFailed,
@@ -325,7 +326,7 @@ _READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # need the exec credential like a session's writes do. (The algorithm verbs are
 # not here: they only start or stop entries the user registered, and `register`
 # adds a url, never code.)
-_EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new"})
+_EXEC_CONTROL_PATHS = frozenset({"/api/sessions/new", "/api/update"})
 
 # Launching a client starts an agent with a shell; stopping it is the same verb's
 # other half.
@@ -1037,6 +1038,8 @@ def build_app(
     auth: str | None = None,
     hide: frozenset[str] = frozenset(),
     relay_clients: bool = False,
+    updates: UpdateChecker | None = None,
+    update_allowed: bool = False,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -1311,8 +1314,34 @@ def build_app(
                 "version": __version__,
                 "data_plane": supervisor.snapshot(),
                 "sessions": len(_sessions.list_sessions()),
+                "update": _update_status(),
+                "update_result": _update.last_result(),
             }
         )
+
+    def _update_status() -> dict | None:
+        info = updates.info() if updates else None
+        return {**info, "installable": update_allowed} if info else None
+
+    def api_update(_request: Request) -> JSONResponse:
+        # Hands the update to the installer (stop, swap, start again), which runs
+        # detached because it replaces this process's own code. Only on a control
+        # that belongs to one person (see serve_control_api).
+        found = updates.found() if updates else None
+        if not update_allowed:
+            return JSONResponse(
+                {"error": "this control cannot update itself"}, status_code=403
+            )
+        if found is None:
+            return JSONResponse({"error": "no update is available"}, status_code=400)
+        try:
+            log = _update.start_install(found)
+        except _update.InstallRunning as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("update failed to start")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"started": True, "log": log}, status_code=202)
 
     def api_scope(request: Request) -> JSONResponse:
         # What the presented token may do, for a page deciding which controls to
@@ -1884,6 +1913,7 @@ def build_app(
     routes = [
         Route("/health", health, methods=["GET"]),
         Route("/api/status", api_status, methods=["GET"]),
+        Route("/api/update", api_update, methods=["POST"]),
         Route("/api/scope", api_scope, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/sessions/new", api_session_new, methods=["POST"]),
@@ -1991,6 +2021,7 @@ def serve_control_api(
     ensure_timeout: float,
     data_web_url: str | None = None,
     algorithms: AlgorithmPlane | None = None,
+    updates: UpdateChecker | None = None,
 ) -> tuple[_ControlServer, threading.Thread]:
     """Start the control-plane web origin on ``host:port`` in a background thread.
 
@@ -2024,6 +2055,11 @@ def serve_control_api(
         auth=auth,
         hide=spec.hide,
         relay_clients=spec.relay_clients,
+        updates=updates,
+        # A control one person owns: loopback-bound and not published under a
+        # portal prefix. A shared or remote one is updated by whoever runs it.
+        update_allowed=not _web_auth.host_is_public_bind(spec.grpc_host)
+        and not spec.url_prefix,
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

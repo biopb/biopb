@@ -233,7 +233,7 @@ def stop_daemon(
     return graceful
 
 
-def detach_kwargs() -> dict:
+def detach_kwargs(breakaway: bool = False) -> dict:
     """Popen kwargs that detach a spawned daemon from the launching console and
     process group, so it survives this command returning and isn't killed by
     the terminal's Ctrl+C or close (SIGHUP).
@@ -250,11 +250,14 @@ def detach_kwargs() -> dict:
     daemon that must outlive the session — e.g. a shared/remote control plane —
     must be made persistent at the container/service/wrapper level (a systemd
     unit, `enable-linger`, or a long-lived container), not here.
+
+    ``breakaway`` (Windows) also leaves the parent's job object, so the child
+    outlives a parent whose job is killed on close. Popen fails with access
+    denied when the job forbids breakaway; the caller retries without.
     """
     if sys.platform == "win32":
-        return {
-            "creationflags": (
-                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-        }
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        if breakaway:
+            flags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
+        return {"creationflags": flags}
     return {"start_new_session": True}

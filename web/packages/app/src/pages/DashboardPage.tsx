@@ -89,12 +89,58 @@ async function jpost(url: string): Promise<{ error?: string; data_plane?: DataPl
   }
 }
 
+type UpdateRec = {
+  current: string;
+  latest: string;
+  url: string;
+  // Whether this control may apply the update itself (one person's own control).
+  installable?: boolean;
+};
+// The installer's last record, which outlives the control it stopped.
+type UpdateResult = { status: string; version?: string };
+
+// How long to wait for the installer to bring a control back before giving up.
+const UPDATE_WAIT_MS = 15 * 60 * 1000;
+
+const DISMISSED_KEY = "biopb.update.dismissed";
+
+// The version whose banner the viewer closed: per-browser, so it only has to
+// survive a reload, and a newer release shows the banner again.
+function dismissedVersion(): string | null {
+  try {
+    return localStorage.getItem(DISMISSED_KEY);
+  } catch {
+    return null;
+  }
+}
+
+// The published installer one-liner for this viewer's platform; re-running it is
+// how an installation is upgraded.
+function installCommand(): string {
+  return /windows/i.test(navigator.userAgent)
+    ? "irm https://biopb.org/install.ps1 | iex"
+    : "curl -fsSL https://biopb.org/install.sh | bash";
+}
+
 export default function DashboardPage() {
   useDocumentTitle("BioPB control - dashboard");
   const [conn, setConn] = useState("…");
   // The control's own package version, from /api/status. Absent on an older
   // control that predates the field, so render nothing rather than "undefined".
   const [version, setVersion] = useState<string | null>(null);
+  // A newer release than the installed one, from /api/status; null when there
+  // is none or the check is off.
+  const [update, setUpdate] = useState<UpdateRec | null>(null);
+  const [dismissed, setDismissed] = useState<string | null>(dismissedVersion);
+  const [updateResult, setUpdateResult] = useState<UpdateResult | null>(null);
+  // Set once Update is clicked, until the control is back on the new version (or
+  // the wait runs out): the installer stops this control, so the page watches it
+  // go away and return.
+  const [updating, setUpdating] = useState(false);
+  const [updateErr, setUpdateErr] = useState<string | null>(null);
+  const awaiting = useRef<{ version: string | null; down: boolean; until: number } | null>(
+    null,
+  );
   // Connection health drives the status pill's color (green ok / red down),
   // mirroring the admin pages' status-pill. null = not yet probed (neutral).
   const [connOk, setConnOk] = useState<boolean | null>(null);
@@ -158,11 +204,39 @@ export default function DashboardPage() {
       setConnOk(true);
       setDataPlane(s.data_plane || {});
       if (s.version) setVersion(s.version);
+      setUpdate(s.update || null);
+      setUpdateResult(s.update_result || null);
+      const wait = awaiting.current;
+      if (wait) {
+        const status = s.update_result?.status;
+        if (status === "failed") {
+          awaiting.current = null;
+          setUpdating(false);
+        } else if (status !== "running" && (wait.down || s.version !== wait.version)) {
+          window.location.reload();
+        } else if (Date.now() > wait.until) {
+          awaiting.current = null;
+          setUpdating(false);
+          setUpdateErr("The update did not finish in time.");
+        }
+      }
     } catch {
       setConn("control unreachable");
       setConnOk(false);
+      if (awaiting.current) awaiting.current.down = true;
     }
   }, []);
+
+  const startUpdate = useCallback(async () => {
+    setUpdateErr(null);
+    const res = await jpost(withBase("/api/update"));
+    if (res.error) {
+      setUpdateErr(res.error);
+      return;
+    }
+    awaiting.current = { version, down: false, until: Date.now() + UPDATE_WAIT_MS };
+    setUpdating(true);
+  }, [version]);
 
   // Reverse-proxied to the data plane's own HTTP sidecar (unauthenticated,
   // see http_server.py:/readyz); a plain fetch, same as ClientBootstrap's
@@ -500,6 +574,70 @@ export default function DashboardPage() {
         </button>
       </header>
       <main>
+        {updating || updateResult?.status === "running" ? (
+          <div className="update-banner">
+            <span>
+              Updating BioPB{updateResult?.version ? ` to ${updateResult.version}` : ""}…
+              this control restarts when it is done, which takes a few minutes.
+            </span>
+          </div>
+        ) : (
+          <>
+            {(updateErr || updateResult?.status === "failed") && (
+              <div className="update-banner bad">
+                <span>
+                  {updateErr || "The last update failed."} To update by hand, run{" "}
+                  <code>{installCommand()}</code>
+                </span>
+              </div>
+            )}
+            {update && update.latest !== dismissed && (
+              <div className="update-banner">
+                <span>
+                  BioPB {update.latest} is available (installed {update.current}).{" "}
+                  {update.installable ? (
+                    <>
+                      Updating restarts the data plane and closes the{" "}
+                      {sessions?.length ?? 0} live session(s).
+                    </>
+                  ) : (
+                    <>
+                      Update by running <code>{installCommand()}</code>
+                    </>
+                  )}
+                </span>
+                {update.url && (
+                  <a className="link" href={update.url} target="_blank" rel="noreferrer">
+                    Release notes →
+                  </a>
+                )}
+                {update.installable && (
+                  <button
+                    className="mini"
+                    disabled={!canExec}
+                    title={execTitle(canExec, "Install the new release and restart")}
+                    onClick={() => void startUpdate()}
+                  >
+                    Update
+                  </button>
+                )}
+                <button
+                  className="mini"
+                  onClick={() => {
+                    try {
+                      localStorage.setItem(DISMISSED_KEY, update.latest);
+                    } catch {
+                      /* storage blocked: the banner just returns on reload */
+                    }
+                    setDismissed(update.latest);
+                  }}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+          </>
+        )}
         <div className="card">
           <h2 className="with-actions">
             Data plane
@@ -1071,6 +1209,13 @@ const DASH_CSS = `
   .ctrl-dash button.mini.stop:hover:not(:disabled) { color: #f99; border-color: #844; }
   .ctrl-dash .state { color: #888; font-size: 12px; }
   .ctrl-dash .note { color: #667; font-size: 12px; margin: 12px 0 0; }
+  .ctrl-dash .update-banner { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+            background: #1d2a3a; border: 1px solid #2c4a6e; border-radius: 6px;
+            padding: 8px 14px; margin-bottom: 14px; }
+  .ctrl-dash .update-banner.bad { background: #3a1d1d; border-color: #6e2c2c; }
+  .ctrl-dash .update-banner code { color: #8bf; font-family: ui-monospace, Menlo, monospace; }
+  .ctrl-dash .update-banner a.link { margin-left: auto; }
+  .ctrl-dash .update-banner a.link + button { margin-left: 0; }
   /* A failed launch renders the child's own log tail, so keep its newlines and
      let it scroll rather than stretching the card. */
   .ctrl-dash .note.launch { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace;

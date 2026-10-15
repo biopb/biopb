@@ -16,7 +16,7 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 :mod:`biopb._config.locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
-``viewer`` / ``services`` / ``observe`` / ``update`` are
+``viewer`` / ``services`` / ``observe`` are
 the MCP-server knobs; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
 read by ``ops``. The napari widgets keep their own settings (biopb-napari-widget).
 
@@ -336,33 +336,6 @@ class ChatConfig:
     )
 
 
-@dataclass
-class UpdateConfig:
-    """Kernel-start auto-updater (#87): offers to re-run the installer on a newer release."""
-
-    enabled: bool = _h(
-        True, "Enable the background, fail-open update check at kernel start."
-    )
-    repo: str = _h(
-        "biopb/biopb",
-        "owner/name of the deployment repo whose release-v* line is the product "
-        "(overridable for forks/testing).",
-    )
-    channel: str = _h(
-        "stable",
-        '"stable" -> newest clean release-vX.Y.Z (prereleases skipped); '
-        '"prerelease" -> also consider release candidates.',
-    )
-    skipped_version: str = _h(
-        "",
-        'A version the user chose to skip ("Skip vX.Y.Z"); suppresses the prompt for exactly that version.',
-    )
-    timeout: float = _h(
-        5.0,
-        "Per-request network timeout (s) for the GitHub API fetch; short so the check never delays viewer start.",
-    )
-
-
 def _section(cls, title=None, summary=None):
     """A top-level section. *title* and *summary* are its settings-page nav
     label and panel prose (schema ``title`` / ``description``); a section with
@@ -417,12 +390,6 @@ class McpConfig:
         "the Observe page (chat_enabled); the provider key is not here, by "
         "design — this file is served to the browser, so the key lives in an "
         "owner-only credential file.",
-    )
-    update: UpdateConfig = _section(
-        UpdateConfig,
-        "Updates",
-        "The kernel-start auto-updater that offers to re-run the installer on a "
-        "newer release.",
     )
 
 
@@ -657,6 +624,10 @@ _RETIRED_KEYS = {
         "acp_model": "the ACP engine is gone; set chat.model",
         "acp_permission": "the ACP engine is gone",
     },
+    "update": dict.fromkeys(
+        ("enabled", "repo", "channel", "skipped_version", "timeout"),
+        "the update check moved to the control; BIOPB_UPDATE_CHECK=0 turns it off",
+    ),
 }
 
 
