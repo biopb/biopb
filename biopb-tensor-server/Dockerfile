@@ -29,7 +29,7 @@ COPY wheels/biopb_tensor_server-*.whl /app/wheels/
 WORKDIR /app
 RUN TENSOR_WHEEL=$(ls /app/wheels/biopb_tensor_server-*.whl) \
     && pip install --no-cache-dir /app/wheels/biopb-*.whl \
-    && pip install --no-cache-dir "$TENSOR_WHEEL[web,tls,aics,czi,bioformats,medical,ndtiff]"
+    && pip install --no-cache-dir "$TENSOR_WHEEL[web,tls,vendor,aics,czi,bioformats,medical,ndtiff]"
 
 # Stage 2: Runtime (python only)
 FROM python:3.12-slim

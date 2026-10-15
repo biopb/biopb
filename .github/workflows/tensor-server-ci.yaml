@@ -111,7 +111,7 @@ jobs:
           python -m pip install --upgrade pip setuptools
           pip install -e ".[tensor]"
           # Match the format extras the shipped artifacts install
-          # (Dockerfile / install.sh: web,aics,czi,medical,ndtiff) so CI
+          # (Dockerfile / install.sh: web,vendor,aics,czi,medical,ndtiff) so CI
           # actually covers the adapters we ship. Without these the
           # ndtiff/dicom/nifti-guarded suites self-skip on every job and
           # the adapters get zero CI coverage (biopb#179). [test] pulls [web].
@@ -123,9 +123,9 @@ jobs:
           # 3.14 has no aicspylibczi wheel, so it runs without [czi] and without
           # the tests that need the CZI reader.
           if [[ "${{ matrix.python-version }}" == "3.14" ]]; then
-            pip install -e "./biopb-tensor-server[test,aics,medical,ndtiff,em]"
+            pip install -e "./biopb-tensor-server[test,vendor,aics,medical,ndtiff,em]"
           else
-            pip install -e "./biopb-tensor-server[test,aics,czi,medical,ndtiff,em]"
+            pip install -e "./biopb-tensor-server[test,vendor,aics,czi,medical,ndtiff,em]"
           fi
 
       - name: Run Python tests
