@@ -11,16 +11,53 @@ itself — one button, next to the registration state it already shows.
 Most of what follows was settled by running the clients rather than reading their
 docs, so the measurements are dated; see [Measurements](#measurements).
 
+The client does not own a biopb session. Each client registers `biopb-shim`, which
+starts unbound and, when the agent calls `attach`, takes the **lease** of a session
+that is a detached process (the control launches one with `POST /api/sessions/new`;
+it runs until stopped from the dashboard). Launching a client therefore starts a
+*holder* of a session, not its parent.
+
 ## Which clients, and three shapes
 
 | client | mechanism | where the UI is | what the control owns |
 |---|---|---|---|
-| **opencode** | `opencode web --hostname 127.0.0.1 --port 0` | a loopback HTTP server; opencode opens the browser itself | a foreground child |
+| **opencode 1** | `opencode web --hostname 127.0.0.1 --port 0` | a loopback HTTP server; opencode opens the browser itself | a foreground child |
+| **opencode 2** | `opencode pair` (no `web` command) | a loopback service; a one-time link signs the browser in | nothing — a machine-global background service |
 | **Claude Code** | `claude remote-control --spawn session` | claude.ai/code or the Claude mobile app, over an outbound relay | a foreground child |
 | **Codex CLI** | `codex app-server daemon enable-remote-control` | ChatGPT, over an outbound relay, after a pairing code | nothing — a machine-global daemon |
 
 Claude Desktop and Cursor have no web interface; their rows never show the
 button.
+
+### opencode 1 and 2
+
+The version decides the invocation (`opencode --version`, the probe
+`_agents` already uses to pick the config shape).
+
+**opencode 1** runs `opencode web` as a foreground child that serves one loopback
+listener and opens the browser itself.
+
+**opencode 2** has no `web` command. Its CLI talks to a background service
+(`opencode service start|status|stop`) that starts on demand, on a loopback port it
+chooses. `opencode pair` prints a **one-time link** (single use, expires in 5
+minutes) that signs a browser in to it:
+
+```
+Open a link to connect. Links work once and expire in 5 minutes.
+http://127.0.0.1:<port>/auth/connect/<token>
+```
+
+- **Other devices.** `opencode service set hostname 0.0.0.0` makes the service
+  listen beyond loopback. `opencode pair --url <external-url>` writes links against
+  an external address. `opencode pair --remote` pairs through opencode's tunnel
+  address, "enabling remote access if needed (exposes the server to the internet)";
+  it asks for confirmation, and `--yes` is required without a terminal.
+- **Standalone server.** `opencode serve --hostname H --port P` runs the same API
+  and web server in the foreground, which is the shape that fits a child the
+  control owns.
+- **Ownership.** The background service is machine-global and may be running for
+  other reasons, like the Codex daemon: a launch is `pair` plus showing the link,
+  and `[x]` must not mean `service stop`.
 
 Two notes on the Claude Code invocation. `remote-control` is not listed in
 `claude --help`'s command table even though it exists; `--remote-control` / `--rc`
@@ -75,25 +112,31 @@ The model is:
 - **one client child per client**, kept alive;
 - **`[start]` opens a browser page** against the child that already exists, never
   a second child;
-- **`[x]` lives on the session pane**, because one client child yields exactly
+- **`[x]` lives on the session pane**, because one client child holds exactly
   one biopb session.
 
-That last equivalence is the load-bearing one, and it holds because MCP
-connections are held at *server* scope in two of the three clients:
+That last equivalence is the load-bearing one. A session has one lease holder, so
+the number of sessions a client holds is the number of `biopb-shim` processes it
+runs, which follows the client's MCP connection scope. Measured as scope of a
+stdio MCP server, which the shim is:
 
 | client | MCP connection scope | one child ⇒ |
 |---|---|---|
-| opencode | server-scoped: `GET /mcp` has no session in the path, one MCP child whose parent is the server, unchanged across two sessions | one biopb session |
-| Codex | process-wide on the app-server: `mcpServerStatus/list` with no `threadId` returns the tools | one biopb session |
-| Claude Code | **per session**: two background sessions produced two MCP children with different parents | one *per session* |
+| opencode 1 | server-scoped: `GET /mcp` has no session in the path, one MCP child whose parent is the server, unchanged across two sessions | one shim, one biopb session |
+| Codex | process-wide on the app-server: `mcpServerStatus/list` with no `threadId` returns the tools | one shim, one biopb session |
+| Claude Code | **per session**: two background sessions produced two MCP children with different parents | one shim *per session* |
+
+opencode 2's scope is unmeasured; its service hosts the servers, so the opencode 1
+result is the expectation, not a fact.
 
 ### Claude Code needs `--spawn session`
 
 `claude remote-control` defaults to a server hosting many concurrent sessions
 (`--capacity 32`, `--spawn same-dir`), each its own process with its own MCP
-children — so one daemon would give N biopb session children and N napari
-windows. `--spawn session` is the classic single-session mode that exits when its
-session ends. It restores the 1:1 mapping and gives `[x]` its natural meaning.
+children — so one daemon would give N shims, and each `attach new` N biopb
+sessions and N napari windows. `--spawn session` is the classic single-session
+mode that exits when its session ends. It restores the 1:1 mapping and gives `[x]`
+its natural meaning.
 
 ### Codex is not ours to keep alive
 
@@ -127,85 +170,93 @@ platform detail:
   a parent-death pipe (`_lifecycle/deathwatch.py`) for the uncatchable deaths.
   Windows: a kill-on-close Job Object.
 - **Detached** (`_lifecycle/daemon.detach_kwargs`) — the child survives.
-  `_launch_viewer` uses it deliberately: "a viewer is the user's window, and a
-  control restart must not close it."
+  `_launch_session` uses it deliberately: a session is the user's, and "a control
+  restart must not end the session."
 
-**The client is Pattern O.** Every other link already works that way —
-`control → client → biopb-mcp shim → session child → kernel`, each dying with its
-parent — so making the client an owned child closes the chain, and the teardown
-below stops being something we sequence by hand. Detaching it would break the
-chain at exactly the link holding an unauthenticated listener.
+**The client is Pattern O; the session it holds is detached.** The client's chain
+is `control → client → biopb-shim`: each link dies with its parent, and the shim
+releases its lease on stdin EOF or SIGTERM (and a `kill -9`'d shim's lease lapses
+after 30 s). So making the client an owned child closes the chain, and nothing
+outlives the control but the sessions, which are meant to. Detaching the client
+would break the chain at exactly the link holding a listener that can run code.
 
-The cost is real: **restarting the control drops live chat sessions**, including
-a remote-control session someone is attached to from a phone. Put that in the UI
+The cost is real: **restarting the control drops live client sessions**, including
+a remote-control session someone is attached to from a phone. The biopb session
+itself survives, free, and the next client can attach to it. Put that in the UI
 rather than leaving it to be discovered. (The dashboard is served by the control,
 so it is down in that window regardless.)
 
-## The session record needs the client's pid
+## The lease needs the client's pid
 
-`_sessions.register()` records `session_id, host, port, pid, create_time,
-mcp_url, started_at`, where `pid` is the session child — the port-owning process.
-Nothing names the client that spawned it, so a session pane cannot say who owns
-it or refuse to act on a client the control did not start.
+A session registers itself (`_sessions.register()`: `session_id, host, port, pid,
+create_time, mcp_url, started_at`, with the port-owning session process as `pid`).
+It records nothing about who is using it, and the shim does not register anything,
+so a session pane cannot say which client holds it or refuse to act on a client
+the control did not start.
 
-Add it in the shim, which needs no plumbing from the control because **its own
-parent is the client**:
+The holder is the lease, so that is where the client goes. The shim already finds
+its client for the Windows death watchdog (`_find_client_process`, which climbs
+past launcher stubs that `os.getppid()` would name), and sends only `{token,
+force}` to `/api/lease/acquire`. Add the client's `pid`, its `create_time`
+(`process_create_time`) and its process name to that call; the session keeps them
+beside the holder in `_lease.snapshot()`, and `/api/sessions` returns them in the
+row's busy status.
 
-```python
-_sessions.register(session_id, port=port, pid=child.pid, mcp_url=url,
-                   client_pid=os.getppid(),
-                   client_create_time=process_create_time(os.getppid()))
-```
+Constraints on that value:
 
-`register()` stores `**extra` verbatim as documented forward room, so this is
-additive — but it has to land before the buttons ship, because a record's shape
-does not retrofit. The `--view` path simply omits the fields; it has no client.
-
-Three constraints on that value:
-
-- **Capture at publish time, never re-read.** If the client dies the shim is
-  reparented and a later `getppid()` names init.
-- **It is the client only while the shim is a direct child.** True for both
-  clients measured; a shell wrapper would break it, so record the parent's name
-  too and have `[x]` refuse on a mismatch.
+- **Capture at attach, never re-read.** It is `None` when psutil is missing or an
+  ancestor cannot be read; such a holder is "unknown", never "not ours".
 - **It is not a kill target.** The control holds the client as an `OwnedChild`,
-  and a live `Popen` handle cannot be fooled by pid reuse. `client_pid` is for
-  display and provenance: it is how `[x]` recognises a client the control did
-  *not* launch — a user's own `opencode web` in a terminal, or the shared Codex
+  and a live `Popen` handle cannot be fooled by pid reuse. The pid is for display
+  and provenance: it is how `[x]` recognises a client the control did *not*
+  launch — a user's own `opencode web` in a terminal, or the shared Codex
   daemon — and offers session-stop only.
+- **A match needs the name too.** Compare pid, `create_time` and process name with
+  the handle the control holds, and refuse on a mismatch.
 
 ## Teardown
 
-1. `[x]` → is this a client the control launched (handle still held, matching
-   `client_pid` / `client_create_time`)? If not, offer "stop this biopb session"
-   and nothing more.
-2. If it is, stop the **client**, through `OwnedChild.stop()`. The chain unwinds
-   itself: `biopb-mcp` is the client's child, bridge close triggers
-   `_reap_session`, which stops the session child and drops the registry record
-   in one path.
-3. Wait bounded for the record to disappear; escalate only against the client.
+Two stops, kept separate because the session outlives its client.
 
-**Never stop the biopb session first.** Besides being the wrong order, opencode
-will reconnect it (`POST /mcp/{name}/connect`) and spawn a fresh viewer behind
-the user's back.
+1. `[x]` on a client → is this one the control launched (handle still held,
+   matching the lease holder's pid and `create_time`)? If not, offer "stop this
+   biopb session" and nothing more.
+2. If it is, stop the **client**, through `OwnedChild.stop()`. Its shim exits on
+   stdin EOF or SIGTERM and releases the lease; the session is untouched and free
+   for the next agent. Wait bounded for the lease to show free; escalate only
+   against the client.
+3. Stopping the **session** is its own action (`/api/sessions`). A shim bound to a
+   session that stops is unbound, and its next call says why.
+
+**Stop the client first when both go.** A shim started with `--session auto`
+(Codex) that is respawned after its session is gone attaches to the newest free
+session or launches a new one, so stopping the session first can bring up a fresh
+viewer behind the user's back. An opencode shim starts unbound and costs nothing
+in that case.
 
 ## Security
 
-**The gate is not the same for the two shapes.** opencode's is a loopback
-listener, so its button belongs behind the same condition as the chat proxy
-(the control's `--auth` mode). The relay clients are the opposite case: being
-reachable from another device is the entire point, and gating them on
-loopback-only forbids the case that makes them worth building. They need their
-own opt-in — starting an agent with shell access on the owner's subscription is a
-step up from viewing data, and it should be enabled deliberately rather than
-riding a gate that means something else.
+**The gate is not the same for the shapes.** opencode's is a loopback listener,
+so its button belongs behind the same condition as the chat proxy (the control's
+`--auth` mode). The relay clients are the opposite case: being reachable from
+another device is the entire point, and gating them on loopback-only forbids the
+case that makes them worth building. They need their own opt-in — starting an
+agent with shell access on the owner's subscription is a step up from viewing
+data, and it should be enabled deliberately rather than riding a gate that means
+something else.
+
+opencode 2 sits between: it listens on loopback by default, and `pair --remote`
+or `service set hostname 0.0.0.0` reach beyond it. The control starts the local
+form only (`pair` with no flag) and never passes `--remote` or `--yes`; exposing
+the service to the internet is the user's own step, the way an operator opts in
+to a relay client.
 
 For Claude Code, pin `--permission-mode default`; never `bypassPermissions`.
 
-**opencode's listener is unauthenticated by default, and we warn rather than
+**opencode 1's listener is unauthenticated by default, and we warn rather than
 secure it.** `OPENCODE_SERVER_PASSWORD` (with `OPENCODE_SERVER_USERNAME`,
 default `opencode`) turns on HTTP Basic across the whole listener. The control
-passes its environment to the child the way `_launch_viewer` already does, so a
+passes its environment to the child the way `_launch_session` already does, so a
 user who starts the control with that variable set gets a secured server and no
 warning, with no code on our side. Left unset, opencode prints its own warning as
 the first line of the launch log:
@@ -218,17 +269,20 @@ Surface *that* line rather than reimplementing the check — it stays truthful i
 their default changes. A pre-launch `os.environ` check is still worth having so
 the card can warn before the click.
 
+**opencode 2 is authenticated by default.** The service answers `/api/*` with 401
+until a browser has used a pairing link, and `opencode serve` with no
+`OPENCODE_SERVER_PASSWORD` generates a random password and prints it
+(`server password <...>`) instead of running open; with the variable set, Basic
+auth as `opencode:<password>` works as before. The warning above does not apply;
+the link or password in the launch log is what the user needs, and it is a
+credential, so show it to the one who clicked and do not keep it in a log the
+dashboard serves to others.
+
 **A web session runs under the user's own opencode settings**, where `bash`
 and `edit` default to `allow`. Nothing is pinned on their behalf: this is a
 harness the user chose to open, on a machine already theirs, and rewriting its
 permissions from under it would be the surprising answer rather than the safe
 one. Recorded here so it does not later read as an oversight.
-
-The other side of that comparison used to be the chat pane's ACP engine, which
-started opencode itself and therefore *did* pin permissions through
-`OPENCODE_CONFIG_CONTENT`. That engine has been retired, so this
-proposal is the only launcher in question and there is no second policy to
-reconcile it with.
 
 **The relay clients expose no local listener.** Claude Code polls Anthropic's
 backend over outbound HTTPS; Codex opens an outbound websocket to a chatgpt.com
@@ -245,23 +299,26 @@ a footnote. Codex's equivalent retention behaviour is unverified.
 What `can_launch` cannot see is still invisible until launch: no subscription, an
 org policy toggle, an unaccepted workspace-trust dialog, or a
 `DO_NOT_TRACK`-family variable inherited from the control's environment. So the
-launch contract is `_launch_viewer`'s, which already solves this shape:
+launch contract is `_launch_session`'s, which already solves this shape:
 
 - a per-launch log file with the same retention treatment;
 - a bounded readiness wait, ceilinged under the client's own HTTP timeout;
 - three states — `started` / `starting` / `failed` — where only `failed` carries
   `error`, a log tail and `log_path`;
-- rendered in the inline `.note.launch` block the viewer card already uses, not
-  an `alert()`.
+- rendered in the inline `.note.launch` block the dashboard already uses for
+  session launches, not an `alert()`.
 
-**Show the tail on success too, not only on failure.** opencode prints its URL
+**Show the tail on success too, not only on failure.** opencode 1 prints its URL
 there (`Web interface:      http://127.0.0.1:<port>/`), which is what the user
 needs if the browser-open did not land — and it is where the unsecured-server
-warning lives. Strip ANSI and the ASCII logo for display.
+warning lives. opencode 2's `pair` prints the one-time link and `serve` its
+generated password; those are credentials (see [Security](#security)). Strip ANSI
+and the ASCII logo for display.
 
-Readiness is weaker than the viewer's, which has an exact signal (a registry
-record matching the child's pid). A client child has none, so "started" means the
-process is alive and, for opencode, that the URL line appeared.
+Readiness is weaker than a session's, which has an exact signal (a registry
+record carrying the per-launch token the control handed the child). A client child
+has none, so "started" means the process is alive and, for opencode, that the URL
+or link line appeared; for opencode 2, that `pair` exited 0.
 
 `claude agents --json` lists live Claude Code sessions (`pid`, `cwd`,
 `sessionId`, `name`, `status`) without a TTY, and the Codex app-server emits
@@ -270,7 +327,7 @@ anything we would keep ourselves.
 
 ## Cross-platform
 
-The record and the `getppid()` capture are portable. The kill is where platforms
+The lease record and the client lookup are portable. The kill is where platforms
 diverge, and `process_create_time` (`_lifecycle/proc.py`) is the reason:
 
 | | source | recycled-pid guard |
@@ -294,12 +351,16 @@ on Windows, or on systemd without `enable-linger`.
 
 ## Open questions
 
-- **The button means "a new session", not "drive this viewer."** The registered
-  entry is `biopb-mcp --transport stdio`, so the client spawns its own session
-  child and its own napari window. Codex re-reads its config live, so
-  register-then-start works in either order; Claude Code has no per-session MCP
-  override on the remote-control path, so there is no way to hand it this
-  session's `/mcp`. Label the button honestly rather than implying attachment.
+- **Which session does the launched client get?** The registered entry is
+  `biopb-shim`, which starts unbound: the agent calls `attach` and chooses from the
+  live sessions, and only Codex is registered with `--session auto` (newest free
+  session, else a new one), because it does not follow `list_changed`. So a button
+  on a session's pane cannot say "this one" unless the launch hands the shim the
+  id, and the shim reads `$BIOPB_SESSION`. That reaches a client whose MCP child
+  inherits the control's environment; whether opencode's and Claude Code's do is
+  unmeasured, and Codex passes its MCP servers a short fixed environment, so it
+  would need the id on the `--session` argument instead. Until then, label the
+  button as launching a client that attaches, not one wired to that session.
 - Codex transcript retention while remote control is connected.
 - Whether opencode and Codex's daemon path work on Windows at all; `_agents`
   already carries Windows config paths for all five clients, so registration is
@@ -330,3 +391,29 @@ each result was checked against a byte-identical `diff` afterwards.
   and reached its control socket with stdin not a terminal; `claude
   remote-control --help` printed without one. Codex's TTY refusals are scoped to
   its interactive TUI and a delete confirmation.
+
+### Re-checked 2026-10-15
+
+Linux, opencode 1.18.34 and 2.0.29 (`@opencode/cli`, isolated `HOME` and XDG
+paths), Claude Code 2.1.300, Codex 0.157.1. The 2026-09-05 results above were not
+repeated; these were.
+
+- **Commands still exist.** `claude remote-control` with `--spawn
+  {same-dir,worktree,session}` (default `same-dir`) and `--capacity` (default 32);
+  `claude agents` (`--json`, `--all`); `codex app-server daemon` with
+  `enable-remote-control` / `disable-remote-control`; `codex remote-control
+  start|stop|pair` (marked experimental).
+- **opencode 2 has no `web`.** Its commands include `pair`, `serve`, `service`,
+  `mcp`, `auth`, `acp`, `run`. `opencode pair` started the background service
+  on a loopback port and printed a single-use link, valid 5 minutes, with SSH
+  forwarding instructions; `opencode service status` printed the same address and
+  `service stop` closed it.
+- **opencode 2 authentication.** On the service and on `serve`, `/` answered 200
+  and `/api/session` 401. `serve` with `OPENCODE_SERVER_PASSWORD=<pw>` answered
+  200 to `-u opencode:<pw>`; with it unset, `serve` printed a generated `server
+  password` and still answered 401 without it.
+- **opencode 2 config.** A server registered as `mcp.biopb` (the v1 shape) was
+  not seen (`opencode mcp list`: "No MCP servers configured"); the same server
+  under `mcp.servers.biopb` was.
+- **Not measured.** MCP connection scope under opencode 2's service, `pair
+  --remote` (it exposes the server to the internet), Windows.
