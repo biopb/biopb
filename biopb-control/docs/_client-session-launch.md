@@ -259,7 +259,7 @@ something else.
 Built as: every launch needs the `chat` execute root to be served (so
 `--hide chat` closes it, as it closes the chat pane), the verbs
 (`/api/agents/<id>/launch|stop`) take the exec credential in `split` mode, and a
-relay client additionally needs `biopb-control run --allow-relay-clients` (or
+relay client additionally needs `biopb control start --allow-relay-clients` (or
 `BIOPB_CONTROL_RELAY_CLIENTS=1`). `/api/agents` reports the reason as
 `launch_blocked`, from the same function the verb enforces. The child's
 environment is the control's minus the exec token.
