@@ -9,6 +9,7 @@ deterministic; the ``claude`` CLI is mocked (no real binary needed).
 """
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -336,20 +337,19 @@ def test_opencode_commented_jsonc_message_names_the_v2_place(home, monkeypatch):
 
 def test_opencode_major_reads_the_cli_once(tmp_path, monkeypatch):
     exe = tmp_path / "opencode"
-    exe.write_text("#!/bin/sh\necho 'opencode v2.0.29'\n")
-    exe.chmod(0o755)
+    exe.write_text("")  # only has to exist; the version comes from the stub below
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="opencode v2.0.29\n")
+
     monkeypatch.setattr(_agents.shutil, "which", lambda name: str(exe))
+    monkeypatch.setattr(_agents.subprocess, "run", run)
     monkeypatch.setattr(_agents, "_opencode_majors", {})
     assert _agents._opencode_major() == 2
-    exe_calls = []
-    real_run = _agents.subprocess.run
-    monkeypatch.setattr(
-        _agents.subprocess,
-        "run",
-        lambda *a, **k: exe_calls.append(a) or real_run(*a, **k),
-    )
     assert _agents._opencode_major() == 2
-    assert exe_calls == []
+    assert calls == [[str(exe), "--version"]]
 
 
 # --------------------------------------------------------------------------- #
