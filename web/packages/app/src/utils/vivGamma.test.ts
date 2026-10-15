@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { gamma3dExtensions } from "./vivGamma";
+import { describe, expect, it, vi } from "vitest";
+import { gamma3dExtensions, withGamma } from "./vivGamma";
 
 type Rendered = { rendering: { _RENDER: string; _AFTER_RENDER: string } };
 
@@ -29,5 +29,13 @@ describe("gamma3dExtensions", () => {
 
   it("puts Viv's own rendering extension in front of the gamma one", () => {
     expect(gamma3dExtensions("mip")).toHaveLength(2);
+  });
+
+  it("warns and keeps Viv's rendering when its projection step is not recognised", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rendering = { _BEFORE_RENDER: "", _RENDER: "", _AFTER_RENDER: "color = vec4(1.0);" };
+    expect(withGamma("mip", rendering)).toBe(rendering);
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
   });
 });

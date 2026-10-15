@@ -110,11 +110,11 @@ const PROJECTED = /min\(1\.0, ((?:max|min)Val\w*)\)/;
  * applied to the brightest channel so the hue stays put (per-channel `pow`
  * would shift it, for the reason given at the top of this file).
  *
- * Rewrites Viv's shader text, so it refuses to guess: a Viv whose projection
- * step no longer matches throws here, at load, rather than rendering
- * ungammaed with the slider still moving.
+ * Rewrites Viv's shader text, so it does not guess: a Viv whose projection
+ * step no longer matches is warned about and rendered without gamma, which
+ * costs the slider and nothing else.
  */
-function withGamma(mode: "mip" | "minip" | "additive", rendering: Rendering): Rendering {
+export function withGamma(mode: "mip" | "minip" | "additive", rendering: Rendering): Rendering {
   const g = `${MODULE}.gamma`;
   if (mode === "additive") {
     return {
@@ -128,7 +128,8 @@ function withGamma(mode: "mip" | "minip" | "additive", rendering: Rendering): Re
     };
   }
   if (!PROJECTED.test(rendering._AFTER_RENDER)) {
-    throw new Error(`Viv's ${mode} projection no longer ends in a clamped max/min`);
+    console.warn(`gamma: Viv's ${mode} projection no longer ends in a clamped max/min; rendering without gamma`);
+    return rendering;
   }
   return {
     ...rendering,
