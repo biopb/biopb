@@ -1,30 +1,31 @@
-"""Native ``readlif`` adapter for Leica LIF files.
+"""Native ``liffile`` adapter for Leica LIF files.
 
 BioIO reads a LIF through ``bioio-lif``, whose Dask array pays the same
 graph-rebuild-per-read cost every other bioio-backed format does
-(biopb/biopb#799 phase 3). Unlike CZI or plain TIFF, ``readlif`` offers no
-region-of-interest read: ``LifImage.get_frame`` always decodes one whole plane,
-and it reopens the file for every call rather than holding a handle
-(``LifImage._get_item``) -- there is no I/O shape to win back here, only the
-graph-construction overhead BioIO's Dask array adds on top of that same
-per-plane reopen. That is why this is the lowest-payoff format in the phase-3
-set.
+(biopb/biopb#799 phase 3). ``liffile`` reads one frame (a Y/X plane) at a time
+and has no region-of-interest read, so every read decodes whole planes; the
+win over BioIO is only the graph-construction overhead it adds on top.
 
 **Scope.**  Every image in a local LIF container. A LIF file can hold several
 images (Leica's project tree), each becoming its own tensor -- the same
 dual-role shape :class:`~biopb_tensor_server.adapters.czi.CziAdapter` uses for
-CZI scenes. Unlike a CZI scene, though, a LIF image carries its own
-independent dimensions and channel count, so there is no shared "layout" to
-factor out: each image's shape is read from its own ``image_list`` entry.
+CZI scenes. A LIF image carries its own independent dimensions and channel
+count, so there is no shared "layout" to factor out: each image is described by
+its own :class:`_LifImage`. An image with a dimension this adapter has no axis
+for (RGB samples, FLIM histograms, ...) fails the parse, as a file ``liffile``
+rejects does -- there is no fallback to BioIO for a local ``.lif``.
+
+The adapter holds no file handle: the header is parsed once into the layout,
+and each read reopens the container (one header parse per read, not per plane).
 
 A remote LIF is declined by :meth:`LifAdapter.claim`, so it falls to BioIO's
 ``LeicaAdapter`` through the registry -- this module imports nothing from
 BioIO and has no fallback path of its own.
 """
 
+import json
 import logging
-from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import product
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -60,138 +61,124 @@ logger = logging.getLogger(__name__)
 LIF_EXTENSION = ".lif"
 
 # Descriptor axis order: mosaic tile (if the image has more than one), then
-# the canonical T/C/Z/Y/X readlif itself always reports (size 1 where absent).
+# T/C/Z/Y/X (size 1 where the image has none).
 _PLANE_DIMS = ("T", "C", "Z")
 _SPATIAL_DIMS = ("Y", "X")
 _MOSAIC_DIM = "M"
+_KNOWN_DIMS = frozenset(_PLANE_DIMS + _SPATIAL_DIMS + (_MOSAIC_DIM,))
+_SETTINGS_PATH = "./Data/Image/Attachment/ATLConfocalSettingDefinition"
+_METRES_TO_MICRONS = 1e6
+
+
+@dataclass(frozen=True)
+class _LifImage:
+    """One image of a LIF container, as the adapter needs it.
+
+    ``labels`` and ``shape`` are the descriptor's; ``present`` are the
+    ``liffile`` dimension codes the file really has, the only ones ``frame``
+    accepts as indices.
+    """
+
+    name: str
+    labels: Tuple[str, ...]
+    shape: Tuple[int, ...]
+    dtype: str
+    present: Tuple[str, ...]
+    # Voxel size in micrometres, None where the image has a single element.
+    voxel_x: Optional[float]
+    voxel_y: Optional[float]
+    voxel_z: Optional[float]
+    bit_depth: Tuple[int, ...]
+    settings: Dict[str, str]
 
 
 @dataclass(frozen=True)
 class _LifLayout:
     """What one probe of a LIF container tells the adapter.
 
-    Built once per source (at registration): the parsed image list plus the
-    byte offsets ``readlif.reader.LifFile`` located for each image's pixel
-    block. ``LifImage`` construction from these is pure field assignment (no
-    I/O), so every read rebuilds it cheaply rather than this adapter holding a
-    live ``LifFile``/``LifImage`` handle -- there is nothing stateful to hold:
-    ``readlif`` itself reopens the file per plane (see the module docstring).
+    Built once per source (at registration); every read reopens the file.
     """
 
     filename: str
-    image_list: Tuple[Dict[str, Any], ...]
-    offsets: Tuple[Tuple[int, int], ...]
+    images: Tuple[_LifImage, ...]
 
     def to_payload(self) -> Dict[str, Any]:
-        """The layout as JSON: every image's ``image_list`` entry and byte offsets.
+        """The layout as JSON.
 
-        Raises ``TypeError`` for a value JSON cannot carry faithfully (the caller
-        then stores no payload and the file is parsed on a restart).
+        Raises ``TypeError`` for a value JSON cannot carry (the caller then
+        stores no payload and the file is parsed on a restart).
         """
-        return {
-            "image_list": [_encode(info) for info in self.image_list],
-            "offsets": [[int(a), int(b)] for a, b in self.offsets],
-        }
+        payload = {"images": [asdict(image) for image in self.images]}
+        return json.loads(json.dumps(payload))
 
     @classmethod
     def from_payload(cls, payload: Dict[str, Any], filename: str) -> "_LifLayout":
         """Rebuild a layout from :meth:`to_payload`; *filename* is where the file is now."""
-        return cls(
-            filename=filename,
-            image_list=tuple(_decode(info) for info in payload["image_list"]),
-            offsets=tuple((int(a), int(b)) for a, b in payload["offsets"]),
+        images = []
+        for raw in payload["images"]:
+            raw = dict(raw)
+            for key in ("labels", "shape", "present", "bit_depth"):
+                raw[key] = tuple(raw[key])
+            images.append(_LifImage(**raw))
+        return cls(filename=filename, images=tuple(images))
+
+
+def _voxel_um(image: Any, label: str) -> Optional[float]:
+    """Spacing of axis *label* in micrometres; ``None`` for a single element."""
+    coords = image.coords.get(label)
+    if coords is None or len(coords) < 2:
+        return None
+    step = abs(float(coords[1]) - float(coords[0])) * _METRES_TO_MICRONS
+    return step or None
+
+
+def _describe(image: Any) -> _LifImage:
+    sizes = dict(image.sizes)
+    extra = {
+        label: n for label, n in sizes.items() if label not in _KNOWN_DIMS and n > 1
+    }
+    if extra:
+        raise ValueError(
+            f"LIF image {image.path!r} has dimensions with no tensor axis: {extra}"
         )
-
-
-def _encode(value: Any) -> Any:
-    """*value* as JSON-safe data that :func:`_decode` turns back into the same value.
-
-    ``readlif`` fills an ``image_list`` entry with namedtuples (``dims``), tuples,
-    and dicts keyed by int, none of which survive ``json`` as themselves.
-    """
-    if isinstance(value, tuple) and hasattr(value, "_fields"):
-        return {
-            "__namedtuple__": [type(value).__name__, list(value._fields)],
-            "values": [_encode(v) for v in value],
-        }
-    if isinstance(value, tuple):
-        return {"__tuple__": [_encode(v) for v in value]}
-    if isinstance(value, list):
-        return [_encode(v) for v in value]
-    if isinstance(value, dict):
-        return {"__dict__": [[_encode(k), _encode(v)] for k, v in value.items()]}
-    if isinstance(value, np.generic):
-        return value.item()
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise TypeError(f"cannot store a {type(value).__name__} in a payload")
-
-
-def _decode(value: Any) -> Any:
-    if isinstance(value, list):
-        return [_decode(v) for v in value]
-    if isinstance(value, dict):
-        if "__namedtuple__" in value:
-            name, fields = value["__namedtuple__"]
-            return namedtuple(name, fields)(*[_decode(v) for v in value["values"]])
-        if "__tuple__" in value:
-            return tuple(_decode(v) for v in value["__tuple__"])
-        return {_decode(k): _decode(v) for k, v in value["__dict__"]}
-    return value
+    if tuple(image.frames.frame_dims) != _SPATIAL_DIMS:
+        raise ValueError(
+            f"LIF image {image.path!r} stores frames as "
+            f"{tuple(image.frames.frame_dims)}, not Y/X planes"
+        )
+    labels = _PLANE_DIMS + _SPATIAL_DIMS
+    if sizes.get(_MOSAIC_DIM, 1) > 1:
+        labels = (_MOSAIC_DIM,) + labels
+    settings = image.xml_element.find(_SETTINGS_PATH)
+    channels = getattr(image, "_channels", ())
+    return _LifImage(
+        name=image.path,
+        labels=labels,
+        shape=tuple(int(sizes.get(label, 1)) for label in labels),
+        dtype=np.dtype(image.dtype).str,
+        present=tuple(label for label in labels if label in sizes),
+        voxel_x=_voxel_um(image, "X"),
+        voxel_y=_voxel_um(image, "Y"),
+        voxel_z=_voxel_um(image, "Z"),
+        bit_depth=tuple(int(c.resolution) for c in channels)
+        or (np.dtype(image.dtype).itemsize * 8,),
+        settings=dict(settings.attrib) if settings is not None else {},
+    )
 
 
 def read_layout(path: str) -> _LifLayout:
-    """Parse a LIF container's XML header. Raises for a file readlif rejects."""
-    from readlif.reader import LifFile
+    """Parse a LIF container's XML header. Raises for a file ``liffile`` rejects."""
+    import liffile
 
-    lif = LifFile(path)
-    return _LifLayout(
-        filename=path,
-        image_list=tuple(lif.image_list),
-        offsets=tuple(lif.offsets),
-    )
-
-
-def _lif_image(layout: _LifLayout, position: int):
-    """Build the ``readlif.reader.LifImage`` for one entry. No I/O."""
-    from readlif.reader import LifImage
-
-    return LifImage(
-        layout.image_list[position], layout.offsets[position], layout.filename
-    )
-
-
-def _native_labels(info: Dict[str, Any]) -> Tuple[str, ...]:
-    dims = info["dims"]
-    labels = _PLANE_DIMS + _SPATIAL_DIMS
-    return ((_MOSAIC_DIM,) + labels) if int(dims.m) > 1 else labels
-
-
-def _native_shape(info: Dict[str, Any]) -> Tuple[int, ...]:
-    dims = info["dims"]
-    sizes = {
-        "T": int(dims.t),
-        "C": int(info["channels"]),
-        "Z": int(dims.z),
-        "Y": int(dims.y),
-        "X": int(dims.x),
-        _MOSAIC_DIM: int(dims.m),
-    }
-    return tuple(sizes[axis] for axis in _native_labels(info))
-
-
-def _dtype_for(info: Dict[str, Any]) -> np.dtype:
-    # readlif itself only ever looks at bit_depth[0] to pick the frame's
-    # storage type (LifImage._get_item), so this adapter matches that rather
-    # than validating every channel agrees.
-    bit_depth = info["bit_depth"]
-    depth = bit_depth[0] if bit_depth else 8
-    return np.dtype(np.uint8 if depth == 8 else np.uint16)
+    with liffile.LifFile(path, squeeze=False) as lif:
+        return _LifLayout(
+            filename=path, images=tuple(_describe(image) for image in lif.images)
+        )
 
 
 @canonical_axes
 class LifAdapter(TensorAdapter):
-    """Reads Leica LIF images through readlif, one tensor per image."""
+    """Reads Leica LIF images through liffile, one tensor per image."""
 
     SOURCE_TYPE = "lif"
 
@@ -252,8 +239,8 @@ class LifAdapter(TensorAdapter):
         )
 
     def catalog_payload(self) -> Optional[Dict[str, Any]]:
-        """The parsed image list and offsets. Source-level only; ``None`` when the
-        list holds something JSON cannot carry back faithfully."""
+        """The parsed images. Source-level only; ``None`` when they hold something
+        JSON cannot carry back faithfully."""
         if self.image_position is not None:
             return None
         try:
@@ -275,29 +262,28 @@ class LifAdapter(TensorAdapter):
         self._source_url = url
         self._source_type = self.SOURCE_TYPE
         self._content_version = content_version_from_path(url)
-        # Position in ``layout.image_list``, distinct from the image's own
+        # Position in ``layout.images``, distinct from the image's own
         # (possibly slash-nested) name -- the read uses the position directly.
         self.image_position = image_position
 
         if image_position is None:
             self.dim_labels = None
         else:
-            info = self._layout.image_list[image_position]
-            self.dim_labels = list(_native_labels(info))
+            self.dim_labels = list(self._layout.images[image_position].labels)
 
         self._tensor_adapters: Dict[str, LifAdapter] = {}
 
     # ---- descriptors --------------------------------------------------------
 
     def _descriptor_for(self, position: int) -> TensorDescriptor:
-        info = self._layout.image_list[position]
-        labels = list(_native_labels(info))
-        shape = list(_native_shape(info))
-        dtype = _dtype_for(info).str
+        info = self._layout.images[position]
+        labels = list(info.labels)
+        shape = list(info.shape)
+        dtype = info.dtype
         return TensorDescriptor(
             array_id=f"{self.source_id}/Image:{position}",
             dim_labels=labels,
-            # readlif has no ROI: a read always decodes the whole plane
+            # liffile has no ROI: a read always decodes the whole plane
             # (biopb/biopb#799), so the native unit is one full Y/X plane.
             chunk_shape=default_transfer_chunk_shape(
                 shape,
@@ -315,7 +301,7 @@ class LifAdapter(TensorAdapter):
     def _native_entries(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
-            for position in range(len(self._layout.image_list))
+            for position in range(len(self._layout.images))
         ]
 
     def _native_descriptor(self) -> TensorDescriptor:
@@ -349,7 +335,7 @@ class LifAdapter(TensorAdapter):
     def _position_for_field(self, field: Optional[str]) -> int:
         if not field or field == self.source_id:
             return 0
-        for position in range(len(self._layout.image_list)):
+        for position in range(len(self._layout.images)):
             if field == f"Image:{position}":
                 return position
         raise TensorNotFound(f"Unknown image: {field}", reason="unknown_field")
@@ -358,7 +344,7 @@ class LifAdapter(TensorAdapter):
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
-        """One whole plane: readlif has no ROI, ``get_frame`` reads it whole.
+        """One whole plane: liffile has no ROI, ``frame`` reads it whole.
 
         Full rank, matching the ``native=`` seed in :meth:`_descriptor_for` --
         :func:`~.stream_reduce.streaming_unit` zips this positionally against
@@ -366,7 +352,7 @@ class LifAdapter(TensorAdapter):
         """
         if self.image_position is None:
             return None
-        shape = _native_shape(self._layout.image_list[self.image_position])
+        shape = self._layout.images[self.image_position].shape
         return tuple([1] * (len(shape) - 2)) + tuple(shape[-2:])
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
@@ -376,7 +362,7 @@ class LifAdapter(TensorAdapter):
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """Skip whole planes the stride would drop on T/C/Z/M; Y/X still crop
-        a fully-decoded plane (readlif has no partial-plane read)."""
+        a fully-decoded plane (liffile has no partial-plane read)."""
         return self._read(bounds, step=step)
 
     def _read(self, bounds: ChunkBounds, step: Optional[Tuple[int, ...]]) -> np.ndarray:
@@ -384,7 +370,7 @@ class LifAdapter(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
-        info = self._layout.image_list[self.image_position]
+        info = self._layout.images[self.image_position]
         labels = [label.upper() for label in self.dim_labels]
         starts = [int(value) for value in bounds.start]
         stops = [int(value) for value in bounds.stop]
@@ -395,7 +381,6 @@ class LifAdapter(TensorAdapter):
         y1, x1 = stops[n_plane], stops[n_plane + 1]
         y_step, x_step = steps[n_plane], steps[n_plane + 1]
 
-        image = _lif_image(self._layout, self.image_position)
         plane_ranges = [
             range(starts[axis], stops[axis], steps[axis]) for axis in range(n_plane)
         ]
@@ -403,56 +388,56 @@ class LifAdapter(TensorAdapter):
             len(range(starts[axis], stops[axis], steps[axis]))
             for axis in range(len(labels))
         )
-        output = np.empty(out_shape, dtype=_dtype_for(info))
+        output = np.empty(out_shape, dtype=np.dtype(info.dtype))
 
-        for coordinates in product(*plane_ranges):
-            by_label = dict(zip(labels[:n_plane], coordinates, strict=True))
-            frame = image.get_frame(
-                z=by_label.get("Z", 0),
-                t=by_label.get("T", 0),
-                c=by_label.get("C", 0),
-                m=by_label.get(_MOSAIC_DIM, 0),
-            )
-            plane = np.asarray(frame)[y0:y1:y_step, x0:x1:x_step]
-            destination = tuple(
-                (coordinate - starts[axis]) // steps[axis]
-                for axis, coordinate in enumerate(coordinates)
-            )
-            output[destination] = plane
+        import liffile
+
+        with liffile.LifFile(self._layout.filename, squeeze=False) as lif:
+            image = lif.images[self.image_position]
+            for coordinates in product(*plane_ranges):
+                # An axis the file lacks is a size-1 label here; frame() knows
+                # only the codes the file has.
+                indices = {
+                    label: coordinate
+                    for label, coordinate in zip(
+                        labels[:n_plane], coordinates, strict=True
+                    )
+                    if label in info.present
+                }
+                plane = image.frame(**indices)[y0:y1:y_step, x0:x1:x_step]
+                destination = tuple(
+                    (coordinate - starts[axis]) // steps[axis]
+                    for axis, coordinate in enumerate(coordinates)
+                )
+                output[destination] = plane
         return output
 
     # ---- metadata -------------------------------------------------------------
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
-        """Voxel size in micrometres, from readlif's pixels-per-micron scale."""
+        """Voxel size in micrometres, from liffile's axis coordinates."""
         if self.image_position is None:
             return None
-        scale_x, scale_y, scale_z, _scale_t = self._layout.image_list[
-            self.image_position
-        ]["scale"]
-        values = {
-            "x": (1.0 / scale_x) if scale_x else None,
-            "y": (1.0 / scale_y) if scale_y else None,
-            "z": (1.0 / scale_z) if scale_z else None,
-        }
+        info = self._layout.images[self.image_position]
+        values = {"x": info.voxel_x, "y": info.voxel_y, "z": info.voxel_z}
         return scale_by_label(self.dim_labels, values, MICRON)
 
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        """This image's readlif-parsed acquisition summary."""
+        """This image's acquisition summary."""
         if self.image_position is None:
             return metadata_record(
-                {"format": "lif", "images": len(self._layout.image_list)}
+                {"format": "lif", "images": len(self._layout.images)}
             )
-        info = self._layout.image_list[self.image_position]
+        info = self._layout.images[self.image_position]
         return metadata_record(
             {
                 "format": "lif",
-                "name": info.get("name"),
-                "channels": info.get("channels"),
-                "bit_depth": list(info.get("bit_depth") or ()),
-                "settings": dict(info.get("settings") or {}),
+                "name": info.name,
+                "channels": info.shape[info.labels.index("C")],
+                "bit_depth": list(info.bit_depth),
+                "settings": dict(info.settings),
             }
         )
 

@@ -70,7 +70,7 @@ class TestMissingReaderIsNotClaimed:
     """A reader package that is not installed must leave its extension unclaimed.
 
     ``adapters/__init__.py`` gates each optional adapter on importing its reader
-    (``readlif``, ``mrc``, ``nd2``, ``bioio``), not just its own module -- every
+    (``liffile``, ``mrc``, ``nd2``, ``bioio``), not just its own module -- every
     one of those adapters imports the reader lazily, inside the method that uses
     it, so the module import alone succeeds with the package absent. Without the
     probe the adapter registers, claims its extension, and fails at read instead.
@@ -117,7 +117,7 @@ class TestMissingReaderIsNotClaimed:
     @pytest.mark.parametrize(
         "package,attr",
         [
-            ("readlif", "LifAdapter"),
+            ("liffile", "LifAdapter"),
             ("mrc", "DeltaVisionAdapter"),
             ("nd2", "Nd2Adapter"),
             ("bioio", "ZeissAdapter"),

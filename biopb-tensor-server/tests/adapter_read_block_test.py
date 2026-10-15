@@ -39,7 +39,7 @@ QUANTIZED = {
     "OlympusAdapter": "inherits _BioioAdapterBase",
     "BioformatsAdapter": "inherits _BioioAdapterBase",
     "AicsImageIoAdapter": "inherits _BioioAdapterBase",
-    "LifAdapter": "one plane: readlif has no ROI, get_frame reads it whole",
+    "LifAdapter": "one plane: liffile has no ROI, frame reads it whole",
 }
 
 # No part of a read is wasted: a crop costs its own pages and nothing more.

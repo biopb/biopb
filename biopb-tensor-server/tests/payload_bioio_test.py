@@ -320,8 +320,7 @@ class TestLif:
     def test_a_rebuilt_source_is_the_parsed_one_without_opening_the_file(
         self, tmp_path, monkeypatch
     ):
-        pytest.importorskip("readlif")
-        import readlif.reader
+        liffile = pytest.importorskip("liffile")
         from biopb_tensor_server.adapters.lif import LifAdapter
 
         path, _ = create_leica_lif(str(tmp_path))
@@ -332,11 +331,11 @@ class TestLif:
             parsed,
             source,
             monkeypatch=monkeypatch,
-            opens=[(readlif.reader, "LifFile")],
+            opens=[(liffile, "LifFile")],
         )
 
     def test_the_layout_survives_json(self, tmp_path):
-        pytest.importorskip("readlif")
+        pytest.importorskip("liffile")
         from biopb_tensor_server.adapters.lif import _LifLayout, read_layout
 
         path, _ = create_leica_lif(str(tmp_path))
@@ -345,16 +344,16 @@ class TestLif:
         assert _LifLayout.from_payload(payload, path) == layout
 
     def test_a_value_json_cannot_carry_stores_no_payload(self, tmp_path):
-        pytest.importorskip("readlif")
+        pytest.importorskip("liffile")
         from biopb_tensor_server.adapters.lif import LifAdapter
 
         path, _ = create_leica_lif(str(tmp_path))
         parsed = LifAdapter.create_from_config(_source(path, LifAdapter))
-        parsed._layout.image_list[0]["settings"]["odd"] = object()
+        parsed._layout.images[0].settings["odd"] = object()
         assert parsed.catalog_payload() is None
 
     def test_an_image_adapter_has_no_payload(self, tmp_path):
-        pytest.importorskip("readlif")
+        pytest.importorskip("liffile")
         from biopb_tensor_server.adapters.lif import LifAdapter
 
         path, _ = create_leica_lif(str(tmp_path))

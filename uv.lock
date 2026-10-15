@@ -789,9 +789,9 @@ tls = [
     { name = "cryptography", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
 vendor = [
+    { name = "liffile", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "mrc", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "nd2", extra = ["legacy"], marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
-    { name = "readlif", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
 web = [
     { name = "fastapi", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
@@ -823,6 +823,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
     { name = "imagecodecs", marker = "extra == 'qptiff'", specifier = ">=2023.1.23" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
+    { name = "liffile", marker = "extra == 'vendor'", specifier = ">=2026.10.14" },
     { name = "mrc", marker = "extra == 'vendor'", specifier = ">=0.2.0" },
     { name = "nd2", extras = ["legacy"], marker = "extra == 'vendor'", specifier = ">=0.10.3" },
     { name = "ndtiff", marker = "extra == 'ndtiff'", specifier = ">=3.0.0" },
@@ -835,7 +836,6 @@ requires-dist = [
     { name = "pydicom", marker = "extra == 'medical'", specifier = ">=2.4.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
-    { name = "readlif", marker = "extra == 'vendor'", specifier = ">=0.6.4" },
     { name = "rosettasciio", extras = ["hdf5"], marker = "extra == 'em'", specifier = ">=0.15" },
     { name = "scipy" },
     { name = "scyjava", marker = "extra == 'bioformats'", specifier = ">=1.9.0" },
@@ -2330,6 +2330,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/49/ac/21a1f8aa3777f5658576777ea76bfb124b702c520bbe90edf4ae9915eafa/lazy_loader-0.5.tar.gz", hash = "sha256:717f9179a0dbed357012ddad50a5ad3d5e4d9a0b8712680d4e687f5e6e6ed9b3", size = 15294, upload-time = "2026-03-06T15:45:09.054Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8a/a1/8d812e53a5da1687abb10445275d41a8b13adb781bbf7196ddbcf8d88505/lazy_loader-0.5-py3-none-any.whl", hash = "sha256:ab0ea149e9c554d4ffeeb21105ac60bed7f3b4fd69b1d2360a4add51b170b005", size = 8044, upload-time = "2026-03-06T15:45:07.668Z" },
+]
+
+[[package]]
+name = "liffile"
+version = "2026.10.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/c7/ebd6c3938c6de7aa3fbbfb20f0ca574331b7685e40fa765fa5b0bece7846/liffile-2026.10.14.tar.gz", hash = "sha256:e0f06086b6b14280d9d85493760bf89ecc022aed009bee781bf566d84d9fc794", size = 61746, upload-time = "2026-10-14T18:41:14.133Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/97/976df02762f1c27253d9d1a82e91b3c931fff980da5d44ccfe950afae7c2/liffile-2026.10.14-py3-none-any.whl", hash = "sha256:b3a447d3feb16fa9e478d608d5167ab70699163439a7df968eab214a838ef739", size = 39288, upload-time = "2026-10-14T18:41:13.091Z" },
 ]
 
 [[package]]
