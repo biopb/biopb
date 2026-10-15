@@ -631,11 +631,20 @@ export default function DashboardPage() {
         </div>
 
         <div className="card">
-          <h2>
+          <h2 className="with-actions">
             Agent clients
             <button className="mini" onClick={pollAgents}>
               ↻
             </button>
+            {/* What the last Start printed, kept out of the card. */}
+            <a
+              className="gear-link"
+              href={withBase("/logs?source=agents")}
+              target="_blank"
+              rel="opener"
+            >
+              Logs →
+            </a>
           </h2>
           <ul>
             {agents == null ? (
@@ -840,7 +849,7 @@ function AlgoRow({
 }
 
 // The first link in a client's output: the page it serves, or the one-time link
-// that signs a browser in.
+// that signs a browser in. Used to open the tab, not shown in the card.
 function firstUrl(text?: string): string | null {
   const found = text?.match(/https?:\/\/[^\s"'<>]+/);
   return found ? found[0] : null;
@@ -854,9 +863,9 @@ function describeClientResult(
   act: "launch" | "stop",
 ): { err: boolean; text: string } {
   if (res.error || res.state === "failed") {
-    const where = res.log_path ? `\n\nFull log: ${res.log_path}` : "";
-    const out = res.log ? `\n\n${res.log}` : "";
-    return { err: true, text: `${res.error}${out}${where}` };
+    // A launch with a log file is read from Logs; one without has only this.
+    const out = res.log && !res.log_path ? `\n\n${res.log}` : "";
+    return { err: true, text: `${res.error}${out}` };
   }
   if (act === "stop")
     return { err: !res.stopped, text: res.note || `${name} stopped.` };
@@ -866,7 +875,7 @@ function describeClientResult(
       : res.already
         ? `${name} is already running.`
         : `${name} started.`;
-  return { err: false, text: res.log ? `${head}\n\n${res.log}` : head };
+  return { err: false, text: head };
 }
 
 // The agent-client buttons for one row. not_installed rows get none; a

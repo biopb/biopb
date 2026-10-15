@@ -328,12 +328,15 @@ launch contract is `_launch_session`'s, which already solves this shape:
 - rendered in the inline `.note.launch` block the dashboard already uses for
   session launches, not an `alert()`.
 
-**Show the tail on success too, not only on failure.** opencode 1 prints its URL
-there (`opencode server listening on http://127.0.0.1:<port>`), which the
-dashboard opens in a new tab and shows for when that is blocked — and it is where
-the unsecured-server warning lives. opencode 2's `pair` prints the one-time link and `serve` its
-generated password; those are credentials (see [Security](#security)). Strip ANSI
-and the ASCII logo for display.
+**The output is returned on success too, and read from Logs.** opencode 1 prints
+its URL there (`opencode server listening on http://127.0.0.1:<port>`) and the
+unsecured-server warning; Claude Code prints its `claude.ai` link. The dashboard
+opens the first link in a new tab and does not paste the output into the card: the
+card's *Logs →* link tails the newest client log (`GET /api/agents/logs`). A
+`oneshot` has no log file, so its output is shown only if it fails. opencode 2's
+`pair` prints the one-time link and `serve` its generated password; those are
+credentials (see [Security](#security)), which is why they are never written to the
+log. Strip ANSI and the ASCII logo for display.
 
 Readiness is weaker than a session's, which has an exact signal (a registry
 record carrying the per-launch token the control handed the child). A client child

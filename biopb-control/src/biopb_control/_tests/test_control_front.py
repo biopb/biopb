@@ -976,6 +976,19 @@ def test_a_relay_client_needs_the_operators_opt_in(control, monkeypatch):
     assert "allow-relay-clients" in agent["launch_blocked"]
 
 
+def test_the_clients_log_page_tails_the_newest_launch(control, tmp_path, monkeypatch):
+    monkeypatch.setattr("biopb._config.locations.mcp_viewer_log_dir", lambda: tmp_path)
+    body = json.loads(_get(f"{control}/api/agents/logs")[2])
+    assert body["exists"] is False and "no client" in body["note"]
+    old = tmp_path / "client-opencode-1.log"
+    new = tmp_path / "client-claude-code-2.log"
+    old.write_text("old\n")
+    new.write_text("first\nsecond\n")
+    os.utime(old, (1000, 1000))
+    body = json.loads(_get(f"{control}/api/agents/logs?lines=1")[2])
+    assert body["path"] == str(new) and body["lines"] == ["second"]
+
+
 def test_launching_an_unknown_client_is_a_bad_request(control):
     with pytest.raises(urllib.error.HTTPError) as exc:
         _post(f"{control}/api/agents/nope/launch")

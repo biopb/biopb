@@ -1209,19 +1209,11 @@ def build_app(
                 status_code=500,
             )
 
-    def api_data_plane_logs(request: Request) -> JSONResponse:
-        # The dashboard /logs page polls this: the tail of the data-plane
-        # subprocess's stdout/stderr log (the file the supervisor writes the tensor
-        # server to). Read is bounded in both lines and bytes (see _tail_file), so
+    def _tail_response(path, n: int, note: str | None = None) -> JSONResponse:
+        # The tail of one log file, bounded in lines and bytes (see _tail_file) so
         # tailing a huge log stays cheap; no-store so each poll sees fresh output.
         # Never raises -- a bad read degrades to an error field, not a 500 trace.
-        try:
-            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
-        except (TypeError, ValueError):
-            n = _LOG_TAIL_DEFAULT_LINES
-        n = max(1, min(n, _LOG_TAIL_MAX_LINES))
         headers = {"Cache-Control": "no-store"}
-        path = supervisor.log_path
         if path is None:
             return JSONResponse(
                 {
@@ -1229,8 +1221,7 @@ def build_app(
                     "exists": False,
                     "lines": [],
                     "truncated": False,
-                    "note": "data plane logs to the control's stderr "
-                    "(no log file configured)",
+                    "note": note,
                 },
                 headers=headers,
             )
@@ -1257,7 +1248,7 @@ def build_app(
                 headers=headers,
             )
         except OSError as exc:
-            logger.info("data plane log read failed: %s", exc)
+            logger.info("log read failed: %s", exc)
             return JSONResponse(
                 {
                     "path": str(path),
@@ -1268,6 +1259,31 @@ def build_app(
                 status_code=500,
                 headers=headers,
             )
+
+    def _log_lines(request: Request) -> int:
+        try:
+            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
+        except (TypeError, ValueError):
+            n = _LOG_TAIL_DEFAULT_LINES
+        return max(1, min(n, _LOG_TAIL_MAX_LINES))
+
+    def api_data_plane_logs(request: Request) -> JSONResponse:
+        # The dashboard /logs page polls this: the tail of the data-plane
+        # subprocess's stdout/stderr log (the file the supervisor writes the tensor
+        # server to).
+        return _tail_response(
+            supervisor.log_path,
+            _log_lines(request),
+            "data plane logs to the control's stderr (no log file configured)",
+        )
+
+    def api_agents_logs(request: Request) -> JSONResponse:
+        # The newest agent-client launch log: what the last Start printed.
+        return _tail_response(
+            _logs.latest("client"),
+            _log_lines(request),
+            "no client has been started from this control yet",
+        )
 
     def api_status(_request: Request) -> JSONResponse:
         # What the dashboard polls: the control is up (it answered), the data
@@ -1867,6 +1883,7 @@ def build_app(
         Route("/api/data_plane/restart", data_plane_restart, methods=["POST"]),
         Route("/api/data_plane/logs", api_data_plane_logs, methods=["GET"]),
         Route("/api/agents", api_agents, methods=["GET"]),
+        Route("/api/agents/logs", api_agents_logs, methods=["GET"]),
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/agents/{agent_id}/launch", agent_launch, methods=["POST"]),

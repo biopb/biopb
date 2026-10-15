@@ -81,6 +81,15 @@ def open_log(prefix: str):
     return None, None
 
 
+def latest(prefix: str):
+    """The newest log of *prefix*, or ``None`` if there is none."""
+    try:
+        logs = list(_locations.mcp_viewer_log_dir().glob(f"{prefix}-*.log"))
+        return max(logs, key=lambda p: p.stat().st_mtime, default=None)
+    except OSError:
+        return None
+
+
 def tail(path, limit: int) -> str:
     """The last *limit* characters of this launch's own output, ANSI escapes and
     logo lines removed. The whole file *is* this launch, so no anchor is needed.

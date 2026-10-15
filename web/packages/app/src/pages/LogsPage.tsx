@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { captureUrlToken } from "../auth";
 import { SessionLocked, sessionFetch } from "../utils/sessionFetch";
@@ -36,7 +36,10 @@ function formatBytes(n?: number): string {
 }
 
 export default function LogsPage() {
-  useDocumentTitle("BioPB control - data-plane logs");
+  // `?source=agents` is the last agent-client launch; otherwise the data plane.
+  const agents = useSearchParams()[0].get("source") === "agents";
+  const what = agents ? "Agent client" : "Data-plane";
+  useDocumentTitle(`BioPB control - ${what.toLowerCase()} logs`);
 
   const [data, setData] = useState<LogsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,9 +55,10 @@ export default function LogsPage() {
   const load = useCallback(async (n: number) => {
     setLoading(true);
     try {
-      const r = await sessionFetch(withBase(`/api/data_plane/logs?lines=${n}`), {
-        cache: "no-store",
-      });
+      const r = await sessionFetch(
+        withBase(`/api/${agents ? "agents" : "data_plane"}/logs?lines=${n}`),
+        { cache: "no-store" },
+      );
       if (!r.ok) {
         const body = (await r.json().catch(() => ({}))) as Partial<LogsResponse>;
         throw new Error(body?.error || `Could not load logs (HTTP ${r.status}).`);
@@ -69,7 +73,7 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [agents]);
 
   // Capture a ?token= handed over by the one-time access URL before the first
   // fetch, so a remote-mode deep link to /logs authenticates rather than bouncing.
@@ -107,7 +111,7 @@ export default function LogsPage() {
           alt=""
           aria-hidden="true"
         />
-        <h1>Data-plane logs</h1>
+        <h1>{what} logs</h1>
         <span className="conn">
           {data?.exists
             ? `${data.lines.length} line(s)${
@@ -165,8 +169,8 @@ export default function LogsPage() {
           <div className="banner empty">
             {data.note ||
               (data.path
-                ? "The data-plane log file does not exist yet — start the data plane to produce output."
-                : "No data-plane log file is configured.")}
+                ? `The ${what.toLowerCase()} log file does not exist yet.`
+                : `No ${what.toLowerCase()} log file is configured.`)}
           </div>
         ) : null}
 
