@@ -239,6 +239,10 @@ chunk — `chunk_id` is `array_id + bounds + scale_hint + reduction_method`, so
 a neighbouring scale shares no cache entry and pays a cold read of the
 source.
 
+The body is also capped to what a texture holds: a float64 volume is sent as
+float32 (`X-Dtype` says so, and the `volume` block's `bytes` is the capped
+size). Other dtypes go out unchanged.
+
 `scale_policy` and `scale_hint` are **mutually exclusive** (422): one read
 has one scale, and letting the two disagree would make which one applies a
 silent policy. `X-Scale-Hint` is echoed either way, but it is load-bearing
