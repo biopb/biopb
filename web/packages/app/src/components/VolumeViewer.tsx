@@ -24,7 +24,7 @@ import type { CSSProperties } from "react";
 import { OrbitView } from "@deck.gl/core";
 import DeckGL from "@deck.gl/react";
 import { Matrix4 } from "@math.gl/core";
-import { ColorPalette3DExtensions, XR3DLayer } from "@hms-dbmi/viv";
+import { XR3DLayer } from "@hms-dbmi/viv";
 import {
   TensorAbortError,
   asTypedArray,
@@ -39,7 +39,9 @@ import { useElementSize } from "../hooks/useElementSize";
 import { useMountEpoch, usePublishPlaneReady } from "../hooks/useMountEpoch";
 import { selectContrastWindow, useAppStore } from "../store";
 import type { ViewerErrorKind } from "../store";
+import { gamma3dExtensions } from "../utils/vivGamma";
 import {
+  clampGamma,
   contrastSamples,
   vivColor,
 } from "../utils/vivUtils";
@@ -75,9 +77,9 @@ interface VolumeViewerProps {
  * (`getRenderingFromExtensions`) and throws if nothing defines them.
  */
 const VOLUME_EXTENSIONS: Record<VolumeRenderMode, unknown[]> = {
-  mip: [new ColorPalette3DExtensions.MaximumIntensityProjectionExtension({})],
-  additive: [new ColorPalette3DExtensions.AdditiveBlendExtension({})],
-  minip: [new ColorPalette3DExtensions.MinimumIntensityProjectionExtension({})],
+  mip: gamma3dExtensions("mip"),
+  additive: gamma3dExtensions("additive"),
+  minip: gamma3dExtensions("minip"),
 };
 
 /** One entry, so `XR3DLayer.getNumChannels()` compiles a single-channel shader. */
@@ -185,6 +187,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   // --- contrast ------------------------------------------------------------
   // The same selector the panel's bar reads (biopb/biopb#955).
   const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
+  const gamma = useAppStore((s) => clampGamma(s.display.gamma));
 
   const color = useMemo(() => {
     const stored = channelColors[sourceId]?.[position.c] ?? "auto";
@@ -199,6 +202,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
           data={shown}
           dtype={vivDtype(info.dtype)}
           contrastLimits={contrastLimits}
+          gamma={gamma}
           color={color}
           renderMode={renderMode}
           width={size.width}
@@ -235,6 +239,7 @@ function VolumeStage({
   data,
   dtype,
   contrastLimits,
+  gamma,
   color,
   renderMode,
   width,
@@ -244,6 +249,7 @@ function VolumeStage({
   data: ReturnType<typeof asTypedArray>;
   dtype: ReturnType<typeof vivDtype>;
   contrastLimits: [number, number];
+  gamma: number;
   color: [number, number, number];
   renderMode: VolumeRenderMode;
   width: number;
@@ -336,6 +342,9 @@ function VolumeStage({
         physicalSizeScalingMatrix,
         resolutionMatrix,
         extensions: VOLUME_EXTENSIONS[renderMode],
+        // A prop of `Gamma3DExtension`, not of the layer: a uniform, so moving
+        // it re-renders without reloading the texture.
+        gamma,
       } as unknown as XR3DLayerProps),
     ],
     [
@@ -343,6 +352,7 @@ function VolumeStage({
       data,
       dtype,
       contrastLimits,
+      gamma,
       color,
       renderMode,
       physicalSizeScalingMatrix,
