@@ -36,12 +36,20 @@ export interface PreferencesSlice {
    * someone who wants additive wants it for the next stack too.
    */
   volumeRenderMode: VolumeRenderMode;
+  /**
+   * Draw every channel of a 2-4 channel image blended, each in its own colour.
+   * A request, not a state of the view: it takes effect only where the tensor
+   * in view qualifies (see `compositeChannels`), so it can stay on across a
+   * source change and apply to the next stack that does.
+   */
+  composite: boolean;
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
   // Channel names (sourceId -> channel names array)
   channelNames: Record<string, string[]>;
   setShowAdvancedOptions: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
+  setComposite: (value: boolean) => void;
   getChannelColor: (sourceId: string, channelIdx: number) => ColorValue;
   setChannelColor: (sourceId: string, channelIdx: number, color: ColorValue) => void;
   loadChannelNames: (sourceId: string) => Promise<void>;
@@ -50,6 +58,7 @@ export interface PreferencesSlice {
 export const createPreferencesSlice: StateCreator<AppState, [], [], PreferencesSlice> = (set, get) => ({
   showAdvancedOptions: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
+  composite: false,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
@@ -61,6 +70,10 @@ export const createPreferencesSlice: StateCreator<AppState, [], [], PreferencesS
 
   setVolumeRenderMode(value) {
     set({ volumeRenderMode: value });
+  },
+
+  setComposite(value) {
+    set({ composite: value });
   },
 
   getChannelColor(sourceId, channelIdx) {

@@ -146,6 +146,7 @@ describe("encodeViewerState", () => {
       },
       render3d: true,
       volumeRenderMode: "minip",
+      composite: true,
       camera3d: { target: [12.5, 30, 7.2], zoom: -2.125, rotationX: 20, rotationOrbit: -45 },
       camera2d: null,
       visibleSets: ["default", "@ome"],
@@ -154,6 +155,20 @@ describe("encodeViewerState", () => {
     };
     const qs = encodeViewerState(new URLSearchParams(), state, defaults(TENSOR.array_id));
     expect(decodeViewerState(qs, defaults(TENSOR.array_id))).toEqual(state);
+  });
+});
+
+describe("composite", () => {
+  it("is off unless the link says so", () => {
+    expect(decode("").composite).toBe(false);
+    expect(decode("cp=1").composite).toBe(true);
+    expect(decode("cp=0").composite).toBe(false);
+    expect(decode("cp=junk").composite).toBe(false);
+  });
+
+  it("is written only when it differs from the default", () => {
+    expect(enc({})).not.toContain("cp=");
+    expect(enc({ composite: true })).toContain("cp=1");
   });
 });
 
@@ -241,6 +256,7 @@ describe("the 2-D camera", () => {
       slice: DEFAULT_VIEWER_URL_STATE.slice,
       render3d: false,
       volumeRenderMode: DEFAULT_VIEWER_URL_STATE.volumeRenderMode,
+      composite: false,
       camera3d: null,
       camera2d: { target: [10.5, 20.25], zoom: -1.5 },
       visibleSets: null,

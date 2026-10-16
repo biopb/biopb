@@ -33,6 +33,7 @@ import { usePlaneGate } from "../hooks/usePlaneGate";
 import { useRoiAuthoring } from "../hooks/useRoiAuthoring";
 import { useRoiOverlay } from "../hooks/useRoiOverlay";
 import { useSliceWheelNavigation } from "../hooks/useSliceWheelNavigation";
+import { compositeColors, compositeWindows } from "../utils/composite";
 import { clampGamma, samplesPerPixel, tileCacheSize, vivColor } from "../utils/vivUtils";
 import { HoverReadout } from "./HoverReadout";
 import { RoiToolStrip } from "./RoiToolStrip";
@@ -61,41 +62,82 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   useSliceWheelNavigation(hostRef, info);
 
   const { sources, tileError, clearTileError } = usePixelSources(info, onUnsupported);
-  const { selection, loadedSelection, dataValid, onViewportLoad } = usePlaneGate(info);
+  const {
+    channels,
+    selections,
+    selection,
+    annotationSelection,
+    annotationLoaded,
+    dataValid,
+    onViewportLoad,
+  } = usePlaneGate(info);
   // Scoped to the plane that produced it, so a failed read cannot go on
   // labelling later planes that loaded perfectly well.
   useEffect(clearTileError, [selection, clearTileError]);
 
-  const uniformValue = useContrastSamples(sources, info, selection);
+  const uniformValue = useContrastSamples(sources, info, selections, channels);
   // The same selector the panel's bar reads (biopb/biopb#955).
-  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
+  const singleWindow = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
+  // A composite windows each channel on its own samples; the percentile scale is
+  // shared. A channel not sampled yet is held back, not drawn through a guess.
+  const channelSamples = useAppStore((s) => (channels ? s.runtime.channelSamples : null));
+  const percentileScale = useAppStore((s) => s.display.percentileScale);
+  const windows = useMemo(
+    () =>
+      channels && channelSamples ? compositeWindows(channels, channelSamples, percentileScale) : null,
+    [channels, channelSamples, percentileScale],
+  );
+  const contrastLimits = useMemo<[number, number][]>(
+    () => (windows ? windows.map((w) => w ?? FALLBACK_WINDOW) : [singleWindow]),
+    [windows, singleWindow],
+  );
+  const channelsVisible = useMemo(
+    () => (windows ? windows.map((w) => w !== null) : [true]),
+    [windows],
+  );
   // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
   const gamma = useAppStore((s) => clampGamma(s.display.gamma));
 
   // --- colour -------------------------------------------------------------
   const channel = useAppStore((s) => s.position.c);
-  const channelNames = useAppStore((s) => s.channelNames);
-  const channelColors = useAppStore((s) => s.channelColors);
-  const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[channel] ?? "auto";
+  // This source's own entries, not the maps: an edit on another source must not
+  // rebuild this one's layer.
+  const names = useAppStore((s) => s.channelNames[sourceId]);
+  const sourceColors = useAppStore((s) => s.channelColors[sourceId]);
+  const colors = useMemo<[number, number, number][]>(() => {
+    if (channels) {
+      // `compositeColors` resolves every channel to a colour itself (names
+      // included), so `vivColor` is given only the answer.
+      return compositeColors(
+        channels.map((c) => sourceColors?.[c] ?? "auto"),
+        channels.map((c) => names?.[c]),
+      ).map((color) => vivColor(color));
+    }
+    const stored = sourceColors?.[channel] ?? "auto";
     // `channelNames` is filled asynchronously, so this runs at least once with
     // the name still unknown. `resolveAutoColor` answers grey then and grey
     // again once an unrecognised name lands, which is what keeps the first
     // frames from being a different colour than the settled one.
-    return vivColor(stored, channelNames[sourceId]?.[channel]);
-  }, [channelColors, channelNames, sourceId, channel]);
+    return [vivColor(stored, names?.[channel])];
+  }, [sourceColors, names, channel, channels]);
 
   const maxCacheSize = useMemo(
-    () => tileCacheSize(info.tile_size, vivDtype(info.dtype), samplesPerPixel(info), 1),
-    [info],
+    () =>
+      tileCacheSize(
+        info.tile_size,
+        vivDtype(info.dtype),
+        samplesPerPixel(info),
+        channels?.length ?? 1,
+      ),
+    [info, channels],
   );
 
   // --- annotations and overlays ---------------------------------------------
-  const { shownPlane, shown, roiLayers, selectionLayers } = useRoiOverlay(info, loadedSelection);
+  const { shownPlane, shown, roiLayers, selectionLayers } = useRoiOverlay(info, annotationLoaded);
   const authoring = useRoiAuthoring(info, shownPlane, shown);
   const { hover, bindHover } = useHoverReadout(authoring.draftCursorSinkRef);
-  const label = useLabelOverlayLayers(info, selection, loadedSelection);
+  const label = useLabelOverlayLayers(info, annotationSelection, annotationLoaded);
 
   // Paced on the image *and* the overlay: see `useLabelOverlayLayers`.
   usePublishPlaneReady(dataValid && label.ready, epoch);
@@ -129,10 +171,11 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
       {sources && size ? (
         <VivStage
           sources={sources}
-          selection={selection}
+          selections={selections}
           contrastLimits={contrastLimits}
           gamma={gamma}
-          color={color}
+          colors={colors}
+          channelsVisible={channelsVisible}
           maxCacheSize={maxCacheSize}
           onViewportLoad={onViewportLoad}
           onHover={hover.onHover}
