@@ -142,6 +142,32 @@ function TreeNote({ text, indent }: { text: string; indent: number }) {
   );
 }
 
+/**
+ * Marks a top-level row that came from a drag-and-drop rather than from one of
+ * the server's configured roots: the tree shows both as plain paths, so without
+ * this a dropped folder is indistinguishable from a root that is always there.
+ */
+function DroppedBadge() {
+  return (
+    <span
+      className="tree-dropped"
+      title="Added by drag-and-drop: not one of the server's configured roots, and not kept across a restart"
+      style={{
+        flexShrink: 0,
+        marginLeft: 6,
+        padding: "0 4px",
+        fontSize: 9,
+        lineHeight: "14px",
+        color: "#94a3b8",
+        border: "1px solid #475569",
+        borderRadius: 3,
+      }}
+    >
+      dropped
+    </span>
+  );
+}
+
 export interface TreeRowProps {
   node: TreeNode;
   activeSourceId: string | null;
@@ -212,6 +238,7 @@ export function TreeRow({
           <span className="tree-name" style={{ marginLeft: 4 }} title={node.name}>
             {node.name}
           </span>
+          {node.dropped && <DroppedBadge />}
         </button>
         {expanded &&
           node.children.map((child) => (
@@ -298,6 +325,7 @@ export function TreeRow({
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
           {node.name}
         </span>
+        {node.dropped && <DroppedBadge />}
         {!startResolve ? null : kind === "recall" ? (
           <span
             className="resolve-hint"
@@ -354,6 +382,7 @@ export function TreeRow({
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
           {node.name}
         </span>
+        {node.dropped && <DroppedBadge />}
         {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
             {groups.length}

@@ -75,7 +75,7 @@ from biopb_tensor_server.serving.roi_store import (
     RoiStoreMixin,
     _prepare_roi,
 )
-from biopb_tensor_server.serving.tree_paths import tree_columns
+from biopb_tensor_server.serving.tree_paths import dropped_tops, tree_columns
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -861,7 +861,9 @@ class MetadataDatabase(RoiStoreMixin):
         self, key: str, limit: int = catalog_tree.DEFAULT_LIMIT
     ) -> Dict[str, Any]:
         """One level of the catalog tree; see :func:`catalog_tree.children`."""
-        return catalog_tree.children(self._get_cursor(), key, limit)
+        return catalog_tree.children(
+            self._get_cursor(), key, limit, dropped_tops(self._root_urls.values())
+        )
 
     def _count_sources(self, cursor: duckdb.DuckDBPyConnection) -> int:
         """``COUNT(*)`` of ``sources``, counted once per generation: it is on every

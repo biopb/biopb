@@ -197,6 +197,11 @@ export interface ReadyzSnapshot {
 export interface TreeFolder {
   name: string;
   key: string;
+  /**
+   * A top-level folder that holds a drag-dropped (`dnd://`) root. Present, and
+   * true, only then; a server that predates it never sends it.
+   */
+  dropped?: boolean;
 }
 
 /** A source directly in a folder, under the name the tree shows it by. */
