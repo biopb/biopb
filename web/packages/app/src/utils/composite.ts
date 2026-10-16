@@ -24,6 +24,11 @@ import {
  */
 export const COMPOSITE_MAX_CHANNELS = 4;
 
+/** The tensor's named channel axis, if it has one. */
+function channelAxis(info: TileInfo) {
+  return sliderAxes(info.dim_labels, info.shape).find((a) => a.named === "c");
+}
+
 /**
  * The channel indices a composite would draw for this tensor, or null when it
  * does not apply: not asked for, interleaved RGB (already colour), no channel
@@ -34,7 +39,7 @@ export const COMPOSITE_MAX_CHANNELS = 4;
  */
 export function compositeChannels(info: TileInfo, composite: boolean): number[] | null {
   if (!composite || info.plane.s !== null) return null;
-  const c = sliderAxes(info.dim_labels, info.shape).find((a) => a.named === "c");
+  const c = channelAxis(info);
   if (!c || c.extent < 2 || c.extent > COMPOSITE_MAX_CHANNELS) return null;
   return Array.from({ length: c.extent }, (_, i) => i);
 }
@@ -60,7 +65,7 @@ export function withChannel(
   selection: Record<string, number>,
   c: number,
 ): Record<string, number> {
-  const axis = sliderAxes(info.dim_labels, info.shape).find((a) => a.named === "c");
+  const axis = channelAxis(info);
   if (!axis) return selection;
   return { ...selection, [axis.key]: Math.min(Math.max(0, c), Math.max(0, axis.extent - 1)) };
 }

@@ -80,10 +80,11 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   const singleWindow = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
   // A composite windows each channel on its own samples; the percentile scale is
   // shared. A channel not sampled yet is held back, not drawn through a guess.
-  const channelSamples = useAppStore((s) => s.runtime.channelSamples);
+  const channelSamples = useAppStore((s) => (channels ? s.runtime.channelSamples : null));
   const percentileScale = useAppStore((s) => s.display.percentileScale);
   const windows = useMemo(
-    () => (channels ? compositeWindows(channels, channelSamples, percentileScale) : null),
+    () =>
+      channels && channelSamples ? compositeWindows(channels, channelSamples, percentileScale) : null,
     [channels, channelSamples, percentileScale],
   );
   const contrastLimits = useMemo<[number, number][]>(
@@ -93,31 +94,33 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   const channelsVisible = useMemo(
     () => (windows ? windows.map((w) => w !== null) : [true]),
     [windows],
-  );  // Never trusted straight from the store: a persisted or hand-edited value of 0
+  );
+  // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
   const gamma = useAppStore((s) => clampGamma(s.display.gamma));
 
   // --- colour -------------------------------------------------------------
   const channel = useAppStore((s) => s.position.c);
-  const channelNames = useAppStore((s) => s.channelNames);
-  const channelColors = useAppStore((s) => s.channelColors);
+  // This source's own entries, not the maps: an edit on another source must not
+  // rebuild this one's layer.
+  const names = useAppStore((s) => s.channelNames[sourceId]);
+  const sourceColors = useAppStore((s) => s.channelColors[sourceId]);
   const colors = useMemo<[number, number, number][]>(() => {
-    const names = channelNames[sourceId];
     if (channels) {
-      // `compositeColors` resolves every channel to a colour itself, so no name
-      // is passed on to `vivColor`.
+      // `compositeColors` resolves every channel to a colour itself (names
+      // included), so `vivColor` is given only the answer.
       return compositeColors(
-        channels.map((c) => channelColors[sourceId]?.[c] ?? "auto"),
+        channels.map((c) => sourceColors?.[c] ?? "auto"),
         channels.map((c) => names?.[c]),
       ).map((color) => vivColor(color));
     }
-    const stored = channelColors[sourceId]?.[channel] ?? "auto";
+    const stored = sourceColors?.[channel] ?? "auto";
     // `channelNames` is filled asynchronously, so this runs at least once with
     // the name still unknown. `resolveAutoColor` answers grey then and grey
     // again once an unrecognised name lands, which is what keeps the first
     // frames from being a different colour than the settled one.
     return [vivColor(stored, names?.[channel])];
-  }, [channelColors, channelNames, sourceId, channel, channels]);
+  }, [sourceColors, names, channel, channels]);
 
   const maxCacheSize = useMemo(
     () =>

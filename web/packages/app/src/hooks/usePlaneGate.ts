@@ -75,7 +75,6 @@ export function usePlaneGate(info: TileInfo) {
     channels,
     selections,
     selection,
-    loadedSelection,
     annotationSelection,
     annotationLoaded,
     dataValid,
