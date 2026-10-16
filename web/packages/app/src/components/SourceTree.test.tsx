@@ -80,6 +80,38 @@ describe("TreeRow under Recent", () => {
   });
 });
 
+describe("TreeRow for a dropped root", () => {
+  const folder = (dropped?: boolean): TreeNode => ({
+    id: "scratch",
+    name: "scratch",
+    type: "folder",
+    children: [],
+    depth: 1,
+    ...(dropped ? { dropped } : {}),
+  });
+  const source = (dropped?: boolean): TreeNode => ({
+    id: LISTED.source_id,
+    name: "exp.zarr",
+    type: "source",
+    children: [],
+    source: LISTED,
+    depth: 1,
+    ...(dropped ? { dropped } : {}),
+  });
+
+  it("tags a dropped folder and a dropped dataset, and only those", () => {
+    expect(render(folder(true))).toContain("tree-dropped");
+    expect(render(source(true))).toContain("tree-dropped");
+    expect(render(folder())).not.toContain("tree-dropped");
+    expect(render(source())).not.toContain("tree-dropped");
+  });
+
+  it("tags a dropped source that has not resolved too", () => {
+    const pending: DataSourceDescriptor = { ...LISTED, is_resolved: false };
+    expect(render({ ...source(true), source: pending })).toContain("tree-dropped");
+  });
+});
+
 describe("TreeRow for an unresolved source", () => {
   const CLOUD: DataSourceDescriptor = {
     source_id: "onedrive_9c1",
@@ -394,6 +426,21 @@ describe("buildTree", () => {
     expect(data.children.map((c) => c.name)).toEqual(["x", "y"]);
     expect(data.children[0]!.children).toHaveLength(2);
     expect(data.children[1]!.children).toHaveLength(1);
+  });
+
+  it("marks the top-level node of a dropped root, folder or dataset, and nothing under it", () => {
+    const root = buildTree([
+      src("a", "file:///data/one.tif"),
+      src("b", "dnd://scratch/sub/two.tif"),
+      src("c", "dnd://exp.zarr"),
+    ]);
+    const named = (prefix: string) => root.children.find((n) => n.name.startsWith(prefix))!;
+    expect(named("data").dropped).toBeUndefined();
+    // A one-folder chain is merged ("scratch/sub"); the flag stays on that node.
+    expect(named("scratch").dropped).toBe(true);
+    expect(named("scratch").children[0]!.dropped).toBeUndefined();
+    // A dropped dataset is a source at the top, named by its label.
+    expect(root.children.find((n) => n.source?.source_id === "c")!.dropped).toBe(true);
   });
 
   it("builds 100k single-image folders in one directory promptly", () => {
