@@ -273,13 +273,17 @@ describe("groupTensors", () => {
 describe("lazyTreeNodes", () => {
   const level = (
     key: string,
-    folders: Array<[string, string]> = [],
+    folders: Array<[string, string, boolean?]> = [],
     sources: Array<[string, DataSourceDescriptor]> = [],
     truncated = false,
   ): { level: TreeLevel } => ({
     level: {
       key,
-      folders: folders.map(([name, k]) => ({ name, key: k })),
+      folders: folders.map(([name, k, dropped]) => ({
+        name,
+        key: k,
+        ...(dropped ? { dropped } : {}),
+      })),
       sources: sources.map(([name, descriptor]) => ({ name, descriptor })),
       truncated,
     },
@@ -343,6 +347,39 @@ describe("lazyTreeNodes", () => {
 
   it("is empty before the top has loaded", () => {
     expect(lazyTreeNodes({}, {}, new Set())).toEqual([]);
+  });
+
+  describe("drag-dropped roots", () => {
+    const DROPPED = source({ source_id: "d", source_url: "dnd://exp.zarr" });
+
+    it("marks a top-level folder the server says holds one, and no other", () => {
+      const nodes = lazyTreeNodes(
+        { "": level("", [["lab", "lab"], ["scratch", "scratch", true]]) },
+        {},
+        new Set(),
+      );
+      expect(nodes.map((n) => [n.name, n.dropped])).toEqual([
+        ["lab", undefined],
+        ["scratch", true],
+      ]);
+    });
+
+    it("marks a dropped dataset, which sits at the top as a source", () => {
+      const nodes = lazyTreeNodes({ "": level("", [], [["exp.zarr", DROPPED], ["a.zarr", A]]) }, {}, new Set());
+      expect(nodes.map((n) => [n.name, n.dropped])).toEqual([
+        ["exp.zarr", true],
+        ["a.zarr", undefined],
+      ]);
+    });
+
+    it("marks nothing below the top", () => {
+      const levels = {
+        "": level("", [["scratch", "scratch", true]]),
+        scratch: level("scratch", [["sub", "scratch/sub"]], [["exp.zarr", DROPPED]]),
+      };
+      const [scratch] = lazyTreeNodes(levels, {}, new Set(["scratch"]));
+      expect(scratch!.children.map((n) => n.dropped)).toEqual([undefined, undefined]);
+    });
   });
 });
 

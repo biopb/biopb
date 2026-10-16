@@ -86,6 +86,36 @@ class TestTreeColumns:
         db.ensure_root("late", "dnd://lab")
         assert _place(db, "a") == (f"lab{SEP}d", "a.zarr")
 
+    def test_a_drag_dropped_root_is_marked_at_the_top(self):
+        db = MetadataDatabase()
+        db.sync_roots([("r", "file:///lab")])
+        db.ensure_root("d", "dnd://dropped")
+        _add(db, "a", "x", CatalogRecord(None, {}, "r", "a.zarr"))
+        _add(db, "b", "x", CatalogRecord(None, {}, "d", "b.zarr"))
+        _add(db, "c", "grpc://host:1/up/c.zarr")
+
+        folders = {f["name"]: f for f in db.catalog_children("")["folders"]}
+
+        assert folders["dropped"].get("dropped") is True
+        # Every other root, an upstream's endpoint included, is left unmarked: the
+        # field is there only when true, so those levels are what they were.
+        assert "dropped" not in folders["lab"]
+        assert "dropped" not in folders["grpc://host:1/up"]
+
+    def test_only_the_top_is_marked(self):
+        db = MetadataDatabase()
+        db.ensure_root("d", "dnd://lab")
+        _add(db, "a", "x", CatalogRecord(None, {}, "d", "one/a.zarr"))
+        _add(db, "b", "x", CatalogRecord(None, {}, "d", "two/b.zarr"))
+
+        assert db.catalog_children("")["folders"] == [
+            {"name": "lab", "key": "lab", "dropped": True}
+        ]
+        assert db.catalog_children("lab")["folders"] == [
+            {"name": "one", "key": "lab/one"},
+            {"name": "two", "key": "lab/two"},
+        ]
+
     def test_a_relisted_internal_row_follows_its_new_url(self):
         db = MetadataDatabase()
         _add(db, "a", "file:///one/a.zarr")

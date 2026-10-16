@@ -10,7 +10,7 @@ import pytest
 from biopb.tensor._session import CatalogClient
 from biopb.tensor.client import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import CatalogRecord, MetadataDatabase
 
 from tests.test_metadata_db import MockAdapter
 
@@ -23,16 +23,20 @@ URLS = {
 }
 
 
+def _serve_db(db, token=None):
+    server = TensorFlightServer("localhost:0", metadata_db=db, token=token)
+    threading.Thread(target=server.serve, daemon=True).start()
+    time.sleep(0.5)
+    return server
+
+
 def _serve(urls, token=None):
     db = MetadataDatabase()
     for source_id, url in urls.items():
         db.sync_source_added(
             source_id, MockAdapter(source_id, url, "zarr", [4, 4], "uint8")
         )
-    server = TensorFlightServer("localhost:0", metadata_db=db, token=token)
-    threading.Thread(target=server.serve, daemon=True).start()
-    time.sleep(0.5)
-    return server
+    return _serve_db(db, token)
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +66,27 @@ class TestCatalogChildren:
         assert client.catalog_children("lab/x")["sources"] == [
             {"name": "a.zarr", "source_id": "a"},
             {"name": "b.zarr", "source_id": "b"},
+        ]
+
+    def test_a_dropped_root_arrives_marked_over_the_wire(self):
+        # Through the action and the SDK, not just the database: the field is an
+        # extra key of the JSON level, which both hand back untouched.
+        db = MetadataDatabase()
+        db.ensure_root("d", "dnd://scratch")
+        db.sync_source_added(
+            "b",
+            MockAdapter("b", "x", "zarr", [4, 4], "uint8"),
+            CatalogRecord(None, {}, "d", "b.zarr"),
+        )
+        server = _serve_db(db)
+        try:
+            level = TensorFlightClient(
+                f"grpc://localhost:{server.port}"
+            ).catalog_children()
+        finally:
+            server.shutdown()
+        assert level["folders"] == [
+            {"name": "scratch", "key": "scratch", "dropped": True}
         ]
 
     def test_an_endpoint_is_one_folder(self, client):
