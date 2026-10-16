@@ -65,7 +65,7 @@ says how each is enforced.
 |----------|--------|-------------|
 | Session / connection | `client`, `connectionState`, `apiBase`, `devMode`, `sources`, `scanning`, `sourceJobs` | — |
 | Persisted preference | `channelColors` (localStorage, **keyed by source_id**), `recentIds` | storage |
-| Viewer preference (outlives a tensor) | `display.contrastMode`, `percentileScale`, `gamma`, `volumeRenderMode`, `labelOpacity`, `showRois`, `tool`, `newLabel`, `newSetName`, `newPolylineWidth`, `showAdvancedOptions` | left alone by `openTensor`; a link may override the first five |
+| Viewer preference (outlives a tensor) | `display.contrastMode`, `percentileScale`, `gamma`, `volumeRenderMode`, `composite`, `labelOpacity`, `showRois`, `tool`, `newLabel`, `newSetName`, `newPolylineWidth`, `showAdvancedOptions` | left alone by `openTensor`; a link may override the first five |
 | Per source | `channelNames` (keyed by source_id), `MetaPanel` state | map key; component `key` |
 | Selection | `activeSourceId`, `activeTensorId` (the stable address that was asked for) | `openTensor` |
 | Target | `target`: `epoch`, `requested`, `status`, `key`, `info` (the one `tile_info`), `error` | `openTensor`; landings are dropped when `epoch` moved on |
@@ -157,6 +157,19 @@ derive them from `target.info.dtype`, `views[key].observedLimits`,
 `runtime.samples` and `display`. The shader and the panel's bar call the same
 selectors (#955), so they cannot disagree. They return fresh arrays, so a
 component reads them through `useShallow`.
+
+### Composite
+
+`composite` (a preference, `cp=1` in a link) asks for every channel of a 2-4
+channel, non-RGB image to be drawn blended in 2-D; `compositeChannels` decides
+whether it applies to the tensor in view, and the button is always there. In a
+composite `usePlaneGate` hands Viv one selection per channel, kept stable across
+C moves (the C slider stays but changes nothing on screen; annotations follow
+it). Each channel is windowed from its own `runtime.channelSamples` entry at the
+shared percentile, so the contrast mode is auto whatever was chosen, and a
+channel not yet sampled is held back. Colours come from `compositeColors`:
+picked, then name-implied, then a fallback palette, never two the same. 3-D
+stays single-channel.
 
 ## Plane tracking in the 2-D viewer
 

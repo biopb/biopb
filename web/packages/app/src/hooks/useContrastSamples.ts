@@ -24,10 +24,16 @@ function uniformValue(
  * levels the tensor has shown. The window and the track are selectors over that,
  * so the intensity slider re-derives limits locally instead of refetching.
  *
+ * A composite passes one selection per channel it draws, with those channels
+ * named in `channels`; each is sampled and kept under its own channel, because
+ * each is windowed on its own histogram. Without `channels` there is the one
+ * selection, on the channel the slider is at.
+ *
  * Returns the plane's single value when the sample says it is uniform, else
  * null. A featureless plane renders black, and so does one whose tiles have not
  * arrived and one whose contrast window excludes everything; black is the right
- * rendering for an all-zero plane -- what was missing is saying so.
+ * rendering for an all-zero plane -- what was missing is saying so. A composite
+ * is several planes and names no single value.
  *
  * Keyed to the selection because the stored samples are deliberately kept across
  * a plane change so the contrast does not flash: unkeyed, the label would
@@ -36,11 +42,14 @@ function uniformValue(
 export function useContrastSamples(
   sources: PixelSources | null,
   info: TileInfo,
-  selection: Record<string, number>,
+  selections: Record<string, number>[],
+  channels: number[] | null,
 ): number | null {
   const epoch = useMountEpoch();
   const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
-  const channel = useAppStore((s) => s.position.c);
+  // Only read when there is no composite: a composite samples the same planes
+  // wherever the C slider is, and must not redo them when it moves.
+  const current = useAppStore((s) => (channels ? -1 : s.position.c));
 
   useEffect(() => {
     if (!sources) return;
@@ -50,29 +59,29 @@ export function useContrastSamples(
     if (!overview) return;
     const controller = new AbortController();
     let live = true;
-    overview
-      .getRaster({ selection, signal: controller.signal })
-      .then((raster) => {
-        if (live) {
-          notePlaneSamples(
-            { plane: selection, values: contrastSamples(raster.data) },
-            channel,
-            epoch,
-          );
-        }
-      })
-      .catch(() => {
-        // Keep the previous limits: a failed histogram is a worse reason to
-        // blank the image than to show it with slightly stale contrast.
-      });
+    selections.forEach((selection, i) => {
+      const channel = channels ? (channels[i] as number) : current;
+      overview
+        .getRaster({ selection, signal: controller.signal })
+        .then((raster) => {
+          if (live) {
+            notePlaneSamples({ plane: selection, values: contrastSamples(raster.data) }, channel, epoch);
+          }
+        })
+        .catch(() => {
+          // Keep the previous limits: a failed histogram is a worse reason to
+          // blank the image than to show it with slightly stale contrast.
+        });
+    });
     return () => {
       live = false;
       controller.abort();
     };
-  }, [sources, info, selection, channel, epoch, notePlaneSamples]);
+  }, [sources, info, selections, channels, current, epoch, notePlaneSamples]);
 
   // A selector returning a number, so this re-renders when the answer changes
   // and not on every sample landing (which is every plane, and every frame of a
   // play).
-  return useAppStore((s) => uniformValue(s.runtime.samples, selection));
+  const only = channels === null ? selections[0] : undefined;
+  return useAppStore((s) => (only ? uniformValue(s.runtime.samples, only) : null));
 }

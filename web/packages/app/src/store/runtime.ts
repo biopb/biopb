@@ -31,10 +31,16 @@ export interface Runtime {
    * first.
    */
   samples: PlaneSamples | null;
+  /**
+   * The last plane sampled on each channel, by channel index. A composite
+   * windows every channel from its own samples; `samples` stays the one the
+   * panel and the single-channel viewers read, which is the current channel's.
+   */
+  channelSamples: Record<number, PlaneSamples>;
 }
 
 /** What a viewer that has not reported yet has observed. */
-export const INITIAL_RUNTIME: Runtime = { planeReady: false, samples: null };
+export const INITIAL_RUNTIME: Runtime = { planeReady: false, samples: null, channelSamples: {} };
 
 export interface RuntimeSlice {
   /**
@@ -73,7 +79,13 @@ export const createRuntimeSlice: StateCreator<AppState, [], [], RuntimeSlice> = 
       if (s.target.epoch !== epoch) return s;
       const { values } = samples;
       return {
-        runtime: { ...s.runtime, samples },
+        runtime: {
+          ...s.runtime,
+          // A composite samples every channel, in whatever order the reads
+          // land; only the current channel's is "the plane in view".
+          samples: channel === s.position.c || s.runtime.samples === null ? samples : s.runtime.samples,
+          channelSamples: { ...s.runtime.channelSamples, [channel]: samples },
+        },
         ...(values.length > 0
           ? widenObserved(s, key, [values[0] as number, values[values.length - 1] as number], channel)
           : {}),

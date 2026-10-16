@@ -534,6 +534,34 @@ describe("getRaster superseding", () => {
     await expect(wanted).resolves.toBeDefined();
   });
 
+  it("lets the channels of one plane be read together", async () => {
+    // A composite asks for every channel's raster at once. Each superseding the
+    // last left only the final channel's read standing.
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const reads = [0, 1, 2].map((c) => half!.getRaster({ selection: { t: 0, c, z: 0 } }));
+    expect(calls.map((c) => c.signal?.aborted)).toEqual([false, false, false]);
+    calls.forEach((c) => c.settle());
+    for (const read of reads) await expect(read).resolves.toBeDefined();
+  });
+
+  it("retires every channel of a plane once another plane is asked for", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    const stale = [0, 1].map((c) => half!.getRaster({ selection: { t: 0, c, z: 0 } }));
+    void half!.getRaster({ selection: { t: 0, c: 0, z: 1 } }).catch(() => {});
+    expect(calls.map((c) => c.signal?.aborted)).toEqual([true, true, false]);
+    for (const read of stale) await expect(read).rejects.toBe(SIGNAL_ABORTED);
+  });
+
+  it("keeps a scrub through C from leaving a read behind for every channel", async () => {
+    const { client, calls } = deferredClient();
+    const [, half] = pixelSourcesFromInfo(client, INFO);
+    for (let c = 0; c < 6; c++) void half!.getRaster({ selection: { t: 0, c, z: 0 } }).catch(() => {});
+    // Four stay; the two oldest were retired as the fifth and sixth arrived.
+    expect(calls.map((c) => c.signal?.aborted)).toEqual([true, true, false, false, false, false]);
+  });
+
   it("rejects with the value Viv's ImageLayer swallows", async () => {
     // It ends its chain with `catch(e => { if (e !== SIGNAL_ABORTED) throw e })`,
     // so an AbortError or a TensorAbortError here is an unhandled rejection.

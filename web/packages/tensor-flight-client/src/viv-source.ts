@@ -197,9 +197,21 @@ const DEFAULT_MAX_RASTER_PIXELS = 16_777_216; // 4096 x 4096
  */
 const VIV_SIGNAL_ABORTED = "__vivSignalAborted";
 
+/**
+ * The channels of one plane that may be in flight together.
+ *
+ * A composite draws several channels of the same plane, and each asks for its
+ * own coarsest-level raster at the same moment. Four is the most it draws
+ * (`COMPOSITE_MAX_CHANNELS` in the viewer); it also bounds how many reads a C
+ * scrub can leave behind.
+ */
+const MAX_LIVE_CHANNELS = 4;
+
 interface RasterRequest {
-  /** The selection this was started for; the generation marker. */
+  /** The selection this was started for. */
   key: string;
+  /** The plane it belongs to: the selection without its channel. */
+  group: string;
   promise: Promise<PixelData>;
   controller: AbortController;
   /** Callers still waiting. At zero the answer is wanted by nobody. */
@@ -208,7 +220,9 @@ interface RasterRequest {
 
 /**
  * One in-flight `getRaster` per (level, selection), shared by every caller, and
- * only ever for the newest selection.
+ * only ever for the newest plane -- up to {@link MAX_LIVE_CHANNELS} channels of
+ * it, since a composite wants them all at once and each superseding the others
+ * would leave only the last one's read standing.
  *
  * Two things go wrong without this, both from Viv's `ImageLayer.updateState`
  * making a *new* `AbortController` per selection and dropping the old one
@@ -229,11 +243,28 @@ interface RasterRequest {
  */
 class RasterRequests {
   private readonly inFlight = new Map<string, RasterRequest>();
+  /** The plane the current generation is for. */
   private generation: string | null = null;
+  /** The channels asked for in this generation, oldest first. */
+  private keys: string[] = [];
 
+  private retire(drop: (req: RasterRequest) => boolean): void {
+    for (const [id, req] of this.inFlight) {
+      if (drop(req)) {
+        this.inFlight.delete(id);
+        req.controller.abort(VIV_SIGNAL_ABORTED);
+      }
+    }
+  }
+
+  /**
+   * `key` is the selection; `group` is the same selection with its channel
+   * left out, which is what decides that a plane has been moved off.
+   */
   run(
     level: number,
     key: string,
+    group: string,
     start: (signal: AbortSignal) => Promise<PixelData>,
     caller?: AbortSignal,
   ): Promise<PixelData> {
@@ -242,13 +273,18 @@ class RasterRequests {
     // a selection it no longer wants, nor start a read only to abort it.
     if (caller?.aborted) return Promise.reject(VIV_SIGNAL_ABORTED);
 
-    if (key !== this.generation) {
-      this.generation = key;
-      for (const [id, req] of this.inFlight) {
-        if (req.key !== key) {
-          this.inFlight.delete(id);
-          req.controller.abort(VIV_SIGNAL_ABORTED);
-        }
+    if (group !== this.generation) {
+      this.generation = group;
+      this.keys = [];
+      this.retire((req) => req.group !== group);
+    }
+    if (!this.keys.includes(key)) {
+      this.keys.push(key);
+      // Channels of one plane coexist, but not without limit: a C scrub would
+      // otherwise leave a read behind for every channel it passed.
+      while (this.keys.length > MAX_LIVE_CHANNELS) {
+        const old = this.keys.shift();
+        this.retire((req) => req.key === old);
       }
     }
 
@@ -258,6 +294,7 @@ class RasterRequests {
       const controller = new AbortController();
       const started: RasterRequest = {
         key,
+        group,
         controller,
         waiters: 0,
         promise: start(controller.signal),
@@ -466,9 +503,10 @@ function makeSource(
       // read. It must cover `sel` too -- keyed on t/z/c alone, every frame of a
       // TIFF sequence shares one key, so the second plane read would be served
       // the first plane's in-flight promise.
-      const key =
-        `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}/` +
-        (sel.sel ?? []).map(([axis, index]) => `${axis}:${index}`).join(",");
+      const rest = (sel.sel ?? []).map(([axis, index]) => `${axis}:${index}`).join(",");
+      const key = `t${sel.t ?? 0}/z${sel.z ?? 0}/c${sel.c ?? 0}/${rest}`;
+      // The plane, whatever channel of it: what a later read supersedes on.
+      const group = `t${sel.t ?? 0}/z${sel.z ?? 0}/${rest}`;
 
       // A level that fits one tile is one tile. `_tile_levels` stops halving as
       // soon as the plane fits the edge, so the coarsest level always has
@@ -483,6 +521,7 @@ function makeSource(
         return requests.run(
           level.level,
           key,
+          group,
           async (shared) => {
             const result = await client.tile(
               {
@@ -513,6 +552,7 @@ function makeSource(
       return requests.run(
         level.level,
         key,
+        group,
         async (shared) => {
           const arr = await client.slice(
             {
