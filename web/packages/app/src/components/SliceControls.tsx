@@ -36,7 +36,7 @@ import {
   sliderGrid,
   withContrastLimit,
 } from "../utils/vivUtils";
-import { compositeChannels } from "../utils/composite";
+import { compositeChannels, compositeColors } from "../utils/composite";
 import { VOLUME_RENDER_MODES, volumeRefusal } from "../utils/volumeUtils";
 
 // Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
@@ -280,10 +280,33 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     setUseCustomColor(isCustomColor);
   }, [isCustomColor]);
 
+  // What this channel is drawn as. An "auto" channel in a composite comes from
+  // the composite's palette, not from its name alone, so the swatch asks the
+  // same function the viewer does.
+  const resolvedColor = useMemo(() => {
+    const channels = tileInfo && compositeActive ? compositeChannels(tileInfo, composite) : null;
+    if (!channels) return resolveAutoColor(currentColor, currentChannelName ?? undefined);
+    const names = channelNames[sourceId];
+    return (
+      compositeColors(
+        channels.map((c) => channelColors[sourceId]?.[c] ?? "auto"),
+        channels.map((c) => names?.[c]),
+      )[position.c] ?? currentColor
+    );
+  }, [
+    tileInfo,
+    compositeActive,
+    composite,
+    currentColor,
+    currentChannelName,
+    channelNames,
+    channelColors,
+    sourceId,
+    position.c,
+  ]);
+
   // Get hex representation for the color picker input (resolves auto)
-  const currentHexColor = useMemo(() => {
-    return colorToHex(currentColor, currentChannelName ?? undefined);
-  }, [currentColor, currentChannelName]);
+  const currentHexColor = useMemo(() => colorToHex(resolvedColor), [resolvedColor]);
 
   if (!descriptor) {
     return <section className="slice-controls">Tensor metadata unavailable</section>;
@@ -713,7 +736,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               />
             )}
             {/* Show resolved color swatch for auto mode */}
-            {isAutoColor && !useCustomColor && currentChannelName && (
+            {isAutoColor && !useCustomColor && (currentChannelName || compositeActive) && (
               <div
                 style={{
                   width: 16,
@@ -722,7 +745,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                   background: currentHexColor,
                   border: "1px solid #2d3748",
                 }}
-                title={`Auto → ${resolveAutoColor(currentColor, currentChannelName ?? undefined)}`}
+                title={`Auto → ${resolvedColor}`}
               />
             )}
             {currentChannelName && (

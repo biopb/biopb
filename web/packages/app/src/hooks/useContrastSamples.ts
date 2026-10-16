@@ -71,6 +71,15 @@ export function useContrastSamples(
         .catch(() => {
           // Keep the previous limits: a failed histogram is a worse reason to
           // blank the image than to show it with slightly stale contrast.
+          //
+          // A composite has no previous window for a channel it never sampled,
+          // and an unsampled channel is held back -- so a failure would hide it
+          // for good. An empty sample gives it the plain 0-1 window instead: the
+          // channel is drawn, if crudely, and the next plane tries again. An
+          // aborted read is a superseded one and says nothing about the channel.
+          if (live && channels) {
+            notePlaneSamples({ plane: selection, values: new Float64Array(0) }, channel, epoch);
+          }
         });
     });
     return () => {
