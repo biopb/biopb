@@ -1209,6 +1209,19 @@ def _tile_read(
 # pay a cold decode.
 
 
+def _volume_wire_dtype(dtype: str) -> np.dtype:
+    """The dtype a volume read ships in.
+
+    A volume is uploaded as one texture and Viv casts it to Float32 whatever it
+    arrives as, so a wider float buys nothing but wire bytes: float64 goes out
+    as float32, at half the size and identical on screen. Everything else is
+    sent as it is -- integers are already no wider than the texture, and
+    narrowing one further would be a lossy choice the viewer should make.
+    """
+    dt = np.dtype(dtype)
+    return np.dtype("float32") if dt.kind == "f" and dt.itemsize > 4 else dt
+
+
 def _volume_plan(
     shape: Sequence[int],
     dim_labels: Sequence[str],
@@ -1339,7 +1352,9 @@ def _volume_plan(
         # What the read returns, not what the GPU holds: Viv casts every volume
         # to Float32 on upload regardless of source dtype (3.1), so VRAM is
         # 4 bytes per voxel and the client sizes that from the extents.
-        "bytes": estimate_chunk_bytes((depth, height, width), dtype),
+        "bytes": estimate_chunk_bytes(
+            (depth, height, width), _volume_wire_dtype(dtype).str
+        ),
     }, None
 
 
@@ -3006,6 +3021,12 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         # *other* queued callers have hung up. A volume read makes that starve
         # long enough to matter.
         arr = await run_in_threadpool(_read)
+        if req.scale_policy:
+            # Only a volume policy exists today, and it is the one whose
+            # reader is a single float32 texture.
+            wire = _volume_wire_dtype(arr.dtype.str)
+            if arr.dtype != wire:
+                arr = await run_in_threadpool(arr.astype, wire)
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
