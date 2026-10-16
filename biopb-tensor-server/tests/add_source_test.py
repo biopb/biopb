@@ -555,13 +555,11 @@ class TestAddSourceRoundtrip:
             assert len(result.added) == 1
             source_id = result.added[0]
 
-            # Unlabelled, so the adapter fills the canonical slots itself.
+            # Unlabelled, so the adapter picks the canonical label itself.
             descriptor = client.get_descriptor(f"{source_id}/Image:0")
-            assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
-            assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+            assert list(descriptor.dim_labels) == ["Z", "Y", "X"]
+            assert list(descriptor.shape) == [5, 8, 9]
             assert client.get_tensor(f"{source_id}/Image:0").compute().shape == (
-                1,
-                1,
                 5,
                 8,
                 9,

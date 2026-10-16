@@ -240,7 +240,9 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 for axis in mapped
                 if axis not in _CANONICAL_DIMS and axis != _SAMPLES_DIM
             ]
-            labels = named_axes + list(_CANONICAL_DIMS)
+            # Only the canonical axes the file has: a plain 2-D TIFF is Y/X, not
+            # a 5-D tensor of leading singletons. Y and X are always present.
+            labels = named_axes + [axis for axis in _CANONICAL_DIMS if axis in mapped]
             if _SAMPLES_DIM in mapped:
                 labels.append(_SAMPLES_DIM)
             by_axis = {
