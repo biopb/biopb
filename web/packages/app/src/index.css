@@ -303,6 +303,18 @@ html, body {
   white-space: nowrap;
 }
 
+.tree-dropped {
+  font-size: 9px;
+  line-height: 14px;
+  padding: 0 4px;
+  margin-left: 6px;
+  color: #94a3b8;
+  border: 1px solid #475569;
+  border-radius: 3px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .dim-badge {
   font-size: 10px;
   background: #1e293b;

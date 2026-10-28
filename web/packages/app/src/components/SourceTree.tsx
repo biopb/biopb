@@ -152,16 +152,6 @@ function DroppedBadge() {
     <span
       className="tree-dropped"
       title="Added by drag-and-drop: not one of the server's configured roots, and not kept across a restart"
-      style={{
-        flexShrink: 0,
-        marginLeft: 6,
-        padding: "0 4px",
-        fontSize: 9,
-        lineHeight: "14px",
-        color: "#94a3b8",
-        border: "1px solid #475569",
-        borderRadius: 3,
-      }}
     >
       dropped
     </span>
