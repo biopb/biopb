@@ -1,5 +1,6 @@
 """Phase 3 coverage for the native Leica LIF adapter (biopb/biopb#799)."""
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -103,19 +104,108 @@ def test_eight_bit_image_reads_as_uint8(tmp_path):
     np.testing.assert_array_equal(whole, expected)
 
 
-def test_read_block_shape_is_full_rank_and_floors_at_one_plane(tmp_path):
+def _by_plane(image):
+    """*image* forced onto the per-plane fallback."""
+    layout = image._layout
+    forced = tuple(dataclasses.replace(info, mappable=False) for info in layout.images)
+    image._layout = dataclasses.replace(layout, images=forced)
+    return image
+
+
+def test_a_mapped_image_reports_no_read_block(tmp_path):
+    """A crop of the map costs its own pages: nothing to align a tile to."""
+    path, _ = create_leica_lif(str(tmp_path), n_t=2, n_c=2, n_z=5, image_shape=(24, 32))
+    source = _native(path)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
+
+    assert image._layout.images[0].mappable
+    assert image.read_block_shape is None
+
+
+def test_read_block_shape_of_a_plane_read_image_is_full_rank_one_plane(tmp_path):
     """``streaming_unit`` zips ``read_block_shape`` positionally against the
     transfer grid (``core/stream_reduce.py``), so a Y/X-only tuple would floor
     the wrong axes instead of flooring nothing on the real spatial ones --
     silently defeating the whole-plane floor for a scaled/streamed read."""
     path, _ = create_leica_lif(str(tmp_path), n_t=2, n_c=2, n_z=5, image_shape=(24, 32))
     source = _native(path)
-    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
+    image = _by_plane(source.get_tensor_adapter(source.list_tensors()[0].array_id))
 
     shape = image.get_tensor_descriptor().shape
     block = image.read_block_shape
     assert len(block) == len(shape)
     assert tuple(block) == (1, 1, 1, 24, 32)
+
+
+@pytest.mark.parametrize("n_m", [1, 3])
+def test_the_mapped_and_the_plane_read_agree(tmp_path, n_m):
+    path, expected = create_leica_lif(
+        str(tmp_path), n_t=2, n_z=4, n_c=2, image_shape=(20, 28), n_m=n_m
+    )
+    source = _native(path)
+    tensor = source.list_tensors()[0].array_id
+    mapped = source.get_tensor_adapter(tensor)
+    assert mapped._layout.images[0].mappable
+    by_plane = _by_plane(_native(path).get_tensor_adapter(tensor))
+
+    rank = expected.ndim
+    whole = ChunkBounds(start=[0] * rank, stop=list(expected.shape))
+    crop = ChunkBounds(
+        start=[0] * (rank - 2) + [3, 5], stop=list(expected.shape[:-2]) + [17, 26]
+    )
+    for bounds in (whole, crop):
+        np.testing.assert_array_equal(
+            mapped.get_data(bounds), by_plane.get_data(bounds)
+        )
+    step = (1,) * (rank - 3) + (2, 3, 4)
+    np.testing.assert_array_equal(
+        mapped.get_decimated_data(whole, step), by_plane.get_decimated_data(whole, step)
+    )
+
+
+def test_a_read_owns_its_bytes_and_leaves_no_mapping(tmp_path):
+    path, expected = create_leica_lif(str(tmp_path), n_z=3, image_shape=(16, 16))
+    source = _native(path)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
+    bounds = ChunkBounds(start=[0] * 5, stop=list(expected.shape))
+
+    out = image.get_data(bounds)
+    assert type(out) is np.ndarray and out.flags.writeable and out.flags.c_contiguous
+    Path(path).unlink()  # a retained mapping would still read; an owned copy does too
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_an_image_whose_map_disagrees_with_its_frames_reads_by_plane(
+    tmp_path, monkeypatch
+):
+    import liffile
+
+    path, expected = create_leica_lif(str(tmp_path), n_t=2, n_z=3, image_shape=(8, 8))
+    original = liffile.LifImage.asarray
+
+    def wrong(self, **kwargs):
+        return np.zeros_like(original(self, **kwargs))
+
+    monkeypatch.setattr(liffile.LifImage, "asarray", wrong)
+    source = _native(path)
+    image = source.get_tensor_adapter(source.list_tensors()[0].array_id)
+
+    assert not image._layout.images[0].mappable
+    assert tuple(image.read_block_shape) == (1, 1, 1, 8, 8)
+    whole = image.get_data(ChunkBounds(start=[0] * 5, stop=list(expected.shape)))
+    np.testing.assert_array_equal(whole, expected)
+
+
+def test_a_row_stored_before_the_flag_reads_by_plane(tmp_path):
+    from biopb_tensor_server.adapters.lif import _LifLayout
+
+    path, expected = create_leica_lif(str(tmp_path), n_z=2, image_shape=(8, 8))
+    payload = _native(path)._layout.to_payload()
+    for image in payload["images"]:
+        del image["mappable"]
+    layout = _LifLayout.from_payload(payload, path)
+
+    assert not layout.images[0].mappable
 
 
 def test_physical_scale_reports_liffile_pixel_size(tmp_path):

@@ -2,9 +2,12 @@
 
 BioIO reads a LIF through ``bioio-lif``, whose Dask array pays the same
 graph-rebuild-per-read cost every other bioio-backed format does
-(biopb/biopb#799 phase 3). ``liffile`` reads one frame (a Y/X plane) at a time
-and has no region-of-interest read, so every read decodes whole planes; the
-win over BioIO is only the graph-construction overhead it adds on top.
+(biopb/biopb#799 phase 3). A LIF holds raw, uncompressed pixels, so a read is
+a crop of a memory map: ``liffile`` maps the image (``memmap=True``) and the
+read slices that view, touching only the pages the crop and its stride need.
+``LifImage.frame`` has no region read and always copies a whole plane, so it
+is only the fallback, for an image whose mapped view cannot be proven equal to
+its frames (:func:`_mapped_equals_frames`).
 
 **Scope.**  Every image in a local LIF container. A LIF file can hold several
 images (Leica's project tree), each becoming its own tensor -- the same
@@ -16,7 +19,7 @@ for (RGB samples, FLIM histograms, ...) fails the parse, as a file ``liffile``
 rejects does -- there is no fallback to BioIO for a local ``.lif``.
 
 The adapter holds no file handle: the header is parsed once into the layout,
-and each read reopens the container (one header parse per read, not per plane).
+and each read reopens and maps the container (one header parse per read).
 
 A remote LIF is declined by :meth:`LifAdapter.claim`, so it falls to BioIO's
 ``LeicaAdapter`` through the registry -- this module imports nothing from
@@ -90,6 +93,10 @@ class _LifImage:
     voxel_z: Optional[float]
     bit_depth: Tuple[int, ...]
     settings: Dict[str, str]
+    # Whether the image's memory map, put in label order, equals its frames
+    # (checked at parse). False for a row stored before the flag existed: it
+    # reads by plane until it is registered again.
+    mappable: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,50 @@ def _voxel_um(image: Any, label: str) -> Optional[float]:
     return step or None
 
 
+def _in_label_order(
+    data: np.ndarray, dims: Tuple[str, ...], labels: Tuple[str, ...]
+) -> np.ndarray:
+    """A view of *data* (axes *dims*, as stored) with exactly the axes *labels*.
+
+    An axis the file lacks becomes a length-1 axis; an axis of the file that no
+    label names is length 1 (``_describe`` rejects any other) and is dropped.
+    """
+    keep = [dim for dim in dims if dim in labels]
+    data = data[tuple(slice(None) if dim in labels else 0 for dim in dims)]
+    data = data.transpose([keep.index(label) for label in labels if label in keep])
+    return data[tuple(slice(None) if label in keep else None for label in labels)]
+
+
+def _mapped_equals_frames(
+    image: Any, labels: Tuple[str, ...], shape: Tuple[int, ...], dtype: np.dtype
+) -> bool:
+    """Whether the mapped view of *image* reads the same pixels as ``frame``.
+
+    ``asarray`` assumes the layout is contiguous in the order the file stores
+    its dimensions; a plane at each end of the image is the cheap proof that it
+    is, for this file. A layout it cannot express (padded or mixed-type
+    channels, planes held in other files) answers False and reads by plane.
+    """
+    try:
+        view = _in_label_order(image.asarray(), tuple(image.dims), labels)
+        if view.shape != shape or view.dtype != dtype:
+            return False
+        names = labels[:-2]
+        for position in (0, -1):
+            index = tuple(0 if position == 0 else size - 1 for size in shape[:-2])
+            indices = {
+                name: at
+                for name, at in zip(names, index, strict=True)
+                if name in image.sizes
+            }
+            if not np.array_equal(view[index], image.frame(**indices)):
+                return False
+    except Exception:  # noqa: BLE001 - any failure to map just means "read by plane"
+        logger.debug("LIF image %r is not mappable", image.path, exc_info=True)
+        return False
+    return True
+
+
 def _describe(image: Any) -> _LifImage:
     sizes = dict(image.sizes)
     extra = {
@@ -151,10 +202,11 @@ def _describe(image: Any) -> _LifImage:
         labels = (_MOSAIC_DIM,) + labels
     settings = image.xml_element.find(_SETTINGS_PATH)
     channels = getattr(image, "_channels", ())
+    shape = tuple(int(sizes.get(label, 1)) for label in labels)
     return _LifImage(
         name=image.path,
         labels=labels,
-        shape=tuple(int(sizes.get(label, 1)) for label in labels),
+        shape=shape,
         dtype=np.dtype(image.dtype).str,
         present=tuple(label for label in labels if label in sizes),
         voxel_x=_voxel_um(image, "X"),
@@ -163,6 +215,7 @@ def _describe(image: Any) -> _LifImage:
         bit_depth=tuple(int(c.resolution) for c in channels)
         or (np.dtype(image.dtype).itemsize * 8,),
         settings=dict(settings.attrib) if settings is not None else {},
+        mappable=_mapped_equals_frames(image, labels, shape, np.dtype(image.dtype)),
     )
 
 
@@ -170,7 +223,7 @@ def read_layout(path: str) -> _LifLayout:
     """Parse a LIF container's XML header. Raises for a file ``liffile`` rejects."""
     import liffile
 
-    with liffile.LifFile(path, squeeze=False) as lif:
+    with liffile.LifFile(path, squeeze=False, memmap=True) as lif:
         return _LifLayout(
             filename=path, images=tuple(_describe(image) for image in lif.images)
         )
@@ -283,8 +336,8 @@ class LifAdapter(TensorAdapter):
         return TensorDescriptor(
             array_id=f"{self.source_id}/Image:{position}",
             dim_labels=labels,
-            # liffile has no ROI: a read always decodes the whole plane
-            # (biopb/biopb#799), so the native unit is one full Y/X plane.
+            # Plane-aligned, as when a read could only be a whole plane; kept
+            # so the transfer grid (and so every chunk id) does not move.
             chunk_shape=default_transfer_chunk_shape(
                 shape,
                 dtype,
@@ -344,7 +397,8 @@ class LifAdapter(TensorAdapter):
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
-        """One whole plane: liffile has no ROI, ``frame`` reads it whole.
+        """None for a mapped image: a crop costs its own pages, so there is no
+        block to align a tile to. One whole plane for an image read by ``frame``.
 
         Full rank, matching the ``native=`` seed in :meth:`_descriptor_for` --
         :func:`~.stream_reduce.streaming_unit` zips this positionally against
@@ -352,8 +406,10 @@ class LifAdapter(TensorAdapter):
         """
         if self.image_position is None:
             return None
-        shape = self._layout.images[self.image_position].shape
-        return tuple([1] * (len(shape) - 2)) + tuple(shape[-2:])
+        info = self._layout.images[self.image_position]
+        if info.mappable:
+            return None
+        return tuple([1] * (len(info.shape) - 2)) + tuple(info.shape[-2:])
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         return self._read(bounds, step=None)
@@ -361,8 +417,9 @@ class LifAdapter(TensorAdapter):
     def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
-        """Skip whole planes the stride would drop on T/C/Z/M; Y/X still crop
-        a fully-decoded plane (liffile has no partial-plane read)."""
+        """A strided slice of the mapped image: the copy shrinks by the product
+        of the strides. An image read by plane still skips the planes the stride
+        drops on T/C/Z/M, but decodes each kept plane whole."""
         return self._read(bounds, step=step)
 
     def _read(self, bounds: ChunkBounds, step: Optional[Tuple[int, ...]]) -> np.ndarray:
@@ -381,6 +438,23 @@ class LifAdapter(TensorAdapter):
         y1, x1 = stops[n_plane], stops[n_plane + 1]
         y_step, x_step = steps[n_plane], steps[n_plane + 1]
 
+        import liffile
+
+        if info.mappable:
+            with liffile.LifFile(
+                self._layout.filename, squeeze=False, memmap=True
+            ) as lif:
+                image = lif.images[self.image_position]
+                view = _in_label_order(image.asarray(), tuple(image.dims), info.labels)
+                crop = tuple(
+                    slice(start, stop, step)
+                    for start, stop, step in zip(starts, stops, steps, strict=True)
+                )
+                # The one copy; the result must not outlive the mapping.
+                out = np.array(view[crop], order="C")
+                del view
+            return out
+
         plane_ranges = [
             range(starts[axis], stops[axis], steps[axis]) for axis in range(n_plane)
         ]
@@ -389,8 +463,6 @@ class LifAdapter(TensorAdapter):
             for axis in range(len(labels))
         )
         output = np.empty(out_shape, dtype=np.dtype(info.dtype))
-
-        import liffile
 
         with liffile.LifFile(self._layout.filename, squeeze=False) as lif:
             image = lif.images[self.image_position]
