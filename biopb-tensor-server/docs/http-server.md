@@ -112,7 +112,10 @@ folder's `key` is its full path and is what `?key=` takes. A resolved source
 with no tensor is hidden; an unresolved one is shown, since it is read when
 opened. `descriptor` has the shape of a
 `/api/sources/query` row of the `sources` view. `truncated` says that `limit` or the server's row cap cut the
-level. The server answers a level itself (the `catalog_children` action: folders,
+level. Stripping `dnd://` hides where a root came from, so a top-level folder
+that starts in a drag-dropped root carries `"dropped": true` (the field is
+absent otherwise, and below the top); a dropped dataset sitting at the top is a
+source whose `source_url` still says `dnd://`. The server answers a level itself (the `catalog_children` action: folders,
 and the names and ids of the sources); the sidecar adds one `sources` query for
 those sources' descriptors.
 

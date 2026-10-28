@@ -38,6 +38,16 @@ export interface TreeNode {
   depth: number;
   /** A line shown under an open folder: it is loading, failed, or is cut short. */
   note?: string;
+  /**
+   * A top-level node that comes from a drag-dropped (`dnd://`) root, which the
+   * tree otherwise shows like any other path. Present, and true, only then.
+   */
+  dropped?: boolean;
+}
+
+/** Whether a source's url carries the drag-drop origin scheme. */
+export function isDropped(src: DataSourceDescriptor): boolean {
+  return src.source_url.startsWith(DND_URL_PREFIX);
 }
 
 /** Shown under a folder the server holds more of than it sent. */
@@ -78,6 +88,7 @@ export function lazyTreeNodes(
       depth,
       children: isOpen ? lazyTreeNodes(levels, status, open, f.key, depth + 1) : [],
       note: isOpen ? levelNote(levels[f.key]?.level, status[f.key]) : undefined,
+      ...(f.dropped ? { dropped: true } : {}),
     };
   });
   const sources = level.sources.map(
@@ -88,6 +99,8 @@ export function lazyTreeNodes(
       children: [],
       source: s.descriptor,
       depth,
+      // A dropped file or dataset is a source at the top, not a folder.
+      ...(!key && isDropped(s.descriptor) ? { dropped: true } : {}),
     }),
   );
   return [...folders, ...sources];
@@ -359,6 +372,7 @@ export function buildTree(sources: DataSourceDescriptor[]): TreeNode {
           children: [],
           depth: current.depth + 1,
         };
+        if (current === root && isDropped(src)) child.dropped = true;
         current.children.push(child);
         byName.set(part, child);
       }
@@ -373,6 +387,7 @@ export function buildTree(sources: DataSourceDescriptor[]): TreeNode {
       children: [],
       source: src,
       depth: current.depth + 1,
+      ...(current === root && isDropped(src) ? { dropped: true } : {}),
     });
   }
 
