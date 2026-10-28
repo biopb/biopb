@@ -834,7 +834,7 @@ async def execute_code(
       `tensors`, a LIST of STRUCT(array_id, dim_labels, shape, dtype) with one
       entry per tensor (note source_url, not "url"). This is the browse
       surface; there is no other. Structure is a per-tensor question, so ask it
-      of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,
+      of `tensors`: `WHERE len(list_filter(tensors, lambda t: t.dtype='uint16')) > 0`,
       or `tensors[1].dtype` for the source's first tensor (DuckDB lists are
       1-indexed, unlike `tensors[0]` in Python/TS code). A source not yet read
       (`is_resolved = false`: `pending`, `needs_recall`, `failed`) has an empty

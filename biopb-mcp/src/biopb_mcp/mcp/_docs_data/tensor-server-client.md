@@ -41,7 +41,7 @@ client.query(  # every tensor, one row each
     "FROM sources, UNNEST(tensors) AS u(t)", format="pandas")
 client.query(  # sources having ANY uint16 tensor
     "SELECT source_id FROM sources "
-    "WHERE len(list_filter(tensors, t -> t.dtype = 'uint16')) > 0", format="pandas")
+    "WHERE len(list_filter(tensors, lambda t: t.dtype = 'uint16')) > 0", format="pandas")
 
 # One row per source, with its tensors (query is the only browse)
 for row in client.query(

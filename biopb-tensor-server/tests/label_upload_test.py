@@ -73,7 +73,7 @@ def _create(client, array_id, arr=None, **kw):
 def _tensor_ids(server, source_id="oz1"):
     return (
         server.metadata_db.query(
-            "SELECT list_transform(tensors, t -> t.array_id) FROM sources "
+            "SELECT list_transform(tensors, lambda t: t.array_id) FROM sources "
             f"WHERE source_id = '{source_id}'"
         )
         .column(0)
