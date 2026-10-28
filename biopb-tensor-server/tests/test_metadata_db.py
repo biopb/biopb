@@ -350,7 +350,7 @@ class TestPerTensorCatalog:
         conn = db._get_connection()
         rows = conn.execute(
             "SELECT source_id FROM sources "
-            "WHERE len(list_filter(tensors, t -> t.dtype = 'uint8')) > 0"
+            "WHERE len(list_filter(tensors, lambda t: t.dtype = 'uint8')) > 0"
         ).fetchall()
         assert rows == [("hcs",)]
 
