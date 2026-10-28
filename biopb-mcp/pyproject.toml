@@ -34,7 +34,10 @@ dependencies = [
     "mcp >= 1.20, < 2",
     "uvicorn >= 0.29",
     "jupyter_client",
-    "ipykernel",
+    # ipykernel <7: under 7.x a background task's print no longer reaches its
+    # job record (test_main_thread_free_while_a_task_runs). Lift the cap
+    # together with a port of the output routing.
+    "ipykernel < 7",
     "psutil",
     # packaging: imported by mcp/_update.py (version compare for the update check).
     # It always arrives transitively, but the import is direct, so declare it.
