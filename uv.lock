@@ -665,7 +665,7 @@ requires-dist = [
     { name = "biopb", extras = ["shim", "tensor"], editable = "." },
     { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.2.0" },
     { name = "distributed", specifier = ">=2023.9.0" },
-    { name = "ipykernel" },
+    { name = "ipykernel", specifier = "<7" },
     { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "mcp", specifier = ">=1.20,<2" },
