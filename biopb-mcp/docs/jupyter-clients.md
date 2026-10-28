@@ -84,9 +84,10 @@ under a job's request is that job's.
   which cannot be lost: it ends a cell whose idle was lost, and fails one whose
   iopub `error` was.
 - **A task** outlives the cell that started it, so the kernel announces its
-  start and end as `biopb_job` messages (`_jobs._publish`). ipykernel files a
-  worker thread's prints under the request that started the thread; from the
-  task's announced start they are the task's, not the cell's.
+  start and end as `biopb_job` messages (`_jobs._publish`). The task's thread
+  runs in a copy of the cell's context (`run_async`), so ipykernel stamps its
+  prints with that cell's request; from the announced start they are the task's,
+  not the cell's.
 
 iopub is a PUB socket and can drop. What is lost, the order repairs: cells run
 one at a time and tasks one at a time, so a cell's end ends any other cell that
@@ -225,14 +226,15 @@ environment, so nothing is installed into Lab's.
 
 ## ipykernel internals relied on
 
-Every install gets ipykernel 6.31: `napari-console` 0.1.4, which every napari
-requires, caps it below 7. The kernel class and the records use these 6.31
+Every install gets ipykernel 7.1 or later (`napari-console` 0.1.5, which every
+napari requires, needs it). The kernel class and the records use these
 internals:
 
 - **`do_execute`'s signature** and `get_parent("shell")` in the kernel class —
   without them Stop cannot find a cell and silent foreign cells go unrecorded.
-- **Thread-to-request output attribution**
-  (`_associate_new_top_level_threads_with`), which files a task's prints.
+- **The parent header as a `ContextVar`** (`OutStream`, and the kernel's
+  shell parent): a task's thread copies the cell's context to inherit it.
+  Earlier ipykernel guessed it from the thread's creator; 7.1 removed that.
 - **`IOPubThread._really_send`**, which orders a task's announcements after
   its output.
 - **Custom control messages** (`control_msg_types`) and their busy/idle under
