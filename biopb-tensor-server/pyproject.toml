@@ -65,7 +65,9 @@ dependencies = [
   # >=1.0 for the stable on-disk format: the catalog is a file now, and it
   # holds the annotations, which no rescan can reproduce. Pre-1.0 releases
   # broke the storage format between versions.
-  "duckdb >= 1.0",
+  # <2: 2.0 rejects the `x -> ...` lambda syntax the catalog queries use and
+  # drops `Connection.arrow`. Lift the cap together with that port.
+  "duckdb >= 1.0, < 2",
 ]
 
 [project.optional-dependencies]
