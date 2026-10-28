@@ -816,36 +816,42 @@ def create_leica_lif(
     plane_bytes = n_x * n_y * (bit_depth // 8)
     z_inc = plane_bytes * n_c
 
+    # Every attribute liffile (bioio-lif 2) reads is written; readlif ignores
+    # the extras.
+    def dim(dim_id, n, length, bytes_inc):
+        return (
+            f'<DimensionDescription DimID="{dim_id}" NumberOfElements="{n}" '
+            f'Origin="0" Length="{length:.9e}" Unit="m" '
+            f'BytesInc="{bytes_inc}" BitInc="0"/>'
+        )
+
     dims = [
-        f'<DimensionDescription DimID="1" NumberOfElements="{n_x}" '
-        f'Length="{(n_x - 1) * 1e-7:.9e}" BytesInc="{bit_depth // 8}"/>',
-        f'<DimensionDescription DimID="2" NumberOfElements="{n_y}" '
-        f'Length="{(n_y - 1) * 1e-7:.9e}" BytesInc="{n_x * bit_depth // 8}"/>',
+        dim(1, n_x, (n_x - 1) * 1e-7, bit_depth // 8),
+        dim(2, n_y, (n_y - 1) * 1e-7, n_x * bit_depth // 8),
     ]
     if n_z > 1:
-        dims.append(
-            f'<DimensionDescription DimID="3" NumberOfElements="{n_z}" '
-            f'Length="{(n_z - 1) * 5e-7:.9e}" BytesInc="{z_inc}"/>'
-        )
+        dims.append(dim(3, n_z, (n_z - 1) * 5e-7, z_inc))
     if n_t > 1:
-        dims.append(
-            f'<DimensionDescription DimID="4" NumberOfElements="{n_t}" '
-            f'Length="{(n_t - 1) * 1.0:.9e}" BytesInc="{z_inc * n_z}"/>'
-        )
+        dims.append(dim(4, n_t, (n_t - 1) * 1.0, z_inc * n_z))
     luts = ("Gray", "Green", "Red", "Blue")
     channels = "".join(
-        f'<ChannelDescription Resolution="{bit_depth}" BytesInc="{plane_bytes}" '
-        f'LUTName="{luts[i % len(luts)]}"/>'
+        f'<ChannelDescription DataType="0" ChannelTag="{i}" '
+        f'Resolution="{bit_depth}" NameOfMeasuredQuantity="" Min="0" '
+        f'Max="{2**bit_depth - 1}" Unit="" LUTName="{luts[i % len(luts)]}" '
+        f'IsLUTInverted="0" BytesInc="{plane_bytes}" BitInc="0"/>'
         for i in range(n_c)
     )
     xml = (
-        '<LMSDataContainerHeader Version="2">'
+        # Version 1 is the 4-byte block size written below; liffile reads the
+        # block header by this number (readlif ignores it).
+        '<LMSDataContainerHeader Version="1">'
         '<Element Name="test.lif"><Children>'
         '<Element Name="Image0"><Data><Image><ImageDescription>'
         f"<Dimensions>{''.join(dims)}</Dimensions>"
         f"<Channels>{channels}</Channels>"
-        "</ImageDescription></Image></Data></Element>"
-        "</Children></Element></LMSDataContainerHeader>"
+        "</ImageDescription></Image></Data>"
+        f'<Memory Size="{plane_bytes * n_c * n_z * n_t}" MemoryBlockID="MemBlock"/>'
+        "</Element></Children></Element></LMSDataContainerHeader>"
     )
     xml_bytes = xml.encode("utf-16")  # BOM included; the parser decodes it
 
