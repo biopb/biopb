@@ -31,6 +31,16 @@ def decode(batch: pa.RecordBatch) -> np.ndarray:
     return np.frombuffer(buf, dtype=dtype, count=int(np.prod(shape))).reshape(shape)
 
 
+@pytest.fixture(autouse=True)
+def _tmp_path_may_be_ram_backed(monkeypatch):
+    """pytest's tmp_path is under /tmp, which is tmpfs on some machines (CI
+    runners, dev boxes). These tests are about the cache, not the filesystem
+    guard, so the RAM-backed check is off; the guard has its own tests."""
+    from biopb.tensor import _fs_detect
+
+    monkeypatch.setattr(_fs_detect, "memory_filesystem_type", lambda _p: None)
+
+
 @pytest.fixture
 def settings(tmp_path) -> dc.Settings:
     return dc.Settings(root=tmp_path, budget=10**9, ttl=7 * 24 * 3600, min_free=0)
