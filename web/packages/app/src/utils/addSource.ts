@@ -1,6 +1,7 @@
 import type {
   AddSourceJobStatus,
   AddSourceResult,
+  RemoveSourceResult,
   TensorHttpClient,
 } from "@biopb/tensor-flight-client";
 
@@ -49,6 +50,55 @@ export function describeAdd(result: AddSourceResult): string {
   if (parts.length === 0) return "Nothing found to add";
   // "Added" leads the first clause only when there was something added.
   return parts.join(", ");
+}
+
+/** How many of an add's failed paths its notice lists. */
+const FAILURES_LISTED = 3;
+
+/**
+ * The notice an add earns once it has ended, or null while it still runs.
+ *
+ * An error when the add itself failed, or when it came to nothing but failures;
+ * otherwise info, with any failed paths listed under it.
+ */
+export function addNotice(
+  status: AddSourceJobStatus,
+): { kind: "info" | "error"; text: string; details: string[] } | null {
+  if (status.state === "running") return null;
+  if (status.state === "error" || !status.result) {
+    return {
+      kind: "error",
+      text: `Could not add ${status.source_id}: ${status.error ?? "no result"}`,
+      details: [],
+    };
+  }
+  const r = status.result;
+  const caution = addCaution(r);
+  const text =
+    (status.state === "cancelled" ? "Stopped. " : "") +
+    describeAdd(r) +
+    (caution ? ` — ${caution}` : "");
+  const nothingWorked = r.added + r.already_present + r.refreshed + r.removed === 0;
+  return {
+    kind: r.failed_total > 0 && nothingWorked ? "error" : "info",
+    text,
+    details: r.failed.slice(0, FAILURES_LISTED).map((f) => `${f.path}: ${f.reason}`),
+  };
+}
+
+/** The notice for a finished removal of the dropped root `name`. */
+export function removeNotice(
+  name: string,
+  result: RemoveSourceResult,
+): { kind: "info" | "error"; text: string; details: string[] } {
+  if (result.failed.length === 0) {
+    return { kind: "info", text: `Removed ${name} (${count(result.removed, "source")})`, details: [] };
+  }
+  return {
+    kind: "error",
+    text: `Removed ${result.removed.toLocaleString()} of ${name}; ${result.failed.length.toLocaleString()} failed`,
+    details: result.failed.slice(0, FAILURES_LISTED).map((f) => `${f.path}: ${f.reason}`),
+  };
 }
 
 /** The caution an incomplete import deserves, or null when it was complete. */

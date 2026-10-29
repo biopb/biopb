@@ -3,6 +3,8 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { toggled, useAppStore } from "../store";
+import { removeNotice } from "../utils/addSource";
+import { useNotices } from "../utils/notices";
 import { AddSourceControl } from "./AddSourceControl";
 import { Modal } from "./Modal";
 import { REASON_COLUMN, SOURCE_COLUMNS, descriptorFromRow } from "../utils/catalogRow";
@@ -551,19 +553,16 @@ export function SourceTree() {
   const [pendingRemove, setPendingRemove] = useState<{ rootUrl: string; name: string } | null>(
     null,
   );
-  const [removeError, setRemoveError] = useState<string | null>(null);
   const removeDropped = async () => {
     const target = pendingRemove;
     setPendingRemove(null);
     if (!client || !target) return;
-    setRemoveError(null);
+    const { notify } = useNotices.getState();
     try {
-      const { failed } = await client.http.removeSource(target.rootUrl);
-      if (failed.length > 0) {
-        setRemoveError(`Could not remove ${failed.length} of ${target.name}: ${failed[0]!.reason}`);
-      }
+      const n = removeNotice(target.name, await client.http.removeSource(target.rootUrl));
+      notify(n.kind, n.text, n.details);
     } catch (e) {
-      setRemoveError(`Could not remove ${target.name}: ${e instanceof Error ? e.message : String(e)}`);
+      notify("error", `Could not remove ${target.name}: ${e instanceof Error ? e.message : String(e)}`);
     }
     await refreshTree().catch(() => {});
   };
@@ -767,9 +766,6 @@ export function SourceTree() {
           />
           <AddSourceControl />
         </div>
-        {removeError && (
-          <div style={{ fontSize: 11, color: "#fca5a5", marginTop: 4 }}>{removeError}</div>
-        )}
         {scanning && !topEmpty && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             Still indexing the data folder; more sources may appear

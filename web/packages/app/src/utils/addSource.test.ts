@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AddSourceJobStatus, AddSourceResult } from "@biopb/tensor-flight-client";
-import { addCaution, describeAdd, runAdd } from "./addSource";
+import { addCaution, addNotice, describeAdd, removeNotice, runAdd } from "./addSource";
 
 const status = (
   state: AddSourceJobStatus["state"],
@@ -88,6 +88,61 @@ describe("describeAdd", () => {
   it("reports failures and an empty result", () => {
     expect(describeAdd(result({ added: 2, failed_total: 1 }))).toBe("Added 2 sources, 1 failed");
     expect(describeAdd(result())).toBe("Nothing found to add");
+  });
+});
+
+describe("addNotice", () => {
+  it("is nothing while the add still runs", () => {
+    expect(addNotice(status("running"))).toBeNull();
+  });
+
+  it("tells a finished add in one info line", () => {
+    const n = addNotice(status("done", { result: result({ added: 3, already_present: 1 }) }));
+    expect(n).toEqual({ kind: "info", text: "Added 3 sources, 1 already served", details: [] });
+  });
+
+  it("says when it was stopped, and keeps what it registered", () => {
+    const n = addNotice(status("cancelled", { result: result({ added: 2 }) }));
+    expect(n?.text).toBe("Stopped. Added 2 sources");
+  });
+
+  it("lists the first failed paths, as info while something worked", () => {
+    const failed = ["a", "b", "c", "d"].map((p) => ({ path: `/x/${p}`, reason: "unreadable" }));
+    const n = addNotice(status("done", { result: result({ added: 1, failed, failed_total: 4 }) }));
+    expect(n?.kind).toBe("info");
+    expect(n?.details).toEqual(["/x/a: unreadable", "/x/b: unreadable", "/x/c: unreadable"]);
+  });
+
+  it("is an error when the add failed, or came to nothing but failures", () => {
+    const failed = [{ path: "/x/a", reason: "unreadable" }];
+    expect(addNotice(status("error", { error: "path not found" }))).toEqual({
+      kind: "error",
+      text: "Could not add /data: path not found",
+      details: [],
+    });
+    expect(addNotice(status("done", { result: result({ failed, failed_total: 1 }) }))?.kind).toBe(
+      "error",
+    );
+  });
+});
+
+describe("removeNotice", () => {
+  it("confirms a clean removal with the count", () => {
+    expect(removeNotice("scratch", { removed: 3, failed: [] })).toEqual({
+      kind: "info",
+      text: "Removed scratch (3 sources)",
+      details: [],
+    });
+  });
+
+  it("is an error naming the failures when any remain", () => {
+    const n = removeNotice("scratch", {
+      removed: 2,
+      failed: [{ path: "zarr_a", reason: "not present (already removed?)" }],
+    });
+    expect(n.kind).toBe("error");
+    expect(n.text).toBe("Removed 2 of scratch; 1 failed");
+    expect(n.details).toEqual(["zarr_a: not present (already removed?)"]);
   });
 });
 

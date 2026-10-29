@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AddSourceJobStatus } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
-import { addCaution, describeAdd, runAdd } from "../utils/addSource";
+import { addNotice, runAdd } from "../utils/addSource";
+import { useNotices } from "../utils/notices";
 import { FileBrowser } from "./admin/FileBrowser";
 
 const NOTE: React.CSSProperties = { fontSize: 11, color: "#64748b", marginTop: 4 };
@@ -19,8 +20,8 @@ export function AddSourceControl() {
   const client = useAppStore((s) => s.client);
   const refreshTree = useAppStore((s) => s.refreshTree);
   const [browsing, setBrowsing] = useState(false);
+  // The add under way; its outcome goes to a notice, not here.
   const [job, setJob] = useState<AddSourceJobStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const alive = useRef(true);
   const shown = useRef(0);
   useEffect(() => {
@@ -37,10 +38,10 @@ export function AddSourceControl() {
   const add = async (path: string) => {
     if (!client) return;
     setBrowsing(false);
-    setError(null);
     setJob(null);
     shown.current = 0;
     const reread = () => void refreshTree().catch(() => {});
+    const { notify } = useNotices.getState();
     try {
       const last = await runAdd(
         client.http,
@@ -58,10 +59,12 @@ export function AddSourceControl() {
         undefined,
         () => !alive.current,
       );
-      if (alive.current) setJob(last);
+      const outcome = addNotice(last);
+      if (outcome) notify(outcome.kind, outcome.text, outcome.details);
     } catch (e) {
-      if (alive.current) setError(e instanceof Error ? e.message : String(e));
+      notify("error", `Could not add ${path}: ${e instanceof Error ? e.message : String(e)}`);
     }
+    if (alive.current) setJob(null);
     reread();
   };
 
@@ -69,9 +72,6 @@ export function AddSourceControl() {
     if (!client || !job) return;
     client.http.cancelAddSource(job.source_id).catch(() => {});
   };
-
-  const result = job?.result;
-  const caution = result ? addCaution(result) : null;
 
   return (
     <>
@@ -101,30 +101,6 @@ export function AddSourceControl() {
             </button>
           </div>
         )}
-        {!running && job?.state === "error" && (
-          <div style={{ ...NOTE, color: "#fca5a5" }}>
-            Could not add {job.source_id}: {job.error}{" "}
-            <button type="button" className="icon-btn" onClick={() => setJob(null)}>
-              Dismiss
-            </button>
-          </div>
-        )}
-        {!running && result && job?.state !== "error" && (
-          <div style={NOTE}>
-            {job?.state === "cancelled" ? "Stopped. " : ""}
-            {describeAdd(result)}
-            {caution && <> — {caution}</>}{" "}
-            <button type="button" className="icon-btn" onClick={() => setJob(null)}>
-              Dismiss
-            </button>
-            {result.failed.slice(0, 3).map((f) => (
-              <div key={f.path} style={{ color: "#fca5a5" }} title={f.reason}>
-                {f.path}: {f.reason}
-              </div>
-            ))}
-          </div>
-        )}
-        {error && <div style={{ ...NOTE, color: "#fca5a5" }}>{error}</div>}
       </div>
     </>
   );
