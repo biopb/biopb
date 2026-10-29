@@ -47,11 +47,9 @@ listeners too — defense-in-depth on a shared machine. "No token" is the local
 **default**, not a property of local mode.
 
 **`/api/admin/status`'s `local` flag is a proxy for the bind, not the bind
-itself**: it reports `true` exactly when `token is None`. A loopback
-deployment running behind an optional token therefore reports `local: false`,
-which hides the `/api/admin/browse` file chooser it would otherwise qualify
-for. It fails closed — the data endpoints are unaffected — but it's the thing
-to remember when a local, token-protected box can't browse.
+itself**: it reports `true` exactly when `token is None`. Nothing in the admin
+page keys off it; the `/api/admin/browse` file chooser is gated by the token
+like every other admin route.
 
 ## Endpoints
 
@@ -78,7 +76,7 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
-| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth note above) |
+| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker; also says whether the requested path exists |
 
 > **`/readyz` connects.** It opens the Flight connection if none exists yet,
 > so it answers from the backend rather than from whatever traffic happened

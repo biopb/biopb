@@ -305,7 +305,7 @@ export interface BrowseEntry {
 }
 
 /** Response of `GET /api/admin/browse`: one directory level of the server's FS.
- * Local-mode only; `parent` is null at the filesystem root (biopb/biopb#244). */
+ * `parent` is null at the filesystem root (biopb/biopb#244). */
 export interface BrowseResponse {
   /** Absolute path of the listed directory. */
   path: string;
@@ -314,6 +314,9 @@ export interface BrowseResponse {
   entries: BrowseEntry[];
   /** True when the listing hit the server's per-directory entry cap. */
   truncated: boolean;
+  /** Whether the requested path itself exists; the listing of a missing child
+   * is its parent's. Absent from a server that predates it. */
+  exists?: boolean;
 }
 
 // ---------------------------------------------------------------------------

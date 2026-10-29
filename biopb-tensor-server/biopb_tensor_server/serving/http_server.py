@@ -3197,17 +3197,9 @@ async def admin_status(request: Request) -> JSONResponse:
             # (which owns the process). A self-managed plane can't be restarted
             # from the browser (biopb/biopb#418).
             "supervised": ctx.supervised,
-            # No token enforced. The admin UI keys the local-only server-side file
-            # chooser (#244) off this, since a tokenless plane is loopback-bound
-            # and its filesystem *is* the user's own box.
-            #
-            # KNOWN LIMITATION: this is a proxy for topology, not topology itself.
-            # It was exact while the two-mode model tied the token to the bind
-            # (biopb/biopb#447), but local mode now accepts an optional token, so a
-            # loopback-bound plane behind one reports false here and loses the file
-            # chooser even though its filesystem really is the user's own box. It
-            # fails closed (a feature hides), so it is accepted for now; the fix is
-            # to derive this from the actual bind. See biopb/biopb#470.
+            # No token enforced. A proxy for the loopback bind, not the bind
+            # itself: local mode accepts an optional token, so a loopback plane
+            # behind one reports false. Nothing in the admin UI keys off it.
             "local": ctx.token is None,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
@@ -3227,33 +3219,19 @@ async def admin_status(request: Request) -> JSONResponse:
 async def admin_browse(request: Request) -> JSONResponse:
     """List a directory on the server's filesystem for the Sources file chooser.
 
-    Tokenless deployments only (biopb/biopb#244): a browsable FS listing is an
-    info-disclosure surface, so it is served **only** when no token is enforced —
-    a loopback-bound, single-machine deployment where the server's filesystem
-    *is* the user's own box. Otherwise it 404s (feature absent), matching how the
-    admin UI hides the "Browse…" button unless ``/api/admin/status`` reports
-    ``local``.
+    Gated by the server token like every admin route. Whoever can pass it can
+    already rewrite ``sources`` to any directory and read its contents, so a
+    listing of names discloses nothing more.
 
-    Same known limitation as the ``local`` flag this mirrors (see
-    ``admin_status``): a *local* plane behind an optional token 404s here even
-    though its filesystem is the user's own box. Fails closed; see
-    biopb/biopb#470.
-
-    Returns ``{path, parent, entries: [{name, is_dir}], truncated}``. No path (or
-    a blank one) starts at the server user's home directory; a path that is a file
-    resolves to its containing directory so the chooser can navigate from it. One
+    Returns ``{path, parent, entries: [{name, is_dir}], truncated, exists}``. No
+    path (or a blank one) starts at the server user's home directory; a path that
+    is a file resolves to its containing directory so the chooser can navigate
+    from it. ``exists`` says whether the requested path itself is there, which a
+    listing of its parent does not (a blank path counts as existing). One
     unreadable entry never fails the whole listing.
     """
     ctx = _sidecar(request)
-    ctx.check_token(request)  # no-op in local mode; guards a misconfigured caller
-    if ctx.token is not None:
-        # A token is enforced: never expose the server's filesystem to what may be
-        # a remote browser. (Conservative — a local plane behind an optional token
-        # is caught here too; see the limitation noted above.)
-        raise HTTPException(
-            status_code=404,
-            detail="File browsing is available only on a tokenless local server",
-        )
+    ctx.check_token(request)
 
     from pathlib import Path
 
@@ -3299,6 +3277,7 @@ async def admin_browse(request: Request) -> JSONResponse:
             "parent": parent,
             "entries": entries,
             "truncated": truncated,
+            "exists": base.exists(),
         }
     )
 

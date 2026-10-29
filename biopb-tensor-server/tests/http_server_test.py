@@ -1666,8 +1666,6 @@ class TestAdminStatusRoute:
         assert body["config_path"] == str(config_path)
         assert isinstance(body["pid"], int)
         assert body["version"]
-        # No token enforced ⇒ local mode; the admin UI keys the file chooser off
-        # this (biopb/biopb#244).
         assert body["local"] is True
 
     def test_status_reports_not_supervised_by_default(self, admin_client):
@@ -1683,7 +1681,6 @@ class TestAdminStatusRoute:
         assert tc.get("/api/admin/status").json()["supervised"] is True
 
     def test_status_reports_not_local_when_token_enforced(self, tmp_path):
-        # A token means remote mode; the admin UI then hides the file chooser.
         config_path = tmp_path / "biopb.json"
         config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
         mock_fc = _build_mock_client()
@@ -1753,8 +1750,25 @@ class TestAdminBrowseRoute:
         # A non-existent path resolves to a non-existent parent → not a directory.
         assert r.status_code == 404
 
-    def test_browse_unavailable_in_remote_mode(self, tmp_path):
-        # Remote mode (token enforced): the FS-listing surface must not exist.
+    def test_browse_reports_whether_the_requested_path_exists(
+        self, admin_client, tmp_path
+    ):
+        tc, _ = admin_client
+        (tmp_path / "here").mkdir()
+        (tmp_path / "f.txt").write_text("x")
+
+        def exists(path):
+            r = tc.get("/api/admin/browse", params={"path": str(path)})
+            assert r.status_code == 200
+            return r.json()["exists"]
+
+        assert exists(tmp_path / "here") is True
+        assert exists(tmp_path / "f.txt") is True
+        # A missing child lists its parent, so the listing alone cannot tell.
+        assert exists(tmp_path / "typo") is False
+        assert tc.get("/api/admin/browse").json()["exists"] is True
+
+    def test_browse_is_gated_by_the_token_not_hidden_by_it(self, tmp_path):
         config_path = tmp_path / "biopb.json"
         config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
         mock_fc = _build_mock_client()
@@ -1765,12 +1779,11 @@ class TestAdminBrowseRoute:
         ):
             app = create_app(token=_TOKEN, config_path=str(config_path))
             with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.get(
-                    "/api/admin/browse",
-                    params={"path": str(tmp_path)},
-                    headers=_bearer(_TOKEN),
-                )
-                assert r.status_code == 404
+                params = {"path": str(tmp_path)}
+                assert tc.get("/api/admin/browse", params=params).status_code == 401
+                r = tc.get("/api/admin/browse", params=params, headers=_bearer(_TOKEN))
+                assert r.status_code == 200
+                assert r.json()["path"] == str(tmp_path.resolve())
 
 
 class TestCreateAppSupervisedFromEnv:

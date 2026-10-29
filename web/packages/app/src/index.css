@@ -449,6 +449,7 @@ html, body {
 /* Source entry fields are SchemaField (.setting-field); this only stacks them. */
 .source-row-grid { display: flex; flex-direction: column; gap: 1.1rem; }
 .source-row-errors { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fca5a5; font-size: 12px; }
+.source-row-warnings { margin: 0.5rem 0 0; padding-left: 1.1rem; color: #fcd34d; font-size: 12px; }
 
 .admin-banner.degraded { background: #422006; color: #fcd34d; border: 1px solid #b45309; }
 

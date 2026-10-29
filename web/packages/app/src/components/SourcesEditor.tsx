@@ -29,9 +29,11 @@ interface SourcesEditorProps {
   schema: ConfigSchema | null;
   /** Per-source-index validation messages from a rejected PUT (422). */
   errorsByIndex: Record<number, string[]>;
+  /** Per-source-index notes that do not block a save (e.g. a path not found). */
+  warningsByIndex?: Record<number, string[]>;
   disabled?: boolean;
   /** Open the server-side file chooser for local row `i`, seeded from its current
-   * URL. Provided only in local mode (biopb/biopb#244). */
+   * URL (biopb/biopb#244). */
   onBrowse?: (i: number) => void;
 }
 
@@ -59,6 +61,7 @@ export function SourcesEditor({
   onChange,
   schema,
   errorsByIndex,
+  warningsByIndex = {},
   disabled,
   onBrowse,
 }: SourcesEditorProps) {
@@ -210,6 +213,13 @@ export function SourcesEditor({
                   {errs.length > 0 && (
                     <ul className="source-row-errors">
                       {errs.map((m, k) => (
+                        <li key={k}>{m}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {(warningsByIndex[i] ?? []).length > 0 && (
+                    <ul className="source-row-warnings">
+                      {warningsByIndex[i]!.map((m, k) => (
                         <li key={k}>{m}</li>
                       ))}
                     </ul>
