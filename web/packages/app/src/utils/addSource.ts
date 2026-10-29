@@ -4,31 +4,40 @@ import type {
   RemoveSourceResult,
   TensorHttpClient,
 } from "@biopb/tensor-flight-client";
+import type { NoticeDraft } from "./notices";
 
 /** Wait between polls of a running add. */
 export const ADD_POLL_MS = 1000;
 
 type AddApi = Pick<TensorHttpClient, "addSource" | "addSourceStatus">;
 
+interface RunAddOptions {
+  /** Pause between polls; replaced in tests. */
+  wait?: (ms: number) => Promise<void>;
+  /** True to stop following (the add itself carries on server-side). */
+  stopped?: () => boolean;
+}
+
 /**
  * Add a server path and follow it to the end, reporting each status read.
  *
  * Starting is idempotent per path on the server, so a path already being added
- * is joined, not started twice. Resolves with the last status read; a failed
- * poll rejects, and the add itself carries on server-side regardless.
+ * is joined, not started twice. The server names the job by the path it
+ * normalised, so the poll asks by that name, not the one typed. Resolves with
+ * the last status read; a failed poll rejects, and the add carries on regardless.
  */
 export async function runAdd(
   api: AddApi,
   path: string,
   onUpdate: (status: AddSourceJobStatus) => void,
-  wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
-  stopped: () => boolean = () => false,
+  { wait = (ms) => new Promise((r) => setTimeout(r, ms)), stopped = () => false }: RunAddOptions = {},
 ): Promise<AddSourceJobStatus> {
   let status = await api.addSource(path);
+  const job = status.source_id;
   onUpdate(status);
   while (status.state === "running" && !stopped()) {
     await wait(ADD_POLL_MS);
-    status = await api.addSourceStatus(path);
+    status = await api.addSourceStatus(job);
     onUpdate(status);
   }
   return status;
@@ -48,7 +57,6 @@ export function describeAdd(result: AddSourceResult): string {
   if (result.removed) parts.push(`${result.removed.toLocaleString()} gone from disk`);
   if (result.failed_total) parts.push(`${result.failed_total.toLocaleString()} failed`);
   if (parts.length === 0) return "Nothing found to add";
-  // "Added" leads the first clause only when there was something added.
   return parts.join(", ");
 }
 
@@ -61,9 +69,7 @@ const FAILURES_LISTED = 3;
  * An error when the add itself failed, or when it came to nothing but failures;
  * otherwise info, with any failed paths listed under it.
  */
-export function addNotice(
-  status: AddSourceJobStatus,
-): { kind: "info" | "error"; text: string; details: string[] } | null {
+export function addNotice(status: AddSourceJobStatus): NoticeDraft | null {
   if (status.state === "running") return null;
   if (status.state === "error" || !status.result) {
     return {
@@ -87,10 +93,7 @@ export function addNotice(
 }
 
 /** The notice for a finished removal of the dropped root `name`. */
-export function removeNotice(
-  name: string,
-  result: RemoveSourceResult,
-): { kind: "info" | "error"; text: string; details: string[] } {
+export function removeNotice(name: string, result: RemoveSourceResult): NoticeDraft {
   if (result.failed.length === 0) {
     return { kind: "info", text: `Removed ${name} (${count(result.removed, "source")})`, details: [] };
   }

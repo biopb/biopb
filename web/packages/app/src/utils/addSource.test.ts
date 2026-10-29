@@ -39,7 +39,7 @@ describe("runAdd", () => {
     };
     const seen: string[] = [];
     const wait = vi.fn().mockResolvedValue(undefined);
-    const last = await runAdd(api, "/data", (s) => seen.push(s.state), wait);
+    const last = await runAdd(api, "/data", (s) => seen.push(s.state), { wait });
     expect(last.state).toBe("done");
     expect(seen).toEqual(["running", "running", "done"]);
     expect(wait).toHaveBeenCalledTimes(2);
@@ -51,7 +51,7 @@ describe("runAdd", () => {
       addSource: vi.fn().mockResolvedValue(status("error", { error: "path not found" })),
       addSourceStatus: vi.fn(),
     };
-    const last = await runAdd(api, "/nope", () => {}, vi.fn());
+    const last = await runAdd(api, "/nope", () => {}, { wait: vi.fn() });
     expect(last.error).toBe("path not found");
     expect(api.addSourceStatus).not.toHaveBeenCalled();
   });
@@ -65,9 +65,19 @@ describe("runAdd", () => {
     const wait = vi.fn(async () => {
       stop = true;
     });
-    const last = await runAdd(api, "/data", () => {}, wait, () => stop);
+    const last = await runAdd(api, "/data", () => {}, { wait, stopped: () => stop });
     expect(last.state).toBe("running");
     expect(api.addSourceStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("polls by the name the server gave the job, not the path as typed", async () => {
+    const api = {
+      addSource: vi.fn().mockResolvedValue(status("running", { source_id: "/data" })),
+      addSourceStatus: vi.fn().mockResolvedValue(status("done", { source_id: "/data" })),
+    };
+    await runAdd(api, "/data/", () => {}, { wait: vi.fn().mockResolvedValue(undefined) });
+    expect(api.addSource).toHaveBeenCalledWith("/data/");
+    expect(api.addSourceStatus).toHaveBeenCalledWith("/data");
   });
 });
 

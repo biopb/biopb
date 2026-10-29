@@ -10,6 +10,9 @@ export interface Notice {
   details: string[];
 }
 
+/** A notice before it is shown: what the helpers that word an outcome return. */
+export type NoticeDraft = Omit<Notice, "id">;
+
 /** How long an info notice stays up. An error stays until it is dismissed. */
 export const INFO_MS = 6000;
 /** Notices held at once; a newer one pushes the oldest out. */
@@ -37,7 +40,13 @@ export const useNotices = create<NoticeState>((set, get) => ({
   notices: [],
   notify(kind, text, details = []) {
     const id = nextId++;
-    set((s) => ({ notices: [...s.notices, { id, kind, text, details }].slice(-MAX_NOTICES) }));
+    const held = [...get().notices, { id, kind, text, details }];
+    // One pushed out is gone for good, and so is its timer.
+    for (const gone of held.slice(0, -MAX_NOTICES)) {
+      clearTimeout(timers.get(gone.id));
+      timers.delete(gone.id);
+    }
+    set({ notices: held.slice(-MAX_NOTICES) });
     if (kind === "info") timers.set(id, setTimeout(() => get().dismiss(id), INFO_MS));
     return id;
   },

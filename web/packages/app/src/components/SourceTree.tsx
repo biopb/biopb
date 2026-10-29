@@ -154,32 +154,27 @@ function TreeNote({ text, indent }: { text: string; indent: number }) {
  */
 function DroppedBadge({ onRemove }: { onRemove?: () => void }) {
   const why = "Added by drag-and-drop: not one of the server's configured roots, and not kept across a restart";
-  if (!onRemove) {
-    return (
-      <span className="tree-dropped" title={why}>
-        dropped
-      </span>
-    );
-  }
   // A span, not a button: the row it sits in is one, and buttons do not nest.
   return (
     <span
-      className="tree-dropped removable"
-      role="button"
-      tabIndex={0}
-      title={`${why}.\nClick to stop serving it.`}
-      onClick={(e) => {
-        e.stopPropagation();
-        onRemove();
-      }}
-      onKeyDown={(e) => {
-        if (e.key !== "Enter" && e.key !== " ") return;
-        e.preventDefault();
-        e.stopPropagation();
-        onRemove();
-      }}
+      className={onRemove ? "tree-dropped removable" : "tree-dropped"}
+      title={onRemove ? `${why}.\nClick to stop serving it.` : why}
+      {...(onRemove && {
+        role: "button",
+        tabIndex: 0,
+        onClick: (e: React.MouseEvent) => {
+          e.stopPropagation();
+          onRemove();
+        },
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          e.stopPropagation();
+          onRemove();
+        },
+      })}
     >
-      dropped ✕
+      {onRemove ? "dropped ✕" : "dropped"}
     </span>
   );
 }

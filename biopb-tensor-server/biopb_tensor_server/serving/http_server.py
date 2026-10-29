@@ -2546,6 +2546,10 @@ async def add_source(request: Request) -> JSONResponse:
     cloud = body.get("cloud", False)
     if not isinstance(cloud, bool):
         raise HTTPException(status_code=422, detail="cloud must be a boolean")
+    # The job is keyed by the path, so "/data" and "/data/" must be one key for a
+    # second add to join the first. A URL is left as typed: the server refuses it.
+    if "://" not in url:
+        url = os.path.normpath(url)
     return _start_job("add", lambda c, j: _add_worker(c, j, cloud), url, request)
 
 

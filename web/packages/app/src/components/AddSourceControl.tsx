@@ -7,14 +7,17 @@ import { FileBrowser } from "./admin/FileBrowser";
 
 const NOTE: React.CSSProperties = { fontSize: 11, color: "#64748b", marginTop: 4 };
 
+/** Fewest ms between tree re-lists while a long add runs. */
+const REFRESH_MS = 5000;
+
 /**
  * "Add path…" for the tree: pick a file or folder on the *server*, and it is
  * served from then until the server restarts (it is not written to the config).
  * The same thing a drag-and-drop does from napari, reached from the browser.
  *
- * A folder is walked and can take a while, so the tree is refreshed as sources
- * land rather than at the end, and the walk can be cancelled (what it has
- * registered stays).
+ * A folder is walked and can take a while, so the tree is refreshed every few
+ * seconds as sources land rather than only at the end, and the walk can be
+ * cancelled (what it has registered stays).
  */
 export function AddSourceControl() {
   const client = useAppStore((s) => s.client);
@@ -23,7 +26,6 @@ export function AddSourceControl() {
   // The add under way; its outcome goes to a notice, not here.
   const [job, setJob] = useState<AddSourceJobStatus | null>(null);
   const alive = useRef(true);
-  const shown = useRef(0);
   useEffect(() => {
     alive.current = true;
     return () => {
@@ -39,9 +41,21 @@ export function AddSourceControl() {
     if (!client) return;
     setBrowsing(false);
     setJob(null);
-    shown.current = 0;
-    const reread = () => void refreshTree().catch(() => {});
     const { notify } = useNotices.getState();
+    // Sources show up in the tree as they register, but re-listing the catalog
+    // is a request per open folder: at most one at a time, and not every poll.
+    let shown = 0;
+    let lastRead = 0;
+    let reading = false;
+    const reread = () => {
+      reading = true;
+      lastRead = Date.now();
+      refreshTree()
+        .catch(() => {})
+        .finally(() => {
+          reading = false;
+        });
+    };
     try {
       const last = await runAdd(
         client.http,
@@ -49,15 +63,13 @@ export function AddSourceControl() {
         (s) => {
           if (!alive.current) return;
           setJob(s);
-          // New sources are on the server's tree as they register.
           const n = s.progress.added_count ?? 0;
-          if (n !== shown.current) {
-            shown.current = n;
+          if (n !== shown && !reading && Date.now() - lastRead >= REFRESH_MS) {
+            shown = n;
             reread();
           }
         },
-        undefined,
-        () => !alive.current,
+        { stopped: () => !alive.current },
       );
       const outcome = addNotice(last);
       if (outcome) notify(outcome.kind, outcome.text, outcome.details);
@@ -91,17 +103,15 @@ export function AddSourceControl() {
       )}
 
       {/* Under the search box: sits in the header's column, not in the row. */}
-      <div style={{ gridColumn: "1 / -1" }}>
-        {running && job && (
-          <div style={NOTE}>
-            {job.cancel_requested ? "Cancelling" : "Adding"} {job.source_id}…{" "}
-            {(job.progress.added_count ?? 0).toLocaleString()} found{" "}
-            <button type="button" className="icon-btn" onClick={cancel} disabled={job.cancel_requested}>
-              Cancel
-            </button>
-          </div>
-        )}
-      </div>
+      {running && job && (
+        <div style={{ ...NOTE, gridColumn: "1 / -1" }}>
+          {job.cancel_requested ? "Cancelling" : "Adding"} {job.source_id}…{" "}
+          {(job.progress.added_count ?? 0).toLocaleString()} found{" "}
+          <button type="button" className="icon-btn" onClick={cancel} disabled={job.cancel_requested}>
+            Cancel
+          </button>
+        </div>
+      )}
     </>
   );
 }

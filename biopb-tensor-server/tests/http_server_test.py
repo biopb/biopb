@@ -1836,6 +1836,21 @@ class TestAdminRuntimeSources:
         assert call.args == ("/data/exp",)
         assert call.kwargs["cloud"] is False
 
+    def test_a_path_with_and_without_a_trailing_slash_is_one_job(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        self._client(tc).register_local_path.return_value = AddSourceResult()
+        r = tc.post("/api/admin/sources/add", json={"url": "/data//exp/"})
+        assert r.json()["source_id"] == "/data/exp"
+        self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": "/data/exp"},
+            lambda b: b["state"] != "running",
+        )
+        assert self._client(tc).register_local_path.call_args.args == ("/data/exp",)
+
     def test_add_passes_the_cloud_flag(self, admin_client):
         from biopb.tensor.descriptor_pb2 import AddSourceResult
 
