@@ -5,6 +5,7 @@ Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 """
 
 import json
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -1803,6 +1804,24 @@ class TestAdminRuntimeSources:
                 return body
             time.sleep(0.02)
 
+    def _add(self, tc, url, **extra):
+        """Start an add and wait it out: ``(job, final status)``.
+
+        The job is named by the path as the server normalised it, which is the
+        platform's own spelling (``\\data\\exp`` on Windows), so a poll asks by the
+        name the start returned, as the SPA does.
+        """
+        r = tc.post("/api/admin/sources/add", json={"url": url, **extra})
+        assert r.status_code == 202
+        job = r.json()["source_id"]
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": job},
+            lambda b: b["state"] != "running",
+        )
+        return job, body
+
     def test_add_runs_as_a_job_and_ends_with_the_tally(self, admin_client):
         from biopb.tensor.descriptor_pb2 import AddSourceResult
 
@@ -1811,16 +1830,8 @@ class TestAdminRuntimeSources:
         result.failed.add(path="/data/bad.tif", reason="unreadable")
         self._client(tc).register_local_path.return_value = result
 
-        r = tc.post("/api/admin/sources/add", json={"url": " /data/exp "})
-        assert r.status_code == 202
-        assert r.json()["source_id"] == "/data/exp"
-
-        body = self._wait(
-            tc,
-            "/api/admin/sources/add/status",
-            {"url": "/data/exp"},
-            lambda b: b["state"] != "running",
-        )
+        job, body = self._add(tc, " /data/exp ")
+        assert job == os.path.normpath("/data/exp")
         assert body["state"] == "done"
         assert body["result"] == {
             "added": 2,
@@ -1833,7 +1844,7 @@ class TestAdminRuntimeSources:
             "failed_total": 1,
         }
         call = self._client(tc).register_local_path.call_args
-        assert call.args == ("/data/exp",)
+        assert call.args == (job,)
         assert call.kwargs["cloud"] is False
 
     def test_a_path_with_and_without_a_trailing_slash_is_one_job(self, admin_client):
@@ -1841,28 +1852,17 @@ class TestAdminRuntimeSources:
 
         tc, _ = admin_client
         self._client(tc).register_local_path.return_value = AddSourceResult()
-        r = tc.post("/api/admin/sources/add", json={"url": "/data//exp/"})
-        assert r.json()["source_id"] == "/data/exp"
-        self._wait(
-            tc,
-            "/api/admin/sources/add/status",
-            {"url": "/data/exp"},
-            lambda b: b["state"] != "running",
-        )
-        assert self._client(tc).register_local_path.call_args.args == ("/data/exp",)
+        job, _ = self._add(tc, "/data//exp/")
+        assert job == os.path.normpath("/data/exp")
+        # The walk is asked for by that same spelling.
+        assert self._client(tc).register_local_path.call_args.args == (job,)
 
     def test_add_passes_the_cloud_flag(self, admin_client):
         from biopb.tensor.descriptor_pb2 import AddSourceResult
 
         tc, _ = admin_client
         self._client(tc).register_local_path.return_value = AddSourceResult()
-        tc.post("/api/admin/sources/add", json={"url": "/od", "cloud": True})
-        self._wait(
-            tc,
-            "/api/admin/sources/add/status",
-            {"url": "/od"},
-            lambda b: b["state"] != "running",
-        )
+        self._add(tc, "/od", cloud=True)
         assert self._client(tc).register_local_path.call_args.kwargs["cloud"] is True
 
     @pytest.mark.parametrize(
@@ -1878,13 +1878,7 @@ class TestAdminRuntimeSources:
         self._client(tc).register_local_path.side_effect = flight.FlightServerError(
             "path not found: /nope"
         )
-        tc.post("/api/admin/sources/add", json={"url": "/nope"})
-        body = self._wait(
-            tc,
-            "/api/admin/sources/add/status",
-            {"url": "/nope"},
-            lambda b: b["state"] != "running",
-        )
+        _, body = self._add(tc, "/nope")
         assert body["state"] == "error"
         assert "path not found: /nope" in body["error"]
 
@@ -1899,13 +1893,15 @@ class TestAdminRuntimeSources:
             return AddSourceResult(added=["a"])
 
         self._client(tc).register_local_path.side_effect = walk
-        tc.post("/api/admin/sources/add", json={"url": "/big"})
-        r = tc.post("/api/admin/sources/add/cancel", params={"url": "/big"})
+        job = tc.post("/api/admin/sources/add", json={"url": "/big"}).json()[
+            "source_id"
+        ]
+        r = tc.post("/api/admin/sources/add/cancel", params={"url": job})
         assert r.status_code == 200
         body = self._wait(
             tc,
             "/api/admin/sources/add/status",
-            {"url": "/big"},
+            {"url": job},
             lambda b: b["state"] != "running",
         )
         assert body["state"] == "cancelled"
