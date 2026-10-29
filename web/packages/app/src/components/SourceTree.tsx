@@ -16,7 +16,6 @@ import {
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
   buildTree,
-  droppedRootUrl,
   groupTensors,
   isEmptySource,
   isUnresolved,
@@ -225,7 +224,7 @@ export function TreeRow({
 }: TreeRowProps) {
   // Half a Chevron's width per level, so a deep tree keeps room for its labels.
   const indent = node.depth * INDENT_STEP + 12;
-  const droppedRoot = onRemoveDropped ? droppedRootUrl(node) : null;
+  const droppedRoot = onRemoveDropped && node.dropped ? node.rootUrl : undefined;
   const droppedBadge = node.dropped && (
     <DroppedBadge
       onRemove={

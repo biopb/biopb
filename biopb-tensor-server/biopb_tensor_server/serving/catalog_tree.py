@@ -5,7 +5,8 @@ catalog's own cursor: the folders directly under a folder, and the sources
 sitting in it.
 """
 
-from typing import AbstractSet, Any, Dict, List
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping
 
 from biopb_tensor_server.serving.tree_paths import SEP, dec, enc, key_dir
 
@@ -33,7 +34,7 @@ def children(
     cursor: Any,
     key: str,
     limit: int = DEFAULT_LIMIT,
-    dropped: AbstractSet[str] = frozenset(),
+    dropped: Mapping[str, str] = MappingProxyType({}),
 ) -> Dict[str, Any]:
     """The direct children of folder *key*: ``{key, folders: [{name, key}],
     sources: [{name, source_id}], truncated}``.
@@ -44,9 +45,10 @@ def children(
     id; a resolved source holding no tensor is not listed. A *limit* above
     ``MAX_LIMIT`` is that.
 
-    *dropped* names the top-level folders that hold a drag-dropped (``dnd://``)
-    root. At the top only, a folder starting in one carries ``"dropped": true``;
-    nothing else carries the field, so a level without one is unchanged.
+    *dropped* maps the top-level folders that hold a drag-dropped (``dnd://``)
+    root to that root's url. At the top only, a folder starting in one carries
+    ``"dropped": true`` and ``"root_url"``, the url to remove it by; nothing else
+    carries either, so a level without one is unchanged.
     """
     limit = min(limit, MAX_LIMIT)
     here = key_dir(key)
@@ -85,8 +87,9 @@ def children(
     for seg, lo, hi, _, _ in folder_rows[:limit]:
         name = "/".join(_chain(lo, hi))
         folder = {"name": dec(name), "key": dec(f"{enc(key)}/{name}" if key else name)}
-        if not key and dec(seg) in dropped:
+        if not key and (root_url := dropped.get(dec(seg))):
             folder["dropped"] = True
+            folder["root_url"] = root_url
         folders.append(folder)
     folders.sort(key=lambda f: f["name"].encode("utf-8"))
     sources: List[Dict[str, str]] = []

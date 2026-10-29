@@ -43,27 +43,13 @@ export interface TreeNode {
    * tree otherwise shows like any other path. Present, and true, only then.
    */
   dropped?: boolean;
+  /** With `dropped`: the `dnd://` root to remove it by, when the server named it. */
+  rootUrl?: string;
 }
 
 /** Whether a source's url carries the drag-drop origin scheme. */
 export function isDropped(src: DataSourceDescriptor): boolean {
   return src.source_url.startsWith(DND_URL_PREFIX);
-}
-
-/**
- * The `dnd://` root a dropped top-level node stands for, which is what the
- * server removes by; null for any other node. A folder's id is its key, and a
- * single-child chain ("scratch/sub") is one node, so the root is its first
- * segment. A dropped dataset is its own root: its url.
- */
-export function droppedRootUrl(node: TreeNode): string | null {
-  if (!node.dropped) return null;
-  if (node.type === "folder") {
-    const top = node.id.split("/")[0];
-    return top ? DND_URL_PREFIX + top : null;
-  }
-  const url = node.source?.source_url ?? "";
-  return url.startsWith(DND_URL_PREFIX) ? url : null;
 }
 
 /** Shown under a folder the server holds more of than it sent. */
@@ -104,7 +90,7 @@ export function lazyTreeNodes(
       depth,
       children: isOpen ? lazyTreeNodes(levels, status, open, f.key, depth + 1) : [],
       note: isOpen ? levelNote(levels[f.key]?.level, status[f.key]) : undefined,
-      ...(f.dropped ? { dropped: true } : {}),
+      ...(f.dropped ? { dropped: true, rootUrl: f.root_url } : {}),
     };
   });
   const sources = level.sources.map(
@@ -115,8 +101,11 @@ export function lazyTreeNodes(
       children: [],
       source: s.descriptor,
       depth,
-      // A dropped file or dataset is a source at the top, not a folder.
-      ...(!key && isDropped(s.descriptor) ? { dropped: true } : {}),
+      // A dropped file or dataset is a source at the top, not a folder; its
+      // own url is the root.
+      ...(!key && isDropped(s.descriptor)
+        ? { dropped: true, rootUrl: s.descriptor.source_url }
+        : {}),
     }),
   );
   return [...folders, ...sources];
