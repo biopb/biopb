@@ -6,10 +6,9 @@ import { Modal } from "../Modal";
  * Server-side file/directory chooser (biopb/biopb#244).
  *
  * Navigates the *server's* filesystem via `GET /api/admin/browse`, so the user
- * picks a real server path (`/data/microscopy`) instead of typing it. Only
- * mounted in **local mode** — where the server's filesystem is the user's own
- * machine — so it never discloses a remote host's files; the caller gates it on
- * `AdminStatus.local`.
+ * picks a real server path (`/data/microscopy`) instead of typing it. The route
+ * is behind the server token like the rest of the admin page, so it is offered
+ * wherever the page is.
  *
  * The user can navigate into directories, go up, pick a directory ("Use this
  * folder"), or pick a file (click it). Path joining infers the separator from

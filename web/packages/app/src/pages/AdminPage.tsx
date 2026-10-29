@@ -20,6 +20,7 @@ import { AdminNav } from "../components/admin/AdminNav";
 import { SectionFields } from "../components/admin/SectionFields";
 import { RawJsonPanel } from "../components/admin/RawJsonPanel";
 import { FileBrowser } from "../components/admin/FileBrowser";
+import { checkablePath, useMissingPaths } from "../hooks/useMissingPaths";
 import {
   DEFAULT_ADMIN_NAV_ID,
   navItemById,
@@ -171,6 +172,14 @@ export function AdminPage() {
     (p?: string) => client!.http.browse(p),
     [client],
   );
+
+  // Local source paths the server says are not there: a warning on the row, not
+  // an error (a path can be a drive that is not mounted yet).
+  const sourcePaths = useMemo(
+    () => getSources(config).flatMap((s) => checkablePath(s.url) ?? []),
+    [config],
+  );
+  const missingPaths = useMissingPaths(browse, sourcePaths);
 
   // Initial load.
   useEffect(() => {
@@ -381,9 +390,13 @@ export function AdminPage() {
 
   const sources = getSources(config);
   const activeItem = navItemById(activeSection);
-  // Local mode ⇒ the server's filesystem is this machine, so the "Browse…" file
-  // chooser is safe to offer (biopb/biopb#244). Absent/false ⇒ typed path only.
-  const localMode = status?.local === true;
+  const sourceWarnings: Record<number, string[]> = {};
+  sources.forEach((s, i) => {
+    const path = checkablePath(s.url);
+    if (path && missingPaths.has(path)) {
+      sourceWarnings[i] = ["No such file or folder on the server."];
+    }
+  });
 
   return (
     <div className="app-shell admin-shell">
@@ -493,8 +506,9 @@ export function AdminPage() {
                   onChange={onSourcesChange}
                   schema={schema}
                   errorsByIndex={sourceErrors}
+                  warningsByIndex={sourceWarnings}
                   disabled={restarting}
-                  onBrowse={localMode ? (i) => setBrowseRow(i) : undefined}
+                  onBrowse={(i) => setBrowseRow(i)}
                 />
               )}
 
