@@ -86,7 +86,12 @@ class TestCatalogChildren:
         finally:
             server.shutdown()
         assert level["folders"] == [
-            {"name": "scratch", "key": "scratch", "dropped": True}
+            {
+                "name": "scratch",
+                "key": "scratch",
+                "dropped": True,
+                "root_url": "dnd://scratch",
+            }
         ]
 
     def test_an_endpoint_is_one_folder(self, client):

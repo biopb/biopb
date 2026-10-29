@@ -5,8 +5,6 @@ import type {
   TreeLevel,
 } from "@biopb/tensor-flight-client";
 import {
-  type TreeNode,
-  droppedRootUrl,
   getPathParts,
   groupTensors,
   isEmptySource,
@@ -385,33 +383,51 @@ describe("lazyTreeNodes", () => {
   });
 });
 
-describe("droppedRootUrl", () => {
-  const node = (over: Partial<TreeNode>): TreeNode => ({
-    id: "x",
-    name: "x",
-    type: "folder",
-    children: [],
-    depth: 1,
-    ...over,
+describe("lazyTreeNodes dropped roots", () => {
+  const levels = (level: Partial<TreeLevel>) => ({
+    "": { level: { key: "", folders: [], sources: [], truncated: false, ...level } },
   });
 
-  it("names the dnd:// root of a dropped folder by its first segment", () => {
-    expect(droppedRootUrl(node({ id: "scratch", dropped: true }))).toBe("dnd://scratch");
-    // A single-child chain is one node; the root is still its head.
-    expect(droppedRootUrl(node({ id: "scratch/sub", dropped: true }))).toBe("dnd://scratch");
+  it("carries the root url the server named on a dropped folder", () => {
+    const [node] = lazyTreeNodes(
+      levels({
+        folders: [{ name: "scratch/sub", key: "scratch/sub", dropped: true, root_url: "dnd://scratch" }],
+      }),
+      {},
+      new Set(),
+    );
+    expect(node!.dropped).toBe(true);
+    expect(node!.rootUrl).toBe("dnd://scratch");
   });
 
   it("names a dropped dataset by its own url", () => {
     const d = source({ source_id: "d", source_url: "dnd://exp.zarr" });
-    expect(droppedRootUrl(node({ type: "source", id: "d", source: d, dropped: true }))).toBe(
-      "dnd://exp.zarr",
+    const [node] = lazyTreeNodes(
+      levels({ sources: [{ name: "exp.zarr", descriptor: d }] }),
+      {},
+      new Set(),
     );
+    expect(node!.rootUrl).toBe("dnd://exp.zarr");
   });
 
-  it("is null for anything not dropped", () => {
-    expect(droppedRootUrl(node({ id: "lab" }))).toBeNull();
+  it("names no root for a server that sent none, or for anything not dropped", () => {
     const plain = source({ source_url: "file:///data/a.zarr" });
-    expect(droppedRootUrl(node({ type: "source", source: plain, dropped: true }))).toBeNull();
+    const nodes = lazyTreeNodes(
+      levels({
+        folders: [
+          { name: "old", key: "old", dropped: true },
+          { name: "lab", key: "lab" },
+        ],
+        sources: [{ name: "a.zarr", descriptor: plain }],
+      }),
+      {},
+      new Set(),
+    );
+    expect(nodes.map((n) => [n.name, n.dropped, n.rootUrl])).toEqual([
+      ["old", true, undefined],
+      ["lab", undefined, undefined],
+      ["a.zarr", undefined, undefined],
+    ]);
   });
 });
 

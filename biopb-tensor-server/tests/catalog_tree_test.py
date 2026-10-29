@@ -97,9 +97,11 @@ class TestTreeColumns:
         folders = {f["name"]: f for f in db.catalog_children("")["folders"]}
 
         assert folders["dropped"].get("dropped") is True
+        assert folders["dropped"]["root_url"] == "dnd://dropped"
         # Every other root, an upstream's endpoint included, is left unmarked: the
         # field is there only when true, so those levels are what they were.
         assert "dropped" not in folders["lab"]
+        assert "root_url" not in folders["lab"]
         assert "dropped" not in folders["grpc://host:1/up"]
 
     def test_only_the_top_is_marked(self):
@@ -109,7 +111,7 @@ class TestTreeColumns:
         _add(db, "b", "x", CatalogRecord(None, {}, "d", "two/b.zarr"))
 
         assert db.catalog_children("")["folders"] == [
-            {"name": "lab", "key": "lab", "dropped": True}
+            {"name": "lab", "key": "lab", "dropped": True, "root_url": "dnd://lab"}
         ]
         assert db.catalog_children("lab")["folders"] == [
             {"name": "one", "key": "lab/one"},

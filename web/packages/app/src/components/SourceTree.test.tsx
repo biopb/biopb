@@ -87,7 +87,7 @@ describe("TreeRow for a dropped root", () => {
     type: "folder",
     children: [],
     depth: 1,
-    ...(dropped ? { dropped } : {}),
+    ...(dropped ? { dropped, rootUrl: "dnd://scratch" } : {}),
   });
   const source = (dropped?: boolean): TreeNode => ({
     id: LISTED.source_id,
@@ -96,7 +96,7 @@ describe("TreeRow for a dropped root", () => {
     children: [],
     source: LISTED,
     depth: 1,
-    ...(dropped ? { dropped } : {}),
+    ...(dropped ? { dropped, rootUrl: LISTED.source_url } : {}),
   });
 
   it("tags a dropped folder and a dropped dataset, and only those", () => {
@@ -121,6 +121,10 @@ describe("TreeRow for a dropped root", () => {
       );
     expect(withRemove(folder(true))).toContain("tree-dropped removable");
     expect(withRemove(folder(true))).toContain("dropped ✕");
+    // Dropped, but the server named no root (an older one): tagged, not removable.
+    const unnamed = { ...folder(true), rootUrl: undefined };
+    expect(withRemove(unnamed)).toContain("tree-dropped");
+    expect(withRemove(unnamed)).not.toContain("removable");
     // Not dropped: nothing to remove, and no tag.
     expect(withRemove(folder())).not.toContain("tree-dropped");
     // Without the handler (Recent, a search's matches) the tag stays plain.

@@ -239,6 +239,8 @@ export interface TreeFolder {
    * true, only then; a server that predates it never sends it.
    */
   dropped?: boolean;
+  /** With `dropped`: the root's url, which is what removing it names. */
+  root_url?: string;
 }
 
 /** A source directly in a folder, under the name the tree shows it by. */
