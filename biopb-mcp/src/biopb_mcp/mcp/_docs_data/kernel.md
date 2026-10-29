@@ -48,6 +48,9 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
   `sklearn`, `matplotlib`, `cv2` (opencv-headless), `ome_zarr`. `napari` is
   installed where the session can have a viewer. The kernel is stateful, so one
   import per session is enough.
+- **A figure is not in the result.** A cell that plots (`plt.show()`) says "N figures
+  displayed" and names `view_figure(job_id)`, which returns one as an image. Look only when
+  an image tells you something the numbers do not; print the numbers either way.
 
 ## Long-running jobs
 A slow `execute_code` call returns a `job-N` handle while the cell keeps running on the main

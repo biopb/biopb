@@ -302,6 +302,21 @@ class TestJobConcurrency:
         assert "task-done" in snap["stdout"]
         assert "task-done" not in quick["stdout"]
 
+    def test_a_plotted_figure_reaches_its_record(self, kernel):
+        # A plain kernel's matplotlib backend is inline, which publishes the
+        # figure as display_data: the record must keep it.
+        cell = kernel.jobs.new_id()
+        kernel.run_cell(
+            "import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])\nplt.show()",
+            cell,
+            "mcp",
+        )
+        deadline = time.monotonic() + 30.0
+        while kernel.jobs.poll(cell)["status"] == "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        assert kernel.jobs.poll(cell)["figures"] == 1
+
     @pytest.fixture
     def scratch(self):
         """A session kernel and a factory for real scratch kernels: headless by
@@ -371,6 +386,29 @@ class TestJobConcurrency:
         assert verified["cells"][1]["stdout"] == "6\n"
         assert verified["cells"][1]["result_text"] == "6"
         assert _scratch.running() is None  # the process is gone; slot free
+
+    def test_a_plotted_figure_is_in_the_verified_notebook(self, scratch):
+        # The scratch kernel's inline backend publishes the figure; the saved
+        # notebook carries it as display_data, and the cell's figure can be
+        # fetched by cell number.
+        from biopb_mcp.mcp import _notebook
+
+        _scratch, session = scratch
+        job_id = self._verify(
+            _scratch,
+            session,
+            ["import matplotlib.pyplot as plt\nplt.plot([1, 2, 3])\nplt.show()"],
+        )
+        snap = self._until(_scratch, job_id, lambda s: s["status"] != "running")
+        assert snap["status"] == "ok", snap
+        assert snap["verify"]["cells"][0]["figures"] == 1
+        png, n = _scratch.figure(job_id, 1)
+        assert n == 1 and png
+        # What every poll serialises carries the count, not the bytes.
+        assert "figure_data" not in snap["verify"]["cells"][0]
+        nb = _notebook.build_workflow_notebook(_scratch.verified())
+        (cell,) = [c for c in nb["cells"] if c["cell_type"] == "code"]
+        assert [o["output_type"] for o in cell["outputs"]] == ["display_data"]
 
     def test_cells_after_a_failure_are_skipped(self, scratch):
         _scratch, session = scratch

@@ -424,9 +424,16 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
         # full text of every cell belongs to the notebook, not to a ledger line
         # (see _scratch._record).
         head = (cell.get("stdout_head") or "").strip()
+        figs = cell.get("figures") or 0
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
             + (f" · {head}" if head else "")
+            + (
+                f" · {figs} figure{'s' if figs != 1 else ''}"
+                f" (view_figure('{job_id}', cell={i}))"
+                if figs
+                else ""
+            )
         )
 
     for i, cell in enumerate(cells, 1):
@@ -701,6 +708,46 @@ async def take_screenshot(canvas_only: bool = True) -> list:
 
 
 @mcp.tool()
+async def view_figure(job_id: str, index: int = 0, cell: int | None = None) -> list:
+    """Look at a figure a job displayed, as a PNG image.
+
+    A job that plots (matplotlib's `plt.show()`) does not
+    send the picture with its text: its result says how many figures it made and
+    names this tool. Ask for one only when you can use an image -- the numbers
+    are in the text, and a figure is a check on them, not a replacement.
+
+    Args:
+        job_id: The job that made the figure, or a verification's id.
+        index: Which of the job's figures, from 0.
+        cell: For a verification, the document's cell (1-based) that made it.
+
+    Returns the PNG as an image content block, or a note saying why not.
+    """
+    host, err = _app._require_kernel_host()
+    if err is not None:
+        return [TextContent(type="text", text=err)]
+    if _scratch.owns(job_id):
+        if cell is None:
+            return [
+                TextContent(
+                    type="text",
+                    text="A verification's figures belong to its cells: pass cell=N.",
+                )
+            ]
+        png, n = _scratch.figure(job_id, cell, index)
+    else:
+        png, n = host.jobs.figure(job_id, index)
+    if png is None:
+        why = (
+            f"it has {n} figure{'s' if n != 1 else ''} (index from 0)"
+            if n
+            else "no such job or cell, or it displayed no figures"
+        )
+        return [TextContent(type="text", text=f"No figure: {why}.")]
+    return [ImageContent(type="image", mimeType="image/png", data=png)]
+
+
+@mcp.tool()
 async def show_view(view: str, image: bool = False, max_edge: int = 1024) -> list:
     """Show the user a view of their data in the web viewer, and optionally see it yourself.
 
@@ -951,6 +998,10 @@ async def verify_workflow(document: str, title: str = "") -> str:
     biopb-mcp installed. That covers the whole class of defect that makes a
     transcript unrunnable — a cell reading a variable an earlier discarded cell
     created, a handle only this session had.
+
+    **Figures** a cell plots (matplotlib) are saved in the notebook, and the report
+    counts them per cell: `view_figure(job_id, cell=N)` shows one, if you want to
+    check a plot before keeping it.
 
     **What it does not.** The numbers are right: check them. And a scratch
     *process* is not a scratch *world* — it talks to the same tensor server and
