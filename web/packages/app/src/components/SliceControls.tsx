@@ -202,6 +202,12 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // in 2-D, on a non-RGB image of 2-4 channels. The button itself is always
   // there and keeps its pressed state, so it does not appear and vanish as one
   // moves between tensors.
+  // Whether the tensor could composite at all, whatever the preference or view;
+  // unknown (no grid yet) counts as yes rather than flashing the button grey.
+  const compositeEligible = useMemo(
+    () => tileInfo === null || compositeChannels(tileInfo, true) !== null,
+    [tileInfo],
+  );
   const compositeActive = useMemo(
     () => !render3d && tileInfo !== null && compositeChannels(tileInfo, composite) !== null,
     [render3d, tileInfo, composite],
@@ -372,21 +378,25 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           ))}
           <span style={{ flex: 1 }} />
           {/* Always here, so the row does not change as one moves between
-              tensors; it only does something for a 2-4 channel image in 2-D,
-              and says so. A toggle, so it is never `disabled`: that would be
-              the one thing that changes how it reads when it stops applying. */}
+              tensors; greyed when this tensor is not a 2-4 channel non-RGB
+              image, which no setting can composite. In 3-D it stays live: the
+              tensor is eligible, the preference just waits for the 2-D view. */}
           <button
             onClick={() => setComposite(!composite)}
             aria-pressed={composite}
+            disabled={!compositeEligible}
             title={
               compositeActive
                 ? "Showing every channel blended, each in its own colour"
-                : "Blend every channel, each in its own colour (2D, 2-4 channels, not RGB)"
+                : compositeEligible
+                  ? "Blend every channel, each in its own colour (2D only)"
+                  : "Needs a 2-4 channel image that is not RGB"
             }
             style={{
               padding: "2px 8px",
               fontSize: 10,
-              cursor: "pointer",
+              cursor: compositeEligible ? "pointer" : "default",
+              opacity: compositeEligible ? 1 : 0.4,
               background: composite ? "#4a5568" : "#2d3748",
               border: "1px solid #4a5568",
               borderRadius: 4,
