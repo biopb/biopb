@@ -711,7 +711,7 @@ async def take_screenshot(canvas_only: bool = True) -> list:
 async def view_figure(job_id: str, index: int = 0, cell: int | None = None) -> list:
     """Look at a figure a job displayed, as a PNG image.
 
-    A job that plots (matplotlib, or `show(fig_or_array)` in the kernel) does not
+    A job that plots (matplotlib's `plt.show()`) does not
     send the picture with its text: its result says how many figures it made and
     names this tool. Ask for one only when you can use an image -- the numbers
     are in the text, and a figure is a check on them, not a replacement.

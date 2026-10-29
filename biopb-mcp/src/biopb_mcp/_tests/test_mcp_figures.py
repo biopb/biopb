@@ -1,64 +1,12 @@
-"""``show()`` in the kernel and ``view_figure`` for the agent."""
+"""``view_figure`` and the note that names it."""
 
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
 from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _helpers, _kernel_rpc, _scratch, _server
+from biopb_mcp.mcp import _app, _kernel_rpc, _scratch, _server
 from biopb_mcp.mcp._job_log import JobLog
-
-
-@pytest.fixture
-def shown(monkeypatch):
-    """What ``show`` hands to IPython's ``display``."""
-    out = []
-    import IPython.display
-
-    monkeypatch.setattr(
-        IPython.display, "display", lambda obj, raw=False: out.append((obj, raw))
-    )
-    return out
-
-
-def _png_size(b64):
-    import base64
-    import io
-
-    from PIL import Image
-
-    return Image.open(io.BytesIO(base64.b64decode(b64))).size
-
-
-def test_show_publishes_an_array_as_a_png_bundle(shown):
-    _helpers.show(np.arange(64.0).reshape(8, 8))
-    ((bundle, raw),) = shown
-    assert raw and _png_size(bundle["image/png"]) == (8, 8)
-    assert bundle["text/plain"] == "<figure 8x8>"
-
-
-def test_show_downscales_to_the_longest_edge(shown):
-    _helpers.show(np.zeros((400, 200), dtype=np.uint8), max_edge=100)
-    assert _png_size(shown[0][0]["image/png"]) == (50, 100)
-
-
-def test_show_takes_a_matplotlib_figure(shown):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots()
-    ax.plot([1, 2, 3])
-    _helpers.show(fig)
-    assert _png_size(shown[0][0]["image/png"])[0] > 0
-
-
-def test_show_refuses_a_volume_and_says_what_to_do(shown):
-    with pytest.raises(ValueError, match="Slice a volume"):
-        _helpers.show(np.zeros((4, 8, 8)))
-    assert shown == []
 
 
 def test_a_result_names_its_figures_and_the_tool():

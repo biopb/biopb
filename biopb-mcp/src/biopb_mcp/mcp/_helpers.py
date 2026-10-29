@@ -11,54 +11,6 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 
-def show(obj, max_edge: int = 1024) -> None:
-    """Display *obj* as a figure the agent can look at with ``view_figure``.
-
-    *obj* is a matplotlib figure, or an array: 2-D, or H x W x 1/3/4. A non-uint8
-    array is scaled min-max over its finite values. The PNG is downscaled so its
-    longest edge is at most *max_edge*. Nothing is shown to the user: for that
-    use the viewer.
-    """
-    import base64
-    import io
-
-    import numpy as np
-    from IPython.display import display
-    from PIL import Image
-
-    if hasattr(obj, "savefig"):
-        buf = io.BytesIO()
-        obj.savefig(buf, format="png", bbox_inches="tight")
-        buf.seek(0)
-        img = Image.open(buf)
-        img.load()
-    else:
-        arr = np.asarray(obj)
-        if arr.ndim == 3 and arr.shape[-1] == 1:
-            arr = arr[..., 0]
-        if arr.ndim not in (2, 3) or (arr.ndim == 3 and arr.shape[-1] not in (3, 4)):
-            raise ValueError(
-                f"show() takes a figure, a 2-D array or H x W x 3/4; got {arr.shape}. "
-                "Slice a volume to the plane you mean."
-            )
-        if arr.dtype != np.uint8:
-            a = arr.astype(float)
-            finite = a[np.isfinite(a)]
-            lo, hi = (finite.min(), finite.max()) if finite.size else (0.0, 1.0)
-            a = np.nan_to_num(a, nan=lo, posinf=hi, neginf=lo)
-            arr = ((a - lo) / ((hi - lo) or 1.0) * 255).astype(np.uint8)
-        img = Image.fromarray(arr)
-    if max(img.size) > max_edge:
-        img.thumbnail((max_edge, max_edge))
-    out = io.BytesIO()
-    img.convert("RGBA" if img.mode == "RGBA" else "RGB").save(out, format="PNG")
-    png = base64.b64encode(out.getvalue()).decode("ascii")
-    display(
-        {"image/png": png, "text/plain": f"<figure {img.size[0]}x{img.size[1]}>"},
-        raw=True,
-    )
-
-
 # Origin scheme the tensor server stamps on a drag-dropped source's source_url
 # (server-side DND_URL_PREFIX). Display-only; stripped here so a derived layer
 # name matches what the tensor browser shows. Keep in sync with the server
