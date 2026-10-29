@@ -579,7 +579,7 @@ html, body {
 .file-browser { display: flex; flex-direction: column; gap: 0.75rem; }
 .file-browser-bar { display: flex; align-items: center; gap: 0.6rem; }
 .file-browser-path {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0; font-family: inherit;
   background: #0f1117; border: 1px solid #2d3748; border-radius: 6px;
   color: #cbd5e1; font-size: 12px; padding: 0.4rem 0.55rem;
 }
