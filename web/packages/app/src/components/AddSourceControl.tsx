@@ -10,6 +10,24 @@ const NOTE: React.CSSProperties = { fontSize: 11, color: "#64748b", marginTop: 4
 /** Fewest ms between tree re-lists while a long add runs. */
 const REFRESH_MS = 5000;
 
+const LAST_PATH_KEY = "biopb.addSource.lastPath";
+
+function lastPath(): string | undefined {
+  try {
+    return localStorage.getItem(LAST_PATH_KEY) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberPath(path: string): void {
+  try {
+    localStorage.setItem(LAST_PATH_KEY, path);
+  } catch {
+    // Private window or blocked storage: the chooser just opens at home.
+  }
+}
+
 /**
  * "Add path…" for the tree: pick a file or folder on the *server*, and it is
  * served from then until the server restarts (it is not written to the config).
@@ -40,6 +58,7 @@ export function AddSourceControl() {
   const add = async (path: string) => {
     if (!client) return;
     setBrowsing(false);
+    rememberPath(path);
     setJob(null);
     const { notify } = useNotices.getState();
     // Sources show up in the tree as they register, but re-listing the catalog
@@ -99,7 +118,12 @@ export function AddSourceControl() {
       </button>
 
       {browsing && (
-        <FileBrowser browse={browse} onPick={add} onClose={() => setBrowsing(false)} />
+        <FileBrowser
+          browse={browse}
+          initialPath={lastPath()}
+          onPick={add}
+          onClose={() => setBrowsing(false)}
+        />
       )}
 
       {/* Under the search box: sits in the header's column, not in the row. */}
