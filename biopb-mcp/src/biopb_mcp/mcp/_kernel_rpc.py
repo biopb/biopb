@@ -23,7 +23,22 @@ _WINDOW_CLOSED_NOTE = (
 )
 
 
+def _figure_note(res: dict) -> str:
+    """One line saying a job displayed figures, and how to look at them."""
+    n = res.get("figures") or 0
+    if not n:
+        return ""
+    return (
+        f"\n[{n} figure{'s' if n != 1 else ''} displayed, not shown here: "
+        f"view_figure('{res.get('job_id')}') returns one as an image]"
+    )
+
+
 def _format_execute_result(res: dict) -> str:
+    return _format_text_result(res) + _figure_note(res)
+
+
+def _format_text_result(res: dict) -> str:
     status = res.get("status")
     stdout = res.get("stdout", "")
     result_text = res.get("result_text", "")

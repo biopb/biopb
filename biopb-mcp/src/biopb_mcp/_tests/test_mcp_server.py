@@ -1725,6 +1725,7 @@ class TestToolReturnShape:
         ("search_docs", {"pattern": "kernel"}, True),
         ("write_doc", {"id": "x", "body": "# x\n"}, True),
         ("take_screenshot", {}, False),
+        ("view_figure", {"job_id": "job-1"}, False),
         ("show_view", {"view": "id=a"}, False),
         ("execute_code", {"python_code": "1"}, True),
         ("verify_workflow", {"document": "```python\n1\n```"}, True),

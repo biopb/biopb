@@ -44,6 +44,12 @@ _MAX_RESTART_MARKS = 100
 # the record" rather than "the record ends here".
 _MAX_JOB_OUTPUT_CHARS = 200_000
 
+# Displayed figures kept per job, and the size of one (base64 characters). A
+# loop that plots every iteration is turned away past the count, counted in
+# `figures_dropped`; the notebook and `view_figure` read what was kept.
+_MAX_JOB_FIGURES = 8
+_MAX_FIGURE_CHARS = 4_000_000
+
 # How much of the front of a stream `write_output` copies aside so that
 # `output_head` can find the first line without rebuilding the buffer. Two
 # orders of magnitude above the 80-char line it has to find, so the only text
@@ -117,6 +123,8 @@ class _Record:
         "stdout_dropped",
         "result_text",
         "head_prefix",
+        "figures",
+        "figures_dropped",
     )
 
     def __init__(self, event, kind="task"):
@@ -127,6 +135,9 @@ class _Record:
         # a number that only ever increases (see `output_total`).
         self.stdout_dropped = 0
         self.result_text = ""
+        # PNGs the job displayed (base64), kept for `view_figure` and the notebook.
+        self.figures = []
+        self.figures_dropped = 0
         # A bounded copy of the start of the stream, so `output_head` never has
         # to rebuild the whole buffer to answer with one line. See there.
         self.head_prefix = ""
@@ -188,6 +199,13 @@ class _Record:
             self.stdout = buf
         return n
 
+    def add_figure(self, png):
+        """Keep a displayed PNG, within the caps; count what is turned away."""
+        if len(self.figures) < _MAX_JOB_FIGURES and len(png) <= _MAX_FIGURE_CHARS:
+            self.figures.append(png)
+        else:
+            self.figures_dropped += 1
+
     def output(self):
         """The captured output, marked when the cap dropped its head.
 
@@ -238,8 +256,10 @@ class _Record:
             else round(time.monotonic() - self.started, 3)
         )
 
-    def snapshot(self):
-        return {
+    def snapshot(self, figures=False):
+        """The record as a dict. Figures are a count; *figures* adds their bytes,
+        for the notebook, since a snapshot is also what every poll serialises."""
+        snap = {
             "job_id": self.job_id,
             "code": self.code,
             "status": self.status,
@@ -253,7 +273,11 @@ class _Record:
             "intent": self.intent,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
+            "figures": len(self.figures),
         }
+        if figures:
+            snap["figure_data"] = list(self.figures)
+        return snap
 
     def summary(self):
         return {
@@ -330,6 +354,11 @@ class JobLog:
             # A cell's prints are its own until it starts a task, whose thread
             # prints under the same request (run_async).
             route = self._by_request.get(request)
+        if msg_type == "display_data":
+            png = content.get("data", {}).get("image/png")
+            if png and route is not None:
+                route.add_figure(png)
+            return
         if msg_type == "stream":
             if route is not None:
                 route.write_output(content.get("text", ""))
@@ -603,10 +632,22 @@ class JobLog:
                 "stdout_len": rec.output_total(),
                 "stdout_head": rec.output_head(),
             }
+            out["figures"] = len(rec.figures)
             if full:
                 out["stdout"] = rec.output()
                 out["result_text"] = rec.result_text
+                out["figure_data"] = list(rec.figures)
             return out
+
+    def figure(self, job_id, index=0):
+        """One displayed PNG of *job_id* (base64) and how many it has, or
+        ``(None, 0)`` for an unknown job."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return None, 0
+            n = len(rec.figures)
+            return (rec.figures[index] if 0 <= index < n else None), n
 
     def summary(self):
         """One light row per retained job, for the observe list."""
@@ -624,7 +665,7 @@ class JobLog:
         """Full snapshots of every retained job, for the notebook export, with a
         ``{"restart": True, "at": time}`` entry where each kernel restart fell."""
         with self._lock:
-            return self._interleaved(lambda rec: rec.snapshot())
+            return self._interleaved(lambda rec: rec.snapshot(figures=True))
 
     def _interleaved(self, render):
         """The records, oldest first and *render*ed, with the restart markers

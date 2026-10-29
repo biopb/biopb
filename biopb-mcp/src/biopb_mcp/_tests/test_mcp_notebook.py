@@ -277,3 +277,9 @@ def test_a_restart_marker_becomes_a_note_between_the_cells():
     assert kinds[at - 1] == "code" and kinds[at + 1] == "code"
     assert "1 job" not in "".join(nb["cells"][0]["source"])  # counts jobs, not markers
     assert "2 job(s)" in "".join(nb["cells"][0]["source"])
+
+
+def test_a_displayed_figure_is_a_display_data_output():
+    outputs = _notebook._job_outputs({"stdout": "n=3\n", "figure_data": ["UE5H"]})
+    assert [o["output_type"] for o in outputs] == ["stream", "display_data"]
+    assert outputs[1]["data"]["image/png"] == "UE5H"

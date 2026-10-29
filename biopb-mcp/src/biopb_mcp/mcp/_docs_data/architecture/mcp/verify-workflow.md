@@ -72,6 +72,12 @@ sidesteps all three. The audit-export notebook (a session transcript, not a
 verification) keeps a best-effort viewer, since it's full of viewer cells
 that need somewhere to land.
 
+**Figures are kept.** The scratch kernel is a plain ipykernel, whose matplotlib
+backend is inline, so a plot arrives as `display_data`. The run's record keeps
+up to eight PNGs per cell (`_job_log`), the saved notebook carries them as
+outputs, and `view_figure(job_id, cell=N)` returns one to the agent. A poll
+carries the count, never the bytes.
+
 **Plugins must load the same way on both ends.** The scratch kernel runs
 the same bootstrap a session kernel does, so it loads the user's kernel
 plugins too — the notebook's own bootstrap cell has to rebuild them

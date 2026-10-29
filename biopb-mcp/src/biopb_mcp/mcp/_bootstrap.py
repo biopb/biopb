@@ -234,6 +234,7 @@ def _bootstrap_impl():
     from biopb.tensor import Connection
 
     from . import _jobs
+    from ._helpers import show
     from ._process_ops import Ops, build_ops_from_config
 
     # 2. The data-plane connection, shared by the widget and the agent
@@ -335,6 +336,8 @@ def _bootstrap_impl():
                 # does not get it, since its reader has no such helper
                 # either.
                 "run_async": _jobs.run_async,
+                # Look at a figure: the result names it, `view_figure` returns it.
+                "show": show,
             }
         )
 
