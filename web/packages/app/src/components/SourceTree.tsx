@@ -104,19 +104,23 @@ function Chevron({ expanded }: { expanded: boolean }) {
   return (
     <span
       style={{
-        display: "inline-block",
-        width: 16,
-        flexShrink: 0,
+        display: "inline-flex",
+        alignItems: "center",
         // Centred so the rotation (about the box centre) turns the glyph in
         // place; left-aligned, the expanded triangle lands right of the collapsed one.
-        textAlign: "center",
-        fontSize: 10,
+        justifyContent: "center",
+        width: 16,
+        flexShrink: 0,
         transition: "transform 0.15s",
         transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
         opacity: 0.6,
       }}
     >
-      ▶
+      {/* Drawn, not a text triangle: U+25B6 falls back to a colour emoji or a
+          missing glyph on fonts that lack it (Chromium on Linux). */}
+      <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden="true">
+        <path d="M1.5 0.5 L7 4 L1.5 7.5 Z" fill="currentColor" />
+      </svg>
     </span>
   );
 }
