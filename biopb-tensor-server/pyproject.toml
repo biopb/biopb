@@ -139,6 +139,9 @@ dependencies = [
   # add this everywhere except Intel macOS.
   czi = [
     "bioio-czi",
+    # CziAdapter imports it directly. bioio-czi 4 moved to aicspylibczi and no
+    # longer brings it, so relying on the transitive dep lost native CZI.
+    "pylibczirw",
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",
