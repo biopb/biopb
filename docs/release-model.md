@@ -77,7 +77,9 @@ commit to validate before it lands on `main`.
   (`docker build -f biopb-tensor-server/Dockerfile .`).
 
 The `v*` PyPI tag (biopb) follows PyPI's own prerelease rules: a `…rc1` version
-uploads as a prerelease, which `pip` ignores unless `--pre`.
+uploads as a prerelease, which `pip` ignores unless `--pre`. Maven Central has
+no such notion, so `java-ci` deploys only a final `vX.Y.Z`; an SDK candidate tag
+publishes to PyPI alone.
 
 ## What each tag produces
 
