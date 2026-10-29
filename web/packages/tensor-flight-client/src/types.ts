@@ -71,6 +71,43 @@ export interface SourceJobStatus {
   source?: DataSourceDescriptor;
 }
 
+/** What an add of a server path came to (`POST /api/admin/sources/add`). */
+export interface AddSourceResult {
+  /** Counts of sources: new, already served, rebuilt from a changed file, dropped
+   * because their files are gone. */
+  added: number;
+  already_present: number;
+  refreshed: number;
+  removed: number;
+  skipped_offline: number;
+  skipped_cloud_dirs: number;
+  /** The first failures only; `failed_total` counts all of them. */
+  failed: Array<{ path: string; reason: string }>;
+  failed_total: number;
+}
+
+/** An add of a server path, in flight or recently finished. */
+export interface AddSourceJobStatus {
+  kind: "add";
+  /** The path asked for. */
+  source_id: string;
+  state: "running" | "done" | "error" | "cancelled";
+  progress: { added_count?: number; current_path?: string };
+  error: string | null;
+  elapsed_seconds: number;
+  cancel_requested: boolean;
+  /** Only on the response that started it: false means it joined one running. */
+  started?: boolean;
+  /** On done, and on cancelled: what was registered before it stopped. */
+  result?: AddSourceResult;
+}
+
+/** What removing a dropped root took out (`POST /api/admin/sources/remove`). */
+export interface RemoveSourceResult {
+  removed: number;
+  failed: Array<{ path: string; reason: string }>;
+}
+
 /** A resolve's progress counters. */
 export interface SourceJobProgress {
   elapsed_seconds: number;

@@ -315,6 +315,10 @@ html, body {
   white-space: nowrap;
 }
 
+.tree-dropped.removable { cursor: pointer; }
+.tree-dropped.removable:hover,
+.tree-dropped.removable:focus-visible { color: #fca5a5; border-color: #b91c1c; outline: none; }
+
 .dim-badge {
   font-size: 10px;
   background: #1e293b;

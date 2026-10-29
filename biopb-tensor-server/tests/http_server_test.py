@@ -1786,6 +1786,168 @@ class TestAdminBrowseRoute:
                 assert r.json()["path"] == str(tmp_path.resolve())
 
 
+class TestAdminRuntimeSources:
+    """Adding and removing a served path from the browser (the add_source /
+    remove_source actions behind HTTP)."""
+
+    @staticmethod
+    def _client(tc):
+        return tc.app.state.sidecar.get_client()
+
+    @staticmethod
+    def _wait(tc, path, params, until, timeout=5.0):
+        deadline = time.time() + timeout
+        while True:
+            body = tc.get(path, params=params).json()
+            if until(body) or time.time() > deadline:
+                return body
+            time.sleep(0.02)
+
+    def test_add_runs_as_a_job_and_ends_with_the_tally(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        result = AddSourceResult(added=["a", "b"], already_present=["c"])
+        result.failed.add(path="/data/bad.tif", reason="unreadable")
+        self._client(tc).register_local_path.return_value = result
+
+        r = tc.post("/api/admin/sources/add", json={"url": " /data/exp "})
+        assert r.status_code == 202
+        assert r.json()["source_id"] == "/data/exp"
+
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": "/data/exp"},
+            lambda b: b["state"] != "running",
+        )
+        assert body["state"] == "done"
+        assert body["result"] == {
+            "added": 2,
+            "already_present": 1,
+            "refreshed": 0,
+            "removed": 0,
+            "skipped_offline": 0,
+            "skipped_cloud_dirs": 0,
+            "failed": [{"path": "/data/bad.tif", "reason": "unreadable"}],
+            "failed_total": 1,
+        }
+        call = self._client(tc).register_local_path.call_args
+        assert call.args == ("/data/exp",)
+        assert call.kwargs["cloud"] is False
+
+    def test_add_passes_the_cloud_flag(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        self._client(tc).register_local_path.return_value = AddSourceResult()
+        tc.post("/api/admin/sources/add", json={"url": "/od", "cloud": True})
+        self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": "/od"},
+            lambda b: b["state"] != "running",
+        )
+        assert self._client(tc).register_local_path.call_args.kwargs["cloud"] is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [{}, {"url": ""}, {"url": "   "}, {"url": 5}, {"url": "/x", "cloud": "yes"}],
+    )
+    def test_add_refuses_a_malformed_body(self, admin_client, body):
+        tc, _ = admin_client
+        assert tc.post("/api/admin/sources/add", json=body).status_code == 422
+
+    def test_a_refused_add_ends_in_error_with_the_servers_reason(self, admin_client):
+        tc, _ = admin_client
+        self._client(tc).register_local_path.side_effect = flight.FlightServerError(
+            "path not found: /nope"
+        )
+        tc.post("/api/admin/sources/add", json={"url": "/nope"})
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": "/nope"},
+            lambda b: b["state"] != "running",
+        )
+        assert body["state"] == "error"
+        assert "path not found: /nope" in body["error"]
+
+    def test_cancel_stops_an_add_and_keeps_its_tally(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+
+        def walk(url, *, should_cancel, **_):
+            while not should_cancel():
+                time.sleep(0.01)
+            return AddSourceResult(added=["a"])
+
+        self._client(tc).register_local_path.side_effect = walk
+        tc.post("/api/admin/sources/add", json={"url": "/big"})
+        r = tc.post("/api/admin/sources/add/cancel", params={"url": "/big"})
+        assert r.status_code == 200
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": "/big"},
+            lambda b: b["state"] != "running",
+        )
+        assert body["state"] == "cancelled"
+        assert body["result"]["added"] == 1
+
+    def test_status_of_an_unknown_add_is_404(self, admin_client):
+        tc, _ = admin_client
+        r = tc.get("/api/admin/sources/add/status", params={"url": "/never"})
+        assert r.status_code == 404
+
+    def test_remove_reports_what_went(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import RemoveSourceResult
+
+        tc, _ = admin_client
+        result = RemoveSourceResult(removed=["a", "b"])
+        result.failed.add(path="c", reason="not present (already removed?)")
+        self._client(tc).deregister_local_path.return_value = result
+        r = tc.post("/api/admin/sources/remove", json={"root_url": "dnd://scratch"})
+        assert r.status_code == 200
+        assert r.json() == {
+            "removed": 2,
+            "failed": [{"path": "c", "reason": "not present (already removed?)"}],
+        }
+        assert self._client(tc).deregister_local_path.call_args.args == (
+            "dnd://scratch",
+        )
+
+    def test_remove_relays_a_refusal(self, admin_client):
+        tc, _ = admin_client
+        self._client(tc).deregister_local_path.side_effect = flight.FlightServerError(
+            "remove_source only removes drag-dropped (dnd://) sources"
+        )
+        r = tc.post("/api/admin/sources/remove", json={"root_url": "file:///lab"})
+        assert r.status_code == 400
+        assert "drag-dropped" in r.json()["detail"]
+
+    def test_remove_needs_a_root(self, admin_client):
+        tc, _ = admin_client
+        assert tc.post("/api/admin/sources/remove", json={}).status_code == 422
+
+    def test_both_are_gated_by_the_token(self, auth_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult, RemoveSourceResult
+
+        tc, mock_fc = auth_client
+        mock_fc.register_local_path.return_value = AddSourceResult()
+        mock_fc.deregister_local_path.return_value = RemoveSourceResult()
+        for path, body in (
+            ("/api/admin/sources/add", {"url": "/x"}),
+            ("/api/admin/sources/remove", {"root_url": "dnd://x"}),
+        ):
+            assert tc.post(path, json=body).status_code == 401
+            assert tc.post(path, json=body, headers=_bearer(_TOKEN)).status_code in (
+                200,
+                202,
+            )
+
+
 class TestCreateAppSupervisedFromEnv:
     def test_reads_supervised_from_env(self, monkeypatch):
         # The control marks the plane control-owned via BIOPB_DATA_PLANE_SUPERVISED
