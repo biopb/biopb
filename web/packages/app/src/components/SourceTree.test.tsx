@@ -106,6 +106,27 @@ describe("TreeRow for a dropped root", () => {
     expect(render(source())).not.toContain("tree-dropped");
   });
 
+  it("offers removal on a dropped row only when given a way to", () => {
+    const withRemove = (node: TreeNode) =>
+      renderToStaticMarkup(
+        <TreeRow
+          node={node}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+          onRemoveDropped={() => {}}
+        />,
+      );
+    expect(withRemove(folder(true))).toContain("tree-dropped removable");
+    expect(withRemove(folder(true))).toContain("dropped ✕");
+    // Not dropped: nothing to remove, and no tag.
+    expect(withRemove(folder())).not.toContain("tree-dropped");
+    // Without the handler (Recent, a search's matches) the tag stays plain.
+    expect(render(folder(true))).not.toContain("removable");
+  });
+
   it("tags a dropped source that has not resolved too", () => {
     const pending: DataSourceDescriptor = { ...LISTED, is_resolved: false };
     expect(render({ ...source(true), source: pending })).toContain("tree-dropped");

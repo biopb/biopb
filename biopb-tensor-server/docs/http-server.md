@@ -77,6 +77,10 @@ like every other admin route.
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
 | `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker; also says whether the requested path exists |
+| `POST` | `/api/admin/sources/add` | ✓ | Serve a server path until restart (the `add_source` action); starts a job keyed by the path |
+| `GET` | `/api/admin/sources/add/status?url=` | ✓ | Progress, then the tally, of that add |
+| `POST` | `/api/admin/sources/add/cancel?url=` | ✓ | Stop that add; what it registered stays |
+| `POST` | `/api/admin/sources/remove` | ✓ | Stop serving a `dnd://` root (the `remove_source` action) |
 
 > **`/readyz` connects.** It opens the Flight connection if none exists yet,
 > so it answers from the backend rather than from whatever traffic happened

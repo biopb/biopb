@@ -12,6 +12,7 @@
  */
 
 import type {
+  AddSourceJobStatus,
   AdminConfigResponse,
   AdminConfigSaveResult,
   AdminStatus,
@@ -20,6 +21,7 @@ import type {
   DiagnosticsSnapshot,
   QuerySourcesResult,
   ReadyzSnapshot,
+  RemoveSourceResult,
   SourceJobStatus,
   SliceRequest,
   TileInfo,
@@ -479,6 +481,55 @@ export class TensorHttpClient {
     return this.fetchJson<SourceJobStatus>(
       `/api/sources/${encodeURIComponent(sourceId)}/${kind}/cancel`,
       { method: "POST" },
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  // -- Runtime sources --------------------------------------------------
+  //
+  // Serve a path of the server's filesystem until its next restart, and take a
+  // dropped one away again. An add is a job keyed by its path, like a resolve.
+
+  /** Begin adding a server path, or join the add of it already running. */
+  async addSource(
+    url: string,
+    cloud = false,
+    opts?: RequestOptions,
+  ): Promise<AddSourceJobStatus> {
+    return this.fetchJson<AddSourceJobStatus>(
+      "/api/admin/sources/add",
+      { method: "POST", body: JSON.stringify({ url, cloud }) },
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  /** Poll an add. Rejects with a 404 `TensorApiError` if none was started. */
+  async addSourceStatus(url: string, opts?: RequestOptions): Promise<AddSourceJobStatus> {
+    return this.fetchJson<AddSourceJobStatus>(
+      `/api/admin/sources/add/status?url=${encodeURIComponent(url)}`,
+      undefined,
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  /** Ask an add to stop; what it has registered stays. Not an error once finished. */
+  async cancelAddSource(url: string, opts?: RequestOptions): Promise<AddSourceJobStatus> {
+    return this.fetchJson<AddSourceJobStatus>(
+      `/api/admin/sources/add/cancel?url=${encodeURIComponent(url)}`,
+      { method: "POST" },
+      this.metadataTimeoutMs,
+      opts,
+    );
+  }
+
+  /** Stop serving a `dnd://` root and everything under it. */
+  async removeSource(rootUrl: string, opts?: RequestOptions): Promise<RemoveSourceResult> {
+    return this.fetchJson<RemoveSourceResult>(
+      "/api/admin/sources/remove",
+      { method: "POST", body: JSON.stringify({ root_url: rootUrl }) },
       this.metadataTimeoutMs,
       opts,
     );

@@ -18,6 +18,8 @@ All mount on `http_server.create_app`. `GET /api/config` and the `/api/admin/*` 
 | `/api/config` | `PUT` | Validate the body against the schema → restore redacted secrets → `save_config()` atomically → `{saved, restart_required: true}`. Does **not** restart. |
 | `/api/admin/status` | `GET` | `running / health / pid / version / config path / uptime` + the discovery freshness fields (`source_count`, `full_scan_in_progress`, `last_full_scan_finished_at`) + the `supervised` / `local` flags. |
 | `/api/admin/browse` | `GET` | Filesystem directory listing for the Sources file chooser, behind the server token like every admin route. Returns `{path, parent, entries:[{name,is_dir}], truncated, exists}`; `exists` is whether the requested path itself is there, which the page uses to flag a typo'd source path. |
+| `/api/admin/sources/add` | `POST` | Body `{url, cloud?}`: serve a path on the server's filesystem **until restart** (not written to config) — the browser's route to the `add_source` action. Returns a job (202) keyed by the path, so a second add of it joins; poll `GET /api/admin/sources/add/status?url=` for `progress` (`added_count`, `current_path`) and, once finished, `result` (counts of `added` / `already_present` / `refreshed` / `removed`, `failed` paths, `skipped_*`); `POST …/add/cancel?url=` stops it and keeps what it registered. |
+| `/api/admin/sources/remove` | `POST` | Body `{root_url}`: stop serving a `dnd://` root and everything under it (the `remove_source` action). Anything not `dnd://` is refused with 400, so a configured root cannot be removed here. Returns `{removed, failed}`. |
 
 There is **no** restart route on this sidecar — restart is control-owned (see **Restart** below).
 

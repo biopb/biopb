@@ -43,6 +43,7 @@ own design see [[architecture/web/roi-annotations-ui]].
 ```
 HomePage                          useViewerUrlSync()  (URL ⇄ store)
 ├─ SourceTree                     openTensor(), setLabelOverlay()
+│  └─ AddSourceControl            "+ Add path…": serve a server path until restart (also removes dropped roots)
 ├─ ViewerPane                     renders nothing until target.status === "ready"
 │  └─ <key = target.key#epoch#2d|3d#attempt>
 │     ├─ TileViewer   info = target.info            (lazy chunk)

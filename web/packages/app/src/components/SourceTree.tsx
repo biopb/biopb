@@ -3,6 +3,10 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { toggled, useAppStore } from "../store";
+import { removeNotice } from "../utils/addSource";
+import { useNotices } from "../utils/notices";
+import { AddSourceControl } from "./AddSourceControl";
+import { Modal } from "./Modal";
 import { REASON_COLUMN, SOURCE_COLUMNS, descriptorFromRow } from "../utils/catalogRow";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import {
@@ -12,6 +16,7 @@ import {
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
   buildTree,
+  droppedRootUrl,
   groupTensors,
   isEmptySource,
   isUnresolved,
@@ -147,13 +152,29 @@ function TreeNote({ text, indent }: { text: string; indent: number }) {
  * the server's configured roots: the tree shows both as plain paths, so without
  * this a dropped folder is indistinguishable from a root that is always there.
  */
-function DroppedBadge() {
+function DroppedBadge({ onRemove }: { onRemove?: () => void }) {
+  const why = "Added by drag-and-drop: not one of the server's configured roots, and not kept across a restart";
+  // A span, not a button: the row it sits in is one, and buttons do not nest.
   return (
     <span
-      className="tree-dropped"
-      title="Added by drag-and-drop: not one of the server's configured roots, and not kept across a restart"
+      className={onRemove ? "tree-dropped removable" : "tree-dropped"}
+      title={onRemove ? `${why}.\nClick to stop serving it.` : why}
+      {...(onRemove && {
+        role: "button",
+        tabIndex: 0,
+        onClick: (e: React.MouseEvent) => {
+          e.stopPropagation();
+          onRemove();
+        },
+        onKeyDown: (e: React.KeyboardEvent) => {
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          e.stopPropagation();
+          onRemove();
+        },
+      })}
     >
-      dropped
+      {onRemove ? "dropped ✕" : "dropped"}
     </span>
   );
 }
@@ -181,6 +202,12 @@ export interface TreeRowProps {
   labelOverlay?: string | null;
   /** Draw this set, or nothing. Optional, so a row renders standalone. */
   setLabelOverlay?: (arrayId: string | null) => void;
+  /**
+   * Stop serving a dropped top-level root: its `dnd://` url and the name to
+   * show. Only the catalog's own rows are given it; a row without it shows the
+   * "dropped" tag but cannot remove.
+   */
+  onRemoveDropped?: (rootUrl: string, name: string) => void;
 }
 
 export function TreeRow({
@@ -194,9 +221,18 @@ export function TreeRow({
   resolving,
   labelOverlay,
   setLabelOverlay,
+  onRemoveDropped,
 }: TreeRowProps) {
   // Half a Chevron's width per level, so a deep tree keeps room for its labels.
   const indent = node.depth * INDENT_STEP + 12;
+  const droppedRoot = onRemoveDropped ? droppedRootUrl(node) : null;
+  const droppedBadge = node.dropped && (
+    <DroppedBadge
+      onRemove={
+        droppedRoot && onRemoveDropped ? () => onRemoveDropped(droppedRoot, node.name) : undefined
+      }
+    />
+  );
   // Label sets filed under the image they annotate, rather than listed beside
   // it: a set is a tensor of the source, but it is *about* one of the others.
   //
@@ -228,7 +264,7 @@ export function TreeRow({
           <span className="tree-name" style={{ marginLeft: 4 }} title={node.name}>
             {node.name}
           </span>
-          {node.dropped && <DroppedBadge />}
+          {droppedBadge}
         </button>
         {expanded &&
           node.children.map((child) => (
@@ -315,7 +351,7 @@ export function TreeRow({
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
           {node.name}
         </span>
-        {node.dropped && <DroppedBadge />}
+        {droppedBadge}
         {!startResolve ? null : kind === "recall" ? (
           <span
             className="resolve-hint"
@@ -372,7 +408,7 @@ export function TreeRow({
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
           {node.name}
         </span>
-        {node.dropped && <DroppedBadge />}
+        {droppedBadge}
         {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
             {groups.length}
@@ -505,6 +541,26 @@ export function SourceTree() {
       ),
     [sourceJobs],
   );
+
+  const client = useAppStore((s) => s.client);
+  const refreshTree = useAppStore((s) => s.refreshTree);
+  // A dropped root the user asked to remove, awaiting their confirmation.
+  const [pendingRemove, setPendingRemove] = useState<{ rootUrl: string; name: string } | null>(
+    null,
+  );
+  const removeDropped = async () => {
+    const target = pendingRemove;
+    setPendingRemove(null);
+    if (!client || !target) return;
+    const { notify } = useNotices.getState();
+    try {
+      const n = removeNotice(target.name, await client.http.removeSource(target.rootUrl));
+      notify(n.kind, n.text, n.details);
+    } catch (e) {
+      notify("error", `Could not remove ${target.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await refreshTree().catch(() => {});
+  };
 
   const [query, setQuery] = useState("");
   // The sources a server-side search matched, whole: the catalog is searched,
@@ -693,13 +749,18 @@ export function SourceTree() {
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
       <div style={{ padding: "0.5rem 1rem" }}>
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search (SQL filter)"
-          aria-label="Search sources"
-          style={{ width: "100%" }}
-        />
+        <div
+          style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, alignItems: "center" }}
+        >
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search (SQL filter)"
+            aria-label="Search sources"
+            style={{ width: "100%" }}
+          />
+          <AddSourceControl />
+        </div>
         {scanning && !topEmpty && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             Still indexing the data folder; more sources may appear
@@ -765,6 +826,7 @@ export function SourceTree() {
                     {...rowProps}
                     expandedFolders={openFolders}
                     toggleFolder={toggleOpenFolder}
+                    onRemoveDropped={(rootUrl, name) => setPendingRemove({ rootUrl, name })}
                   />
                 ))}
                 {topNote && <TreeNote text={topNote} indent={0} />}
@@ -773,6 +835,26 @@ export function SourceTree() {
           </>
         )}
       </div>
+      {pendingRemove && (
+        <Modal
+          title="Stop serving this?"
+          onClose={() => setPendingRemove(null)}
+          labelId="remove-dropped-title"
+        >
+          <p>
+            <strong>{pendingRemove.name}</strong> and the sources under it are taken off this
+            server until it is added again. The files on disk are not touched.
+          </p>
+          <div className="admin-modal-actions">
+            <button type="button" className="icon-btn" onClick={() => setPendingRemove(null)}>
+              Cancel
+            </button>
+            <button type="button" className="submit-btn" onClick={removeDropped}>
+              Remove
+            </button>
+          </div>
+        </Modal>
+      )}
     </section>
   );
 }

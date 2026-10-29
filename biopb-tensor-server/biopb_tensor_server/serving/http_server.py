@@ -486,6 +486,7 @@ class _SourceJob:
         self._error: Optional[str] = None
         self._finished_at: Optional[float] = None
         self._source: Optional[Dict[str, Any]] = None
+        self._result: Optional[Dict[str, Any]] = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -502,6 +503,11 @@ class _SourceJob:
         """The catalog row a resolve ends with, handed to the client on done."""
         with self._lock:
             self._source = source
+
+    def set_result(self, result: Dict[str, Any]) -> None:
+        """The tally an add ends with, handed to the client on done."""
+        with self._lock:
+            self._result = result
 
     def finish(self, state: str, error: Optional[str] = None) -> None:
         with self._lock:
@@ -537,6 +543,7 @@ class _SourceJob:
                 # A finished resolve carries the source's now-concrete row, so a
                 # client updates its catalog copy without re-reading the listing.
                 **({"source": self._source} if self._source is not None else {}),
+                **({"result": self._result} if self._result is not None else {}),
             }
 
 
@@ -2442,6 +2449,139 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     second recall of the same bytes.
     """
     return _start_job("resolve", _resolve_worker, source_id, request)
+
+
+# -- Runtime sources (add / remove a path without a restart) -------------------
+#
+# The browser's way to the server's ``add_source`` / ``remove_source`` actions,
+# which napari reaches over Flight. Adding walks a directory and so is a job like
+# resolve, keyed by the path; removal is quick and answers inline. Both change
+# what the server serves, so they sit with the admin routes under the same token
+# and the same-origin guard.
+
+#: How many failed paths an add reports back; the rest are counted.
+_ADD_FAILURES_SHOWN = 50
+
+
+async def _json_object(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+    return body
+
+
+def _body_str(body: Dict[str, Any], field: str) -> str:
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=422, detail=f"{field} must be a non-empty string"
+        )
+    return value.strip()
+
+
+def _add_result_dict(result: Any) -> Dict[str, Any]:
+    failed = [{"path": f.path, "reason": f.reason} for f in result.failed]
+    return {
+        "added": len(result.added),
+        "already_present": len(result.already_present),
+        "refreshed": len(result.refreshed),
+        "removed": len(result.removed),
+        "skipped_offline": result.skipped_offline,
+        "skipped_cloud_dirs": result.skipped_cloud_dirs,
+        "failed": failed[:_ADD_FAILURES_SHOWN],
+        "failed_total": len(failed),
+    }
+
+
+def _add_worker(ctx: _SidecarContext, job: _SourceJob, cloud: bool) -> None:
+    """Body of an add job; ``job.source_id`` is the path. Runs on a daemon thread."""
+    try:
+        result = ctx.get_client().register_local_path(
+            job.source_id,
+            cloud=cloud,
+            on_progress=lambda p: job.set_progress(
+                {"added_count": int(p.added_count), "current_path": str(p.current_path)}
+            ),
+            should_cancel=job.cancel_requested,
+        )
+    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
+        logger.warning(f"add failed for {job.source_id}: {exc}")
+        ctx.diag.mark_error("ADD_SOURCE_FAILED", str(exc))
+        job.finish(_JOB_ERROR, str(exc))
+        return
+    job.set_result(_add_result_dict(result))
+    job.finish(_JOB_CANCELLED if job.cancel_requested() else _JOB_DONE)
+
+
+@_router.post("/api/admin/sources/add/cancel")
+async def cancel_add_source(request: Request) -> JSONResponse:
+    """Stop an in-flight add; what it has registered stays registered."""
+    return _cancel_job("add", request.query_params.get("url", ""), request)
+
+
+@_router.get("/api/admin/sources/add/status")
+async def add_source_status(request: Request) -> JSONResponse:
+    """Progress and, once finished, the tally of the add of ``?url=``."""
+    return _job_status("add", request.query_params.get("url", ""), request)
+
+
+@_router.post("/api/admin/sources/add")
+async def add_source(request: Request) -> JSONResponse:
+    """Serve a path on the server's filesystem until the next restart.
+
+    Body ``{url, cloud?}``: an absolute path of a dataset, or of a directory to
+    walk. The server reads it on its own filesystem; it is not written to the
+    config, so it does not outlive a restart (use the config's ``sources`` for
+    that). Returns a job to poll; a second add of the same path while one runs
+    joins it.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    body = await _json_object(request)
+    url = _body_str(body, "url")
+    cloud = body.get("cloud", False)
+    if not isinstance(cloud, bool):
+        raise HTTPException(status_code=422, detail="cloud must be a boolean")
+    # The job is keyed by the path, so "/data" and "/data/" must be one key for a
+    # second add to join the first. A URL is left as typed: the server refuses it.
+    if "://" not in url:
+        url = os.path.normpath(url)
+    return _start_job("add", lambda c, j: _add_worker(c, j, cloud), url, request)
+
+
+@_router.post("/api/admin/sources/remove")
+async def remove_source(request: Request) -> JSONResponse:
+    """Stop serving a drag-dropped / runtime-added branch.
+
+    Body ``{root_url}``: a ``dnd://`` root. The server refuses anything else, so
+    a configured root cannot be removed from here.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    root_url = _body_str(await _json_object(request), "root_url")
+    try:
+        result = await run_in_threadpool(
+            ctx.get_client().deregister_local_path, root_url
+        )
+    except flight.FlightServerError as exc:
+        # A refusal (not a dnd:// root, removal off) names its own reason.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except flight.FlightError as exc:
+        ctx.diag.mark_error("REMOVE_SOURCE_FAILED", str(exc))
+        raise HTTPException(
+            status_code=502, detail=f"Flight error: {type(exc).__name__}"
+        )
+    return JSONResponse(
+        {
+            "removed": len(result.removed),
+            "failed": [{"path": f.path, "reason": f.reason} for f in result.failed],
+        }
+    )
 
 
 # -- Tiles (cacheable GET reads) --------------------------------------------

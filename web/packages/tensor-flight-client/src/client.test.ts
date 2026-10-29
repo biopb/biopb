@@ -585,6 +585,46 @@ describe("TensorHttpClient.browse", () => {
   });
 });
 
+describe("TensorHttpClient runtime sources", () => {
+  const job = { kind: "add", source_id: "/data/exp", state: "running" };
+
+  it("starts an add with the path and the cloud flag in the body", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse(job));
+    const c = new TensorHttpClient(BASE, null);
+    await c.addSource("/data/exp", true);
+    const [url, init] = mockFetch.mock.calls[0]!;
+    expect(url).toBe(`${BASE}/api/admin/sources/add`);
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual({ url: "/data/exp", cloud: true });
+  });
+
+  it("polls and cancels an add by its path, URL-encoded", async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse(job))
+      .mockResolvedValueOnce(jsonResponse(job));
+    const c = new TensorHttpClient(BASE, null);
+    await c.addSourceStatus("/data/my exp");
+    await c.cancelAddSource("/data/my exp");
+    expect(mockFetch.mock.calls[0]![0]).toBe(
+      `${BASE}/api/admin/sources/add/status?url=%2Fdata%2Fmy%20exp`,
+    );
+    expect(mockFetch.mock.calls[1]![0]).toBe(
+      `${BASE}/api/admin/sources/add/cancel?url=%2Fdata%2Fmy%20exp`,
+    );
+    expect(mockFetch.mock.calls[1]![1].method).toBe("POST");
+  });
+
+  it("removes a dropped root", async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ removed: 3, failed: [] }));
+    const c = new TensorHttpClient(BASE, null);
+    const r = await c.removeSource("dnd://scratch");
+    const [url, init] = mockFetch.mock.calls[0]!;
+    expect(url).toBe(`${BASE}/api/admin/sources/remove`);
+    expect(JSON.parse(init.body)).toEqual({ root_url: "dnd://scratch" });
+    expect(r.removed).toBe(3);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------

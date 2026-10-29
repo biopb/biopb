@@ -975,3 +975,66 @@ class TestReDropRemovesVanished:
 
         assert removed == [sid]
         assert sid not in server.sources
+
+
+def _wait_add(tc, path, timeout=15.0):
+    """Poll an add job until it stops running; its last status."""
+    deadline = time.time() + timeout
+    while True:
+        body = tc.get("/api/admin/sources/add/status", params={"url": path}).json()
+        if body["state"] != "running" or time.time() > deadline:
+            return body
+        time.sleep(0.05)
+
+
+class TestAddRemoveOverHttp:
+    """The browser's route to the same actions: the sidecar's HTTP endpoints over a
+    real Flight server, no mocked client."""
+
+    def test_add_then_remove_a_dropped_dataset(self, tmp_path):
+        from biopb_tensor_server.serving.http_server import create_app
+        from fastapi.testclient import TestClient
+
+        manager, server = _make_manager()
+        server.set_add_source_handler(manager.add_local_source)
+        server.set_remove_source_handler(manager.remove_dropped_root)
+        server.mark_ready()
+        threading.Thread(target=server.serve, daemon=True).start()
+        time.sleep(1)
+
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        try:
+            app = create_app(f"grpc://localhost:{server.port}")
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post("/api/admin/sources/add", json={"url": zpath})
+                assert r.status_code == 202
+                body = _wait_add(tc, zpath)
+                assert body["state"] == "done", body
+                assert body["result"]["added"] == 1
+                assert body["result"]["failed_total"] == 0
+                (sid,) = [
+                    s for s in server.sources if _url(server, s) == "dnd://exp.zarr"
+                ]
+
+                # Only a dropped root can be removed; a configured one is refused.
+                refused = tc.post(
+                    "/api/admin/sources/remove", json={"root_url": "file:///lab"}
+                )
+                assert refused.status_code == 400
+                assert "drag-dropped" in refused.json()["detail"]
+
+                r = tc.post(
+                    "/api/admin/sources/remove", json={"root_url": "dnd://exp.zarr"}
+                )
+                assert r.status_code == 200
+                assert r.json() == {"removed": 1, "failed": []}
+                assert sid not in server.sources
+
+                # A path the server does not have ends in an error with its reason.
+                missing = str(tmp_path / "nope")
+                tc.post("/api/admin/sources/add", json={"url": missing})
+                bad = _wait_add(tc, missing)
+                assert bad["state"] == "error"
+                assert bad["error"]
+        finally:
+            server.shutdown()
