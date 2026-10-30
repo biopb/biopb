@@ -6,6 +6,7 @@
 [![Sonatype Central](https://maven-badges.sml.io/sonatype-central/io.github.jiyuuchc/biopb/badge.svg)](https://maven-badges.sml.io/sonatype-central/io.github.jiyuuchc/biopb/)
 [![Python Tests](https://github.com/biopb/biopb/actions/workflows/python-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions/workflows/python-ci.yaml)
 [![Java Tests](https://github.com/biopb/biopb/actions/workflows/java-ci.yaml/badge.svg)](https://github.com/biopb/biopb/actions/workflows/java-ci.yaml)
+[![Fresh Resolve](https://github.com/biopb/biopb/actions/workflows/unlocked-resolve.yaml/badge.svg)](https://github.com/biopb/biopb/actions/workflows/unlocked-resolve.yaml)
 
 An experimental biomedical image analysis platform, designed from the ground up around three aspects of the modern analysis pipeline: (1) distributed data serving, (2) easy model customization and deployment, and (3) LLM/agentic workflows that co-evolve with the user's tasks.
 
