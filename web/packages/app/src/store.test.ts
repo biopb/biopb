@@ -648,7 +648,7 @@ function viewWithDtype(key: string, dtype: string) {
     ...viewOf(key, { info: { ...TILE_INFO, array_id: key, dtype } as TileInfo }),
     position: BASE_POSITION,
     display: BASE_DISPLAY,
-    runtime: { planeReady: false, samples: null },
+    runtime: { planeReady: false, samples: null, channelSamples: {} },
   });
 }
 
@@ -734,6 +734,20 @@ describe("the contrast track and window", () => {
     expect(held().observedLimits[0]).toBeUndefined();
   });
 
+  it("keeps every channel's samples, and the current channel's as the plane in view", () => {
+    // A composite samples all its channels in whatever order the reads land;
+    // the panel's limits are the current channel's, not the last to arrive.
+    viewWithDtype("first", "<f4");
+    const own = samplesOf(1, 2);
+    const other = samplesOf(50, 90);
+    useAppStore.getState().notePlaneSamples(own, 0, 100);
+    useAppStore.getState().notePlaneSamples(other, 1, 100);
+
+    const rt = useAppStore.getState().runtime;
+    expect(rt.samples).toBe(own);
+    expect(rt.channelSamples).toEqual({ 0: own, 1: other });
+  });
+
   it("starts a new epoch with no plane and nothing ready", () => {
     viewWithDtype("first", "<f4");
     useAppStore.getState().notePlaneSamples(samplesOf(1, 2), 0, 100);
@@ -741,7 +755,7 @@ describe("the contrast track and window", () => {
     useAppStore.setState({ client: null });
     useAppStore.getState().openTensor("second");
 
-    expect(useAppStore.getState().runtime).toEqual({ planeReady: false, samples: null });
+    expect(useAppStore.getState().runtime).toEqual({ planeReady: false, samples: null, channelSamples: {} });
   });
 
   it("un-readies the plane in the same write that moves the position", () => {
@@ -854,7 +868,7 @@ describe("opening a tensor", () => {
       position: BASE_POSITION,
       display: BASE_DISPLAY,
       views: {},
-      runtime: { planeReady: false, samples: null },
+      runtime: { planeReady: false, samples: null, channelSamples: {} },
     });
   }
 

@@ -780,21 +780,21 @@ def create_leica_lif(
     n_c: int = 2,
     image_shape: Tuple[int, int] = (64, 64),
     bit_depth: int = 16,
+    n_m: int = 1,
 ) -> Tuple[str, np.ndarray]:
     """Create a Leica LIF file.
 
-    readlif ships no writer, so the container is assembled from what its parser
-    reads (readlif ``LifFile.__init__`` / ``LifImage._get_item``)::
+    No LIF writer is available, so the container is assembled from what
+    ``liffile`` parses::
 
         header:  70 00 00 00 | 4 ignored bytes | 2a |
                  int32 xml_len_in_chars | UTF-16 XML
         block:   70 00 00 00 | 4 ignored bytes | 2a | int32 data_len | 2a |
                  int32 name_len_in_chars | UTF-16 name | pixel data
 
-    Two constraints beyond the byte layout: bioio-lif requires ``LUTName`` on
-    every ChannelDescription, and readlif infers channel-before-Z ordering by
-    comparing BytesInc values, so the Z BytesInc must be at least the summed
-    channel BytesInc for the plane order written here.
+    Beyond the byte layout, every ChannelDescription needs ``LUTName`` and its
+    own ``BytesInc`` (the channel's offset within a Z step), and the Z
+    ``BytesInc`` must cover all channels for the plane order written here.
 
     Args:
         tmpdir: Temporary directory to create the file in
@@ -803,9 +803,10 @@ def create_leica_lif(
         n_c: Number of channels
         image_shape: (height, width) of each plane
         bit_depth: 8 or 16
+        n_m: Number of mosaic tiles (a leading M axis when above 1)
 
     Returns:
-        Tuple of (lif_path, expected_array) with expected_array in TCZYX order
+        Tuple of (lif_path, expected_array) in TCZYX order, MTCZYX for a mosaic
     """
     import struct
 
@@ -816,8 +817,7 @@ def create_leica_lif(
     plane_bytes = n_x * n_y * (bit_depth // 8)
     z_inc = plane_bytes * n_c
 
-    # Every attribute liffile (bioio-lif 2) reads is written; readlif ignores
-    # the extras.
+    # Every attribute liffile (and so bioio-lif 2) reads is written.
     def dim(dim_id, n, length, bytes_inc):
         return (
             f'<DimensionDescription DimID="{dim_id}" NumberOfElements="{n}" '
@@ -833,24 +833,26 @@ def create_leica_lif(
         dims.append(dim(3, n_z, (n_z - 1) * 5e-7, z_inc))
     if n_t > 1:
         dims.append(dim(4, n_t, (n_t - 1) * 1.0, z_inc * n_z))
+    if n_m > 1:
+        dims.append(dim(10, n_m, n_m - 1, z_inc * n_z * n_t))
     luts = ("Gray", "Green", "Red", "Blue")
     channels = "".join(
         f'<ChannelDescription DataType="0" ChannelTag="{i}" '
         f'Resolution="{bit_depth}" NameOfMeasuredQuantity="" Min="0" '
         f'Max="{2**bit_depth - 1}" Unit="" LUTName="{luts[i % len(luts)]}" '
-        f'IsLUTInverted="0" BytesInc="{plane_bytes}" BitInc="0"/>'
+        f'IsLUTInverted="0" BytesInc="{i * plane_bytes}" BitInc="0"/>'
         for i in range(n_c)
     )
     xml = (
         # Version 1 is the 4-byte block size written below; liffile reads the
-        # block header by this number (readlif ignores it).
+        # block header by this number.
         '<LMSDataContainerHeader Version="1">'
         '<Element Name="test.lif"><Children>'
         '<Element Name="Image0"><Data><Image><ImageDescription>'
         f"<Dimensions>{''.join(dims)}</Dimensions>"
         f"<Channels>{channels}</Channels>"
         "</ImageDescription></Image></Data>"
-        f'<Memory Size="{plane_bytes * n_c * n_z * n_t}" MemoryBlockID="MemBlock"/>'
+        f'<Memory Size="{plane_bytes * n_c * n_z * n_t * n_m}" MemoryBlockID="MemBlock"/>'
         "</Element></Children></Element></LMSDataContainerHeader>"
     )
     xml_bytes = xml.encode("utf-16")  # BOM included; the parser decodes it
@@ -859,10 +861,12 @@ def create_leica_lif(
     planes = [
         (
             np.arange(n_y * n_x, dtype=np.uint32).reshape(n_y, n_x)
+            + m * 10000
             + t * 1000
             + z * 100
             + c * 10
         ).astype(dtype)
+        for m in range(n_m)
         for t in range(n_t)
         for z in range(n_z)
         for c in range(n_c)
@@ -881,8 +885,9 @@ def create_leica_lif(
         handle.write(block_name)
         handle.write(payload)
 
-    expected = np.stack(planes).reshape(n_t, n_z, n_c, n_y, n_x)
-    return str(lif_path), expected.transpose(0, 2, 1, 3, 4)
+    expected = np.stack(planes).reshape(n_m, n_t, n_z, n_c, n_y, n_x)
+    expected = expected.transpose(0, 1, 3, 2, 4, 5)
+    return str(lif_path), (expected if n_m > 1 else expected[0])
 
 
 def _czi_plane(n_y: int, n_x: int, seed: int, dtype: np.dtype) -> np.ndarray:

@@ -51,11 +51,9 @@ listeners too — defense-in-depth on a shared machine. "No token" is the local
 **default**, not a property of local mode.
 
 **`/api/admin/status`'s `local` flag is a proxy for the bind, not the bind
-itself**: it reports `true` exactly when `token is None`. A loopback
-deployment running behind an optional token therefore reports `local: false`,
-which hides the `/api/admin/browse` file chooser it would otherwise qualify
-for. It fails closed — the data endpoints are unaffected — but it's the thing
-to remember when a local, token-protected box can't browse.
+itself**: it reports `true` exactly when `token is None`. Nothing in the admin
+page keys off it; the `/api/admin/browse` file chooser is gated by the token
+like every other admin route.
 
 ## Endpoints
 
@@ -82,7 +80,11 @@ to remember when a local, token-protected box can't browse.
 | `GET` | `/api/config` | ✓ | Current config (secrets redacted) |
 | `PUT` | `/api/config` | ✓ | Update config (same-origin guarded) |
 | `GET` | `/api/admin/status` | ✓ | Server/catalog status for the admin page |
-| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker (local only — see the auth note above) |
+| `GET` | `/api/admin/browse` | ✓ | Filesystem browse for the data-folder picker; also says whether the requested path exists |
+| `POST` | `/api/admin/sources/add` | ✓ | Serve a server path until restart (the `add_source` action); starts a job keyed by the path |
+| `GET` | `/api/admin/sources/add/status?url=` | ✓ | Progress, then the tally, of that add |
+| `POST` | `/api/admin/sources/add/cancel?url=` | ✓ | Stop that add; what it registered stays |
+| `POST` | `/api/admin/sources/remove` | ✓ | Stop serving a `dnd://` root (the `remove_source` action) |
 
 > **`/readyz` connects.** It opens the Flight connection if none exists yet,
 > so it answers from the backend rather than from whatever traffic happened
@@ -116,7 +118,11 @@ folder's `key` is its full path and is what `?key=` takes. A resolved source
 with no tensor is hidden; an unresolved one is shown, since it is read when
 opened. `descriptor` has the shape of a
 `/api/sources/query` row of the `sources` view. `truncated` says that `limit` or the server's row cap cut the
-level. The server answers a level itself (the `catalog_children` action: folders,
+level. Stripping `dnd://` hides where a root came from, so a top-level folder
+that starts in a drag-dropped root carries `"dropped": true` and `"root_url"`,
+the `dnd://` url `/api/admin/sources/remove` takes (both are absent otherwise,
+and below the top); a dropped dataset sitting at the top is a
+source whose `source_url` still says `dnd://`. The server answers a level itself (the `catalog_children` action: folders,
 and the names and ids of the sources); the sidecar adds one `sources` query for
 those sources' descriptors.
 
@@ -238,6 +244,10 @@ the server's pyramid planner, and a guess one rung away misses every warmed
 chunk — `chunk_id` is `array_id + bounds + scale_hint + reduction_method`, so
 a neighbouring scale shares no cache entry and pays a cold read of the
 source.
+
+The body is also capped to what a texture holds: a float64 volume is sent as
+float32 (`X-Dtype` says so, and the `volume` block's `bytes` is the capped
+size). Other dtypes go out unchanged.
 
 `scale_policy` and `scale_hint` are **mutually exclusive** (422): one read
 has one scale, and letting the two disagree would make which one applies a

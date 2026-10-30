@@ -227,6 +227,10 @@ the control, as `failed` and the log tail.
 | `POST /api/algorithms/register` | add a url entry: `{url, name?, token?}` for a server someone else runs |
 | `POST /api/algorithms/deregister?name=` | remove a url entry; a script entry is a file on this machine and is refused (400) |
 
+The dashboard's Algorithm plane card opens the log page at
+`?source=algorithms`, with a selector over the script entries (a url entry has no
+log); the page reads this route.
+
 The routes sit behind the control's token like the rest of `/api`. A verb
 waits at most `?client_timeout` less five seconds (at most the install bound,
 60 s without the hint), so a slow install answers before the caller gives up.

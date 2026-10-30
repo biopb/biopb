@@ -427,6 +427,9 @@ class DataPlaneSpec:
     exec_token: Optional[str] = None
     # Execute roots (`chat`, `mcp`) the control must not proxy at all.
     hide: frozenset = frozenset()
+    # Whether the dashboard may launch a client reachable from other devices
+    # through a relay (Claude Code, Codex). The operator's opt-in.
+    relay_clients: bool = False
     # Path prefix a reverse proxy publishes the control's web origin under (an
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.

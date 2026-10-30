@@ -256,6 +256,7 @@ export const createTargetSlice: StateCreator<AppState, [], [], TargetSlice> = (s
       display: init ? pickDisplay(init.slice) : { ...s.display, fixedLimits: null },
       render3d: init?.render3d ?? false,
       volumeRenderMode: init?.volumeRenderMode ?? s.volumeRenderMode,
+      composite: init?.composite ?? s.composite,
       camera3d: init?.camera3d ?? null,
       camera2d: init?.camera2d ?? null,
       labelOpacity: init?.labelOpacity ?? s.labelOpacity,
@@ -331,6 +332,7 @@ export const createTargetSlice: StateCreator<AppState, [], [], TargetSlice> = (s
         gamma: s.display.gamma,
       },
       volumeRenderMode: s.volumeRenderMode,
+      composite: s.composite,
       labelOpacity: s.labelOpacity,
     });
     get().openTensor(requested, init);

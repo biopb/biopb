@@ -917,6 +917,7 @@ def _control_run_argv(
     url_prefix: Optional[str] = None,
     grpc_external_location: Optional[str] = None,
     tokenless: bool = False,
+    allow_relay_clients: bool = False,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -965,6 +966,8 @@ def _control_run_argv(
         argv += ["--url-prefix", url_prefix]
     if grpc_external_location:
         argv += ["--grpc-external-location", grpc_external_location]
+    if allow_relay_clients:
+        argv.append("--allow-relay-clients")
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
@@ -1077,6 +1080,15 @@ _OPT_DATA_PLANE = typer.Option(
     "control plane starts without it; a client brings it up on demand via the "
     "control API.",
 )
+_OPT_ALLOW_RELAY_CLIENTS = typer.Option(
+    False,
+    "--allow-relay-clients",
+    envvar="BIOPB_CONTROL_RELAY_CLIENTS",
+    help="Let the dashboard launch Claude Code and Codex remote sessions, which "
+    "other devices reach through the vendor's relay, and start opencode 2 with "
+    "`pair --remote`, which exposes its server to the internet. Off by default: "
+    "the client it starts is an agent with a shell.",
+)
 _OPT_GRPC_EXTERNAL_LOCATION = typer.Option(
     None,
     "--grpc-external-location",
@@ -1107,6 +1119,7 @@ def control_start(
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
     grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
+    allow_relay_clients: bool = _OPT_ALLOW_RELAY_CLIENTS,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1142,9 +1155,95 @@ def control_start(
     Only the flight plane is ever published; the sidecar and the control stay on
     loopback (plaintext HTTP). To reach the UI from another machine, tunnel it:
     ``ssh -L 8813:localhost:8813 <host>``.
+
+    The resolved options are saved, and `biopb control restart` starts with them.
     """
+    _start_control(
+        config=config,
+        static_dir=static_dir,
+        base_port=base_port,
+        log_level=log_level,
+        grpc_bind=_resolve_grpc_bind(grpc_bind, remote),
+        tls=tls,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
+        san=san,
+        token=token,
+        data_plane=data_plane,
+        url_prefix=url_prefix,
+        grpc_external_location=grpc_external_location,
+        allow_relay_clients=allow_relay_clients,
+    )
+
+
+# What `control restart` replays; the token is kept apart, in a credential file.
+_START_PATHS = ("config", "static_dir", "tls_cert", "tls_key")
+_START_KEYS = _START_PATHS + (
+    "base_port",
+    "log_level",
+    "grpc_bind",
+    "tls",
+    "san",
+    "data_plane",
+    "url_prefix",
+    "grpc_external_location",
+    "allow_relay_clients",
+)
+_START_TOKEN = "control-start-token"
+
+
+def _save_start_options(opts: dict, token: Optional[str]) -> None:
+    """Record what this start resolved, for `control restart`. Best-effort: a state
+    dir that cannot be written costs the restart its memory, not the start."""
+    try:
+        path = _locations.control_start_options_file()
+        saved = {k: (str(v) if k in _START_PATHS and v else v) for k, v in opts.items()}
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        if token:
+            _credentials.write_credential(token, _START_TOKEN)
+        else:
+            _credentials.remove_credential(_START_TOKEN)
+    except OSError as exc:
+        console.print(f"[yellow]Could not save the start options: {exc}[/yellow]")
+
+
+def _load_start_options() -> Optional[Tuple[dict, Optional[str]]]:
+    """The saved start options and token, or ``None`` when absent or unreadable."""
+    try:
+        raw = json.loads(
+            _locations.control_start_options_file().read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    opts = {k: raw[k] for k in _START_KEYS if k in raw}
+    for k in _START_PATHS:
+        if opts.get(k):
+            opts[k] = Path(opts[k])
+    return opts, _credentials.read_credential(_START_TOKEN)
+
+
+def _start_control(
+    *,
+    config: Path,
+    static_dir: Optional[Path],
+    base_port: int,
+    log_level: str,
+    grpc_bind: Optional[str],
+    tls: Optional[bool],
+    tls_cert: Optional[Path],
+    tls_key: Optional[Path],
+    san: Optional[List[str]],
+    token: Optional[str],
+    data_plane: bool,
+    url_prefix: Optional[str],
+    grpc_external_location: Optional[str],
+    allow_relay_clients: bool,
+) -> None:
     _require_biopb_control()
-    grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
     url_prefix = _resolve_url_prefix(url_prefix)
     tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
     # A BYO cert needs no `cryptography`; only a minted one does.
@@ -1199,6 +1298,7 @@ def control_start(
                 url_prefix=url_prefix,
                 grpc_external_location=grpc_external_location,
                 tokenless=_says_tokenless(resolved_token),
+                allow_relay_clients=allow_relay_clients,
             )
 
             log_file = _control_log_file()
@@ -1247,12 +1347,58 @@ def control_start(
             console.print(f"  Logs: {log_file}")
             if _web_auth.host_is_public_bind(grpc_bind):
                 _print_ui_tunnel_hint(control_port)
+            _save_start_options(
+                {k: v for k, v in locals().items() if k in _START_KEYS},
+                resolved_token,
+            )
     except LockTimeout:
         console.print(
             "[red]Another 'biopb control start' is already in progress and did not "
             "finish within 30s.[/red] Retry shortly, or check 'biopb control status'."
         )
         raise typer.Exit(1)
+
+
+@control_app.command(
+    "restart",
+    help="Stop the control plane and start it with the options of its last start.",
+)
+def control_restart(
+    timeout: int = typer.Option(
+        10, "--timeout", "-t", help="Seconds to wait for graceful shutdown"
+    ),
+):
+    """Restart the control plane with the options the last `control start` resolved
+    (ports, bind, TLS, prefix, access token, ...). Without a saved start it starts
+    with the defaults. An exec token comes from the environment, as for `start`."""
+    _require_biopb_control()
+    saved = _load_start_options()
+    try:
+        control_stop(timeout=timeout)
+    except typer.Exit as stopped:
+        if stopped.exit_code:
+            raise
+    opts, token = saved or ({}, None)
+    if saved is None:
+        console.print(
+            "[yellow]No saved start options; starting with defaults.[/yellow]"
+        )
+    base = dict(  # noqa: C408
+        config=DEFAULT_CONFIG,
+        static_dir=DEFAULT_WEBAPP,
+        base_port=_endpoints.BASE_DEFAULT_PORT,
+        log_level="INFO",
+        grpc_bind=None,
+        tls=None,
+        tls_cert=None,
+        tls_key=None,
+        san=None,
+        data_plane=True,
+        url_prefix=None,
+        grpc_external_location=None,
+        allow_relay_clients=False,
+    )
+    _start_control(**{**base, **opts}, token=token)
 
 
 def _live_foreground_control() -> Optional[Tuple[dict, int]]:
@@ -1507,6 +1653,7 @@ def dashboard(
                 remote=remote,
                 url_prefix=None,
                 grpc_external_location=grpc_external_location,
+                allow_relay_clients=False,
             )
         except typer.Exit as started:
             if started.exit_code:

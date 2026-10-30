@@ -273,13 +273,17 @@ describe("groupTensors", () => {
 describe("lazyTreeNodes", () => {
   const level = (
     key: string,
-    folders: Array<[string, string]> = [],
+    folders: Array<[string, string, boolean?]> = [],
     sources: Array<[string, DataSourceDescriptor]> = [],
     truncated = false,
   ): { level: TreeLevel } => ({
     level: {
       key,
-      folders: folders.map(([name, k]) => ({ name, key: k })),
+      folders: folders.map(([name, k, dropped]) => ({
+        name,
+        key: k,
+        ...(dropped ? { dropped } : {}),
+      })),
       sources: sources.map(([name, descriptor]) => ({ name, descriptor })),
       truncated,
     },
@@ -343,6 +347,87 @@ describe("lazyTreeNodes", () => {
 
   it("is empty before the top has loaded", () => {
     expect(lazyTreeNodes({}, {}, new Set())).toEqual([]);
+  });
+
+  describe("drag-dropped roots", () => {
+    const DROPPED = source({ source_id: "d", source_url: "dnd://exp.zarr" });
+
+    it("marks a top-level folder the server says holds one, and no other", () => {
+      const nodes = lazyTreeNodes(
+        { "": level("", [["lab", "lab"], ["scratch", "scratch", true]]) },
+        {},
+        new Set(),
+      );
+      expect(nodes.map((n) => [n.name, n.dropped])).toEqual([
+        ["lab", undefined],
+        ["scratch", true],
+      ]);
+    });
+
+    it("marks a dropped dataset, which sits at the top as a source", () => {
+      const nodes = lazyTreeNodes({ "": level("", [], [["exp.zarr", DROPPED], ["a.zarr", A]]) }, {}, new Set());
+      expect(nodes.map((n) => [n.name, n.dropped])).toEqual([
+        ["exp.zarr", true],
+        ["a.zarr", undefined],
+      ]);
+    });
+
+    it("marks nothing below the top", () => {
+      const levels = {
+        "": level("", [["scratch", "scratch", true]]),
+        scratch: level("scratch", [["sub", "scratch/sub"]], [["exp.zarr", DROPPED]]),
+      };
+      const [scratch] = lazyTreeNodes(levels, {}, new Set(["scratch"]));
+      expect(scratch!.children.map((n) => n.dropped)).toEqual([undefined, undefined]);
+    });
+  });
+});
+
+describe("lazyTreeNodes dropped roots", () => {
+  const levels = (level: Partial<TreeLevel>) => ({
+    "": { level: { key: "", folders: [], sources: [], truncated: false, ...level } },
+  });
+
+  it("carries the root url the server named on a dropped folder", () => {
+    const [node] = lazyTreeNodes(
+      levels({
+        folders: [{ name: "scratch/sub", key: "scratch/sub", dropped: true, root_url: "dnd://scratch" }],
+      }),
+      {},
+      new Set(),
+    );
+    expect(node!.dropped).toBe(true);
+    expect(node!.rootUrl).toBe("dnd://scratch");
+  });
+
+  it("names a dropped dataset by its own url", () => {
+    const d = source({ source_id: "d", source_url: "dnd://exp.zarr" });
+    const [node] = lazyTreeNodes(
+      levels({ sources: [{ name: "exp.zarr", descriptor: d }] }),
+      {},
+      new Set(),
+    );
+    expect(node!.rootUrl).toBe("dnd://exp.zarr");
+  });
+
+  it("names no root for a server that sent none, or for anything not dropped", () => {
+    const plain = source({ source_url: "file:///data/a.zarr" });
+    const nodes = lazyTreeNodes(
+      levels({
+        folders: [
+          { name: "old", key: "old", dropped: true },
+          { name: "lab", key: "lab" },
+        ],
+        sources: [{ name: "a.zarr", descriptor: plain }],
+      }),
+      {},
+      new Set(),
+    );
+    expect(nodes.map((n) => [n.name, n.dropped, n.rootUrl])).toEqual([
+      ["old", true, undefined],
+      ["lab", undefined, undefined],
+      ["a.zarr", undefined, undefined],
+    ]);
   });
 });
 

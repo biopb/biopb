@@ -134,9 +134,15 @@ def _record(run, full=False, final=False):
     for code, job_id in zip(run["cells"], run["cell_jobs"], strict=True):
         out = log.outcome(job_id, full) if job_id is not None else None
         if out is None:
-            out = {"error_text": "", "elapsed": 0.0, "stdout_len": 0, "stdout_head": ""}
+            out = {
+                "error_text": "",
+                "elapsed": 0.0,
+                "stdout_len": 0,
+                "stdout_head": "",
+                "figures": 0,
+            }
             if full:
-                out.update(stdout="", result_text="")
+                out.update(stdout="", result_text="", figure_data=[])
             status = "skipped" if final else "pending"
         elif out["status"] == "running":
             status = "error" if final else "running"
@@ -176,6 +182,16 @@ def _snapshot(run, output=False):
     cell's output under the progress note, for a poll that shows it.
     """
     record = run["record"] if run["record"] is not None else _record(run)
+    if record is not None:
+        # The figures' bytes are the notebook's and `figure`'s; a snapshot is
+        # what the observe page and every poll serialise.
+        record = {
+            **record,
+            "cells": [
+                {k: v for k, v in c.items() if k != "figure_data"}
+                for c in record["cells"]
+            ],
+        }
     stdout = run["note"]
     if output and run["status"] == "running" and run["log"] is not None:
         current = _current_cell(run)
@@ -261,6 +277,27 @@ def poll(job_id):
         if _run is not None and _run["job_id"] == job_id:
             return _snapshot(_run, output=True)
     return None
+
+
+def figure(job_id, cell, index=0):
+    """One figure of a verification's cell *cell* (1-based): ``(png, count)``,
+    ``(None, count)`` when *index* is out of range, ``(None, 0)`` for a run or
+    cell that is not there."""
+    with _lock:
+        if _run is None or _run["job_id"] != job_id:
+            return None, 0
+        record = _run["record"]
+        if record is not None:  # ended: the record holds what the log held
+            cells = record["cells"]
+            if not 1 <= cell <= len(cells):
+                return None, 0
+            figs = cells[cell - 1].get("figure_data") or []
+            return (figs[index] if 0 <= index < len(figs) else None), len(figs)
+        jobs = _run["cell_jobs"]
+        if _run["log"] is None or not 1 <= cell <= len(jobs) or jobs[cell - 1] is None:
+            return None, 0
+        log, cell_job = _run["log"], jobs[cell - 1]
+    return log.figure(cell_job, index)
 
 
 def runs_view():

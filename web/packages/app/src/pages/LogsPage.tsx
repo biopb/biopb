@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { captureUrlToken } from "../auth";
 import { SessionLocked, sessionFetch } from "../utils/sessionFetch";
@@ -36,7 +36,25 @@ function formatBytes(n?: number): string {
 }
 
 export default function LogsPage() {
-  useDocumentTitle("BioPB control - data-plane logs");
+  // `?source=` picks whose log: the last agent-client launch, the last session
+  // the dashboard launched, an algorithm server's (`?name=` the entry), or
+  // (default) the data plane.
+  const params = useSearchParams()[0];
+  const source = params.get("source") ?? "data_plane";
+  const what =
+    source === "agents"
+      ? "Agent client"
+      : source === "sessions"
+        ? "Session"
+        : source === "algorithms"
+          ? "Algorithm"
+          : "Data-plane";
+  useDocumentTitle(`BioPB control - ${what.toLowerCase()} logs`);
+
+  // Algorithm logs are per entry: the script entries the control runs (a url
+  // entry's logs belong to whoever runs it), and the one being read.
+  const [entries, setEntries] = useState<string[] | null>(null);
+  const [entry, setEntry] = useState<string | null>(params.get("name"));
 
   const [data, setData] = useState<LogsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,12 +67,16 @@ export default function LogsPage() {
   const followRef = useRef(follow);
   followRef.current = follow;
 
-  const load = useCallback(async (n: number) => {
+  const load = useCallback(
+    async (n: number) => {
+    const url =
+      source === "algorithms"
+        ? entry && `/api/algorithms/logs?name=${encodeURIComponent(entry)}&lines=${n}`
+        : `/api/${source}/logs?lines=${n}`;
+    if (!url) return;
     setLoading(true);
     try {
-      const r = await sessionFetch(withBase(`/api/data_plane/logs?lines=${n}`), {
-        cache: "no-store",
-      });
+      const r = await sessionFetch(withBase(url), { cache: "no-store" });
       if (!r.ok) {
         const body = (await r.json().catch(() => ({}))) as Partial<LogsResponse>;
         throw new Error(body?.error || `Could not load logs (HTTP ${r.status}).`);
@@ -69,7 +91,25 @@ export default function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  },
+    [source, entry],
+  );
+
+  useEffect(() => {
+    if (source !== "algorithms") return;
+    sessionFetch(withBase("/api/algorithms"))
+      .then((r) => r.json())
+      .then((body) => {
+        const names: string[] = (body?.servers ?? [])
+          .filter((s: { kind: string }) => s.kind === "script")
+          .map((s: { name: string }) => s.name);
+        setEntries(names);
+        setEntry((cur) => (cur && names.includes(cur) ? cur : (names[0] ?? null)));
+      })
+      .catch((err) => {
+        if (!(err instanceof SessionLocked)) setError(String(err));
+      });
+  }, [source]);
 
   // Capture a ?token= handed over by the one-time access URL before the first
   // fetch, so a remote-mode deep link to /logs authenticates rather than bouncing.
@@ -107,7 +147,19 @@ export default function LogsPage() {
           alt=""
           aria-hidden="true"
         />
-        <h1>Data-plane logs</h1>
+        <h1>{what} logs</h1>
+        {source === "algorithms" && entries && entries.length ? (
+          <label className="lines-sel">
+            Entry
+            <select value={entry ?? ""} onChange={(e) => setEntry(e.target.value)}>
+              {entries.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         <span className="conn">
           {data?.exists
             ? `${data.lines.length} line(s)${
@@ -161,12 +213,18 @@ export default function LogsPage() {
           <div className="banner error">Could not load logs: {error}</div>
         ) : null}
 
+        {source === "algorithms" && entries && !entries.length ? (
+          <div className="banner empty">
+            No script entries: a server someone else runs keeps its own logs.
+          </div>
+        ) : null}
+
         {data && !data.exists ? (
           <div className="banner empty">
             {data.note ||
               (data.path
-                ? "The data-plane log file does not exist yet — start the data plane to produce output."
-                : "No data-plane log file is configured.")}
+                ? `The ${what.toLowerCase()} log file does not exist yet.`
+                : `No ${what.toLowerCase()} log file is configured.`)}
           </div>
         ) : null}
 

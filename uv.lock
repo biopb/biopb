@@ -552,6 +552,7 @@ source = { editable = "biopb-control" }
 dependencies = [
     { name = "biopb", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "httpx", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
+    { name = "packaging", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "sniffio", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "starlette", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "uvicorn", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
@@ -566,6 +567,7 @@ testing = [
 requires-dist = [
     { name = "biopb", editable = "." },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "packaging", specifier = ">=23" },
     { name = "sniffio", specifier = ">=1.3" },
     { name = "starlette", specifier = ">=0.37" },
     { name = "uvicorn", specifier = ">=0.34" },
@@ -624,7 +626,6 @@ dependencies = [
     { name = "matplotlib", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "mcp", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "numpy", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
-    { name = "packaging", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "pandas", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "psutil", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "scikit-image", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
@@ -665,13 +666,12 @@ requires-dist = [
     { name = "biopb", extras = ["shim", "tensor"], editable = "." },
     { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.2.0" },
     { name = "distributed", specifier = ">=2023.9.0" },
-    { name = "ipykernel", specifier = "<7" },
+    { name = "ipykernel", specifier = ">=7.1" },
     { name = "jupyter-client" },
     { name = "matplotlib" },
     { name = "mcp", specifier = ">=1.20,<2" },
     { name = "napari", extras = ["all"], marker = "extra == 'napari'", specifier = "==0.9.2" },
     { name = "numpy" },
-    { name = "packaging" },
     { name = "pandas" },
     { name = "psutil" },
     { name = "pyqt6", marker = "extra == 'napari'" },
@@ -789,9 +789,9 @@ tls = [
     { name = "cryptography", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
 vendor = [
+    { name = "liffile", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "mrc", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "nd2", extra = ["legacy"], marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
-    { name = "readlif", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
 web = [
     { name = "fastapi", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
@@ -817,12 +817,13 @@ requires-dist = [
     { name = "cjdk", marker = "extra == 'bioformats'", specifier = ">=0.5.0" },
     { name = "cryptography", marker = "extra == 'tls'", specifier = ">=41.0.0" },
     { name = "dask", extras = ["array"], specifier = ">=2024.0.0" },
-    { name = "duckdb", specifier = ">=1.0,<2" },
+    { name = "duckdb", specifier = ">=1.5" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.111.0" },
     { name = "fsspec", specifier = ">=2024.12.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
     { name = "imagecodecs", marker = "extra == 'qptiff'", specifier = ">=2023.1.23" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
+    { name = "liffile", marker = "extra == 'vendor'", specifier = ">=2026.10.14" },
     { name = "mrc", marker = "extra == 'vendor'", specifier = ">=0.2.0" },
     { name = "nd2", extras = ["legacy"], marker = "extra == 'vendor'", specifier = ">=0.10.3" },
     { name = "ndtiff", marker = "extra == 'ndtiff'", specifier = ">=3.0.0" },
@@ -835,7 +836,6 @@ requires-dist = [
     { name = "pydicom", marker = "extra == 'medical'", specifier = ">=2.4.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
-    { name = "readlif", marker = "extra == 'vendor'", specifier = ">=0.6.4" },
     { name = "rosettasciio", extras = ["hdf5"], marker = "extra == 'em'", specifier = ">=0.15" },
     { name = "scipy" },
     { name = "scyjava", marker = "extra == 'bioformats'", specifier = ">=1.9.0" },
@@ -2021,7 +2021,7 @@ wheels = [
 
 [[package]]
 name = "ipykernel"
-version = "6.31.0"
+version = "7.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "appnope", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin')" },
@@ -2031,16 +2031,15 @@ dependencies = [
     { name = "jupyter-client", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "jupyter-core", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "matplotlib-inline", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
-    { name = "nest-asyncio", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
+    { name = "nest-asyncio2", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "packaging", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
-    { name = "psutil", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "pyzmq", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "tornado", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "traitlets", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a5/1d/d5ba6edbfe6fae4c3105bca3a9c889563cc752c7f2de45e333164c7f4846/ipykernel-6.31.0.tar.gz", hash = "sha256:2372ce8bc1ff4f34e58cafed3a0feb2194b91fc7cad0fc72e79e47b45ee9e8f6", size = 167493, upload-time = "2025-10-20T11:42:39.948Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/05/e5499c8b762387d83926bf0389e8fff888c9bf6e7af30566a8527bc12f4a/ipykernel-7.4.0.tar.gz", hash = "sha256:4330114d22b9b33575b2c7c68753fc8faabbbcfbc60b0cdff9f14dd4ce63742f", size = 192731, upload-time = "2026-09-29T16:33:11.468Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f6/d8/502954a4ec0efcf264f99b65b41c3c54e65a647d9f0d6f62cd02227d242c/ipykernel-6.31.0-py3-none-any.whl", hash = "sha256:abe5386f6ced727a70e0eb0cf1da801fa7c5fa6ff82147747d5a0406cd8c94af", size = 117003, upload-time = "2025-10-20T11:42:37.502Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/f8/8b5c10c7f36ab5a3b5c4703669e5b14e44e98782b58e535dd30670e8799a/ipykernel-7.4.0-py3-none-any.whl", hash = "sha256:a6757f790ddc5a6006b813d82da1a9dbb65b3a00f2b6607df776418c6566ec1c", size = 123184, upload-time = "2026-09-29T16:33:09.612Z" },
 ]
 
 [[package]]
@@ -2330,6 +2329,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/49/ac/21a1f8aa3777f5658576777ea76bfb124b702c520bbe90edf4ae9915eafa/lazy_loader-0.5.tar.gz", hash = "sha256:717f9179a0dbed357012ddad50a5ad3d5e4d9a0b8712680d4e687f5e6e6ed9b3", size = 15294, upload-time = "2026-03-06T15:45:09.054Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8a/a1/8d812e53a5da1687abb10445275d41a8b13adb781bbf7196ddbcf8d88505/lazy_loader-0.5-py3-none-any.whl", hash = "sha256:ab0ea149e9c554d4ffeeb21105ac60bed7f3b4fd69b1d2360a4add51b170b005", size = 8044, upload-time = "2026-03-06T15:45:07.668Z" },
+]
+
+[[package]]
+name = "liffile"
+version = "2026.10.14"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/c7/ebd6c3938c6de7aa3fbbfb20f0ca574331b7685e40fa765fa5b0bece7846/liffile-2026.10.14.tar.gz", hash = "sha256:e0f06086b6b14280d9d85493760bf89ecc022aed009bee781bf566d84d9fc794", size = 61746, upload-time = "2026-10-14T18:41:14.133Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/97/976df02762f1c27253d9d1a82e91b3c931fff980da5d44ccfe950afae7c2/liffile-2026.10.14-py3-none-any.whl", hash = "sha256:b3a447d3feb16fa9e478d608d5167ab70699163439a7df968eab214a838ef739", size = 39288, upload-time = "2026-10-14T18:41:13.091Z" },
 ]
 
 [[package]]
@@ -3131,7 +3142,7 @@ all = [
 
 [[package]]
 name = "napari-console"
-version = "0.1.4"
+version = "0.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ipykernel", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
@@ -3139,9 +3150,9 @@ dependencies = [
     { name = "qtconsole", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
     { name = "qtpy", marker = "(python_full_version < '3.14' and sys_platform == 'darwin') or (platform_machine != 'x86_64' and sys_platform == 'darwin') or (sys_platform != 'darwin' and sys_platform != 'emscripten')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5a/03/6e1fcd9aa9ac4746ce2b44050ea8f7192d883f4d3da4e7ff08589ac3ad3b/napari_console-0.1.4.tar.gz", hash = "sha256:e185e4d36d8171ae23ca383dc69c38df76592a984d6c99ad08372d188a1fbb9b", size = 20152, upload-time = "2025-10-15T14:24:18.456Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/a0/e32a461b475e52962dd4f197129a0f04fc4d7819efed4180cb2f969c6f97/napari_console-0.1.5.tar.gz", hash = "sha256:c06e48709802b833a1fb3aab190454fb0211abf3dc86e1d80158c012b9aaa8d2", size = 13578, upload-time = "2026-10-22T08:01:30.416Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/01/72/2067f28fd0ae87978f3b61e8ec30c1d085bbed03f64eb58e43949d526b3a/napari_console-0.1.4-py3-none-any.whl", hash = "sha256:565df1fa15db579552af9e9d9d3883067c00191be282ad47d80f9b0d50b4e5ad", size = 9786, upload-time = "2025-10-15T14:24:17.677Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/34/dc928a52a7b153286b985dc2ec9d33195e2c5f9967d656d225c2680e50cd/napari_console-0.1.5-py3-none-any.whl", hash = "sha256:a9cec209fba31c80f439caff5a72c4f97007eab8d1d02ca20c88c3ab3b600caa", size = 9585, upload-time = "2026-10-22T08:01:29.188Z" },
 ]
 
 [[package]]
@@ -3257,12 +3268,12 @@ wheels = [
 ]
 
 [[package]]
-name = "nest-asyncio"
-version = "1.6.0"
+name = "nest-asyncio2"
+version = "1.7.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/83/f8/51569ac65d696c8ecbee95938f89d4abf00f47d58d48f6fbabfe8f0baefe/nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe", size = 7418, upload-time = "2024-01-21T14:25:19.227Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/32/2c/70e3b6bb2189cfd260280b7e1042bd622949a258663f95e887fada4ac1e6/nest_asyncio2-1.7.4.tar.gz", hash = "sha256:995b1409d926ec55e0876ea39a69bffdd8852cf1db3652c177e8c8ffdbcaf3cc", size = 16891, upload-time = "2026-10-07T22:31:50.507Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
+    { url = "https://files.pythonhosted.org/packages/09/ed/559d2915dce85794bc0c36064043da170da50cd98746dcbddd85d5932017/nest_asyncio2-1.7.4-py3-none-any.whl", hash = "sha256:86e77b52c3d1496b294af3c944b44213b9b82a12a5ee590c0acc4ca4692ef6c7", size = 8543, upload-time = "2026-10-07T22:31:49.245Z" },
 ]
 
 [[package]]

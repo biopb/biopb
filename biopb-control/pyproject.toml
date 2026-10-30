@@ -44,6 +44,8 @@ dependencies = [
     # no longer pulls it in), pays a failed-import path scan each time: ~45% of
     # the /data_plane proxy's CPU per request.
     "sniffio>=1.3",
+    # Version ordering for the update check.
+    "packaging>=23",
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same

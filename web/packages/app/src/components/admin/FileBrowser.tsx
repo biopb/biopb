@@ -6,10 +6,9 @@ import { Modal } from "../Modal";
  * Server-side file/directory chooser (biopb/biopb#244).
  *
  * Navigates the *server's* filesystem via `GET /api/admin/browse`, so the user
- * picks a real server path (`/data/microscopy`) instead of typing it. Only
- * mounted in **local mode** — where the server's filesystem is the user's own
- * machine — so it never discloses a remote host's files; the caller gates it on
- * `AdminStatus.local`.
+ * picks a real server path (`/data/microscopy`) by clicking down to it, or by
+ * typing or pasting it into the path field. The route is behind the server
+ * token like the rest of the admin page, so it is offered wherever the page is.
  *
  * The user can navigate into directories, go up, pick a directory ("Use this
  * folder"), or pick a file (click it). Path joining infers the separator from
@@ -55,6 +54,13 @@ export function FileBrowser({ browse, initialPath, onPick, onClose }: FileBrowse
   }, [load, initialPath]);
 
   const dir = data?.path ?? "";
+  // The path field: follows the folder shown, until the user types over it.
+  const [typed, setTyped] = useState("");
+  useEffect(() => setTyped(dir), [dir]);
+  const go = () => {
+    const p = typed.trim();
+    if (p) load(p);
+  };
 
   return (
     <Modal
@@ -74,10 +80,31 @@ export function FileBrowser({ browse, initialPath, onPick, onClose }: FileBrowse
           >
             ↑ Up
           </button>
-          <code className="file-browser-path" title={dir}>
-            {dir || "…"}
-          </code>
+          <input
+            type="text"
+            className="file-browser-path"
+            aria-label="Path"
+            placeholder="Type or paste a path, then Enter"
+            spellCheck={false}
+            value={typed}
+            onChange={(e) => setTyped(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && go()}
+          />
+          <button
+            type="button"
+            className="icon-btn"
+            disabled={loading || !typed.trim()}
+            onClick={go}
+          >
+            Go
+          </button>
         </div>
+
+        {data?.exists === false && !loading && (
+          <p className="file-browser-note">
+            That path does not exist on the server; showing the nearest folder.
+          </p>
+        )}
 
         {error ? (
           <div className="admin-banner error">{error}</div>

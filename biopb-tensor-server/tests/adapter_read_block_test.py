@@ -39,7 +39,6 @@ QUANTIZED = {
     "OlympusAdapter": "inherits _BioioAdapterBase",
     "BioformatsAdapter": "inherits _BioioAdapterBase",
     "AicsImageIoAdapter": "inherits _BioioAdapterBase",
-    "LifAdapter": "one plane: readlif has no ROI, get_frame reads it whole",
 }
 
 # No part of a read is wasted: a crop costs its own pages and nothing more.
@@ -54,6 +53,7 @@ UNQUANTIZED = {
     "CacheMember": "inherits CachedSourceAdapter; chunks served as stored",
     "QptiffAdapter": "source-level; serves levels through _QptiffLevelAdapter",
     "DeltaVisionAdapter": "one np.memmap (mrc.DVFile); indexing computes byte offsets",
+    "LifAdapter": "liffile memory map of the image; a crop costs its own pages",
     "TensorAdapter": "the base class itself",
     "RasterizedMaskAdapter": "computed, not stored; a read paints only its own bounds",
 }

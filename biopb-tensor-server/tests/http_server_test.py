@@ -5,6 +5,7 @@ Integration tests spin up a real TensorFlightServer + ZarrAdapter.
 """
 
 import json
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -1666,8 +1667,6 @@ class TestAdminStatusRoute:
         assert body["config_path"] == str(config_path)
         assert isinstance(body["pid"], int)
         assert body["version"]
-        # No token enforced ⇒ local mode; the admin UI keys the file chooser off
-        # this (biopb/biopb#244).
         assert body["local"] is True
 
     def test_status_reports_not_supervised_by_default(self, admin_client):
@@ -1683,7 +1682,6 @@ class TestAdminStatusRoute:
         assert tc.get("/api/admin/status").json()["supervised"] is True
 
     def test_status_reports_not_local_when_token_enforced(self, tmp_path):
-        # A token means remote mode; the admin UI then hides the file chooser.
         config_path = tmp_path / "biopb.json"
         config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
         mock_fc = _build_mock_client()
@@ -1753,8 +1751,25 @@ class TestAdminBrowseRoute:
         # A non-existent path resolves to a non-existent parent → not a directory.
         assert r.status_code == 404
 
-    def test_browse_unavailable_in_remote_mode(self, tmp_path):
-        # Remote mode (token enforced): the FS-listing surface must not exist.
+    def test_browse_reports_whether_the_requested_path_exists(
+        self, admin_client, tmp_path
+    ):
+        tc, _ = admin_client
+        (tmp_path / "here").mkdir()
+        (tmp_path / "f.txt").write_text("x")
+
+        def exists(path):
+            r = tc.get("/api/admin/browse", params={"path": str(path)})
+            assert r.status_code == 200
+            return r.json()["exists"]
+
+        assert exists(tmp_path / "here") is True
+        assert exists(tmp_path / "f.txt") is True
+        # A missing child lists its parent, so the listing alone cannot tell.
+        assert exists(tmp_path / "typo") is False
+        assert tc.get("/api/admin/browse").json()["exists"] is True
+
+    def test_browse_is_gated_by_the_token_not_hidden_by_it(self, tmp_path):
         config_path = tmp_path / "biopb.json"
         config_path.write_text('{"server": {"host": "0.0.0.0", "port": 8815}}')
         mock_fc = _build_mock_client()
@@ -1765,12 +1780,183 @@ class TestAdminBrowseRoute:
         ):
             app = create_app(token=_TOKEN, config_path=str(config_path))
             with TestClient(app, raise_server_exceptions=True) as tc:
-                r = tc.get(
-                    "/api/admin/browse",
-                    params={"path": str(tmp_path)},
-                    headers=_bearer(_TOKEN),
-                )
-                assert r.status_code == 404
+                params = {"path": str(tmp_path)}
+                assert tc.get("/api/admin/browse", params=params).status_code == 401
+                r = tc.get("/api/admin/browse", params=params, headers=_bearer(_TOKEN))
+                assert r.status_code == 200
+                assert r.json()["path"] == str(tmp_path.resolve())
+
+
+class TestAdminRuntimeSources:
+    """Adding and removing a served path from the browser (the add_source /
+    remove_source actions behind HTTP)."""
+
+    @staticmethod
+    def _client(tc):
+        return tc.app.state.sidecar.get_client()
+
+    @staticmethod
+    def _wait(tc, path, params, until, timeout=5.0):
+        deadline = time.time() + timeout
+        while True:
+            body = tc.get(path, params=params).json()
+            if until(body) or time.time() > deadline:
+                return body
+            time.sleep(0.02)
+
+    def _add(self, tc, url, **extra):
+        """Start an add and wait it out: ``(job, final status)``.
+
+        The job is named by the path as the server normalised it, which is the
+        platform's own spelling (``\\data\\exp`` on Windows), so a poll asks by the
+        name the start returned, as the SPA does.
+        """
+        r = tc.post("/api/admin/sources/add", json={"url": url, **extra})
+        assert r.status_code == 202
+        job = r.json()["source_id"]
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": job},
+            lambda b: b["state"] != "running",
+        )
+        return job, body
+
+    def test_add_runs_as_a_job_and_ends_with_the_tally(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        result = AddSourceResult(added=["a", "b"], already_present=["c"])
+        result.failed.add(path="/data/bad.tif", reason="unreadable")
+        self._client(tc).register_local_path.return_value = result
+
+        job, body = self._add(tc, " /data/exp ")
+        assert job == os.path.normpath("/data/exp")
+        assert body["state"] == "done"
+        assert body["result"] == {
+            "added": 2,
+            "already_present": 1,
+            "refreshed": 0,
+            "removed": 0,
+            "skipped_offline": 0,
+            "skipped_cloud_dirs": 0,
+            "failed": [{"path": "/data/bad.tif", "reason": "unreadable"}],
+            "failed_total": 1,
+        }
+        call = self._client(tc).register_local_path.call_args
+        assert call.args == (job,)
+        assert call.kwargs["cloud"] is False
+
+    def test_a_path_with_and_without_a_trailing_slash_is_one_job(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        self._client(tc).register_local_path.return_value = AddSourceResult()
+        job, _ = self._add(tc, "/data//exp/")
+        assert job == os.path.normpath("/data/exp")
+        # The walk is asked for by that same spelling.
+        assert self._client(tc).register_local_path.call_args.args == (job,)
+
+    def test_add_passes_the_cloud_flag(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+        self._client(tc).register_local_path.return_value = AddSourceResult()
+        self._add(tc, "/od", cloud=True)
+        assert self._client(tc).register_local_path.call_args.kwargs["cloud"] is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [{}, {"url": ""}, {"url": "   "}, {"url": 5}, {"url": "/x", "cloud": "yes"}],
+    )
+    def test_add_refuses_a_malformed_body(self, admin_client, body):
+        tc, _ = admin_client
+        assert tc.post("/api/admin/sources/add", json=body).status_code == 422
+
+    def test_a_refused_add_ends_in_error_with_the_servers_reason(self, admin_client):
+        tc, _ = admin_client
+        self._client(tc).register_local_path.side_effect = flight.FlightServerError(
+            "path not found: /nope"
+        )
+        _, body = self._add(tc, "/nope")
+        assert body["state"] == "error"
+        assert "path not found: /nope" in body["error"]
+
+    def test_cancel_stops_an_add_and_keeps_its_tally(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult
+
+        tc, _ = admin_client
+
+        def walk(url, *, should_cancel, **_):
+            while not should_cancel():
+                time.sleep(0.01)
+            return AddSourceResult(added=["a"])
+
+        self._client(tc).register_local_path.side_effect = walk
+        job = tc.post("/api/admin/sources/add", json={"url": "/big"}).json()[
+            "source_id"
+        ]
+        r = tc.post("/api/admin/sources/add/cancel", params={"url": job})
+        assert r.status_code == 200
+        body = self._wait(
+            tc,
+            "/api/admin/sources/add/status",
+            {"url": job},
+            lambda b: b["state"] != "running",
+        )
+        assert body["state"] == "cancelled"
+        assert body["result"]["added"] == 1
+
+    def test_status_of_an_unknown_add_is_404(self, admin_client):
+        tc, _ = admin_client
+        r = tc.get("/api/admin/sources/add/status", params={"url": "/never"})
+        assert r.status_code == 404
+
+    def test_remove_reports_what_went(self, admin_client):
+        from biopb.tensor.descriptor_pb2 import RemoveSourceResult
+
+        tc, _ = admin_client
+        result = RemoveSourceResult(removed=["a", "b"])
+        result.failed.add(path="c", reason="not present (already removed?)")
+        self._client(tc).deregister_local_path.return_value = result
+        r = tc.post("/api/admin/sources/remove", json={"root_url": "dnd://scratch"})
+        assert r.status_code == 200
+        assert r.json() == {
+            "removed": 2,
+            "failed": [{"path": "c", "reason": "not present (already removed?)"}],
+        }
+        assert self._client(tc).deregister_local_path.call_args.args == (
+            "dnd://scratch",
+        )
+
+    def test_remove_relays_a_refusal(self, admin_client):
+        tc, _ = admin_client
+        self._client(tc).deregister_local_path.side_effect = flight.FlightServerError(
+            "remove_source only removes drag-dropped (dnd://) sources"
+        )
+        r = tc.post("/api/admin/sources/remove", json={"root_url": "file:///lab"})
+        assert r.status_code == 400
+        assert "drag-dropped" in r.json()["detail"]
+
+    def test_remove_needs_a_root(self, admin_client):
+        tc, _ = admin_client
+        assert tc.post("/api/admin/sources/remove", json={}).status_code == 422
+
+    def test_both_are_gated_by_the_token(self, auth_client):
+        from biopb.tensor.descriptor_pb2 import AddSourceResult, RemoveSourceResult
+
+        tc, mock_fc = auth_client
+        mock_fc.register_local_path.return_value = AddSourceResult()
+        mock_fc.deregister_local_path.return_value = RemoveSourceResult()
+        for path, body in (
+            ("/api/admin/sources/add", {"url": "/x"}),
+            ("/api/admin/sources/remove", {"root_url": "dnd://x"}),
+        ):
+            assert tc.post(path, json=body).status_code == 401
+            assert tc.post(path, json=body, headers=_bearer(_TOKEN)).status_code in (
+                200,
+                202,
+            )
 
 
 class TestCreateAppSupervisedFromEnv:
@@ -3253,6 +3439,65 @@ class TestScalePolicyOnSlice:
         # Echoed, because the caller did not choose it: this header is the only
         # statement of what it got.
         assert r.headers["X-Scale-Hint"] == "4,4,4"
+
+    def _volume_read(self, dtype):
+        td = _make_tensor_desc(
+            array_id="big/Image:0",
+            shape=(1024, 1024, 1024),
+            dim_labels=["z", "y", "x"],
+            dtype=np.dtype(dtype).str,
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="big", tensors=[td]))
+        mock_fc.get_array.return_value = np.full((4, 4, 4), 3, dtype=dtype)
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                plan = tc.get("/api/tile_info/big/Image:0").json()["volume"]
+                r = tc.post(
+                    "/api/slice",
+                    json={"array_id": "big/Image:0", "scale_policy": "volume"},
+                )
+        assert r.status_code == 200, r.text
+        return plan, r
+
+    def test_a_float64_volume_ships_as_float32(self):
+        # The texture is float32 whatever arrives, so the extra four bytes per
+        # voxel are pure wire cost.
+        plan, r = self._volume_read("float64")
+        assert r.headers["X-Dtype"] == "float32"
+        assert np.frombuffer(r.content, dtype="float32").tolist() == [3.0] * 64
+        # The plan advertises what the read will send, since the viewer's
+        # size gate reads it before the read is made.
+        assert plan["bytes"] == plan["depth"] * plan["height"] * plan["width"] * 4
+
+    def test_a_volume_in_a_narrower_dtype_is_not_touched(self):
+        plan, r = self._volume_read("uint16")
+        assert r.headers["X-Dtype"] == "uint16"
+        assert plan["bytes"] == plan["depth"] * plan["height"] * plan["width"] * 2
+
+    def test_a_read_that_names_its_own_scale_keeps_its_dtype(self):
+        td = _make_tensor_desc(
+            array_id="f/Image:0",
+            shape=(8, 8, 8),
+            dim_labels=["z", "y", "x"],
+            dtype="<f8",
+        )
+        mock_fc = _build_mock_client(_make_source_desc(source_id="f", tensors=[td]))
+        mock_fc.get_array.return_value = np.zeros((8, 8, 8), dtype="float64")
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            return_value=mock_fc,
+        ):
+            app = create_app(token=None)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                r = tc.post(
+                    "/api/slice",
+                    json={"array_id": "f/Image:0", "scale_hint": [1, 1, 1]},
+                )
+        assert r.headers["X-Dtype"] == "float64"
 
     def test_a_caller_that_chose_gets_its_own_scale_echoed(self, tile_client):
         tc, mock_fc = tile_client

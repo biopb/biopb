@@ -5,7 +5,8 @@ catalog's own cursor: the folders directly under a folder, and the sources
 sitting in it.
 """
 
-from typing import Any, Dict, List
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping
 
 from biopb_tensor_server.serving.tree_paths import SEP, dec, enc, key_dir
 
@@ -29,7 +30,12 @@ def _chain(lo: str, hi: str) -> List[str]:
     return chain
 
 
-def children(cursor: Any, key: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
+def children(
+    cursor: Any,
+    key: str,
+    limit: int = DEFAULT_LIMIT,
+    dropped: Mapping[str, str] = MappingProxyType({}),
+) -> Dict[str, Any]:
     """The direct children of folder *key*: ``{key, folders: [{name, key}],
     sources: [{name, source_id}], truncated}``.
 
@@ -38,6 +44,11 @@ def children(cursor: Any, key: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any
     are in byte order of name. A source with no path sits at the top, named by its
     id; a resolved source holding no tensor is not listed. A *limit* above
     ``MAX_LIMIT`` is that.
+
+    *dropped* maps the top-level folders that hold a drag-dropped (``dnd://``)
+    root to that root's url. At the top only, a folder starting in one carries
+    ``"dropped": true`` and ``"root_url"``, the url to remove it by; nothing else
+    carries either, so a level without one is unchanged.
     """
     limit = min(limit, MAX_LIMIT)
     here = key_dir(key)
@@ -73,11 +84,13 @@ def children(cursor: Any, key: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any
     folder_rows = [row for row in rows if not row[4]]
     truncated = len(folder_rows) > limit
     folders = []
-    for _seg, lo, hi, _, _ in folder_rows[:limit]:
+    for seg, lo, hi, _, _ in folder_rows[:limit]:
         name = "/".join(_chain(lo, hi))
-        folders.append(
-            {"name": dec(name), "key": dec(f"{enc(key)}/{name}" if key else name)}
-        )
+        folder = {"name": dec(name), "key": dec(f"{enc(key)}/{name}" if key else name)}
+        if not key and (root_url := dropped.get(dec(seg))):
+            folder["dropped"] = True
+            folder["root_url"] = root_url
+        folders.append(folder)
     folders.sort(key=lambda f: f["name"].encode("utf-8"))
     sources: List[Dict[str, str]] = []
     if not truncated and direct:

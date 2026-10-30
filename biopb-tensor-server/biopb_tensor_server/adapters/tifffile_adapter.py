@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 _PERSISTENT_PAGE_THRESHOLD = 16_384
 _CANONICAL_DIMS = ("T", "C", "Z", "Y", "X")
 _SAMPLES_DIM = "S"
+# Extents that make an unlabeled axis a channel / samples axis, not a Z stack.
+_MAX_CHANNELS = 4
+_SAMPLE_COUNTS = (3, 4)
 _SUPPORTED_EXTENSIONS = (".tif", ".tiff")
 
 
@@ -49,6 +52,11 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
     rather than relabeling them as biological dimensions or handing the file to
     BioIO. If there are more unknown axes than canonical slots, preserve the
     native labels instead of declining a readable array.
+
+    Before that positional default, two unknown axes are labelled by their
+    extent, because a short axis is rarely a Z stack: the one just before ``Y``
+    is ``C`` when it has at most 4 elements, and a trailing one after ``X`` is
+    ``S`` when it has 3 or 4 (RGB / RGBA).
 
     The return value has one label per native array axis, in native order.  It
     is used only for indexing; no pixel transpose is done here.
@@ -74,6 +82,27 @@ def _mapped_axes(native_axes: str, shape: Tuple[int, ...]) -> Optional[str]:
             used.add(axis)
         else:
             unknown.append(index)
+
+    if unknown:
+        y_index, x_index = axes.index("Y"), axes.index("X")
+        last = len(axes) - 1
+        by_extent = {}
+        if (
+            unknown[-1] == last > x_index
+            and shape[last] in _SAMPLE_COUNTS
+            and _SAMPLES_DIM not in used
+        ):
+            by_extent[unknown.pop()] = _SAMPLES_DIM
+        if (
+            y_index - 1 in unknown
+            and shape[y_index - 1] <= _MAX_CHANNELS
+            and "C" not in used
+        ):
+            unknown.remove(y_index - 1)
+            by_extent[y_index - 1] = "C"
+        for index, axis in by_extent.items():
+            mapped[index] = axis
+            used.add(axis)
 
     if unknown:
         if _SAMPLES_DIM in used:
@@ -211,7 +240,9 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 for axis in mapped
                 if axis not in _CANONICAL_DIMS and axis != _SAMPLES_DIM
             ]
-            labels = named_axes + list(_CANONICAL_DIMS)
+            # Only the canonical axes the file has: a plain 2-D TIFF is Y/X, not
+            # a 5-D tensor of leading singletons. Y and X are always present.
+            labels = named_axes + [axis for axis in _CANONICAL_DIMS if axis in mapped]
             if _SAMPLES_DIM in mapped:
                 labels.append(_SAMPLES_DIM)
             by_axis = {

@@ -49,7 +49,7 @@ const PARAM_LABELS = "lb";
 const PARAM_LABEL_OPACITY = "lo";
 
 /** Every parameter this module owns, so unrelated ones survive a write. */
-const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "tg", "zm", "rx", "ro", PARAM_SETS, PARAM_LABELS, PARAM_LABEL_OPACITY]);
+const OWNED = new Set([PARAM_ID, "t", "z", "c", "p", "mm", "cl", "g", "v", "vm", "cp", "tg", "zm", "rx", "ro", PARAM_SETS, PARAM_LABELS, PARAM_LABEL_OPACITY]);
 
 /** `OrbitController` clamps pitch to this; a link may not ask for more. */
 const ROTATION_X_LIMIT = 90;
@@ -69,6 +69,8 @@ export interface ViewerUrlState {
   slice: SliceState;
   render3d: boolean;
   volumeRenderMode: VolumeRenderMode;
+  /** Composite requested; applies only where the tensor qualifies. */
+  composite: boolean;
   /** Null when the view was never orbited, i.e. "open at the fitted camera". */
   camera3d: Camera3DState | null;
   /** Null when the view was never panned, i.e. "open at the fitted camera". */
@@ -239,6 +241,7 @@ export function decodeViewerState(
     },
     render3d: params.get("v") === "1" ? true : params.get("v") === "0" ? false : defaults.render3d,
     volumeRenderMode: vm !== null && isVolumeRenderMode(vm) ? vm : defaults.volumeRenderMode,
+    composite: params.get("cp") === "1" ? true : params.get("cp") === "0" ? false : defaults.composite,
     camera3d: decodeCamera3d(params) ?? defaults.camera3d,
     camera2d: decodeCamera2d(params) ?? defaults.camera2d,
     visibleSets: sets ?? defaults.visibleSets,
@@ -280,6 +283,7 @@ export function encodeViewerState(params: URLSearchParams, state: ViewerUrlState
   if (state.slice.gamma !== defaults.slice.gamma) out.set("g", String(round(state.slice.gamma, 3)));
   if (state.render3d !== defaults.render3d) out.set("v", state.render3d ? "1" : "0");
   if (state.volumeRenderMode !== defaults.volumeRenderMode) out.set("vm", state.volumeRenderMode);
+  if (state.composite !== defaults.composite) out.set("cp", state.composite ? "1" : "0");
   // The camera of the viewer that is actually mounted. Writing both would put a
   // camera in the link for a viewer the recipient will not open, and the two
   // share `tg`/`zm`.
@@ -333,6 +337,7 @@ export const DEFAULT_VIEWER_URL_STATE: Omit<ViewerUrlState, "arrayId"> = {
   },
   render3d: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
+  composite: false,
   camera3d: null,
   camera2d: null,
   visibleSets: null,

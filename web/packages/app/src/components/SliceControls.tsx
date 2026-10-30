@@ -36,6 +36,7 @@ import {
   sliderGrid,
   withContrastLimit,
 } from "../utils/vivUtils";
+import { compositeChannels, compositeColors } from "../utils/composite";
 import { VOLUME_RENDER_MODES, volumeRefusal } from "../utils/volumeUtils";
 
 // Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
@@ -98,6 +99,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const setRender3d = useAppStore((s) => s.setRender3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const setVolumeRenderMode = useAppStore((s) => s.setVolumeRenderMode);
+  const composite = useAppStore((s) => s.composite);
+  const setComposite = useAppStore((s) => s.setComposite);
   // What the shader is applying, and the plane's own extremes: derived from the
   // store, by the selectors the viewers call.
   const appliedLimits = useAppStore(useShallow(selectContrastWindow));
@@ -195,6 +198,25 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     [tileInfo],
   );
 
+  // Whether the composite button is doing anything for this tensor: asked for,
+  // in 2-D, on a non-RGB image of 2-4 channels. The button itself is always
+  // there and keeps its pressed state, so it does not appear and vanish as one
+  // moves between tensors.
+  // Whether the tensor could composite at all, whatever the preference or view;
+  // unknown (no grid yet) counts as yes rather than flashing the button grey.
+  const compositeEligible = useMemo(
+    () => tileInfo === null || compositeChannels(tileInfo, true) !== null,
+    [tileInfo],
+  );
+  const compositeActive = useMemo(
+    () => !render3d && tileInfo !== null && compositeChannels(tileInfo, composite) !== null,
+    [render3d, tileInfo, composite],
+  );
+  // A composite is windowed per channel from its own histogram, so the mode the
+  // panel reflects is auto whatever was chosen: a fixed window is one pair of
+  // grey levels and has no meaning across several channels.
+  const contrastMode = compositeActive ? "auto" : display.contrastMode;
+
   // One `vivDtype` for the panel: it is what decides whether the track below is
   // the dtype's own range or the data's, and what the step is counted in.
   const dtype = useMemo(
@@ -264,10 +286,33 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     setUseCustomColor(isCustomColor);
   }, [isCustomColor]);
 
+  // What this channel is drawn as. An "auto" channel in a composite comes from
+  // the composite's palette, not from its name alone, so the swatch asks the
+  // same function the viewer does.
+  const resolvedColor = useMemo(() => {
+    const channels = tileInfo && compositeActive ? compositeChannels(tileInfo, composite) : null;
+    if (!channels) return resolveAutoColor(currentColor, currentChannelName ?? undefined);
+    const names = channelNames[sourceId];
+    return (
+      compositeColors(
+        channels.map((c) => channelColors[sourceId]?.[c] ?? "auto"),
+        channels.map((c) => names?.[c]),
+      )[position.c] ?? currentColor
+    );
+  }, [
+    tileInfo,
+    compositeActive,
+    composite,
+    currentColor,
+    currentChannelName,
+    channelNames,
+    channelColors,
+    sourceId,
+    position.c,
+  ]);
+
   // Get hex representation for the color picker input (resolves auto)
-  const currentHexColor = useMemo(() => {
-    return colorToHex(currentColor, currentChannelName ?? undefined);
-  }, [currentColor, currentChannelName]);
+  const currentHexColor = useMemo(() => colorToHex(resolvedColor), [resolvedColor]);
 
   if (!descriptor) {
     return <section className="slice-controls">Tensor metadata unavailable</section>;
@@ -280,7 +325,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // already sitting on the plane's extremes. With nothing sampled yet there is
   // no image min/max to reset onto, so there is nothing for the button to do.
   const minMaxActive =
-    display.contrastMode === "auto"
+    contrastMode === "auto"
       ? display.percentileScale === 0
       : planeLimits === null ||
         (fixedWindow[0] === planeLimits[0] && fixedWindow[1] === planeLimits[1]);
@@ -331,6 +376,35 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               {mode ? "3D" : "2D"}
             </button>
           ))}
+          <span style={{ flex: 1 }} />
+          {/* Always here, so the row does not change as one moves between
+              tensors; greyed when this tensor is not a 2-4 channel non-RGB
+              image, which no setting can composite. In 3-D it stays live: the
+              tensor is eligible, the preference just waits for the 2-D view. */}
+          <button
+            onClick={() => setComposite(!composite)}
+            aria-pressed={composite}
+            disabled={!compositeEligible}
+            title={
+              compositeActive
+                ? "Showing every channel blended, each in its own colour"
+                : compositeEligible
+                  ? "Blend every channel, each in its own colour (2D only)"
+                  : "Needs a 2-4 channel image that is not RGB"
+            }
+            style={{
+              padding: "2px 8px",
+              fontSize: 10,
+              cursor: compositeEligible ? "pointer" : "default",
+              opacity: compositeEligible ? 1 : 0.4,
+              background: composite ? "#4a5568" : "#2d3748",
+              border: "1px solid #4a5568",
+              borderRadius: 4,
+              color: "#e2e8f0",
+            }}
+          >
+            Comp
+          </button>
         </div>
 
         {/* How the ray-cast combines voxels. Only in 3-D: it names nothing in a
@@ -470,13 +544,17 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                 // window the user chose, not to the whole track.
                 setDisplay({ contrastMode: "auto" });
               }}
-              disabled={display.contrastMode === mode.key}
-              title={mode.title}
+              disabled={contrastMode === mode.key || compositeActive}
+              title={
+                compositeActive
+                  ? "A composite windows each channel from its own histogram"
+                  : mode.title
+              }
               style={{
                 padding: "2px 8px",
                 fontSize: 10,
-                cursor: display.contrastMode === mode.key ? "default" : "pointer",
-                background: display.contrastMode === mode.key ? "#4a5568" : "#2d3748",
+                cursor: contrastMode === mode.key ? "default" : "pointer",
+                background: contrastMode === mode.key ? "#4a5568" : "#2d3748",
                 border: "1px solid #4a5568",
                 borderRadius: 4,
                 color: "#e2e8f0",
@@ -490,7 +568,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               onto the extremes of the plane in view. */}
           <button
             onClick={() => {
-              if (display.contrastMode === "fixed") {
+              if (contrastMode === "fixed") {
                 if (!planeLimits) return;
                 setLocalFixed(null);
                 setDisplay({ fixedLimits: clampContrastLimits(planeLimits, track, dtype) });
@@ -501,7 +579,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             }}
             disabled={minMaxActive}
             title={
-              display.contrastMode === "fixed"
+              contrastMode === "fixed"
                 ? "Set the window to this image's own min and max grey level"
                 : "Automatic window with neither tail trimmed"
             }
@@ -521,7 +599,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 20 }} />
-          {display.contrastMode === "auto" ? (
+          {contrastMode === "auto" ? (
             <input
               type="range"
               min={0}
@@ -586,7 +664,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             </div>
           )}
           <span style={VALUE_READOUT}>
-            {display.contrastMode === "auto"
+            {contrastMode === "auto"
               ? percentileLabel(localPercentile)
               : contrastLabel(fixedWindow, fixedStep)}
           </span>
@@ -668,7 +746,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               />
             )}
             {/* Show resolved color swatch for auto mode */}
-            {isAutoColor && !useCustomColor && currentChannelName && (
+            {isAutoColor && !useCustomColor && (currentChannelName || compositeActive) && (
               <div
                 style={{
                   width: 16,
@@ -677,7 +755,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                   background: currentHexColor,
                   border: "1px solid #2d3748",
                 }}
-                title={`Auto → ${resolveAutoColor(currentColor, currentChannelName ?? undefined)}`}
+                title={`Auto → ${resolvedColor}`}
               />
             )}
             {currentChannelName && (

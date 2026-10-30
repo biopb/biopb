@@ -19,7 +19,7 @@ contains it, so byte order of the joined strings is component order (with ``/``,
 ``://`` is ``\\x02`` so it stays one segment; :func:`dec` spells it back.
 """
 
-from typing import List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 ENDPOINT_MARK = "\x02"
 SEP = "\x01"
@@ -60,6 +60,17 @@ def tree_parts(url: str) -> List[str]:
         else:
             body = url
     return [s for s in body.split("/") if s]
+
+
+def dropped_tops(root_urls: Iterable[str]) -> Dict[str, str]:
+    """The top-level folders a drag-dropped (``dnd://``) root puts in the tree,
+    each mapped to the root's url: the first segment of the root's path. Where
+    two roots start in one folder, the shorter url (the one covering the other)."""
+    tops: Dict[str, str] = {}
+    for url in sorted(root_urls, key=lambda u: (len(u), u)):
+        if url.startswith("dnd://") and (parts := tree_parts(url)):
+            tops.setdefault(parts[0], url)
+    return tops
 
 
 def catalog_url(root_url: str, rel: str) -> str:

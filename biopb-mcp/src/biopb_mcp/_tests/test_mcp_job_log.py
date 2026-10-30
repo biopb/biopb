@@ -101,6 +101,7 @@ class TestRecord:
             "intent",
             "elapsed",
             "created",
+            "figures",
         }
         assert log.poll("job-1")["created"] == 123.0
 
@@ -567,3 +568,49 @@ def test_one_line_helper():
     assert _job_log._one_line("\n\n  hello  \nworld") == "hello"
     capped = _job_log._one_line("x" * 100)
     assert len(capped) == 80 and capped.endswith("…")
+
+
+class TestFigures:
+    """A ``display_data`` PNG under a job's request is the job's figure: kept for
+    ``view_figure`` and the notebook, counted (not carried) in a poll."""
+
+    def _display(self, log, request, png="UE5H", **extra):
+        log.on_iopub(_msg("display_data", request, data={"image/png": png}, **extra))
+
+    def test_a_figure_is_counted_in_a_poll_and_carried_in_the_export(self):
+        log = JobLog(host_session="host")
+        _input(log, "plot()", "c1")
+        self._display(log, "c1")
+        _idle(log, "c1")
+        (rec,) = log.export()
+        assert rec["figures"] == 1 and rec["figure_data"] == ["UE5H"]
+        polled = log.poll(rec["job_id"])
+        assert polled["figures"] == 1 and "figure_data" not in polled
+        assert log.figure(rec["job_id"], 0) == ("UE5H", 1)
+        assert log.figure(rec["job_id"], 3) == (None, 1)
+        assert log.figure("job-nope") == (None, 0)
+
+    def test_display_data_without_a_png_is_not_a_figure(self):
+        log = JobLog(host_session="host")
+        _input(log, "display('x')", "c1")
+        log.on_iopub(_msg("display_data", "c1", data={"text/plain": "x"}))
+        (rec,) = log.export()
+        assert rec["figures"] == 0
+
+    def test_a_loop_that_plots_is_capped(self):
+        log = JobLog(host_session="host")
+        _input(log, "loop()", "c1")
+        for _ in range(_job_log._MAX_JOB_FIGURES + 3):
+            self._display(log, "c1")
+        self._display(log, "c1", png="x" * (_job_log._MAX_FIGURE_CHARS + 1))
+        (rec,) = log.export()
+        assert rec["figures"] == _job_log._MAX_JOB_FIGURES
+
+    def test_the_outcome_counts_and_the_full_one_carries(self):
+        log = JobLog(host_session="host")
+        _input(log, "plot()", "c1")
+        self._display(log, "c1")
+        (rec,) = log.export()
+        assert log.outcome(rec["job_id"])["figures"] == 1
+        assert "figure_data" not in log.outcome(rec["job_id"])
+        assert log.outcome(rec["job_id"], full=True)["figure_data"] == ["UE5H"]

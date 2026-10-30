@@ -102,10 +102,11 @@ const VIV_EXTENSIONS = [new ColorPaletteExtension(), new GammaExtension()];
 
 export function VivStage({
   sources,
-  selection,
+  selections,
   contrastLimits,
   gamma,
-  color,
+  colors,
+  channelsVisible,
   maxCacheSize,
   onViewportLoad,
   onHover,
@@ -116,10 +117,14 @@ export function VivStage({
   height,
 }: {
   sources: PixelSources;
-  selection: Record<string, number>;
-  contrastLimits: [number, number];
+  /** One per drawn channel: a composite draws several, otherwise there is one. */
+  selections: Record<string, number>[];
+  /** Aligned with `selections`. */
+  contrastLimits: [number, number][];
   gamma: number;
-  color: [number, number, number];
+  colors: [number, number, number][];
+  /** Aligned with `selections`; a channel not yet windowed is held back. */
+  channelsVisible: boolean[];
   maxCacheSize: number;
   onViewportLoad: (loaded?: unknown) => void;
   onHover: (info: HoverInfo) => void;
@@ -188,18 +193,16 @@ export function VivStage({
     [height, width, placing],
   );
 
-  // Its own memo: this array's identity is what Viv's ImageLayer diffs on, so it
-  // must survive a contrast or colour change untouched.
-  const selections = useMemo(() => [selection], [selection]);
-
+  // `selections` arrives as its own array because its identity is what Viv's
+  // ImageLayer diffs on: the caller keeps it across a contrast or colour change.
   const layerProps = useMemo(
     () => [
       {
         loader: sources,
         selections,
-        contrastLimits: [contrastLimits],
-        colors: [color],
-        channelsVisible: [true],
+        contrastLimits,
+        colors,
+        channelsVisible,
         // Costs no fetch: gamma is a uniform, so moving it recolours the tiles
         // already on the GPU. Same for contrastLimits.
         extensions: VIV_EXTENSIONS,
@@ -210,7 +213,7 @@ export function VivStage({
         onViewportLoad,
       },
     ],
-    [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
+    [sources, selections, contrastLimits, gamma, colors, channelsVisible, maxCacheSize, onViewportLoad],
   );
 
   // VivViewer concatenates these after its own layers -- but only draws the

@@ -34,14 +34,10 @@ dependencies = [
     "mcp >= 1.20, < 2",
     "uvicorn >= 0.29",
     "jupyter_client",
-    # ipykernel <7: under 7.x a background task's print no longer reaches its
-    # job record (test_main_thread_free_while_a_task_runs). Lift the cap
-    # together with a port of the output routing.
-    "ipykernel < 7",
+    # 7.1 is where ipykernel stopped guessing which cell a thread's output belongs
+    # to (run_async stamps it itself), and what napari-console >= 0.1.5 requires.
+    "ipykernel >= 7.1",
     "psutil",
-    # packaging: imported by mcp/_update.py (version compare for the update check).
-    # It always arrives transitively, but the import is direct, so declare it.
-    "packaging",
     "numpy",
     "pandas",
     "scikit-image",

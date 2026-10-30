@@ -71,6 +71,43 @@ export interface SourceJobStatus {
   source?: DataSourceDescriptor;
 }
 
+/** What an add of a server path came to (`POST /api/admin/sources/add`). */
+export interface AddSourceResult {
+  /** Counts of sources: new, already served, rebuilt from a changed file, dropped
+   * because their files are gone. */
+  added: number;
+  already_present: number;
+  refreshed: number;
+  removed: number;
+  skipped_offline: number;
+  skipped_cloud_dirs: number;
+  /** The first failures only; `failed_total` counts all of them. */
+  failed: Array<{ path: string; reason: string }>;
+  failed_total: number;
+}
+
+/** An add of a server path, in flight or recently finished. */
+export interface AddSourceJobStatus {
+  kind: "add";
+  /** The path asked for. */
+  source_id: string;
+  state: "running" | "done" | "error" | "cancelled";
+  progress: { added_count?: number; current_path?: string };
+  error: string | null;
+  elapsed_seconds: number;
+  cancel_requested: boolean;
+  /** Only on the response that started it: false means it joined one running. */
+  started?: boolean;
+  /** On done, and on cancelled: what was registered before it stopped. */
+  result?: AddSourceResult;
+}
+
+/** What removing a dropped root took out (`POST /api/admin/sources/remove`). */
+export interface RemoveSourceResult {
+  removed: number;
+  failed: Array<{ path: string; reason: string }>;
+}
+
 /** A resolve's progress counters. */
 export interface SourceJobProgress {
   elapsed_seconds: number;
@@ -197,6 +234,13 @@ export interface ReadyzSnapshot {
 export interface TreeFolder {
   name: string;
   key: string;
+  /**
+   * A top-level folder that holds a drag-dropped (`dnd://`) root. Present, and
+   * true, only then; a server that predates it never sends it.
+   */
+  dropped?: boolean;
+  /** With `dropped`: the root's url, which is what removing it names. */
+  root_url?: string;
 }
 
 /** A source directly in a folder, under the name the tree shows it by. */
@@ -300,7 +344,7 @@ export interface BrowseEntry {
 }
 
 /** Response of `GET /api/admin/browse`: one directory level of the server's FS.
- * Local-mode only; `parent` is null at the filesystem root (biopb/biopb#244). */
+ * `parent` is null at the filesystem root (biopb/biopb#244). */
 export interface BrowseResponse {
   /** Absolute path of the listed directory. */
   path: string;
@@ -309,6 +353,9 @@ export interface BrowseResponse {
   entries: BrowseEntry[];
   /** True when the listing hit the server's per-directory entry cap. */
   truncated: boolean;
+  /** Whether the requested path itself exists; the listing of a missing child
+   * is its parent's. Absent from a server that predates it. */
+  exists?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -39,7 +39,8 @@ none at all. Name the type in the step:
   is interpreted. Put the result where the user can see it and report two or
   three numbers with it. **Never a picture alone**: without numbers an agent
   will call a failed result good, and volumes can be too large to show usefully,
-  so every visual check needs a numeric fallback and a stated slice or crop.
+  so every visual check needs a numeric fallback and a stated slice or crop. A
+  figure you make yourself comes back as `view_figure`, never inline.
 
   *Where* they see it is the session's, not the doc's: the napari window when
   there is one ([[napari-viewer]]), otherwise a [[web-viewer]] link. Write the step as

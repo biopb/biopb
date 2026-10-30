@@ -32,16 +32,16 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     assert isinstance(source, TiffAdapter)
 
     descriptor = source.list_tensors()[0]
-    assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
-    assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+    assert list(descriptor.dim_labels) == ["Z", "Y", "X"]
+    assert list(descriptor.shape) == [5, 8, 9]
     assert source.registration_record([], import_rois=False).metadata == {
         "shape": [5, 8, 9]
     }
 
     scene = source.get_tensor_adapter(descriptor.array_id)
-    bounds = ChunkBounds(start=[0, 0, 2, 3, 4], stop=[1, 1, 5, 7, 9])
+    bounds = ChunkBounds(start=[2, 3, 4], stop=[5, 7, 9])
     actual = scene.get_data(bounds)
-    np.testing.assert_array_equal(actual, data[2:5, 3:7, 4:9][None, None])
+    np.testing.assert_array_equal(actual, data[2:5, 3:7, 4:9])
     assert (
         scene._pool_key() not in _store_pool._handles
     )  # a small file's store is closed after the read
@@ -73,8 +73,8 @@ def test_plain_tiff_labels_come_from_the_format(tmp_path):
         SourceConfig(url=str(path), type="tiff", source_id="native")
     )
     descriptor = source.list_tensors()[0]
-    assert list(descriptor.dim_labels) == ["T", "C", "Z", "Y", "X"]
-    assert list(descriptor.shape) == [1, 1, 5, 8, 9]
+    assert list(descriptor.dim_labels) == ["Z", "Y", "X"]
+    assert list(descriptor.shape) == [5, 8, 9]
 
 
 def test_unknown_axes_claim_and_read_natively(tmp_path):
@@ -110,15 +110,15 @@ def test_named_axes_are_claimed_natively_and_kept_in_descriptor(tmp_path):
             "position",
             "PTZYX",
             (2, 3, 4, 8, 9),
-            ["P", "T", "C", "Z", "Y", "X"],
-            [2, 3, 1, 4, 8, 9],
+            ["P", "T", "Z", "Y", "X"],
+            [2, 3, 4, 8, 9],
         ),
         (
             "mosaic",
             "MYXC",
             (2, 8, 9, 3),
-            ["M", "T", "C", "Z", "Y", "X"],
-            [2, 1, 3, 1, 8, 9],
+            ["M", "C", "Y", "X"],
+            [2, 3, 8, 9],
         ),
     ]
     registry = get_default_registry()
@@ -217,3 +217,27 @@ def test_remote_tiff_and_lsm_fall_back_without_sniff(filename, source_type):
         ClaimContext(filename, _RemoteClaimStore()), DiscoveryState()
     )
     assert [claim.source_type for claim in claims] == [source_type]
+
+
+@pytest.mark.parametrize(
+    "axes, shape, expected",
+    [
+        # A short axis before YX is channels, a long one is a Z stack.
+        ("QYX", (3, 8, 9), "CYX"),
+        ("QYX", (4, 8, 9), "CYX"),
+        ("QYX", (5, 8, 9), "ZYX"),
+        # A trailing 3/4 axis is samples; other extents keep the positional default.
+        ("YXQ", (8, 9, 3), "YXS"),
+        ("YXQ", (8, 9, 4), "YXS"),
+        ("YXQ", (8, 9, 5), "YXZ"),
+        ("QYXQ", (3, 8, 9, 4), "CYXS"),
+        # With the channel axis claimed by extent, the rest take what is left.
+        ("QQYX", (5, 3, 8, 9), "ZCYX"),
+        ("QQYX", (5, 6, 8, 9), "CZYX"),
+        # Labelled axes are never reinterpreted.
+        ("ZYX", (3, 8, 9), "ZYX"),
+        ("CYX", (30, 8, 9), "CYX"),
+    ],
+)
+def test_unlabeled_axes_are_guessed_from_their_extent(axes, shape, expected):
+    assert _mapped_axes(axes, shape) == expected

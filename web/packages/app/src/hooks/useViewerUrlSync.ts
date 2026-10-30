@@ -31,6 +31,7 @@ export function useViewerUrlSync() {
   const slice = useMemo(() => ({ ...position, ...display }), [position, display]);
   const render3d = useAppStore((s) => s.render3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
+  const composite = useAppStore((s) => s.composite);
   const tileInfo = useAppStore(selectTileInfo);
   const requested = useAppStore((s) => s.target.requested);
   const camera3d = useAppStore((s) => s.camera3d);
@@ -80,6 +81,7 @@ export function useViewerUrlSync() {
         slice,
         render3d,
         volumeRenderMode,
+        composite,
         camera3d,
         camera2d,
         visibleSets,
@@ -100,6 +102,7 @@ export function useViewerUrlSync() {
     slice,
     render3d,
     volumeRenderMode,
+    composite,
     camera3d,
     camera2d,
     visibleSets,

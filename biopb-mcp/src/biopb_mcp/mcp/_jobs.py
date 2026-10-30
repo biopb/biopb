@@ -22,6 +22,7 @@ What this module keeps is what the host cannot do from outside:
 """
 
 import contextlib
+import contextvars
 import ctypes
 import logging
 import os
@@ -384,8 +385,14 @@ def run_async(fn, *args, **kwargs):
             if value is not None:
                 job.result_text = repr(value)
 
+        # In the cell's context, so the thread's prints are stamped with the
+        # cell's request: ipykernel 7 keeps the parent header in a ContextVar,
+        # and a bare thread would fall back to whichever request ran last.
         thread = threading.Thread(
-            target=_run, args=(job, body), name=job.job_id, daemon=True
+            target=contextvars.copy_context().run,
+            args=(_run, job, body),
+            name=job.job_id,
+            daemon=True,
         )
         job.thread = thread
         thread.start()

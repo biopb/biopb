@@ -75,7 +75,7 @@ from biopb_tensor_server.serving.roi_store import (
     RoiStoreMixin,
     _prepare_roi,
 )
-from biopb_tensor_server.serving.tree_paths import tree_columns
+from biopb_tensor_server.serving.tree_paths import dropped_tops, tree_columns
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -854,14 +854,19 @@ class MetadataDatabase(RoiStoreMixin):
                 f"Accessible here: {', '.join(sorted(self.allowed_tables))}."
             )
         return (
-            self._get_cursor().execute(f"SELECT * FROM {table} LIMIT 0").arrow().schema
+            self._get_cursor()
+            .sql(f"SELECT * FROM {table} LIMIT 0")
+            .to_arrow_table()
+            .schema
         )
 
     def catalog_children(
         self, key: str, limit: int = catalog_tree.DEFAULT_LIMIT
     ) -> Dict[str, Any]:
         """One level of the catalog tree; see :func:`catalog_tree.children`."""
-        return catalog_tree.children(self._get_cursor(), key, limit)
+        return catalog_tree.children(
+            self._get_cursor(), key, limit, dropped_tops(self._root_urls.values())
+        )
 
     def _count_sources(self, cursor: duckdb.DuckDBPyConnection) -> int:
         """``COUNT(*)`` of ``sources``, counted once per generation: it is on every
@@ -889,7 +894,7 @@ class MetadataDatabase(RoiStoreMixin):
         cursor = self._get_cursor()
         start_time = time.time()
         try:
-            arrow_table = cursor.execute(sql).to_arrow_table()
+            arrow_table = cursor.sql(sql).to_arrow_table()
             # Catalog size: context for a caller sizing the browse surface. NOT
             # a truncation denominator -- the query may count something else
             # entirely (a filtered subset, or another table), which is exactly
@@ -1454,8 +1459,7 @@ class MetadataDatabase(RoiStoreMixin):
         ``idle_runs`` is how many earlier runs neither wrote the row nor finished a
         walk of its root.
         """
-        conn = self._get_connection()
-        cursor = conn.execute(
+        cursor = self._get_cursor().execute(
             "SELECT c.source_id, c.source_type, c.is_resolved, "
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
@@ -1563,12 +1567,13 @@ class MetadataDatabase(RoiStoreMixin):
         source being registered as this runs is never taken for an orphan. Returns
         the number deleted.
         """
-        conn = self._get_connection()
         held = [
             r[0]
-            for r in conn.execute(
+            for r in self._get_cursor()
+            .execute(
                 "SELECT source_id FROM source_catalog WHERE root_id = ?", [root_id]
-            ).fetchall()
+            )
+            .fetchall()
         ]
         orphans = [source_id for source_id in held if not is_claimed(source_id)]
         self.drop_catalog_rows(orphans)
@@ -1707,9 +1712,9 @@ class MetadataDatabase(RoiStoreMixin):
         Uses ``cursor()`` for a thread-safe read; raises on a DuckDB error.
         """
         cursor = self._get_cursor()
-        table = cursor.execute(
+        table = cursor.sql(
             f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = ?",
-            [source_id],
+            params=[source_id],
         ).to_arrow_table()
         if table.num_rows == 0:
             return None

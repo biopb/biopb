@@ -805,13 +805,16 @@ function Remove-McpClients {
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },
         @{ File = (Join-Path $BiopbHome ".cursor\mcp.json");                     Prop = 'mcpServers'; Label = 'Cursor' },
-        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' }
+        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' },
+        @{ File = $opencode;                                                      Prop = 'mcp.servers'; Label = 'opencode' }
     )
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.File)) { continue }
         try {
             $json = Get-Content -Raw -LiteralPath $t.File | ConvertFrom-Json
-            $container = $json.$($t.Prop)
+            # opencode 1 keeps servers under "mcp", opencode 2 under "mcp.servers".
+            $container = $json
+            foreach ($key in $t.Prop.Split('.')) { if ($container) { $container = $container.$key } }
             if ($container -and ($container.PSObject.Properties.Name -contains 'biopb')) {
                 $container.PSObject.Properties.Remove('biopb')
                 Set-FileUtf8NoBom -Path $t.File -Content ($json | ConvertTo-Json -Depth 20)
@@ -866,6 +869,24 @@ function Show-LogTail {
 
 # Start (or restart) the background data server, then report its health.
 # Best-effort: never aborts the install.
+# Record how this run ended in <state>\update-result.json, which the control reads
+# after an update it started (a failed install leaves no control to say so).
+# "running" is written first, so a run that dies leaves a record that is not "ok".
+function Write-InstallResult {
+    param([string]$Status, [string]$Version = "")
+    try {
+        $dir = Get-BiopbTree "BIOPB_STATE_HOME" ".local\state"
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $json = [ordered]@{
+            status  = $Status
+            version = $Version
+            time    = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        } | ConvertTo-Json
+        Set-FileUtf8NoBom -Path (Join-Path $dir "update-result.json") -Content $json
+        $script:InstallResultOpen = ($Status -eq 'running')
+    } catch { }
+}
+
 function Start-ControlPlane {
     param([string]$BiopbHome, [string]$ConfigFile, [bool]$NoStart)
 
@@ -900,7 +921,9 @@ function Start-ControlPlane {
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     $startOut = @()
-    try { $startOut = @(& $biopb control start 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
+    # `restart` rather than `start`: it comes back with the options the previous
+    # control ran with (or the defaults when none were saved).
+    try { $startOut = @(& $biopb control restart 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Report-Warn "Control plane failed to start"
@@ -1436,6 +1459,7 @@ function Invoke-BiopbInstall {
 
     # ===== 3. Install biopb packages =====
     Report-Step 3 "Installing biopb packages..."
+    Write-InstallResult running
 
     # On Windows a running biopb process keeps its executables under the uv tool
     # dir open, so `uv tool install --force` cannot delete that dir to reinstall
@@ -1906,6 +1930,7 @@ function Invoke-BiopbInstall {
     # ===== 7. Start the control plane (which owns the data plane) =====
     Report-Step 7 "Starting control plane..."
     Start-ControlPlane -BiopbHome $BiopbHome -ConfigFile $activeConfig -NoStart ([bool]$NoServerStart)
+    Write-InstallResult ok $releaseVersion
 
     # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
     Install-DesktopShortcut -BiopbHome $BiopbHome
@@ -1945,6 +1970,7 @@ function Invoke-BiopbInstall {
         # Report the failure through the same reporter (console: red text;
         # gui: an ERROR record), then mark the stream done with a nonzero code.
         Report-Error $_.Exception.Message
+        if ($script:InstallResultOpen) { Write-InstallResult failed }
         if ($Mode -eq 'gui') { Emit-Gui "::biopb::DONE|1" }
         throw
     } finally {

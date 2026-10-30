@@ -87,8 +87,7 @@ always the seed:
 | | `TiffSequenceAdapter`, `MicroManagerLegacyAdapter` | one strile |
 | | `DicomAdapter`, `DicomSeriesAdapter` | one frame / slice file |
 | | `NdTiffAdapter`, `EmdAdapter`, `_BioioAdapterBase` family | the dask block |
-| | `LifAdapter` | one plane (readlif has no ROI read) |
-| `None` | `MrcAdapter`, `DeltaVisionAdapter` | memmap; a crop costs its own pages |
+| `None` | `MrcAdapter`, `DeltaVisionAdapter`, `LifAdapter` | memmap; a crop costs its own pages (a LIF image whose map cannot be proven equal to its frames reads one plane) |
 | | `NiftiAdapter` | dataobj slicing |
 | | `NikonAdapter`, `Nd2Adapter` | `read_frame` returns an mmap view; the seed (a whole C/Y/X frame) would floor every scaled read at the frame |
 | | `CziAdapter` | a libCZI ROI read composes only the subblocks it touches |

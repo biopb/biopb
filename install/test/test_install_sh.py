@@ -504,6 +504,19 @@ def test_mcp_unmerge_removes_only_the_biopb_entry(tmp_path):
     assert data["theme"] == "dark"
 
 
+def test_mcp_unmerge_follows_a_dotted_parent_path(tmp_path):
+    """opencode 2 keeps servers under mcp.servers."""
+    cfg = tmp_path / "opencode.json"
+    cfg.write_text(
+        json.dumps({"mcp": {"servers": {"biopb": {}, "other": {}}, "keep": {}}})
+    )
+    assert _unmerge(cfg, "mcp.servers") == "removed"
+    assert json.loads(cfg.read_text()) == {
+        "mcp": {"servers": {"other": {}}, "keep": {}}
+    }
+    assert _unmerge(cfg, "mcp.servers") == ""
+
+
 def test_mcp_unmerge_is_silent_when_there_is_nothing_to_remove(tmp_path):
     """Callers report per client off this output, so silence has to mean untouched."""
     cfg = tmp_path / "mcp.json"
@@ -569,3 +582,40 @@ def test_no_variable_is_read_that_nothing_assigns():
 def test_the_unassigned_read_check_catches_a_deleted_assignment():
     script = 'main() {\n  if [ "$A" = "$LEGACY_CONFIG" ]; then :; fi\n  A=1\n}\n'
     assert _unassigned_names(script) == {"LEGACY_CONFIG"}
+
+
+# --- _write_install_result / _install_exit -----------------------------------
+
+
+def _result(tmp_path):
+    return json.loads((tmp_path / "state" / "biopb" / "update-result.json").read_text())
+
+
+def test_install_result_records_status_and_version(tmp_path):
+    bash(
+        "RELEASE_VERSION=0.15.0; _write_install_result running",
+        env={"BIOPB_STATE_HOME": str(tmp_path / "state")},
+    )
+    got = _result(tmp_path)
+    assert got["status"] == "running" and got["version"] == "0.15.0"
+
+
+def test_a_failing_install_is_recorded_as_failed(tmp_path):
+    """The exit trap turns a result still "running" into "failed", and keeps the
+    failing exit code."""
+    out = bash(
+        "INSTALL_RESULT_DONE=0; trap _install_exit EXIT; _write_install_result running; false",
+        env={"BIOPB_STATE_HOME": str(tmp_path / "state")},
+        check=False,
+    )
+    assert out.returncode != 0
+    assert _result(tmp_path)["status"] == "failed"
+
+
+def test_a_finished_install_keeps_its_ok(tmp_path):
+    bash(
+        "INSTALL_RESULT_DONE=0; trap _install_exit EXIT; _write_install_result running;"
+        " INSTALL_RESULT_DONE=1; _write_install_result ok",
+        env={"BIOPB_STATE_HOME": str(tmp_path / "state")},
+    )
+    assert _result(tmp_path)["status"] == "ok"

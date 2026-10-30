@@ -486,6 +486,7 @@ class _SourceJob:
         self._error: Optional[str] = None
         self._finished_at: Optional[float] = None
         self._source: Optional[Dict[str, Any]] = None
+        self._result: Optional[Dict[str, Any]] = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -502,6 +503,11 @@ class _SourceJob:
         """The catalog row a resolve ends with, handed to the client on done."""
         with self._lock:
             self._source = source
+
+    def set_result(self, result: Dict[str, Any]) -> None:
+        """The tally an add ends with, handed to the client on done."""
+        with self._lock:
+            self._result = result
 
     def finish(self, state: str, error: Optional[str] = None) -> None:
         with self._lock:
@@ -537,6 +543,7 @@ class _SourceJob:
                 # A finished resolve carries the source's now-concrete row, so a
                 # client updates its catalog copy without re-reading the listing.
                 **({"source": self._source} if self._source is not None else {}),
+                **({"result": self._result} if self._result is not None else {}),
             }
 
 
@@ -1209,6 +1216,19 @@ def _tile_read(
 # pay a cold decode.
 
 
+def _volume_wire_dtype(dtype: str) -> np.dtype:
+    """The dtype a volume read ships in.
+
+    A volume is uploaded as one texture and Viv casts it to Float32 whatever it
+    arrives as, so a wider float buys nothing but wire bytes: float64 goes out
+    as float32, at half the size and identical on screen. Everything else is
+    sent as it is -- integers are already no wider than the texture, and
+    narrowing one further would be a lossy choice the viewer should make.
+    """
+    dt = np.dtype(dtype)
+    return np.dtype("float32") if dt.kind == "f" and dt.itemsize > 4 else dt
+
+
 def _volume_plan(
     shape: Sequence[int],
     dim_labels: Sequence[str],
@@ -1339,7 +1359,9 @@ def _volume_plan(
         # What the read returns, not what the GPU holds: Viv casts every volume
         # to Float32 on upload regardless of source dtype (3.1), so VRAM is
         # 4 bytes per voxel and the client sizes that from the extents.
-        "bytes": estimate_chunk_bytes((depth, height, width), dtype),
+        "bytes": estimate_chunk_bytes(
+            (depth, height, width), _volume_wire_dtype(dtype).str
+        ),
     }, None
 
 
@@ -2429,6 +2451,139 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     return _start_job("resolve", _resolve_worker, source_id, request)
 
 
+# -- Runtime sources (add / remove a path without a restart) -------------------
+#
+# The browser's way to the server's ``add_source`` / ``remove_source`` actions,
+# which napari reaches over Flight. Adding walks a directory and so is a job like
+# resolve, keyed by the path; removal is quick and answers inline. Both change
+# what the server serves, so they sit with the admin routes under the same token
+# and the same-origin guard.
+
+#: How many failed paths an add reports back; the rest are counted.
+_ADD_FAILURES_SHOWN = 50
+
+
+async def _json_object(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+    return body
+
+
+def _body_str(body: Dict[str, Any], field: str) -> str:
+    value = body.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise HTTPException(
+            status_code=422, detail=f"{field} must be a non-empty string"
+        )
+    return value.strip()
+
+
+def _add_result_dict(result: Any) -> Dict[str, Any]:
+    failed = [{"path": f.path, "reason": f.reason} for f in result.failed]
+    return {
+        "added": len(result.added),
+        "already_present": len(result.already_present),
+        "refreshed": len(result.refreshed),
+        "removed": len(result.removed),
+        "skipped_offline": result.skipped_offline,
+        "skipped_cloud_dirs": result.skipped_cloud_dirs,
+        "failed": failed[:_ADD_FAILURES_SHOWN],
+        "failed_total": len(failed),
+    }
+
+
+def _add_worker(ctx: _SidecarContext, job: _SourceJob, cloud: bool) -> None:
+    """Body of an add job; ``job.source_id`` is the path. Runs on a daemon thread."""
+    try:
+        result = ctx.get_client().register_local_path(
+            job.source_id,
+            cloud=cloud,
+            on_progress=lambda p: job.set_progress(
+                {"added_count": int(p.added_count), "current_path": str(p.current_path)}
+            ),
+            should_cancel=job.cancel_requested,
+        )
+    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
+        logger.warning(f"add failed for {job.source_id}: {exc}")
+        ctx.diag.mark_error("ADD_SOURCE_FAILED", str(exc))
+        job.finish(_JOB_ERROR, str(exc))
+        return
+    job.set_result(_add_result_dict(result))
+    job.finish(_JOB_CANCELLED if job.cancel_requested() else _JOB_DONE)
+
+
+@_router.post("/api/admin/sources/add/cancel")
+async def cancel_add_source(request: Request) -> JSONResponse:
+    """Stop an in-flight add; what it has registered stays registered."""
+    return _cancel_job("add", request.query_params.get("url", ""), request)
+
+
+@_router.get("/api/admin/sources/add/status")
+async def add_source_status(request: Request) -> JSONResponse:
+    """Progress and, once finished, the tally of the add of ``?url=``."""
+    return _job_status("add", request.query_params.get("url", ""), request)
+
+
+@_router.post("/api/admin/sources/add")
+async def add_source(request: Request) -> JSONResponse:
+    """Serve a path on the server's filesystem until the next restart.
+
+    Body ``{url, cloud?}``: an absolute path of a dataset, or of a directory to
+    walk. The server reads it on its own filesystem; it is not written to the
+    config, so it does not outlive a restart (use the config's ``sources`` for
+    that). Returns a job to poll; a second add of the same path while one runs
+    joins it.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    body = await _json_object(request)
+    url = _body_str(body, "url")
+    cloud = body.get("cloud", False)
+    if not isinstance(cloud, bool):
+        raise HTTPException(status_code=422, detail="cloud must be a boolean")
+    # The job is keyed by the path, so "/data" and "/data/" must be one key for a
+    # second add to join the first. A URL is left as typed: the server refuses it.
+    if "://" not in url:
+        url = os.path.normpath(url)
+    return _start_job("add", lambda c, j: _add_worker(c, j, cloud), url, request)
+
+
+@_router.post("/api/admin/sources/remove")
+async def remove_source(request: Request) -> JSONResponse:
+    """Stop serving a drag-dropped / runtime-added branch.
+
+    Body ``{root_url}``: a ``dnd://`` root. The server refuses anything else, so
+    a configured root cannot be removed from here.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    root_url = _body_str(await _json_object(request), "root_url")
+    try:
+        result = await run_in_threadpool(
+            ctx.get_client().deregister_local_path, root_url
+        )
+    except flight.FlightServerError as exc:
+        # A refusal (not a dnd:// root, removal off) names its own reason.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except flight.FlightError as exc:
+        ctx.diag.mark_error("REMOVE_SOURCE_FAILED", str(exc))
+        raise HTTPException(
+            status_code=502, detail=f"Flight error: {type(exc).__name__}"
+        )
+    return JSONResponse(
+        {
+            "removed": len(result.removed),
+            "failed": [{"path": f.path, "reason": f.reason} for f in result.failed],
+        }
+    )
+
+
 # -- Tiles (cacheable GET reads) --------------------------------------------
 
 
@@ -3006,6 +3161,12 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
         # *other* queued callers have hung up. A volume read makes that starve
         # long enough to matter.
         arr = await run_in_threadpool(_read)
+        if req.scale_policy:
+            # Only a volume policy exists today, and it is the one whose
+            # reader is a single float32 texture.
+            wire = _volume_wire_dtype(arr.dtype.str)
+            if arr.dtype != wire:
+                arr = await run_in_threadpool(arr.astype, wire)
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -3176,17 +3337,9 @@ async def admin_status(request: Request) -> JSONResponse:
             # (which owns the process). A self-managed plane can't be restarted
             # from the browser (biopb/biopb#418).
             "supervised": ctx.supervised,
-            # No token enforced. The admin UI keys the local-only server-side file
-            # chooser (#244) off this, since a tokenless plane is loopback-bound
-            # and its filesystem *is* the user's own box.
-            #
-            # KNOWN LIMITATION: this is a proxy for topology, not topology itself.
-            # It was exact while the two-mode model tied the token to the bind
-            # (biopb/biopb#447), but local mode now accepts an optional token, so a
-            # loopback-bound plane behind one reports false here and loses the file
-            # chooser even though its filesystem really is the user's own box. It
-            # fails closed (a feature hides), so it is accepted for now; the fix is
-            # to derive this from the actual bind. See biopb/biopb#470.
+            # No token enforced. A proxy for the loopback bind, not the bind
+            # itself: local mode accepts an optional token, so a loopback plane
+            # behind one reports false. Nothing in the admin UI keys off it.
             "local": ctx.token is None,
             "config_path": str(ctx.config_path) if ctx.config_path else None,
             "health": _h("status"),
@@ -3206,33 +3359,19 @@ async def admin_status(request: Request) -> JSONResponse:
 async def admin_browse(request: Request) -> JSONResponse:
     """List a directory on the server's filesystem for the Sources file chooser.
 
-    Tokenless deployments only (biopb/biopb#244): a browsable FS listing is an
-    info-disclosure surface, so it is served **only** when no token is enforced —
-    a loopback-bound, single-machine deployment where the server's filesystem
-    *is* the user's own box. Otherwise it 404s (feature absent), matching how the
-    admin UI hides the "Browse…" button unless ``/api/admin/status`` reports
-    ``local``.
+    Gated by the server token like every admin route. Whoever can pass it can
+    already rewrite ``sources`` to any directory and read its contents, so a
+    listing of names discloses nothing more.
 
-    Same known limitation as the ``local`` flag this mirrors (see
-    ``admin_status``): a *local* plane behind an optional token 404s here even
-    though its filesystem is the user's own box. Fails closed; see
-    biopb/biopb#470.
-
-    Returns ``{path, parent, entries: [{name, is_dir}], truncated}``. No path (or
-    a blank one) starts at the server user's home directory; a path that is a file
-    resolves to its containing directory so the chooser can navigate from it. One
+    Returns ``{path, parent, entries: [{name, is_dir}], truncated, exists}``. No
+    path (or a blank one) starts at the server user's home directory; a path that
+    is a file resolves to its containing directory so the chooser can navigate
+    from it. ``exists`` says whether the requested path itself is there, which a
+    listing of its parent does not (a blank path counts as existing). One
     unreadable entry never fails the whole listing.
     """
     ctx = _sidecar(request)
-    ctx.check_token(request)  # no-op in local mode; guards a misconfigured caller
-    if ctx.token is not None:
-        # A token is enforced: never expose the server's filesystem to what may be
-        # a remote browser. (Conservative — a local plane behind an optional token
-        # is caught here too; see the limitation noted above.)
-        raise HTTPException(
-            status_code=404,
-            detail="File browsing is available only on a tokenless local server",
-        )
+    ctx.check_token(request)
 
     from pathlib import Path
 
@@ -3278,6 +3417,7 @@ async def admin_browse(request: Request) -> JSONResponse:
             "parent": parent,
             "entries": entries,
             "truncated": truncated,
+            "exists": base.exists(),
         }
     )
 

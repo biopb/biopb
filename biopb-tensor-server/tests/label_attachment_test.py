@@ -302,7 +302,7 @@ class TestOverTheWire:
     def test_catalog_lists_the_sets_after_the_image(self, served, client):
         rows = (
             served.metadata_db.query(
-                "SELECT list_transform(tensors, t -> t.array_id) FROM sources "
+                "SELECT list_transform(tensors, lambda t: t.array_id) FROM sources "
                 "WHERE source_id = 'oz1'"
             )
             .column(0)

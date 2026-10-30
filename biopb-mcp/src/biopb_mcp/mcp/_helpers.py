@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+
 # Origin scheme the tensor server stamps on a drag-dropped source's source_url
 # (server-side DND_URL_PREFIX). Display-only; stripped here so a derived layer
 # name matches what the tensor browser shows. Keep in sync with the server

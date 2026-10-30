@@ -9,6 +9,7 @@ import { RoiAuthor, RoiPanel } from "../components/RoiPanel";
 import { SliceControls } from "../components/SliceControls";
 import { SourceTree } from "../components/SourceTree";
 import { ResolveModal } from "../components/ResolveModal";
+import { NoticeToasts } from "../components/NoticeToasts";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useViewerShow } from "../hooks/useViewerShow";
@@ -285,6 +286,7 @@ export function HomePage() {
       </main>
 
       <TipBar />
+      <NoticeToasts />
 
       {connectionError && connectionState === "error" && (
         <div className="error-toast">

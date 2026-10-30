@@ -125,34 +125,6 @@ _py() {
     fi
 }
 
-# Write the opencode zen API key into opencode's credential store
-# (~/.local/share/opencode/auth.json) under provider id "opencode" (the id zen
-# uses). Merges into any existing auth.json so other providers survive; writes
-# atomically with 0600 perms. Returns non-zero on any error.
-_opencode_write_auth() {
-    local key="$1"
-    local auth_file="$HOME/.local/share/opencode/auth.json"
-    mkdir -p "$(dirname "$auth_file")"
-    _py - "$auth_file" "$key" 2>/dev/null <<'PY'
-import json, os, sys
-path, key = sys.argv[1], sys.argv[2]
-try:
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    data = {}
-data["opencode"] = {"type": "api", "key": key}
-tmp = path + ".biopb.tmp"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, path)
-PY
-}
-
 # Write the tensor-server config as JSON (biopb.json) -- the canonical format
 # (biopb/biopb#34). JSON generation is stdlib on both ends (json.dump), so the
 # old hand-rolled TOML escaping is gone.
@@ -225,8 +197,7 @@ PY
 }
 
 # Detect AI agents (MCP clients) already on the system that biopb-mcp can plug into.
-# Populates the DETECTED_AGENTS array with human-readable names; if it comes back empty,
-# the MCP-configuration step offers to install one (opencode) before registering biopb.
+# Populates the DETECTED_AGENTS array with human-readable names.
 _detect_agents() {
     DETECTED_AGENTS=()
     command -v claude &>/dev/null && DETECTED_AGENTS+=("Claude Code")
@@ -255,73 +226,6 @@ _agent_launch_cmd() {
         echo "codex"
     elif command -v cursor &>/dev/null || [ -d "$HOME/.cursor" ]; then
         echo "cursor"
-    fi
-}
-
-# Install the opencode agent (https://opencode.ai) and walk the user through
-# authenticating it against opencode zen. Called when no agent is detected and the
-# user opts in. Best-effort: a failed install/login warns but never aborts the run.
-_install_opencode() {
-    _info "Installing opencode..."
-    if curl -fsSL https://opencode.ai/install | bash; then
-        _ok "opencode installed"
-    else
-        _warn "opencode install failed — install it manually from https://opencode.ai, then rerun this script"
-        return 0
-    fi
-
-    # opencode's installer drops the binary in ~/.opencode/bin and edits shell rc files
-    # (not this process), so expose it here for the auth + registration steps that follow.
-    export PATH="$HOME/.opencode/bin:$PATH"
-
-    # opencode's installer only appends to ~/.bashrc, so on macOS (zsh) and other
-    # non-bash shells ~/.opencode/bin never lands on PATH and `opencode` is missing
-    # from new terminals. Symlink it into ~/.local/bin, which uv keeps on PATH for
-    # every shell (see _ensure_local_bin_on_path), so the command is always found.
-    if [ -x "$HOME/.opencode/bin/opencode" ]; then
-        mkdir -p "$HOME/.local/bin"
-        ln -sf "$HOME/.opencode/bin/opencode" "$HOME/.local/bin/opencode"
-    fi
-
-    # We prompt for the key and write opencode's credential file ourselves rather
-    # than running `opencode auth login`: that command is a full-screen TUI which
-    # does not receive keyboard input when driven from a piped (curl|bash)
-    # installer, so the user could never finish it.
-    echo ""
-    _info "opencode needs an API key to talk to an LLM (free with opencode zen):"
-    _info "  1. Open ${BOLD}https://opencode.ai/auth${RESET}, sign in, create a new API key, and copy it."
-    printf '  %sPaste the API key (or press Enter to skip): %s' "$DIM" "$RESET" >/dev/tty
-    # Read silently but echo a "*" per character so the user gets visual
-    # confirmation their paste registered (plain `read -s` shows nothing, which
-    # makes it hard to tell whether a paste worked).
-    local _key="" _ch=""
-    while IFS= read -rs -n1 _ch </dev/tty; do
-        # Empty _ch on a newline-terminated read => Enter pressed; we're done.
-        [ -z "$_ch" ] && break
-        case "$_ch" in
-            $'\r') break ;;                              # carriage return => done
-            $'\x7f'|$'\b')                               # backspace / delete
-                if [ -n "$_key" ]; then
-                    _key="${_key%?}"
-                    printf '\b \b' >/dev/tty
-                fi
-                ;;
-            *)
-                _key+="$_ch"
-                printf '*' >/dev/tty
-                ;;
-        esac
-    done
-    printf "\n" >/dev/tty   # the silent read ate the user's newline
-
-    if [ -n "$_key" ]; then
-        if _opencode_write_auth "$_key"; then
-            _ok "opencode authenticated (opencode zen)"
-        else
-            _warn "Couldn't write opencode credentials — run later: opencode auth login"
-        fi
-    else
-        _info "No key entered — authenticate later with: opencode auth login"
     fi
 }
 
@@ -837,6 +741,26 @@ _tail_log() {
     done
 }
 
+# Record how this run ended in <state>/update-result.json, which the control
+# reads after an update it started (a failed install leaves no control to say so).
+# "running" is written first, so a run that dies leaves a record that is not "ok".
+_write_install_result() {
+    local state_dir="${BIOPB_STATE_HOME:-$HOME/.local/state}/biopb"
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+    printf '{"status": "%s", "version": "%s", "time": "%s"}\n' \
+        "$1" "${RELEASE_VERSION:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$state_dir/update-result.json" 2>/dev/null || true
+}
+
+# Runs on any exit of the install: removes the wheel download dir, and turns a
+# result still "running" (error, set -e, signal) into "failed".
+_install_exit() {
+    local rc=$?
+    rm -rf "${WHEELS_DIR:-}"
+    if [ "${INSTALL_RESULT_DONE:-0}" != "1" ]; then _write_install_result failed; fi
+    return $rc
+}
+
 # Start the control plane (biopb control), which spawns and supervises the data
 # plane. Best-effort: never aborts the install. Skip with BIOPB_NO_SERVER_START=1.
 # Starting now lets the pre-cache warm overviews before the user opens anything.
@@ -871,7 +795,9 @@ _start_control_plane() {
     # swallow a failure (biopb/biopb#324): e.g. a gRPC port held by an untracked
     # process makes the control plane refuse, and the CLI prints the real cause.
     local start_out
-    if ! start_out=$("$biopb_cmd" control start 2>&1); then
+    # `restart` rather than `start`: it comes back with the options the previous
+    # control ran with (or the defaults when none were saved).
+    if ! start_out=$("$biopb_cmd" control restart 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
@@ -1507,7 +1433,9 @@ install_biopb() {
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
-    trap 'rm -rf "${WHEELS_DIR:-}"' EXIT
+    INSTALL_RESULT_DONE=0
+    trap _install_exit EXIT
+    _write_install_result running
     # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
     # status, so a failing _urldecode/basename would sail past `set -e` and leave
     # a truncated path to curl into.
@@ -1785,30 +1713,22 @@ install_biopb() {
     _step "[6/7] Configuring MCP client..."
 
     # An MCP client (AI agent) is what actually drives biopb-mcp. Detect known
-    # agents; if none is present, offer to install opencode so the user ends up
-    # with a working setup instead of a server with nothing to talk to it.
+    # agents. The installer does not install one; registration covers whatever
+    # is present.
     _detect_agents
     if [ "${#DETECTED_AGENTS[@]}" -gt 0 ]; then
         _ok "AI agent detected: ${DETECTED_AGENTS[*]}"
-    elif [ "$NONINTERACTIVE" = "1" ]; then
-        _note "Non-interactive: no AI agent detected and none installed; set one up later and rerun to wire it in."
     else
-        _info ""
-        _info "BioPB needs an AI agent to work, but it seems you don't have one installed."
-        _info "We can install and setup one (opencode) for you. This allows you to start"
-        _info "playing with the system using a free AI agent - no cost."
-        _info ""
-        if _confirm "Install the opencode agent now?"; then
-            _install_opencode
-        else
-            _info "No agent will be installed; set one up later and rerun to wire it in."
-        fi
+        _note "No AI agent detected. Install one (Claude Code, Codex CLI, opencode, ...)"
+        _note "and rerun this script, or run: biopb agents register <client>"
     fi
     _setup_mcp
 
     # ===== 7. Start the control plane (which owns the data plane) =====
     _step "[7/7] Starting control plane..."
     _start_control_plane
+    INSTALL_RESULT_DONE=1
+    _write_install_result ok
 
     # Drop a "biopb Dashboard" launcher on the Desktop (runs `biopb dashboard`).
     _install_desktop_shortcut
@@ -1915,8 +1835,8 @@ install_biopb() {
 # stop that does nothing must not abort the rest of the teardown.
 
 # Remove the biopb stdio entry from a JSON MCP config: delete the "biopb" key
-# under top-level <parent> in <file>. No-op when the file, the parent section,
-# or the entry is absent (the file is left byte-for-byte untouched). Preserves
+# under <parent> (a dotted path, e.g. mcp.servers) in <file>. No-op when the
+# file, the parent section, or the entry is absent (the file is left byte-for-byte untouched). Preserves
 # all other content and writes atomically — the inverse of the merge that
 # registration performs. Kept hand-rolled (not delegated to `biopb agents
 # unregister`) so teardown never depends on the biopb tool it is removing.
@@ -1934,7 +1854,9 @@ except (FileNotFoundError, ValueError):
     sys.exit(0)
 if not isinstance(data, dict):
     sys.exit(0)
-section = data.get(parent)
+section = data
+for key in parent.split("."):
+    section = section.get(key) if isinstance(section, dict) else None
 if not isinstance(section, dict) or "biopb" not in section:
     sys.exit(0)
 del section["biopb"]
@@ -1981,6 +1903,7 @@ _unregister_agents() {
     esac
     # opencode reads either opencode.json or opencode.jsonc; target the file the
     # user actually keeps (prefer .jsonc) so teardown matches registration (#536).
+    # opencode 1 keeps servers under "mcp", opencode 2 under "mcp.servers".
     local oc_cfg="$HOME/.config/opencode/opencode.json"
     [ -f "$HOME/.config/opencode/opencode.jsonc" ] && oc_cfg="$HOME/.config/opencode/opencode.jsonc"
 
@@ -1988,7 +1911,8 @@ _unregister_agents() {
     for row in \
         "Claude Desktop|$cd_cfg|mcpServers" \
         "Cursor|$HOME/.cursor/mcp.json|mcpServers" \
-        "opencode|$oc_cfg|mcp"; do
+        "opencode|$oc_cfg|mcp" \
+        "opencode|$oc_cfg|mcp.servers"; do
         IFS='|' read -r label file parent <<< "$row"
         [ -n "$file" ] || continue
         if [ "$(_mcp_unmerge "$file" "$parent")" = "removed" ]; then

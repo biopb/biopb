@@ -65,9 +65,9 @@ dependencies = [
   # >=1.0 for the stable on-disk format: the catalog is a file now, and it
   # holds the annotations, which no rescan can reproduce. Pre-1.0 releases
   # broke the storage format between versions.
-  # <2: 2.0 rejects the `x -> ...` lambda syntax the catalog queries use and
-  # drops `Connection.arrow`. Lift the cap together with that port.
-  "duckdb >= 1.0, < 2",
+  # >=1.5: the oldest line the suite runs on. `lambda x: ...` (1.3+) is the
+  # only lambda form 2.0 accepts; the catalog's list columns are queried with it.
+  "duckdb >= 1.5",
 ]
 
 [project.optional-dependencies]
@@ -97,14 +97,14 @@ dependencies = [
     "biopb-tensor-server[tls]",
   ]
   # Readers the native vendor adapters import directly (biopb/biopb#799). These
-  # used to arrive only transitively through [aics] -- bioio-lif pulls readlif,
+  # used to arrive only transitively through [aics] -- bioio-lif pulls liffile,
   # bioio-nd2 pulls nd2, bioio-dv pulls mrc -- which made the default install
   # depend on bioio for packages bioio itself is not needed to use. Declared
   # here so dropping [aics] does not silently remove local LIF/DV/ND2 support.
   # .czi's pylibczirw stays in [czi]: it has no Intel-macOS wheel, so it cannot
   # be part of a set every platform installs.
   vendor = [
-    "readlif >= 0.6.4",  # Leica LIF (LifAdapter)
+    "liffile >= 2026.10.14",  # Leica LIF (LifAdapter)
     "mrc >= 0.2.0",      # DeltaVision DV (DeltaVisionAdapter)
     # [legacy] (-> imagecodecs) is what bioio-nd2 asked for; without it nd2
     # refuses JPEG-compressed legacy .nd2 files, which would be a silent
@@ -118,7 +118,7 @@ dependencies = [
   # format, leaving bioio the Java bridge and remote sources.
   aics = [
     "bioio >= 3.0",
-    "bioio-lif",       # Leica LIF (readlif)
+    "bioio-lif",       # Leica LIF (liffile)
     "bioio-nd2",       # Nikon ND2
     "bioio-dv",        # DeltaVision DV (mrc)
     "bioio-tifffile",  # plain/non-OME TIFF and Zeiss LSM (ZeissAdapter's .lsm path)
@@ -139,6 +139,9 @@ dependencies = [
   # add this everywhere except Intel macOS.
   czi = [
     "bioio-czi",
+    # CziAdapter imports it directly. bioio-czi 4 moved to aicspylibczi and no
+    # longer brings it, so relying on the transitive dep lost native CZI.
+    "pylibczirw",
   ]
   ndtiff = [
     "ndtiff >= 3.0.0",

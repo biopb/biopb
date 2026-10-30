@@ -140,7 +140,8 @@ def _job_outputs(snap):
     """Build the nbformat output list for one job snapshot.
 
     ``stdout`` -> a stream output; ``result_text`` (the repr of the job's last
-    expression) -> an execute_result; ``error_text`` (tracebacks and/or the
+    expression) -> an execute_result; each displayed figure
+    (``figure_data``, base64 PNG) -> a display_data; ``error_text`` (tracebacks and/or the
     user-attributed cancel/interrupt reason) -> a stderr stream so a stopped job
     visibly shows why it stopped.
     """
@@ -157,6 +158,14 @@ def _job_outputs(snap):
                 "output_type": "execute_result",
                 "execution_count": None,
                 "data": {"text/plain": _lines(result_text)},
+                "metadata": {},
+            }
+        )
+    for png in snap.get("figure_data") or []:
+        outputs.append(
+            {
+                "output_type": "display_data",
+                "data": {"image/png": png, "text/plain": "<Figure>"},
                 "metadata": {},
             }
         )

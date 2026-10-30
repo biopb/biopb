@@ -62,7 +62,7 @@ try:
 except ImportError:
     EmdAdapter = None  # type: ignore
 
-# Native phase-3 vendor adapters (biopb/biopb#799): readlif / mrc / nd2 direct,
+# Native phase-3 vendor adapters (biopb/biopb#799): liffile / mrc / nd2 direct,
 # no bioio dependency. Each is optional on its own package, independent of the
 # others and of the bioio-based fallback group below.
 #
@@ -72,7 +72,7 @@ except ImportError:
 # claim its extension, and only then fail at read. Probing makes "not installed"
 # mean "not claimed".
 try:
-    import readlif  # noqa: F401
+    import liffile  # noqa: F401
 
     from .lif import LifAdapter
 except ImportError:
@@ -176,7 +176,7 @@ def get_default_registry() -> AdapterRegistry:
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
-    - LifAdapter - local Leica LIF files (.lif; readlif)
+    - LifAdapter - local Leica LIF files (.lif; liffile)
     - DeltaVisionAdapter - local DeltaVision DV files (.dv; mrc.DVFile)
     - Nd2Adapter - local Nikon ND2 files (.nd2; nd2)
     - ZeissAdapter - Zeiss microscopy (remote CZI and LSM only; the native

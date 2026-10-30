@@ -52,6 +52,19 @@ def test_remove_mcp_clients_edits_the_opencode_file_opencode_reads(tmp_path):
     )
 
 
+@requires_pwsh
+def test_remove_mcp_clients_clears_the_opencode_2_place_too(tmp_path):
+    oc = tmp_path / ".config" / "opencode"
+    oc.mkdir(parents=True)
+    cfg = oc / "opencode.json"
+    cfg.write_text(json.dumps({"mcp": {"servers": {"biopb": {}, "other": {}}}}))
+    pwsh(
+        f"Remove-McpClients -BiopbHome {ps_literal(tmp_path)}",
+        env={"APPDATA": str(tmp_path / "appdata")},
+    )
+    assert json.loads(cfg.read_text())["mcp"]["servers"] == {"other": {}}
+
+
 def _run_uninstall_ps1(tmp_path, *args):
     """Run uninstall.ps1 over a fake install in tmp_path; returns (webapp, samples, config)."""
     from conftest import INSTALL_DIR, PWSH, _pwsh_base_env

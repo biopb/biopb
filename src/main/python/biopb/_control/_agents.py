@@ -20,6 +20,10 @@ Per client:
   Code rewrites ``~/.claude.json`` constantly, and only Codex's editor keeps
   its TOML comments and sibling servers intact (we have no TOML writer).
 - **unregister** -- the inverse; idempotent.
+- **launch** -- the command that opens a web or remote session with the client
+  (:meth:`ClientBackend.launch_argv`), for the dashboard to run. ``can_launch``
+  is a second predicate beside ``state``: registration is a config read, so a
+  client can be registered with no CLI on the machine.
 
 The registered command is the absolute path to ``biopb-shim`` (GUI clients
 launch it without a shell PATH). If biopb moves, the stored command no longer
@@ -104,6 +108,22 @@ def _load_json_object(path: Path) -> dict:
     if not isinstance(data, dict):
         raise AgentError(f"{path} is not a JSON object")
     return data
+
+
+def _dig(data: Optional[dict], path: tuple) -> Optional[dict]:
+    """The object at ``path`` (keys, outermost first) in ``data``, or ``None``."""
+    for key in path:
+        data = data.get(key) if isinstance(data, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def _drop_biopb(data: dict, path: tuple) -> bool:
+    """Delete biopb's entry at ``path`` in ``data``; whether there was one."""
+    parent = _dig(data, path)
+    if parent is None or "biopb" not in parent:
+        return False
+    del parent["biopb"]
+    return True
 
 
 def _strip_jsonc(text: str) -> str:
@@ -426,6 +446,21 @@ class ClientBackend(ABC):
     entry_style: str = "stdio"
     #: what the client launches ``biopb-shim`` with; a change shows as drift
     mcp_args: tuple = _MCP_ARGS
+    #: the client's command-line program, where it has one
+    exe: str = ""
+    #: whether the client has a web or remote surface to launch at all; one that
+    #: does not (Claude Desktop, Cursor) never gets a Start button
+    has_launch: bool = False
+    #: how a launch runs: ``child`` is a foreground process the caller owns and
+    #: stops; ``oneshot`` is a command that returns, leaving a machine-global
+    #: service the caller does not own
+    launch_kind: str = "child"
+    #: whether a launched session is reachable from other devices through a
+    #: relay, which an operator opts in to rather than inheriting
+    relay: bool = False
+    #: what a ``child`` launch prints once it is usable; ``None`` if it prints
+    #: nothing reliable, and staying up is the signal
+    ready_pattern: Optional[re.Pattern] = None
 
     @abstractmethod
     def config_path(self) -> Optional[Path]:
@@ -479,6 +514,31 @@ class ClientBackend(ABC):
         _, _, extract = _dispatch(_SHAPES, self.entry_style, self, "entry style")
         return extract(entry)
 
+    # -- launching a session ------------------------------------------------ #
+
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
+        """The command that opens a web or remote session, or ``None`` if this
+        client has no such surface. *remote* is the operator's opt-in to reach it
+        from other devices, for a client whose local form is not already that."""
+        return None
+
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
+        """The command that ends a ``oneshot`` launch, or ``None`` if there is
+        nothing to end."""
+        return None
+
+    def can_launch(self) -> bool:
+        """Whether :meth:`launch_argv` names something runnable here."""
+        argv = self.launch_argv()
+        return bool(argv) and shutil.which(argv[0]) is not None
+
+    def launch_hint(self) -> Optional[str]:
+        """What would make this client launchable, for a client that has a launch
+        surface but cannot launch here; ``None`` otherwise."""
+        if not self.has_launch or self.can_launch():
+            return None
+        return f"{self.exe} was not found on PATH"
+
 
 class JsonConfigClient(ClientBackend):
     """A client whose config is a calm JSON object we edit ourselves.
@@ -501,11 +561,15 @@ class JsonConfigClient(ClientBackend):
         if _jsonc_unmergeable(path):
             raise AgentError(self._manual_edit_message(path, removing=False))
         data = _load_json_object(path)
-        parent = data.get(self.parent_key)
-        if not isinstance(parent, dict):
-            parent = {}
+        for stale in self.stale_paths():
+            _drop_biopb(data, stale)
+        parent = data
+        for key in self.parent_path():
+            child = parent.get(key)
+            if not isinstance(child, dict):
+                child = parent[key] = {}
+            parent = child
         parent["biopb"] = self.entry()
-        data[self.parent_key] = parent
         _write_json_atomic(path, data)
 
     def unregister(self) -> None:
@@ -519,20 +583,34 @@ class JsonConfigClient(ClientBackend):
                 raise AgentError(self._manual_edit_message(path, removing=True))
             return
         data = _load_json_object(path)
-        parent = data.get(self.parent_key)
-        if isinstance(parent, dict) and "biopb" in parent:
-            del parent["biopb"]
+        dropped = [
+            _drop_biopb(data, p) for p in (self.parent_path(), *self.stale_paths())
+        ]
+        if any(dropped):
             _write_json_atomic(path, data)
+
+    def parent_path(self) -> tuple:
+        """The keys, outermost first, down to the object biopb's entry lives in."""
+        return (self.parent_key,)
+
+    def stale_paths(self) -> tuple:
+        """Other places an entry of ours may be left by a different version of
+        the client; written over and removed along with the current one."""
+        return ()
 
     def _manual_edit_message(self, path: Path, *, removing: bool) -> str:
         """The AgentError text shown when biopb can't safely edit a commented
         ``.jsonc``."""
+        where = ".".join(self.parent_path())
         if removing:
             return (
                 f"{path} has comments, so biopb won't rewrite it (that would drop "
-                f'them). Remove the "biopb" key under "{self.parent_key}" by hand.'
+                f'them). Remove the "biopb" key under "{where}" by hand.'
             )
-        snippet = json.dumps({self.parent_key: {"biopb": self.entry()}}, indent=2)
+        snippet: dict = {"biopb": self.entry()}
+        for key in reversed(self.parent_path()):
+            snippet = {key: snippet}
+        snippet = json.dumps(snippet, indent=2)
         return (
             f"{path} has comments, so biopb won't rewrite it (that would drop "
             f"them). Add this entry under the top level by hand:\n{snippet}"
@@ -562,9 +640,25 @@ class ClaudeCode(CliManagedClient):
     exe = "claude"
     # User-scope servers live in ~/.claude.json; read-only here.
     parent_key = "mcpServers"
+    relay = True
+    has_launch = True
+    # The link to the session on claude.ai, printed once it is connected.
+    ready_pattern = re.compile(r"https://claude\.ai/\S+")
 
     def config_path(self) -> Optional[Path]:
         return Path.home() / ".claude.json"
+
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
+        # One session per process, so stopping the process ends that one
+        # conversation; `default` is the permission mode, never a bypass.
+        return [
+            self.exe,
+            "remote-control",
+            "--spawn",
+            "session",
+            "--permission-mode",
+            "default",
+        ]
 
     def register(self) -> None:
         # Idempotent: best-effort remove, then add.
@@ -626,11 +720,41 @@ class CodexCli(CliManagedClient):
     # binds the newest free session (else a new one) before the handshake. Codex
     # cannot choose its session.
     mcp_args = (*_MCP_ARGS, "--session", "auto")
+    launch_kind = "oneshot"
+    relay = True
+    has_launch = True
 
-    def config_path(self) -> Optional[Path]:
+    def _home(self) -> Path:
         # $CODEX_HOME relocates the Codex home; read at call time for tests.
         base = os.environ.get("CODEX_HOME")
-        return (Path(base) if base else Path.home() / ".codex") / "config.toml"
+        return Path(base) if base else Path.home() / ".codex"
+
+    def config_path(self) -> Optional[Path]:
+        return self._home() / "config.toml"
+
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
+        return [self.exe, "app-server", "daemon", "enable-remote-control"]
+
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
+        return [self.exe, "app-server", "daemon", "disable-remote-control"]
+
+    def _standalone(self) -> Path:
+        return self._home() / "packages" / "standalone" / "current" / "codex"
+
+    def can_launch(self) -> bool:
+        # The daemon runs only from Codex's own installer; `which` cannot tell
+        # that install from an npm one.
+        return super().can_launch() and self._standalone().exists()
+
+    def launch_hint(self) -> Optional[str]:
+        if not self.has_launch or self.can_launch():
+            return None
+        if shutil.which(self.exe) is None:
+            return super().launch_hint()
+        return (
+            "remote control runs only from Codex's own installer, not an npm "
+            f"install; expected {self._standalone()}"
+        )
 
     def register(self) -> None:
         # `codex mcp add` overwrites an existing entry, so no remove first.
@@ -658,11 +782,91 @@ class Cursor(JsonConfigClient):
         return Path.home() / ".cursor" / "mcp.json"
 
 
+#: opencode 1 keeps servers directly under ``mcp``; opencode 2 under
+#: ``mcp.servers`` and ignores the old place. opencode 1.1 rejects the new one,
+#: so the shape written has to follow the version that will read it.
+_OPENCODE_V1 = ("mcp",)
+_OPENCODE_V2 = ("mcp", "servers")
+
+#: (resolved binary, mtime) -> major version, so status polling runs
+#: ``opencode --version`` once per install rather than once per poll
+_opencode_majors: dict = {}
+
+
+def _opencode_major() -> Optional[int]:
+    """The major version of the ``opencode`` on PATH, or ``None`` if there is
+    none or it will not say."""
+    exe = shutil.which("opencode")
+    if exe is None:
+        return None
+    try:
+        key = (exe, os.stat(exe).st_mtime_ns)
+    except OSError:
+        return None
+    if key not in _opencode_majors:
+        major = None
+        try:
+            out = subprocess.run(
+                [exe, "--version"], capture_output=True, text=True, timeout=10
+            ).stdout
+            found = re.search(r"(\d+)\.\d+", out)
+            major = int(found.group(1)) if found else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _opencode_majors[key] = major
+    return _opencode_majors[key]
+
+
 class Opencode(JsonConfigClient):
     id = "opencode"
     name = "opencode"
+    exe = "opencode"
     parent_key = "mcp"
     entry_style = "opencode"
+    has_launch = True
+    ready_pattern = re.compile(r"https?://\S+")  # `opencode serve` names its URL
+
+    def stop_argv(self, *, remote: bool = False) -> Optional[list]:
+        # The service is machine-wide and left up, except when this launch put it
+        # on the internet: stopping it is the only way to take it back off.
+        return [self.exe, "service", "stop"] if remote else None
+
+    def launch_hint(self) -> Optional[str]:
+        if self.can_launch():
+            return None
+        if shutil.which(self.exe) is None:
+            return super().launch_hint()
+        return f"could not read the version from `{self.exe} --version`"
+
+    def parent_path(self) -> tuple:
+        """Where this machine's opencode reads servers from: by the installed
+        version, else (no CLI on PATH, e.g. the desktop app) by the shape of the
+        config already there, else the old place."""
+        major = _opencode_major()
+        if major is not None:
+            return _OPENCODE_V2 if major >= 2 else _OPENCODE_V1
+        path = self.config_path()
+        data = _load_json_tolerant(path) if path is not None else None
+        return _OPENCODE_V2 if _dig(data, _OPENCODE_V2) is not None else _OPENCODE_V1
+
+    def stale_paths(self) -> tuple:
+        return tuple(p for p in (_OPENCODE_V1, _OPENCODE_V2) if p != self.parent_path())
+
+    def read_entry(self) -> Optional[dict]:
+        """The entry where this opencode reads it. One left in the other place
+        is not registered: the client ignores it."""
+        path = self.config_path()
+        if path is None or not path.exists():
+            return None
+        parent = _dig(_load_json_tolerant(path), self.parent_path())
+        entry = parent.get("biopb") if parent is not None else None
+        return entry if isinstance(entry, dict) else None
+
+    def entry(self) -> dict:
+        entry = super().entry()
+        if self.parent_path() == _OPENCODE_V2:
+            entry.pop("enabled", None)  # opencode 2 spells it ``disabled``
+        return entry
 
     def config_path(self) -> Optional[Path]:
         """An existing ``opencode.jsonc`` (so no shadow ``.json`` is written
@@ -672,7 +876,27 @@ class Opencode(JsonConfigClient):
         return jsonc if jsonc.exists() else base / "opencode.json"
 
     def is_installed(self) -> bool:
-        return shutil.which("opencode") is not None or super().is_installed()
+        return shutil.which(self.exe) is not None or super().is_installed()
+
+    @property
+    def launch_kind(self) -> str:
+        # opencode 2 has a background service the CLI talks to; it is not ours
+        # to stop, so a launch there is a command that returns.
+        return "oneshot" if _opencode_major() == 2 else "child"
+
+    def launch_argv(self, *, remote: bool = False) -> Optional[list]:
+        major = _opencode_major()
+        if major is None:
+            return None
+        if major >= 2:
+            # A one-time link for the loopback service. `--remote` pairs through
+            # opencode's tunnel, which exposes the server to the internet, and
+            # `--yes` accepts that where there is no terminal to ask: only on the
+            # operator's opt-in.
+            return [self.exe, "pair", *(["--remote", "--yes"] if remote else [])]
+        # `serve` is `web` without opening a browser, which the dashboard does
+        # for every client.
+        return [self.exe, "serve", "--hostname", "127.0.0.1", "--port", "0"]
 
 
 # --------------------------------------------------------------------------- #
@@ -709,12 +933,15 @@ def supported() -> list[ClientBackend]:
 
 
 def status(client_id: str) -> dict:
-    """One client's status: ``{id, name, state, drifted, config_path}``.
+    """One client's status: ``{id, name, state, drifted, config_path,
+    can_launch, relay}``.
 
     ``state`` is ``registered`` if the biopb entry is present (regardless of
     detection), else ``installed`` if detected, else ``not_installed``.
     ``drifted`` is set only when ``registered`` and the stored command or
-    arguments no longer match what would be registered now.
+    arguments no longer match what would be registered now. ``can_launch`` is
+    whether the dashboard can open a session with the client; ``relay`` whether
+    that session is reachable from other devices.
     """
     client = _client(client_id)
     path = client.config_path()
@@ -734,7 +961,15 @@ def status(client_id: str) -> dict:
         "state": state,
         "drifted": drifted,
         "config_path": str(path) if path is not None else None,
+        "can_launch": client.can_launch(),
+        "launch_hint": client.launch_hint(),
+        "relay": client.relay,
     }
+
+
+def backend(client_id: str) -> ClientBackend:
+    """The client's backend, for a caller that launches it."""
+    return _client(client_id)
 
 
 def statuses() -> list[dict]:
