@@ -33,8 +33,9 @@ classifiers = [
 # the lean-control discipline holds.
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    # The algorithm Ops protocol (biopb.image).
-    "biopb >= 0.12.0",
+    # The algorithm Ops protocol (biopb.image), and the SDK's control helpers:
+    # detach_kwargs(breakaway=) and _agents.backend need 0.14.
+    "biopb >= 0.14.0",
     "starlette>=0.37",
     # No websockets extra: the control proxies HTTP only and runs uvicorn with
     # ws="none", so neither a server impl nor a client library is pulled in.
