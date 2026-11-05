@@ -54,6 +54,7 @@ function writerName(origin?: string): string {
 }
 
 const CHAT_WIDTH_KEY = "biopb.observe.chatWidth";
+const CHAT_HIDDEN_KEY = "biopb.observe.chatHidden";
 
 interface JobSummary {
   job_id: string;
@@ -171,6 +172,23 @@ export default function ObservePage() {
       return null;
     }
   });
+  // Hidden, not unmounted: the thread, its poll and a half-typed turn survive
+  // the toggle, and showing it again costs nothing.
+  const [chatHidden, setChatHidden] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(CHAT_HIDDEN_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHAT_HIDDEN_KEY, chatHidden ? "1" : "0");
+    } catch {
+      /* a preference that cannot be saved is still a working session */
+    }
+  }, [chatHidden]);
+  const chatShown = showChat && !chatHidden;
   const mainRef = useRef<HTMLElement | null>(null);
   const dragging = useRef(false);
 
@@ -520,6 +538,15 @@ export default function ObservePage() {
               </button>
             ))
           : null}
+        {showChat ? (
+          <button
+            aria-pressed={!chatHidden}
+            onClick={() => setChatHidden((h) => !h)}
+            title={chatHidden ? "Show the chat pane" : "Hide the chat pane"}
+          >
+            {chatHidden ? "Show chat" : "Hide chat"}
+          </button>
+        ) : null}
         {/* Both act on the child, so both 404 once it is gone. A dead button is
             how the page told the user nothing was wrong. */}
         {ended ? null : (
@@ -605,7 +632,7 @@ export default function ObservePage() {
       </header>
       <main
         ref={mainRef}
-        className={showChat ? "with-chat" : ""}
+        className={chatShown ? "with-chat" : ""}
         style={
           chatWidth === null
             ? undefined
@@ -620,14 +647,18 @@ export default function ObservePage() {
           </div>
         ) : null}
         {showChat && chatStatus ? (
-          <ChatPane
-            base={base}
-            status={chatStatus}
-            pollMs={pollMs}
-            canExec={canExec}
-          />
+          // `contents` while shown, so the pane is still the flex item the
+          // layout rules address; `none` keeps it mounted but out of the way.
+          <div style={{ display: chatHidden ? "none" : "contents" }}>
+            <ChatPane
+              base={base}
+              status={chatStatus}
+              pollMs={pollMs}
+              canExec={canExec}
+            />
+          </div>
         ) : null}
-        {showChat && chatStatus ? (
+        {chatShown && chatStatus ? (
           // Pointer events rather than mouse: capture keeps the drag alive when
           // the cursor outruns the handle, which it will on a fast drag.
           <div
