@@ -577,7 +577,11 @@ class TestExecuteCode:
         intent = payload["parameters"]["properties"]["intent"]
         assert "why" in intent["description"]
 
-    def test_the_users_cells_reach_the_model_through_execute_code(self, chat_host):
+    def test_the_users_cells_reach_the_model_through_execute_code(
+        self, chat_host, monkeypatch
+    ):
+        # Pins the tool-result seam; the turn-start note would take the digest first.
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
         # The tool the model reaches for most, and the one path that carried no
         # notice: poll_job and server_status append it, but a model with no
         # reason to call them ran a whole session never learning that the person
@@ -648,6 +652,42 @@ class TestExecuteCode:
         )
         asyncio.run(_chat.run_turn("set x", model))
         assert chat_host.acked == []
+
+    def test_a_notice_whose_ack_is_declined_is_not_repeated(
+        self, chat_host, monkeypatch
+    ):
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
+        # Another client holds the claim, so the kernel keeps offering the cell;
+        # the thread must not carry the same warning on every tool result.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        _writers._note_claim("someone-else")
+        call = {
+            "content": "",
+            "tool_calls": [_call("execute_code", python_code="x = 1")],
+        }
+        model = _scripted(call, call, call, {"content": "done"})
+        asyncio.run(_chat.run_turn("set x", model))
+        results = [m["content"] for m in _chat.history() if m["role"] == "tool"]
+        assert sum("job-7" in r for r in results) == 1
+
+    def test_a_running_cell_is_reported_once_and_again_when_it_ends(
+        self, chat_host, monkeypatch
+    ):
+        monkeypatch.setattr(_chat, "_sync_activity", lambda: None)
+        call = {
+            "content": "",
+            "tool_calls": [_call("execute_code", python_code="x = 1")],
+        }
+        chat_host._digest = [{"job_id": "job-7", "status": "running", "origin": "user"}]
+        model = _scripted(call, call, {"content": "done"})
+        asyncio.run(_chat.run_turn("set x", model))
+        results = [m["content"] for m in _chat.history() if m["role"] == "tool"]
+        assert sum("job-7 (running" in r for r in results) == 1
+
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        asyncio.run(_chat.run_turn("again", _scripted(call, {"content": "done"})))
+        results = [m["content"] for m in _chat.history() if m["role"] == "tool"]
+        assert "job-7 (ok" in results[-1]
 
     def test_nothing_is_acked_when_there_is_nothing_to_report(self, chat_host):
         model = _scripted(
