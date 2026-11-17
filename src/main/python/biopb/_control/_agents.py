@@ -793,10 +793,60 @@ _OPENCODE_V2 = ("mcp", "servers")
 _opencode_majors: dict = {}
 
 
+def _opencode_desktop_cli_dirs() -> list:
+    """Directories where the opencode desktop app keeps its bundled CLI, by
+    platform. The app installs this CLI but does not add it to ``PATH``."""
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        return [Path(appdata) / "ai.opencode.desktop" / "cli"] if appdata else []
+    home = Path.home()
+    return [
+        home / "Library" / "Application Support" / "ai.opencode.desktop" / "cli",
+        home / ".config" / "ai.opencode.desktop" / "cli",
+    ]
+
+
+def _version_tuple(name: str) -> tuple:
+    """The leading dotted number of a folder like ``2.3.0-x64`` as a sort key;
+    ``()`` when it has none, so a named-but-unversioned dir sorts oldest."""
+    match = re.match(r"(\d+(?:\.\d+)*)", name)
+    return tuple(int(p) for p in match.group(1).split(".")) if match else ()
+
+
+def _opencode_bundled_cli() -> Optional[str]:
+    """The newest ``opencode-cli`` the desktop app ships under a per-version
+    directory, or ``None`` if the desktop app is not installed here."""
+    exe_name = "opencode-cli.exe" if os.name == "nt" else "opencode-cli"
+    best_key: Optional[tuple] = None
+    best_path: Optional[str] = None
+    for base in _opencode_desktop_cli_dirs():
+        try:
+            versions = list(base.iterdir())
+        except OSError:
+            continue
+        for version in versions:
+            cli = version / exe_name
+            try:
+                mtime = cli.stat().st_mtime  # also the existence check
+            except OSError:
+                continue
+            key = (_version_tuple(version.name), mtime)
+            if best_key is None or key > best_key:
+                best_key, best_path = key, str(cli)
+    return best_path
+
+
+def _opencode_exe() -> Optional[str]:
+    """A runnable ``opencode`` CLI: the one on ``PATH``, else the desktop app's
+    bundled CLI (which the app leaves off ``PATH``). ``None`` if neither."""
+    return shutil.which("opencode") or _opencode_bundled_cli()
+
+
 def _opencode_major() -> Optional[int]:
-    """The major version of the ``opencode`` on PATH, or ``None`` if there is
-    none or it will not say."""
-    exe = shutil.which("opencode")
+    """The major version of the usable ``opencode`` CLI -- the one on ``PATH``
+    or the desktop app's bundled one -- or ``None`` if there is none or it will
+    not say."""
+    exe = _opencode_exe()
     if exe is None:
         return None
     try:
@@ -826,21 +876,35 @@ class Opencode(JsonConfigClient):
     has_launch = True
     ready_pattern = re.compile(r"https?://\S+")  # `opencode serve` names its URL
 
+    def _launch_exe(self) -> str:
+        """What to spawn: the bare name when ``opencode`` is on ``PATH`` (the
+        launcher resolves it), else the desktop app's bundled CLI by absolute
+        path -- the app installs that CLI but does not put it on ``PATH``."""
+        if shutil.which(self.exe) is not None:
+            return self.exe
+        return _opencode_bundled_cli() or self.exe
+
     def stop_argv(self, *, remote: bool = False) -> Optional[list]:
         # The service is machine-wide and left up, except when this launch put it
         # on the internet: stopping it is the only way to take it back off.
-        return [self.exe, "service", "stop"] if remote else None
+        return [self._launch_exe(), "service", "stop"] if remote else None
+
+    def can_launch(self) -> bool:
+        # ``launch_argv`` is non-``None`` only once a usable CLI named its major
+        # version; a bare ``shutil.which(self.exe)`` would miss the desktop app's
+        # bundled CLI, which is not on ``PATH``.
+        return self.launch_argv() is not None
 
     def launch_hint(self) -> Optional[str]:
         if self.can_launch():
             return None
-        if shutil.which(self.exe) is None:
+        if _opencode_exe() is None:
             return super().launch_hint()
         return f"could not read the version from `{self.exe} --version`"
 
     def parent_path(self) -> tuple:
-        """Where this machine's opencode reads servers from: by the installed
-        version, else (no CLI on PATH, e.g. the desktop app) by the shape of the
+        """Where this machine's opencode reads servers from: by the detected
+        version (PATH or the desktop app's bundled CLI), else by the shape of the
         config already there, else the old place."""
         major = _opencode_major()
         if major is not None:
@@ -876,7 +940,7 @@ class Opencode(JsonConfigClient):
         return jsonc if jsonc.exists() else base / "opencode.json"
 
     def is_installed(self) -> bool:
-        return shutil.which(self.exe) is not None or super().is_installed()
+        return _opencode_exe() is not None or super().is_installed()
 
     @property
     def launch_kind(self) -> str:
@@ -888,15 +952,16 @@ class Opencode(JsonConfigClient):
         major = _opencode_major()
         if major is None:
             return None
+        exe = self._launch_exe()
         if major >= 2:
             # A one-time link for the loopback service. `--remote` pairs through
             # opencode's tunnel, which exposes the server to the internet, and
             # `--yes` accepts that where there is no terminal to ask: only on the
             # operator's opt-in.
-            return [self.exe, "pair", *(["--remote", "--yes"] if remote else [])]
+            return [exe, "pair", *(["--remote", "--yes"] if remote else [])]
         # `serve` is `web` without opening a browser, which the dashboard does
         # for every client.
-        return [self.exe, "serve", "--hostname", "127.0.0.1", "--port", "0"]
+        return [exe, "serve", "--hostname", "127.0.0.1", "--port", "0"]
 
 
 # --------------------------------------------------------------------------- #

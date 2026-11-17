@@ -32,6 +32,10 @@ Claude Desktop and Cursor have no web or remote surface and never get a button.
   browser the dashboard opens itself. opencode 2's service is machine-wide
   (`opencode service start|status|stop`); `pair` prints a link that works once and
   expires in 5 minutes.
+- The **opencode desktop app** installs a CLI but does not add it to PATH, so when
+  no `opencode` is on PATH the probe and the launch fall back to the app's bundled
+  `opencode-cli` (the newest `…/ai.opencode.desktop/cli/<version>/`), launched by
+  its absolute path. A real `opencode` on PATH still wins and is run by bare name.
 - **Claude Code** runs one conversation per process (`--spawn session`), so Stop
   ends that conversation. The default mode hosts many conversations in one daemon
   and works too, but Stop then ends them all. A shim per conversation is cheap: it
@@ -49,7 +53,7 @@ Claude Desktop and Cursor have no web or remote surface and never get a button.
 | `has_launch` | whether the client has a launch surface at all |
 | `launch_argv(remote=)` / `stop_argv(remote=)` | the commands; `None` when there is none |
 | `launch_kind` | `child` (a process the control owns) or `oneshot` (a command that returns) |
-| `can_launch()` | `launch_argv()` names a program on PATH (Codex also needs its standalone install) |
+| `can_launch()` | `launch_argv()` names a runnable program (on PATH, or opencode's bundled desktop-app CLI; Codex also needs its standalone install) |
 | `launch_hint()` | what is missing, for a client that has a surface but cannot launch here |
 | `relay` | reachable from other devices through a relay |
 | `ready_pattern` | the output that means a `child` is usable (opencode's URL, Claude Code's `claude.ai` link) |
