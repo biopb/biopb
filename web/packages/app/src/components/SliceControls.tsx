@@ -37,7 +37,7 @@ import {
   withContrastLimit,
 } from "../utils/vivUtils";
 import { compositeChannels, compositeColors } from "../utils/composite";
-import { VOLUME_RENDER_MODES, volumeRefusal } from "../utils/volumeUtils";
+import { VOLUME_RENDER_MODES, compositeVolumeFits, volumeRefusal } from "../utils/volumeUtils";
 
 // Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
 const SLIDER_DEBOUNCE_MS = 150;
@@ -199,19 +199,25 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   );
 
   // Whether the composite button is doing anything for this tensor: asked for,
-  // in 2-D, on a non-RGB image of 2-4 channels. The button itself is always
-  // there and keeps its pressed state, so it does not appear and vanish as one
-  // moves between tensors.
+  // on a non-RGB image of 2-4 channels, in either view. The button itself is
+  // always there and keeps its pressed state, so it does not appear and vanish
+  // as one moves between tensors.
   // Whether the tensor could composite at all, whatever the preference or view;
   // unknown (no grid yet) counts as yes rather than flashing the button grey.
   const compositeEligible = useMemo(
     () => tileInfo === null || compositeChannels(tileInfo, true) !== null,
     [tileInfo],
   );
-  const compositeActive = useMemo(
-    () => !render3d && tileInfo !== null && compositeChannels(tileInfo, composite) !== null,
-    [render3d, tileInfo, composite],
-  );
+  const compositeActive = useMemo(() => {
+    if (tileInfo === null) return false;
+    const channels = compositeChannels(tileInfo, composite);
+    if (channels === null) return false;
+    // In 3-D each channel is its own volume; a set that will not fit in VRAM
+    // falls back to a single channel in the viewer, so it is not active here.
+    const volume = tileInfo.volume;
+    if (render3d) return !!volume && volume.available && compositeVolumeFits(volume, channels.length);
+    return true;
+  }, [render3d, tileInfo, composite]);
   // A composite is windowed per channel from its own histogram, so the mode the
   // panel reflects is auto whatever was chosen: a fixed window is one pair of
   // grey levels and has no meaning across several channels.
@@ -383,8 +389,9 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             3D
           </button>
           {/* Greyed when this tensor is not a 2-4 channel non-RGB image, which
-              no setting can composite. In 3-D it stays live: the tensor is
-              eligible, the preference just waits for the 2-D view. */}
+              no setting can composite. It applies in both views now; in 3-D it
+              falls back to a single channel only when the channels will not fit
+              in VRAM together. */}
           <button
             onClick={() => setComposite(!composite)}
             aria-pressed={composite}
@@ -393,7 +400,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               compositeActive
                 ? "Showing every channel blended, each in its own colour"
                 : compositeEligible
-                  ? "Blend every channel, each in its own colour (2D only)"
+                  ? "Blend every channel, each in its own colour"
                   : "Needs a 2-4 channel image that is not RGB"
             }
             style={{

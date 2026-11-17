@@ -5,6 +5,7 @@ import {
   VOLUME_MAX_BYTES,
   VOLUME_MAX_VOXELS,
   VOLUME_RENDER_MODES,
+  compositeVolumeFits,
   volumeCentre,
   volumeKey,
   volumeRefusal,
@@ -81,6 +82,28 @@ describe("volumeRefusal", () => {
   it("accepts one exactly at the limit", () => {
     const info = makeInfo({ volume: makeVolume({ bytes: VOLUME_MAX_BYTES }) });
     expect(volumeRefusal(info)).toBeNull();
+  });
+});
+
+describe("compositeVolumeFits", () => {
+  it("always fits a single channel", () => {
+    // A volume right at the single-channel voxel ceiling still fits at one.
+    const volume = makeVolume({ ...volumeOf(VOLUME_MAX_VOXELS), bytes: 1 });
+    expect(compositeVolumeFits(volume, 1)).toBe(true);
+  });
+
+  it("refuses a channel set whose voxels exceed the ceiling together", () => {
+    // Half the voxel ceiling fits alone and in a pair, but not in three.
+    const volume = makeVolume({ ...volumeOf(VOLUME_MAX_VOXELS / 2), bytes: 1 });
+    expect(compositeVolumeFits(volume, 2)).toBe(true);
+    expect(compositeVolumeFits(volume, 3)).toBe(false);
+  });
+
+  it("refuses a channel set whose wire bytes exceed the ceiling together", () => {
+    // Tiny voxel count, but each channel is half the byte ceiling.
+    const volume = makeVolume({ ...volumeOf(1000), bytes: VOLUME_MAX_BYTES / 2 });
+    expect(compositeVolumeFits(volume, 2)).toBe(true);
+    expect(compositeVolumeFits(volume, 3)).toBe(false);
   });
 });
 
