@@ -9,6 +9,7 @@ deterministic; the ``claude`` CLI is mocked (no real binary needed).
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -432,6 +433,39 @@ def test_opencode_major_reads_the_cli_once(tmp_path, monkeypatch):
     assert _agents._opencode_major() == 2
     assert _agents._opencode_major() == 2
     assert calls == [[str(exe), "--version"]]
+
+
+def test_opencode_discovers_the_desktop_apps_bundled_cli(tmp_path, monkeypatch):
+    # The opencode desktop app installs a CLI under a per-version directory but
+    # does not add it to PATH; the dashboard must still be able to launch it.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    monkeypatch.setattr(_agents, "_opencode_majors", {})
+    monkeypatch.setattr(_agents.shutil, "which", lambda name: None)  # not on PATH
+
+    name = "opencode-cli.exe" if os.name == "nt" else "opencode-cli"
+    if os.name == "nt":
+        root = Path(os.environ["APPDATA"]) / "ai.opencode.desktop" / "cli"
+    else:
+        root = tmp_path / ".config" / "ai.opencode.desktop" / "cli"
+    (root / "1.9.0-x64").mkdir(parents=True)
+    (root / "1.9.0-x64" / name).write_text("")  # an older version lingers
+    (root / "2.3.0-x64").mkdir(parents=True)
+    bundled = root / "2.3.0-x64" / name
+    bundled.write_text("")
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="opencode v2.3.0\n")
+
+    monkeypatch.setattr(_agents.subprocess, "run", run)
+
+    assert _agents._opencode_exe() == str(bundled)  # newest, not 1.9.0
+    assert _agents._opencode_major() == 2
+    opencode = _agents.backend("opencode")
+    assert opencode.is_installed()
+    assert opencode.can_launch() and opencode.launch_kind == "oneshot"
+    assert opencode.launch_argv() == [str(bundled), "pair"]
+    assert opencode.launch_hint() is None
 
 
 # --------------------------------------------------------------------------- #
