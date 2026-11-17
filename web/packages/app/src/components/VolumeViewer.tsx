@@ -45,7 +45,9 @@ import {
   contrastSamples,
   vivColor,
 } from "../utils/vivUtils";
+import { compositeChannels, compositeColors, compositeWindows } from "../utils/composite";
 import {
+  compositeVolumeFits,
   volumeCentre,
   volumeKey,
   volumeRefusal,
@@ -97,8 +99,11 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   const position = useAppStore((s) => s.position);
   const epoch = useMountEpoch();
   const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
-  const channelNames = useAppStore((s) => s.channelNames);
-  const channelColors = useAppStore((s) => s.channelColors);
+  const composite = useAppStore((s) => s.composite);
+  // This source's own entries, not the whole maps: an edit on another source
+  // must not rebuild this one's layer (the same split TileViewer makes).
+  const names = useAppStore((s) => s.channelNames[sourceId]);
+  const sourceColors = useAppStore((s) => s.channelColors[sourceId]);
   const renderMode = useAppStore((s) => s.volumeRenderMode);
 
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -124,41 +129,65 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   // is what lets the rest of the component read the plan without re-narrowing.
   const plan = (info?.volume ?? null) as VolumeAvailable | null;
 
-  // --- the volume ----------------------------------------------------------
-  // Keyed on the *request*, so a contrast drag or a colour change — neither of
-  // which alters a byte of it — cannot re-issue a read of hundreds of MB.
-  const request = useMemo(
-    () => (info && plan ? volumeRequest(info, plan, position) : null),
-    [info, plan, position],
+  // --- which channels are drawn -------------------------------------------
+  // A composite draws each channel as its own volume. It applies in the same
+  // cases as the 2-D path (`compositeChannels`), and then only if the channels
+  // fit in VRAM together (`compositeVolumeFits`): N channels multiply a read
+  // already up to a gigabyte. Over budget it falls back to the current channel
+  // alone, so 3-D still renders rather than refusing.
+  const wantedChannels = useMemo(
+    () => (info ? compositeChannels(info, composite) : null),
+    [info, composite],
   );
-  const requestKey = request ? volumeKey(request) : "";
+  const channels = useMemo(
+    () =>
+      wantedChannels && plan && compositeVolumeFits(plan, wantedChannels.length)
+        ? wantedChannels
+        : null,
+    [wantedChannels, plan],
+  );
+  // The channels actually read: the composite set, or the single current one.
+  const readChannels = useMemo(() => channels ?? [position.c], [channels, position.c]);
+
+  // --- the volume(s) -------------------------------------------------------
+  // Keyed on the *requests*, so a contrast drag or a colour change — neither of
+  // which alters a byte of them — cannot re-issue a read of hundreds of MB. A
+  // composite's selections override `c`, so a C move leaves the key unchanged.
+  const requests = useMemo(
+    () =>
+      info && plan ? readChannels.map((c) => volumeRequest(info, plan, { ...position, c })) : null,
+    [info, plan, position, readChannels],
+  );
+  const requestKey = requests ? requests.map(volumeKey).join("~") : "";
 
   type VolumeData = ReturnType<typeof asTypedArray>;
-  const [volume, setVolume] = useState<{ key: string; data: VolumeData } | null>(null);
+  const [volume, setVolume] = useState<{ key: string; data: VolumeData[] } | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!client || !info || !request) return;
+    if (!client || !info || !requests) return;
     const controller = new AbortController();
     let live = true;
     setReadError(null);
-    client.http
-      // Not the tile budget: a volume is up to three orders of magnitude
-      // larger, and the deadline covers the body download as well as the read.
-      .slice(request, {
-        signal: controller.signal,
-        timeoutMs: client.http.volumeTimeoutMs,
-      })
-      .then((arr) => {
+    Promise.all(
+      requests.map((req) =>
+        client.http
+          // Not the tile budget: a volume is up to three orders of magnitude
+          // larger, and the deadline covers the body download as well as the read.
+          .slice(req, { signal: controller.signal, timeoutMs: client.http.volumeTimeoutMs })
+          .then((arr) => asTypedArray(arr.buffer, vivDtype(arr.dtype))),
+      ),
+    )
+      .then((datas) => {
         if (!live) return;
-        const data = asTypedArray(arr.buffer, vivDtype(arr.dtype));
-        // Sampled from the volume itself: there is no coarser level to sample
-        // here the way the tiled viewer samples its overview -- this *is* the
-        // coarsest -- and the whole volume is already in memory, so a strided
-        // subsample of it costs nothing beyond the sort. Noted in the same
-        // batch as the volume, so the window and the pixels land together.
-        notePlaneSamples({ plane: data, values: contrastSamples(data) }, position.c, epoch);
-        setVolume({ key: requestKey, data });
+        // Each channel is windowed on its own samples, noted under its own index
+        // so `channelSamples[c]` feeds `compositeWindows` the way the 2-D path
+        // does. Sampled from the volume itself: this is already the coarsest
+        // level, so a strided subsample costs nothing beyond the sort.
+        datas.forEach((data, i) =>
+          notePlaneSamples({ plane: data, values: contrastSamples(data) }, readChannels[i]!, epoch),
+        );
+        setVolume({ key: requestKey, data: datas });
       })
       .catch((err: unknown) => {
         if (!live || err instanceof TensorAbortError) return;
@@ -168,7 +197,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
       live = false;
       controller.abort();
     };
-    // `requestKey` and not `request`: the object identity changes on every
+    // `requestKey` and not `requests`: the object identity changes on every
     // store write, its content only when the pixels would.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, info, requestKey, epoch, notePlaneSamples]);
@@ -181,18 +210,51 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
 
   // Under play, keep the last volume on the canvas while the next read is in
   // flight. Unmounting the stage between frames -- which is what a null here
-  // does -- makes a scrub through T a strobe of empty panes.
-  const shown = current ?? (playing ? (volume?.data ?? null) : null);
+  // does -- makes a scrub through T a strobe of empty panes. Only when the
+  // channel count still matches, so toggling composite mid-play does not feed
+  // the layer a stale volume of the wrong channel count.
+  const shown =
+    current ??
+    (playing && volume && volume.data.length === readChannels.length ? volume.data : null);
 
-  // --- contrast ------------------------------------------------------------
-  // The same selector the panel's bar reads (biopb/biopb#955).
-  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
+  // --- contrast and colour -------------------------------------------------
+  // The single-channel window: the same selector the panel's bar reads
+  // (biopb/biopb#955). A composite replaces it with a per-channel window.
+  const singleWindow = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
   const gamma = useAppStore((s) => clampGamma(s.display.gamma));
+  const channelSamples = useAppStore((s) => (channels ? s.runtime.channelSamples : null));
+  const percentileScale = useAppStore((s) => s.display.percentileScale);
 
-  const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[position.c] ?? "auto";
-    return vivColor(stored, channelNames[sourceId]?.[position.c]);
-  }, [channelColors, channelNames, sourceId, position.c]);
+  // A composite windows each channel on its own samples; a channel not sampled
+  // yet is held back (hidden) rather than drawn through a guessed window.
+  const windows = useMemo(
+    () =>
+      channels && channelSamples
+        ? compositeWindows(channels, channelSamples, percentileScale)
+        : null,
+    [channels, channelSamples, percentileScale],
+  );
+  const contrastLimits = useMemo<[number, number][]>(
+    () => (windows ? windows.map((w) => w ?? FALLBACK_WINDOW) : [singleWindow]),
+    [windows, singleWindow],
+  );
+  const channelsVisible = useMemo(
+    () => (windows ? windows.map((w) => w !== null) : [true]),
+    [windows],
+  );
+  const colors = useMemo<[number, number, number][]>(() => {
+    if (channels) {
+      // `compositeColors` resolves every channel to a colour itself (names
+      // included), so `vivColor` is given only the answer.
+      return compositeColors(
+        channels.map((c) => sourceColors?.[c] ?? "auto"),
+        channels.map((c) => names?.[c]),
+      ).map((color) => vivColor(color));
+    }
+    return [vivColor(sourceColors?.[position.c] ?? "auto", names?.[position.c])];
+  }, [channels, sourceColors, names, position.c]);
+  // One entry per drawn channel, so `XR3DLayer.getNumChannels` sizes the shader.
+  const selections = useMemo(() => (channels ? channels.map(() => ({})) : ONE_CHANNEL), [channels]);
 
   return (
     <div ref={hostRef} style={HOST}>
@@ -203,7 +265,9 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
           dtype={vivDtype(info.dtype)}
           contrastLimits={contrastLimits}
           gamma={gamma}
-          color={color}
+          colors={colors}
+          channelsVisible={channelsVisible}
+          selections={selections}
           renderMode={renderMode}
           width={size.width}
           height={size.height}
@@ -213,7 +277,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
           {readError
             ? `Volume unavailable — ${readError}`
             : plan
-              ? `Reading volume (${(plan.bytes / 1024 / 1024).toFixed(0)} MB)…`
+              ? `Reading volume (${((plan.bytes * readChannels.length) / 1024 / 1024).toFixed(0)} MB)…`
               : "Loading volume…"}
         </div>
       )}
@@ -240,17 +304,22 @@ function VolumeStage({
   dtype,
   contrastLimits,
   gamma,
-  color,
+  colors,
+  channelsVisible,
+  selections,
   renderMode,
   width,
   height,
 }: {
   plan: VolumeAvailable;
-  data: ReturnType<typeof asTypedArray>;
+  /** One volume per drawn channel, aligned with the arrays below. */
+  data: ReturnType<typeof asTypedArray>[];
   dtype: ReturnType<typeof vivDtype>;
-  contrastLimits: [number, number];
+  contrastLimits: [number, number][];
   gamma: number;
-  color: [number, number, number];
+  colors: [number, number, number][];
+  channelsVisible: boolean[];
+  selections: unknown[];
   renderMode: VolumeRenderMode;
   width: number;
   height: number;
@@ -327,18 +396,20 @@ function VolumeStage({
       // Checked against @vivjs/layers@0.22.1 — this reaches over a gap in the
       // types, not over props the layer ignores.
       new XR3DLayer({
-        id: `volume-${plan.width}-${plan.height}-${plan.depth}`,
+        // The channel count is in the id: `getNumChannels` sizes the shader from
+        // `selections.length`, so a change there must build a new layer.
+        id: `volume-${plan.width}-${plan.height}-${plan.depth}-${selections.length}`,
         channelData: {
-          data: [data],
+          data,
           width: plan.width,
           height: plan.height,
           depth: plan.depth,
         },
-        selections: ONE_CHANNEL,
+        selections,
         dtype,
-        contrastLimits: [contrastLimits],
-        colors: [color],
-        channelsVisible: [true],
+        contrastLimits,
+        colors,
+        channelsVisible,
         physicalSizeScalingMatrix,
         resolutionMatrix,
         extensions: VOLUME_EXTENSIONS[renderMode],
@@ -353,7 +424,9 @@ function VolumeStage({
       dtype,
       contrastLimits,
       gamma,
-      color,
+      colors,
+      channelsVisible,
+      selections,
       renderMode,
       physicalSizeScalingMatrix,
       resolutionMatrix,
