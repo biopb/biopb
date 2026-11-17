@@ -52,9 +52,9 @@ export interface LabelLayerOptions {
   showing: boolean;
   /**
    * Called when this layer's viewport is fully loaded, exactly as the image's
-   * own is: `MultiscaleImageLayer` pins its background layer's copy to null, so
-   * this fires once per completed viewport. What {@link LabelLayerOptions.showing}
-   * is decided from.
+   * own is: the overlay has no background layer (`excludeBackground`) to report
+   * a second time, so this fires once per completed viewport. What
+   * {@link LabelLayerOptions.showing} is decided from.
    */
   onViewportLoad: (loaded?: unknown) => void;
 }
@@ -96,6 +96,15 @@ export function buildLabelLayers(options: LabelLayerOptions | null): unknown[] {
       // makes the overlay correct rather than merely pretty: a linear filter
       // would blend two ids into a third that names no object.
       interpolation: "nearest",
+      // `MultiscaleImageLayer` otherwise draws the coarsest level under the
+      // tiles as a placeholder, and hard-codes `linear` on it whatever is asked
+      // for above. For an image that is a blur behind sharp tiles; for ids it is
+      // exactly the blend the line above exists to prevent, and it is *visible*:
+      // a tile is transparent wherever its id is 0, so around every object the
+      // ramp from its id down to 0 shows through as a block of unrelated
+      // colours, one coarse pixel wide. `ImageLayer` has no background and
+      // ignores this.
+      excludeBackground: true,
       // Nothing on the overlay is clickable, and leaving it pickable would put
       // it between the pointer and the ROI surface underneath -- deck reports
       // the topmost picked layer, and a click that places a vertex needs to

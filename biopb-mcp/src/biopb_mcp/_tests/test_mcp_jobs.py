@@ -311,7 +311,8 @@ class TestJobConcurrency:
             cell,
             "mcp",
         )
-        deadline = time.monotonic() + 30.0
+        # The first matplotlib import can build its font cache on a cold runner.
+        deadline = time.monotonic() + 180.0
         while kernel.jobs.poll(cell)["status"] == "running":
             assert time.monotonic() < deadline
             time.sleep(0.05)
@@ -408,7 +409,8 @@ class TestJobConcurrency:
         assert "figure_data" not in snap["verify"]["cells"][0]
         nb = _notebook.build_workflow_notebook(_scratch.verified())
         (cell,) = [c for c in nb["cells"] if c["cell_type"] == "code"]
-        assert [o["output_type"] for o in cell["outputs"]] == ["display_data"]
+        # matplotlib may also write a notice to stderr (a stream output).
+        assert "display_data" in [o["output_type"] for o in cell["outputs"]]
 
     def test_cells_after_a_failure_are_skipped(self, scratch):
         _scratch, session = scratch

@@ -103,6 +103,27 @@ export function volumeRefusal(info: TileInfo): string | null {
 }
 
 /**
+ * Whether a 3-D composite's channels can be uploaded at once.
+ *
+ * Each channel is its own volume, cast to Float32 in VRAM and held as a transient
+ * buffer on the heap while it lands, so N of them multiply the budget
+ * {@link volumeRefusal} applies to one. A single channel always "fits" here —
+ * `volumeRefusal` is the gate for that — so this only ever narrows the composite
+ * case. When it returns false the viewer draws the current channel alone rather
+ * than refuse 3-D outright: the server's coarsest scale caps one channel well
+ * under the ceiling, and most multichannel stacks are far smaller than the max,
+ * so this bites only a near-maximal volume asked for in several channels.
+ */
+export function compositeVolumeFits(volume: VolumeAvailable, channelCount: number): boolean {
+  if (channelCount <= 1) return true;
+  const voxels = volume.depth * volume.height * volume.width;
+  return (
+    voxels * channelCount <= VOLUME_MAX_VOXELS &&
+    volume.bytes * channelCount <= VOLUME_MAX_BYTES
+  );
+}
+
+/**
  * The read for one volume: whole in z/y/x, pinned on every other axis.
  *
  * `slice_start`/`slice_stop` are full-resolution world coordinates — the units

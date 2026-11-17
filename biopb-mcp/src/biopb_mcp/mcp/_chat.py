@@ -108,6 +108,10 @@ _pending_user: list = []
 # Jobs already written into the thread as an activity note, so a notice whose
 # ack the kernel declined (another writer holds the claim) is not noted twice.
 _noted_jobs: set = set()
+# Jobs already reported as still running. The kernel offers a running cell on
+# every call until it ends, and the ack can be declined for the whole run, so
+# without this each tool result in the thread repeats the same notice.
+_told_running: set = set()
 # The compacted prefix: a summary of the first `_compacted` messages, standing
 # in for them when the thread is projected to the provider. Projection only --
 # `_messages` keeps every word, because the human's record of the conversation
@@ -228,6 +232,7 @@ def drop_unsent():
     """
     _pending_user.clear()
     _noted_jobs.clear()
+    _told_running.clear()
 
 
 def reset():
@@ -301,6 +306,14 @@ def _render_activity(digest):
         "viewer.layers rather than trusting what you last saw. Read the cells "
         "with poll_job."
     )
+
+
+def _already_told(entry) -> bool:
+    """Whether the thread already carries this digest entry at its current status:
+    a finished cell once, a running one once (its end is a new status)."""
+    if entry.get("status") == "running":
+        return entry["job_id"] in _told_running
+    return entry["job_id"] in _noted_jobs
 
 
 def _sync_activity():
@@ -505,7 +518,7 @@ async def _run_code(arguments, on_progress):
 
     # Read under this dispatch's `_local_origin`, which is what keeps this
     # loop's own cells out of its own digest.
-    digest = _writers._foreign_digest(host)
+    digest = [d for d in _writers._foreign_digest(host) if not _already_told(d)]
     foreign_note = _writers._render_foreign_note(digest)
 
     def deliver(text):
@@ -698,6 +711,10 @@ async def _discharge_notice():
     host = _app._kernel_host
     if not digest or host is None:
         return
+    for d in digest:
+        (_told_running if d.get("status") == "running" else _noted_jobs).add(
+            d["job_id"]
+        )
     _writers._ack_foreign_digest(host, digest, WRITER_ID)
 
 

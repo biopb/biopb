@@ -2463,8 +2463,13 @@ class TestApiUpdate:
     belongs to one person."""
 
     @pytest.fixture
-    def serve(self, upstream, tmp_path, web_bundle):
+    def serve(self, upstream, tmp_path, web_bundle, monkeypatch):
         from biopb_control._update import UpdateInfo
+
+        installed = {"managed": True}
+        monkeypatch.setattr(
+            "biopb_control._update.managed_install", lambda: installed["managed"]
+        )
 
         class _Checker:
             def __init__(self, found):
@@ -2479,7 +2484,8 @@ class TestApiUpdate:
 
         servers = []
 
-        def _serve(found=True, **spec_kw):
+        def _serve(found=True, host="127.0.0.1", managed=True, **spec_kw):
+            installed["managed"] = managed
             spec = DataPlaneSpec(
                 config=tmp_path / "config.json",
                 grpc_host=spec_kw.pop("grpc_host", "127.0.0.1"),
@@ -2490,7 +2496,7 @@ class TestApiUpdate:
             )
             port = _free_port()
             server, _thread = serve_control_api(
-                "127.0.0.1",
+                host,
                 port,
                 DataPlaneSupervisor(spec),
                 ensure_timeout=8.0,
@@ -2538,7 +2544,60 @@ class TestApiUpdate:
         base = serve(grpc_host="0.0.0.0", token="t" * 20)
         assert self._post_status(f"{base}/api/update") in (401, 403)
 
+    def test_a_public_control_bind_does_not_update_itself(self, serve):
+        # The data plane is loopback; only the control's own listener is public
+        # (an operator's reverse proxy, a shared login node).
+        base = serve(host="0.0.0.0")
+        assert self._post_status(f"{base}/api/update") == 403
+        _s, _h, body = _get(f"{base}/api/status")
+        assert json.loads(body)["update"]["installable"] is False
+
+    def test_an_unmanaged_install_does_not_update_itself(self, serve, monkeypatch):
+        # A shared venv or module: the installer would rewrite ~/.local instead
+        # and relaunch from that copy.
+        monkeypatch.setattr(
+            "biopb_control._update.start_install",
+            lambda info: pytest.fail("installer must not run"),
+        )
+        base = serve(managed=False)
+        assert self._post_status(f"{base}/api/update") == 403
+        _s, _h, body = _get(f"{base}/api/status")
+        assert json.loads(body)["update"]["installable"] is False
+
     def test_it_needs_the_exec_credential(self):
         from biopb_control._control import _needs_exec
 
         assert _needs_exec("POST", "/api/update")
+
+
+class TestManagedInstall:
+    """Only the installer's own `uv tool` environment may be upgraded in place."""
+
+    def test_the_default_uv_tool_dir(self, tmp_path, monkeypatch):
+        from biopb_control import _update
+
+        env = tmp_path / "share" / "uv" / "tools" / "biopb"
+        env.mkdir(parents=True)
+        monkeypatch.delenv("UV_TOOL_DIR", raising=False)
+        monkeypatch.setattr("sys.prefix", str(env))
+        assert _update.managed_install()
+
+    def test_a_shared_venv_is_not_managed(self, tmp_path, monkeypatch):
+        from biopb_control import _update
+
+        venv = tmp_path / "apps" / "biopb" / "0.15.2" / "venv"
+        venv.mkdir(parents=True)
+        monkeypatch.delenv("UV_TOOL_DIR", raising=False)
+        monkeypatch.setattr("sys.prefix", str(venv))
+        assert not _update.managed_install()
+
+    def test_uv_tool_dir_override_is_honoured(self, tmp_path, monkeypatch):
+        from biopb_control import _update
+
+        env = tmp_path / "mytools" / "biopb"
+        env.mkdir(parents=True)
+        monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "mytools"))
+        monkeypatch.setattr("sys.prefix", str(env))
+        assert _update.managed_install()
+        monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "elsewhere"))
+        assert not _update.managed_install()

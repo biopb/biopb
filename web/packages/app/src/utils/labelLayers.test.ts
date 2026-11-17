@@ -50,6 +50,13 @@ describe("buildLabelLayers", () => {
     expect(layers[0]!.props.pickable).toBe(false);
   });
 
+  it("draws no interpolated background under the tiles", () => {
+    // Viv's placeholder is the coarsest level, linearly filtered: between an id
+    // and the 0 beside it that is every id in between, each its own colour, and
+    // it shows wherever the tile above is transparent.
+    expect(build()[0]!.props.excludeBackground).toBe(true);
+  });
+
   it("hands a single level the one source rather than the pyramid", () => {
     expect(build({ sources: [sources[0]!] })[0]!.props.loader).toBe(sources[0]);
   });

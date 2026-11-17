@@ -2056,10 +2056,13 @@ def serve_control_api(
         hide=spec.hide,
         relay_clients=spec.relay_clients,
         updates=updates,
-        # A control one person owns: loopback-bound and not published under a
-        # portal prefix. A shared or remote one is updated by whoever runs it.
-        update_allowed=not _web_auth.host_is_public_bind(spec.grpc_host)
-        and not spec.url_prefix,
+        # A control one person owns: both listeners loopback-bound, not published
+        # under a portal prefix, and running from the installer's own tool env. A
+        # shared or remote one is updated by whoever runs it.
+        update_allowed=not _web_auth.host_is_public_bind(host)
+        and not _web_auth.host_is_public_bind(spec.grpc_host)
+        and not spec.url_prefix
+        and _update.managed_install(),
     )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

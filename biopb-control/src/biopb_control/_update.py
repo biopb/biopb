@@ -161,6 +161,19 @@ def last_result() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def managed_install() -> bool:
+    """Whether this control runs from the ``uv tool`` environment the installer
+    maintains. The installer only ever rewrites that environment, so from a shared
+    venv, a module or a source checkout it would replace some other copy and
+    relaunch from it."""
+    prefix = Path(sys.prefix).resolve()
+    override = os.environ.get("UV_TOOL_DIR")
+    if override:
+        return prefix.parent == Path(override).resolve()
+    # uv's default: <data home>/uv/tools/<tool>.
+    return prefix.parent.name == "tools" and prefix.parent.parent.name == "uv"
+
+
 class InstallRunning(Exception):
     """An installer started earlier has not finished."""
 
