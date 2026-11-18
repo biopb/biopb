@@ -967,14 +967,21 @@ describe("opening a tensor", () => {
   });
 
   describe("a remembered 3-D request", () => {
-    const withVolume = (available: boolean) =>
-      ({ ...TILE_INFO, volume: { available } }) as unknown as TileInfo;
-
-    it("opens the next tensor in 3-D when it offers a volume", async () => {
-      fresh(resolver((id) => ({ ...withVolume(true), array_id: id }) as TileInfo));
+    // Every tensor but "flat" offers a volume; the user is in 3-D on "first".
+    const in3dOnFirst = async () => {
+      fresh(
+        resolver(
+          (id) =>
+            ({ ...TILE_INFO, array_id: id, volume: { available: id !== "flat" } }) as unknown as TileInfo,
+        ),
+      );
       useAppStore.getState().openTensor("first");
       await settle();
       useAppStore.getState().setRender3d(true);
+    };
+
+    it("opens the next tensor in 3-D when it offers a volume", async () => {
+      await in3dOnFirst();
 
       useAppStore.getState().openTensor("second");
       // Not before the tile info says so: the tensor may have no volume.
@@ -984,12 +991,7 @@ describe("opening a tensor", () => {
     });
 
     it("stays in 2-D where there is no volume, and returns to 3-D where there is", async () => {
-      fresh(
-        resolver((id) => ({ ...withVolume(id !== "flat"), array_id: id }) as TileInfo),
-      );
-      useAppStore.getState().openTensor("first");
-      await settle();
-      useAppStore.getState().setRender3d(true);
+      await in3dOnFirst();
 
       useAppStore.getState().openTensor("flat");
       await settle();
@@ -1001,10 +1003,7 @@ describe("opening a tensor", () => {
     });
 
     it("is forgotten once the user returns to 2-D", async () => {
-      fresh(resolver((id) => ({ ...withVolume(true), array_id: id }) as TileInfo));
-      useAppStore.getState().openTensor("first");
-      await settle();
-      useAppStore.getState().setRender3d(true);
+      await in3dOnFirst();
       useAppStore.getState().setRender3d(false);
 
       useAppStore.getState().openTensor("second");
@@ -1013,8 +1012,7 @@ describe("opening a tensor", () => {
     });
 
     it("leaves a link to say what view it opens", async () => {
-      fresh(resolver((id) => ({ ...withVolume(true), array_id: id }) as TileInfo));
-      useAppStore.setState({ prefer3d: true });
+      await in3dOnFirst();
       useAppStore.getState().applyViewerState(new URLSearchParams("id=second"));
       await settle();
       expect(useAppStore.getState().render3d).toBe(false);

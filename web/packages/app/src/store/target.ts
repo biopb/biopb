@@ -257,7 +257,7 @@ export const createTargetSlice: StateCreator<AppState, [], [], TargetSlice> = (s
       position: init ? pickPosition(init.slice) : { t: 0, z: 0, c: 0, axes: {} },
       display: init ? pickDisplay(init.slice) : { ...s.display, fixedLimits: null },
       render3d: init?.render3d ?? false,
-      prefer3d: init?.render3d ? true : s.prefer3d,
+      prefer3d: init?.render3d || s.prefer3d,
       volumeRenderMode: init?.volumeRenderMode ?? s.volumeRenderMode,
       composite: init?.composite ?? s.composite,
       camera3d: init?.camera3d ?? null,
