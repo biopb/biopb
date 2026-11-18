@@ -491,8 +491,8 @@ _fetch_latest_release() {
         # substitution. We want to return 1 and let the caller print a friendly
         # message, so the empty-tag check below handles it.
         RELEASE_TAG=$(printf '%s' "$_releases" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | sed -E 's/.*"([^"]+)"$/\1/' \
             | grep -E "$_tag_re" | head -1) || true
     fi
     [ -n "${RELEASE_TAG:-}" ] || return 1
