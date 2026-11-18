@@ -144,7 +144,9 @@ export interface TargetSlice {
    * Not part of `SliceState`: that object's identity drives the tiled viewer's
    * refetches, and the render mode changes which viewer is mounted rather than
    * which pixels it wants. Reset on a source change — the next tensor may have
-   * no volume to render, and a toggle stuck on would open it on an error.
+   * no volume to render, and a toggle stuck on would open it on an error. The
+   * request outlives the change as `prefer3d`, and is taken up again when the
+   * next tensor's tile info shows a volume.
    */
   render3d: boolean;
   /**
@@ -255,6 +257,7 @@ export const createTargetSlice: StateCreator<AppState, [], [], TargetSlice> = (s
       position: init ? pickPosition(init.slice) : { t: 0, z: 0, c: 0, axes: {} },
       display: init ? pickDisplay(init.slice) : { ...s.display, fixedLimits: null },
       render3d: init?.render3d ?? false,
+      prefer3d: init?.render3d || s.prefer3d,
       volumeRenderMode: init?.volumeRenderMode ?? s.volumeRenderMode,
       composite: init?.composite ?? s.composite,
       camera3d: init?.camera3d ?? null,
@@ -340,7 +343,7 @@ export const createTargetSlice: StateCreator<AppState, [], [], TargetSlice> = (s
   },
 
   setRender3d(value) {
-    set({ render3d: value });
+    set({ render3d: value, prefer3d: value });
   },
 
   setCamera3d(value) {
@@ -390,6 +393,11 @@ async function resolveTarget(
       if (!current()) return;
       const key = splitArrayVersion(info.array_id).arrayId;
       set((s) => ({
+        // A click opens in 2-D and takes the remembered 3-D request up only
+        // here, where the tensor has said it has a volume; a link names its own
+        // view and is left as it spelled it.
+        render3d:
+          s.render3d || (!s.target.linked && s.prefer3d && info.volume?.available === true),
         target: {
           ...s.target,
           status: "ready",

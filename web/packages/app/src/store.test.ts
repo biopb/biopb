@@ -966,6 +966,59 @@ describe("opening a tensor", () => {
     expect(useAppStore.getState().position).toMatchObject({ t: 0, z: 0 });
   });
 
+  describe("a remembered 3-D request", () => {
+    // Every tensor but "flat" offers a volume; the user is in 3-D on "first".
+    const in3dOnFirst = async () => {
+      fresh(
+        resolver(
+          (id) =>
+            ({ ...TILE_INFO, array_id: id, volume: { available: id !== "flat" } }) as unknown as TileInfo,
+        ),
+      );
+      useAppStore.getState().openTensor("first");
+      await settle();
+      useAppStore.getState().setRender3d(true);
+    };
+
+    it("opens the next tensor in 3-D when it offers a volume", async () => {
+      await in3dOnFirst();
+
+      useAppStore.getState().openTensor("second");
+      // Not before the tile info says so: the tensor may have no volume.
+      expect(useAppStore.getState().render3d).toBe(false);
+      await settle();
+      expect(useAppStore.getState().render3d).toBe(true);
+    });
+
+    it("stays in 2-D where there is no volume, and returns to 3-D where there is", async () => {
+      await in3dOnFirst();
+
+      useAppStore.getState().openTensor("flat");
+      await settle();
+      expect(useAppStore.getState().render3d).toBe(false);
+
+      useAppStore.getState().openTensor("third");
+      await settle();
+      expect(useAppStore.getState().render3d).toBe(true);
+    });
+
+    it("is forgotten once the user returns to 2-D", async () => {
+      await in3dOnFirst();
+      useAppStore.getState().setRender3d(false);
+
+      useAppStore.getState().openTensor("second");
+      await settle();
+      expect(useAppStore.getState().render3d).toBe(false);
+    });
+
+    it("leaves a link to say what view it opens", async () => {
+      await in3dOnFirst();
+      useAppStore.getState().applyViewerState(new URLSearchParams("id=second"));
+      await settle();
+      expect(useAppStore.getState().render3d).toBe(false);
+    });
+  });
+
   it("fetches the ROI listing once, under the address tile_info resolved", async () => {
     const asked: string[] = [];
     const client = {

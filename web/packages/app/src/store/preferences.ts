@@ -43,6 +43,13 @@ export interface PreferencesSlice {
    * source change and apply to the next stack that does.
    */
   composite: boolean;
+  /**
+   * Whether the user last asked for the 3-D view. Like `composite`, a request:
+   * `render3d` follows it only where the tensor in view offers a volume, once
+   * its tile info is in, so it can stay on across a source change without
+   * opening one that has no volume on an error.
+   */
+  prefer3d: boolean;
   // Channel colors (sourceId -> channelIdx -> color)
   channelColors: Record<string, Record<number, ColorValue>>;
   // Channel names (sourceId -> channel names array)
@@ -59,6 +66,7 @@ export const createPreferencesSlice: StateCreator<AppState, [], [], PreferencesS
   showAdvancedOptions: false,
   volumeRenderMode: DEFAULT_VOLUME_RENDER_MODE,
   composite: false,
+  prefer3d: false,
 
   // Load persisted colors from localStorage on initialization
   channelColors: loadColorsFromStorage(),
