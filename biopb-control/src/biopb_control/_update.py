@@ -229,6 +229,9 @@ def start_install(info: UpdateInfo) -> str | None:
     # An unattended run never asks (a fresh install would otherwise answer its
     # consent prompts with yes).
     env["BIOPB_NONINTERACTIVE"] = "1"
+    # The release the dashboard announced, not whatever the installer finds or an
+    # inherited pin names (a control an older installer started carries its own).
+    env["BIOPB_INSTALL_VERSION"] = info.latest
     env[ENV_RESULT] = str(path)
     if Version(info.current).is_prerelease:
         env["BIOPB_INSTALL_RC"] = "1"

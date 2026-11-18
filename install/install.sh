@@ -491,8 +491,8 @@ _fetch_latest_release() {
         # substitution. We want to return 1 and let the caller print a friendly
         # message, so the empty-tag check below handles it.
         RELEASE_TAG=$(printf '%s' "$_releases" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+            | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | sed -E 's/.*"([^"]+)"$/\1/' \
             | grep -E "$_tag_re" | head -1) || true
     fi
     [ -n "${RELEASE_TAG:-}" ] || return 1
@@ -797,7 +797,11 @@ _start_control_plane() {
     local start_out
     # `restart` rather than `start`: it comes back with the options the previous
     # control ran with (or the defaults when none were saved).
-    if ! start_out=$("$biopb_cmd" control restart 2>&1); then
+    # The control keeps this environment, and a later dashboard update hands it to
+    # the next installer, so the choices that steered this run must not reach it:
+    # BIOPB_INSTALL_VERSION would pin every later update to this release.
+    if ! start_out=$(env -u BIOPB_INSTALL_VERSION -u BIOPB_NONINTERACTIVE \
+        -u BIOPB_UPDATE_RESULT "$biopb_cmd" control restart 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's

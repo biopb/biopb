@@ -164,6 +164,14 @@ class TestStartInstall:
         # Detached, so it outlives this control.
         assert kwargs.get("start_new_session") or kwargs.get("creationflags")
 
+    def test_installs_the_announced_release_whatever_the_env_pins(
+        self, spawned, monkeypatch
+    ):
+        # A control an older installer started inherited its pin to that release.
+        monkeypatch.setenv("BIOPB_INSTALL_VERSION", "release-v0.6.6")
+        _update.start_install(_update.UpdateInfo("0.6.6", "0.7.0", "u"))
+        assert spawned[0][1]["env"]["BIOPB_INSTALL_VERSION"] == "0.7.0"
+
     def test_a_candidate_install_asks_for_candidates(self, spawned):
         _update.start_install(_update.UpdateInfo("0.7.0rc1", "0.7.0rc2", "u"))
         assert spawned[0][1]["env"]["BIOPB_INSTALL_RC"] == "1"

@@ -62,8 +62,8 @@ _resolve_tag() {
         "https://api.github.com/repos/$RELEASE_REPO/releases?per_page=100") || return 1
     # `|| true`: no match makes grep exit 1, and the caller reports the empty tag.
     tag=$(printf '%s' "$releases" \
-        | grep '"tag_name"' \
-        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
+        | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | sed -E 's/.*"([^"]+)"$/\1/' \
         | grep -E "$re" | head -1) || true
     [ -n "$tag" ] || return 1
     printf '%s\n' "$tag"

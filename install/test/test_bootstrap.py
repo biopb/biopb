@@ -97,6 +97,13 @@ def test_runs_the_latest_stable_installer(run):
     assert urls[-1].endswith("/releases/download/release-v0.15.2/install.sh")
 
 
+def test_a_minified_listing_still_picks_the_newest(run):
+    # GitHub does not always pretty-print: every tag then sits on one line.
+    minified = "".join(LISTING.split())
+    _, urls = run(listing=minified)
+    assert urls[-1].endswith("/releases/download/release-v0.15.2/install.sh")
+
+
 def test_rc_channel_takes_the_candidate(run):
     proc, urls = run(env={"BIOPB_INSTALL_RC": "1"})
     assert proc.returncode == 0, proc.stderr
