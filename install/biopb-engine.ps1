@@ -923,7 +923,21 @@ function Start-ControlPlane {
     $startOut = @()
     # `restart` rather than `start`: it comes back with the options the previous
     # control ran with (or the defaults when none were saved).
+    # The control keeps this environment, and a later dashboard update hands it to
+    # the next installer, so the choices that steered this run must not reach it:
+    # BIOPB_INSTALL_VERSION would pin every later update to this release.
+    $steering = 'BIOPB_INSTALL_VERSION', 'BIOPB_NONINTERACTIVE', 'BIOPB_UPDATE_RESULT'
+    $saved = @{}
+    foreach ($name in $steering) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
     try { $startOut = @(& $biopb control restart 2>&1 | ForEach-Object { "$_" }) } catch { $startOut += "$_" }
+    $startExit = $LASTEXITCODE
+    foreach ($name in $steering) {
+        [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process')
+    }
+    $LASTEXITCODE = $startExit
     if ($LASTEXITCODE -ne 0) {
         $ErrorActionPreference = $prevEAP
         Report-Warn "Control plane failed to start"

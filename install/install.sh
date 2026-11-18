@@ -797,7 +797,11 @@ _start_control_plane() {
     local start_out
     # `restart` rather than `start`: it comes back with the options the previous
     # control ran with (or the defaults when none were saved).
-    if ! start_out=$("$biopb_cmd" control restart 2>&1); then
+    # The control keeps this environment, and a later dashboard update hands it to
+    # the next installer, so the choices that steered this run must not reach it:
+    # BIOPB_INSTALL_VERSION would pin every later update to this release.
+    if ! start_out=$(env -u BIOPB_INSTALL_VERSION -u BIOPB_NONINTERACTIVE \
+        -u BIOPB_UPDATE_RESULT "$biopb_cmd" control restart 2>&1); then
         _warn "Control plane failed to start:"
         # A plain `if` (not `[ -n "$line" ] && _info`): an empty $start_out still
         # yields one loop pass whose trailing false test would make the while's
